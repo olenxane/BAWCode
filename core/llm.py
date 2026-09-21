@@ -4,6 +4,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 try:
@@ -16,6 +17,7 @@ except ImportError:
 
 from core import hooks
 from core import policy
+from core import prompt_loader
 from core import register
 from core import tokens as tokenmod
 from core.config import normalize_base_url
@@ -23,12 +25,33 @@ from core.log import get_logger
 
 log = get_logger("llm")
 
-SYSTEM_PROMPT = (
-    "你是 BAWCode 编码 Agent。根据用户任务与记忆/计划/步骤工作。"
-    "复杂任务先 write_plan / generate_steps；执行中 update_step_status。"
-    "工具调用可能被安全策略拦截，收到用户拒绝 error 时说明原因并调整。"
-    "回复使用简洁中文。"
-)
+_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _fallback_system_prompt() -> str:
+    return (
+        "你是 BAWCode 编码 Agent。根据用户任务与记忆/计划/步骤工作。"
+        "复杂任务先 write_plan / generate_steps；执行中 update_step_status。"
+        "工具调用可能被安全策略拦截，收到用户拒绝 error 时说明原因并调整。"
+        "回复使用简洁中文。"
+    )
+
+
+def get_system_prompt(config=None, **kwargs) -> str:
+    """从 core/prompts 加载系统提示词（占位符替换）"""
+    try:
+        return prompt_loader.get_system_prompt(config=config, **kwargs)
+    except Exception as e:
+        log.warn("加载系统提示词失败，使用兜底: %s", e)
+        return _fallback_system_prompt()
+
+
+# 兼容旧 import：惰性取当前配置提示词
+class _SystemPromptProxy(str):
+    pass
+
+
+SYSTEM_PROMPT = _SystemPromptProxy(_fallback_system_prompt())
 
 
 class LLM:
@@ -38,20 +61,32 @@ class LLM:
         self.meter.context_window = getattr(config, "context_window", 0) or 0
         self.meter.model = config.model_name
         self.client = None
+        self._client_provider_id = None
         self._build_client()
 
-    def _build_client(self) -> None:
+    def _build_client(self, provider_id: Optional[str] = None, api_key: Optional[str] = None,
+                      base_url: Optional[str] = None) -> None:
+        """构建 OpenAI 兼容客户端；可按 provider 指定 key/base_url"""
         self.client = None
-        if HAS_OPENAI and getattr(self.config, "api_key", ""):
-            base = normalize_base_url(getattr(self.config, "base_url", "") or "")
+        pid = provider_id or getattr(self.config, "provider_id", None) or self.config.data.get("active_provider_id")
+        key = api_key if api_key is not None else getattr(self.config, "api_key", "")
+        base = base_url if base_url is not None else getattr(self.config, "base_url", "") or ""
+        base = normalize_base_url(base or "")
+        if HAS_OPENAI and key:
             try:
-                self.client = openai.OpenAI(api_key=self.config.api_key, base_url=base)
-                log.debug("OpenAI 客户端已构建: %s", base)
+                self.client = openai.OpenAI(api_key=key, base_url=base)
+                self._client_provider_id = pid
+                log.debug("OpenAI 客户端已构建 provider=%s base=%s", pid, base)
             except Exception as e:
                 self.client = None
                 log.warn("OpenAI 客户端构建失败: %s", e)
         else:
-            log.debug("未构建 OpenAI 客户端: openai=%s api_key=%s", HAS_OPENAI, bool(getattr(self.config, "api_key", "")))
+            log.debug(
+                "未构建 OpenAI 客户端: openai=%s api_key=%s provider=%s",
+                HAS_OPENAI,
+                bool(key),
+                pid,
+            )
 
     def refresh_from_config(self, config) -> None:
         self.config = config
@@ -59,27 +94,82 @@ class LLM:
         self._build_client()
         self.query_balance()
 
-    def _headers(self) -> dict:
+    def resolve_request(self, model: Optional[str] = None) -> dict:
+        """按任务/激活模型解析该次请求的 provider 凭证与 model_id
+
+        DeepSeek/SenseNova 等多 provider 场景：model 属于谁就用谁的 api_key/base_url，
+        避免「model_id 换了、client 仍是另一家」导致的 404。
+        """
+        cfg = self.config
+        name = model or getattr(cfg, "model_name", None) or cfg.active_model_name()
+        row = None
+        if hasattr(cfg, "resolve_model_row"):
+            row = cfg.resolve_model_row(name)
+        if row is None and hasattr(cfg, "find_model"):
+            row = cfg.find_model(name)
+        if row is None or not row.get("api_key"):
+            active_name = cfg.active_model_name() if hasattr(cfg, "active_model_name") else name
+            active_row = None
+            if hasattr(cfg, "find_model"):
+                active_row = cfg.find_model(active_name)
+            if active_row and active_row.get("api_key"):
+                log.warn("模型 %s 不可用（无凭证/未找到），回退 %s", name, active_name)
+                row = active_row
+            else:
+                log.warn("模型 %s 不可用，且激活模型亦无凭证", name)
+                return {
+                    "model_id": getattr(cfg, "model", "") or "",
+                    "api_key": getattr(cfg, "api_key", "") or "",
+                    "base_url": normalize_base_url(getattr(cfg, "base_url", "") or ""),
+                    "provider_id": getattr(cfg, "provider_id", "") or "",
+                    "temperature": getattr(cfg, "temperature", 1.0),
+                    "max_tokens": getattr(cfg, "max_tokens", 2048),
+                    "model_name": name,
+                    "ok": False,
+                }
         return {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.config.api_key}",
+            "model_id": row.get("model_id") or "",
+            "api_key": row.get("api_key") or "",
+            "base_url": normalize_base_url(row.get("base_url") or ""),
+            "provider_id": row.get("provider_id") or "",
+            "temperature": row.get("temperature") or getattr(cfg, "temperature", 1.0),
+            "max_tokens": row.get("max_tokens") or getattr(cfg, "max_tokens", 2048),
+            "model_name": row.get("model_name") or name,
+            "thinking_effort": row.get("thinking_effort") or "none",
+            "ok": True,
         }
 
-    def _chat_url(self) -> str:
-        base = normalize_base_url(self.config.base_url or "")
-        return f"{base}/chat/completions"
+    def _headers(self, req: Optional[dict] = None) -> dict:
+        key = (req or {}).get("api_key") or getattr(self.config, "api_key", "")
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+        }
 
-    def _http_chat(self, payload: dict) -> dict:
+    def _chat_url(self, req: Optional[dict] = None) -> str:
+        base = (req or {}).get("base_url") or getattr(self.config, "base_url", "") or ""
+        return f"{normalize_base_url(base or '')}/chat/completions"
+
+    def _http_chat(self, payload: dict, req: Optional[dict] = None) -> dict:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(self._chat_url(), data=body, headers=self._headers(), method="POST")
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        request = urllib.request.Request(
+            self._chat_url(req), data=body, headers=self._headers(req), method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=120) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _native_chat(self, payload: dict) -> dict:
-        if self.client is not None:
-            resp = self.client.chat.completions.create(**payload)
-            return resp.model_dump() if hasattr(resp, "model_dump") else resp
-        return self._http_chat(payload)
+    def _native_chat(self, payload: dict, req: Optional[dict] = None) -> dict:
+        req = req or {}
+        provider_id = req.get("provider_id")
+        api_key = req.get("api_key")
+        base_url = req.get("base_url")
+        if HAS_OPENAI and api_key:
+            if self.client is None or self._client_provider_id != provider_id:
+                self._build_client(provider_id=provider_id, api_key=api_key, base_url=base_url)
+            if self.client is not None:
+                resp = self.client.chat.completions.create(**payload)
+                return resp.model_dump() if hasattr(resp, "model_dump") else resp
+        return self._http_chat(payload, req)
 
     def query_balance(self) -> Optional[float]:
         """余额查询：provider.balance_url 支持时写入 meter；否则 None"""
@@ -108,7 +198,6 @@ class LLM:
             for key in ("currency", "unit"):
                 if data.get(key):
                     currency = str(data[key])
-            # 嵌套 data.balance
             if amount is None and isinstance(data.get("data"), dict):
                 inner = data["data"]
                 for key in ("balance", "available_balance", "total_balance"):
@@ -125,6 +214,54 @@ class LLM:
         self.meter.set_balance(amount, currency=currency, source="api")
         return amount
 
+    @staticmethod
+    def _map_api_messages(messages: List[dict]) -> List[dict]:
+        """组装 DeepSeek/OpenAI Tool Calls 协议消息，透传 tool_call_id / tool_calls"""
+        out: List[dict] = []
+        for m in messages or []:
+            role = m.get("role") or "user"
+            content = m.get("content")
+            if content is None:
+                content = ""
+            item: dict = {"role": role, "content": content if isinstance(content, str) else str(content)}
+            if m.get("name"):
+                item["name"] = m["name"]
+            if role == "tool":
+                # DeepSeek：tool 消息必须携带 tool_call_id
+                tcid = m.get("tool_call_id")
+                if tcid:
+                    item["tool_call_id"] = tcid
+                else:
+                    # 兼容无 id 的旧消息：降级为 system 注记，避免协议错误
+                    item = {
+                        "role": "system",
+                        "content": f"[tool:{m.get('tool_name') or 'tool'}]\n{item['content']}",
+                    }
+            if role == "assistant" and m.get("tool_calls"):
+                calls = []
+                for c in m["tool_calls"]:
+                    if not isinstance(c, dict):
+                        continue
+                    fn_name = c.get("name") or (c.get("function") or {}).get("name") or ""
+                    args = c.get("arguments")
+                    if args is None:
+                        args = (c.get("function") or {}).get("arguments") or "{}"
+                    if not isinstance(args, str):
+                        args = json.dumps(args, ensure_ascii=False)
+                    calls.append(
+                        {
+                            "id": c.get("id") or "",
+                            "type": "function",
+                            "function": {"name": fn_name, "arguments": args},
+                        }
+                    )
+                if calls:
+                    item["tool_calls"] = calls
+                    if not item["content"]:
+                        item["content"] = None
+            out.append(item)
+        return out
+
     def chat(
         self,
         messages: List[dict],
@@ -132,32 +269,25 @@ class LLM:
         temperature: Optional[float] = None,
         model: Optional[str] = None,
     ) -> dict:
-        """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型 id"""
+        """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型"""
         self.meter.measure_context(messages)
-        # 任务模型若是完整 model_name，取 model_id 部分作为 API model
-        model_id = model or self.config.model
-        if model and "-" in str(model):
-            # provider_id-model_id
-            parts = str(model).split("-", 1)
-            if len(parts) == 2 and parts[1]:
-                # 若与当前 provider 匹配或本地能解析，用 model_id
-                resolved = self.config.find_model(model) if hasattr(self.config, "find_model") else None
-                if resolved:
-                    model_id = resolved.get("model_id") or model
-                else:
-                    model_id = parts[1]
+        req = self.resolve_request(model)
+        model_id = req.get("model_id") or req.get("model_name") or ""
         payload = {
             "model": model_id,
-            "messages": [{"role": m.get("role", "user"), "content": str(m.get("content", ""))} for m in messages],
-            "temperature": self.config.temperature if temperature is None else temperature,
-            "max_tokens": self.config.max_tokens,
+            "messages": self._map_api_messages(messages),
+            "temperature": req.get("temperature", 1.0) if temperature is None else temperature,
+            "max_tokens": int(req.get("max_tokens") or 2048),
         }
         if tools:
             payload["tools"] = tools
+            # DeepSeek 思考模式不支持 required/指定 function，固定 auto
             payload["tool_choice"] = "auto"
-        if not self.config.api_key:
-            log.warn("未配置 api_key，LLM 请求被拒绝")
-            hooked = hooks.call_hook("llm_request", {"messages": messages, "tools": tools, "payload": payload}, default=None)
+        if not req.get("api_key"):
+            log.warn("未配置可用 api_key，LLM 请求被拒绝 model=%s", model_id)
+            hooked = hooks.call_hook(
+                "llm_request", {"messages": messages, "tools": tools, "payload": payload}, default=None
+            )
             if hooked is None:
                 return {"content": "", "tool_calls": [], "error": "未配置 api_key"}
             return self._normalize(hooked)
@@ -167,7 +297,13 @@ class LLM:
         attempt = 0
         last_error = None
         start = time.monotonic()
-        log.debug("LLM 请求 model=%s messages=%d tools=%d", model_id, len(messages), len(tools or []))
+        log.debug(
+            "LLM 请求 provider=%s model=%s messages=%d tools=%d",
+            req.get("provider_id"),
+            model_id,
+            len(payload["messages"]),
+            len(tools or []),
+        )
         while attempt <= max(retry_times, 0):
             try:
                 external = hooks.call_hook(
@@ -175,7 +311,7 @@ class LLM:
                     {"messages": messages, "tools": tools, "payload": payload},
                     default=None,
                 )
-                data = external if external is not None else self._native_chat(payload)
+                data = external if external is not None else self._native_chat(payload, req)
                 result = self._normalize(data)
                 usage = result.get("raw", {}).get("usage") if isinstance(result.get("raw"), dict) else None
                 self.meter.record_api_usage(usage)
@@ -189,8 +325,6 @@ class LLM:
                 )
                 return result
             except Exception as e:
-                # openai.NotFoundError/APIError 等不在旧捕获元组内，会穿透
-                # 导致整个 TUI 崩溃；统一按可重试错误处理并最终返回 error
                 last_error = e
                 attempt += 1
                 log.warn("LLM 调用失败(第%d/%d次): %s", attempt, max(retry_times, 0) + 1, e)
@@ -199,18 +333,31 @@ class LLM:
                     break
                 if retry_delay > 0:
                     time.sleep(retry_delay * attempt)
-                self._build_client()
+                self._build_client(
+                    provider_id=req.get("provider_id"),
+                    api_key=req.get("api_key"),
+                    base_url=req.get("base_url"),
+                )
         log.error("LLM 调用最终失败: %s", last_error)
         return {"content": "", "tool_calls": [], "error": f"LLM 调用失败: {last_error}"}
 
     def _normalize(self, data: Any) -> dict:
         if isinstance(data, dict) and data.get("content") is not None and "tool_calls" in data:
-            return {"content": data.get("content") or "", "tool_calls": data.get("tool_calls") or [], "raw": data.get("raw", data), "error": data.get("error")}
+            return {
+                "content": data.get("content") or "",
+                "tool_calls": data.get("tool_calls") or [],
+                "raw": data.get("raw", data),
+                "error": data.get("error"),
+            }
         if isinstance(data, dict) and data.get("error") and "choices" not in data:
             return {"content": "", "tool_calls": [], "raw": data, "error": data.get("error")}
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
-            return {"content": str(data.get("result", data)) if isinstance(data, dict) else str(data), "tool_calls": [], "raw": data if isinstance(data, dict) else {}}
+            return {
+                "content": str(data.get("result", data)) if isinstance(data, dict) else str(data),
+                "tool_calls": [],
+                "raw": data if isinstance(data, dict) else {},
+            }
         message = choices[0].get("message", {})
         tool_calls = []
         for call in message.get("tool_calls") or []:
@@ -220,8 +367,19 @@ class LLM:
                 args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             except json.JSONDecodeError:
                 args = {}
-            tool_calls.append({"id": call.get("id"), "name": function.get("name"), "arguments": args})
-        return {"content": message.get("content") or "", "tool_calls": tool_calls, "raw": data}
+            tool_calls.append(
+                {
+                    "id": call.get("id"),
+                    "name": function.get("name"),
+                    "arguments": args,
+                    "type": call.get("type") or "function",
+                }
+            )
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        if reasoning and not content:
+            content = reasoning
+        return {"content": content, "tool_calls": tool_calls, "raw": data}
 
     def evaluate_tool(self, tool_name: str, args: dict) -> tuple:
         action, reason = policy.evaluate(tool_name, args, getattr(self.config, "mode", policy.MODE_AUTO))
@@ -317,7 +475,7 @@ class LLM:
         if isinstance(external, str) and external:
             log.debug("prompt_refine 外部接口生效")
             return external
-        if not self.config.api_key:
+        if not getattr(self.config, "api_key", ""):
             return prompt
         result = self.chat(
             [
@@ -341,13 +499,22 @@ class LLM:
         external = hooks.call_hook("plan_generate", {"prompt": prompt}, default=None)
         if isinstance(external, dict) and external.get("content"):
             log.info("计划生成（外部接口）: %s", external.get("title", "任务计划"))
-            return {"title": external.get("title", "任务计划"), "content": external["content"], "complexity": "high"}
+            return {
+                "title": external.get("title", "任务计划"),
+                "content": external["content"],
+                "complexity": "high",
+            }
         plan_model = None
         if hasattr(self.config, "get_task_model"):
             plan_model = self.config.get_task_model("plan")
+        try:
+            system = prompt_loader.get_plan_prompt(prompt, config=self.config)
+        except Exception as e:
+            log.warn("加载 plan.md 失败: %s", e)
+            system = "输出 markdown 计划：目标、步骤、风险、验收。不要执行任务。"
         result = self.chat(
             [
-                {"role": "system", "content": "输出 markdown 计划：目标、步骤、风险、验收。不要执行任务。"},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             model=plan_model,

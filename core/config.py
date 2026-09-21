@@ -21,10 +21,10 @@ def default_config() -> dict:
                 "provider_id": "deepseek",
                 "name": "DeepSeek",
                 "api_key": "",
-                "base_url": "https://api.deepseek.com/v1",
+                "base_url": "https://api.deepseek.com",
                 "default_model_id": "deepseek-flash",
                 "temperature": 1.0,
-                "balance_url": "",
+                "balance_url": "https://api.deepseek.com/user/balance",
                 "models": [
                     {
                         "model_id": "deepseek-flash",
@@ -32,8 +32,16 @@ def default_config() -> dict:
                         "max_tokens": 384000,
                         "temperature": 1.0,
                         "modalities": ["text"],
-                        "thinking_effort": "none",
-                    }
+                        "thinking_effort": "high",
+                    },
+                    {
+                        "model_id": "deepseek-v4-pro",
+                        "context_window": 1000000,
+                        "max_tokens": 384000,
+                        "temperature": 1.0,
+                        "modalities": ["text"],
+                        "thinking_effort": "high",
+                    },
                 ],
             }
         ],
@@ -44,6 +52,11 @@ def default_config() -> dict:
             "plan": "deepseek-deepseek-flash",
             "code": "deepseek-deepseek-flash",
             "review": "deepseek-deepseek-flash",
+        },
+        "prompt": {
+            "dir": "core/prompts",
+            "system_files": ["system_prompt.md"],
+            "plan_files": ["plan.md"],
         },
         "system": {"font_size": 16},
         "ui": {
@@ -79,6 +92,7 @@ def default_config() -> dict:
         },
         "memory": {
             "longterm_path": "data/memory.json",
+            "longterm_dir": "data/memory",
             "auto_compress": True,
             "compress_threshold": 0.8,
             "strip_tool_history": True,
@@ -282,14 +296,32 @@ class Config:
                 )
         return rows
 
+    def resolve_model_row(self, model_name: str) -> Optional[dict]:
+        """解析 model_name；不存在或所属 provider 无 api_key 时返回 None"""
+        row = self.find_model(model_name) if model_name else None
+        if row and not row.get("api_key"):
+            log.warn("任务模型无 api_key，视为不可用: %s", model_name)
+            return None
+        return row
+
     def task_models(self) -> dict:
         tm = self.data.get("task_models") or {}
+        active = self.active_model_name()
         defaults = {
-            "plan": self.active_model_name(),
-            "code": self.active_model_name(),
-            "review": self.active_model_name(),
+            "plan": active,
+            "code": active,
+            "review": active,
         }
-        defaults.update({k: tm.get(k) or defaults[k] for k in TASK_ROLES})
+        for role in TASK_ROLES:
+            name = tm.get(role) or defaults[role]
+            row = self.resolve_model_row(name)
+            if row is None:
+                if name and name != active:
+                    log.warn("task_models.%s=%s 不可用，回退激活模型 %s", role, name, active)
+                defaults[role] = active
+                self.data.setdefault("task_models", {})[role] = active
+            else:
+                defaults[role] = row.get("model_name") or name
         return defaults
 
     def get_task_model(self, role: str) -> str:

@@ -1,10 +1,13 @@
 #该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.不必要的工具调用历史剥离3.长期记忆写入配置4.在agent对话时提供记忆补充内容5.针对特定项目的RAG模块
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 from core import hooks
+from core import prompt_loader
+from core import project_identity
 from core.log import get_logger
 
 log = get_logger("memory")
@@ -15,10 +18,10 @@ _ROOT = Path(__file__).resolve().parent.parent
 _session: Optional["Memory"] = None
 
 
-def init_session(config) -> "Memory":
+def init_session(config, project_identity_data: Optional[dict] = None) -> "Memory":
     """初始化全局记忆会话"""
     global _session
-    _session = Memory(config)
+    _session = Memory(config, project_identity=project_identity_data)
     return _session
 
 
@@ -28,12 +31,21 @@ def get_session() -> Optional["Memory"]:
 
 
 class Memory:
-    """Agent 记忆：消息、计划、步骤、长期记忆、RAG 接口"""
+    """Agent 记忆：消息、计划、步骤、长期记忆（md）、RAG 接口"""
 
-    def __init__(self, config):
+    def __init__(self, config, project_identity: Optional[dict] = None):
         self.config = config
         memory_cfg = config.data.get("memory", {})
         self.longterm_path = _ROOT / memory_cfg.get("longterm_path", "data/memory.json")
+        longterm_dir = memory_cfg.get("longterm_dir") or "data/memory"
+        self.memory_dir = Path(longterm_dir) if Path(longterm_dir).is_absolute() else _ROOT / longterm_dir
+        self.agent_md_path = self.memory_dir / "Agent.md"
+        self.projects_dir = self.memory_dir / "Projects"
+        self.project_identity = project_identity or {}
+        self.project_id = self.project_identity.get("project_id") or ""
+        self.project_md_path = (
+            self.projects_dir / f"{self.project_id}.md" if self.project_id else self.projects_dir / "_default.md"
+        )
         self.auto_compress = memory_cfg.get("auto_compress", True)
         self.compress_threshold = memory_cfg.get("compress_threshold", 0.8)
         self.strip_tool_history = memory_cfg.get("strip_tool_history", True)
@@ -48,65 +60,182 @@ class Memory:
         self.steps: List[dict] = []
         self.rag_docs: List[dict] = []
         self.longterm = self._load_longterm()
+        self._ensure_md_files()
+        self._migrate_legacy_json()
         log.info(
-            "记忆会话已初始化: 长期记忆=%s 自动压缩=%s 阈值=%.0f%%",
-            self.longterm_path,
+            "记忆会话已初始化: Agent.md=%s 项目记忆=%s 自动压缩=%s 阈值=%.0f%%",
+            self.agent_md_path,
+            self.project_md_path,
             self.auto_compress,
             self.compress_threshold * 100,
         )
 
+    def _memory_dir(self) -> Path:
+        return self.memory_dir
+
     def _load_longterm(self) -> dict:
-        """读取长期记忆；用户参与型可挂 memory_read 扩展点"""
+        """读取长期记忆；优先 md，兼容旧 memory.json"""
         external = hooks.call_user_participating(
             "memory_read",
-            {"path": str(self.longterm_path)},
+            {
+                "path": str(self.longterm_path),
+                "agent_md_path": str(self.agent_md_path),
+                "project_md_path": str(self.project_md_path),
+            },
             default=None,
         )
         if isinstance(external, dict) and external.get("memory"):
             log.debug("长期记忆来自外部接口")
             return external["memory"]
+        data = {"facts": [], "project_notes": [], "updated_at": ""}
         if self.longterm_path.exists():
             raw = self.longterm_path.read_text(encoding="utf-8").strip()
             if raw:
                 try:
-                    data = json.loads(raw)
+                    loaded = json.loads(raw)
+                    if isinstance(loaded, dict):
+                        data.update(loaded)
                 except json.JSONDecodeError as e:
                     log.error("长期记忆 JSON 解析失败 %s: %s", self.longterm_path, e)
-                    raise
-                log.debug("已读取长期记忆: %d条事实", len(data.get("facts") or []) if isinstance(data, dict) else 0)
-                return data
-        log.debug("长期记忆文件不存在，使用空记忆: %s", self.longterm_path)
-        return {"facts": [], "project_notes": [], "updated_at": ""}
+        return data
+
+    def _ensure_md_files(self) -> None:
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+        if not self.agent_md_path.exists():
+            self.agent_md_path.write_text(
+                "# Agent 长期记忆（全局）\n\n## 用户偏好\n\n## 编码规范\n\n## 测试规范\n",
+                encoding="utf-8",
+            )
+        if self.project_id and not self.project_md_path.exists():
+            self.project_md_path.write_text(
+                f"# 项目记忆：{self.project_identity.get('workspace_name') or self.project_id}\n\n"
+                f"## 项目约定\n\n## 技术栈\n\n## 未决事项\n",
+                encoding="utf-8",
+            )
+
+    def _migrate_legacy_json(self) -> None:
+        """旧 memory.json 有 facts 时迁入 Agent.md，避免丢失"""
+        facts = self.longterm.get("facts") or []
+        notes = self.longterm.get("project_notes") or []
+        if not facts and not notes:
+            return
+        try:
+            text = self.agent_md_path.read_text(encoding="utf-8") if self.agent_md_path.exists() else ""
+        except OSError:
+            text = ""
+        changed = False
+        if facts and "## 用户偏好" in text:
+            for f in facts:
+                line = f"- {f}"
+                if line not in text:
+                    text = text.replace("## 用户偏好", f"## 用户偏好\n{line}", 1)
+                    changed = True
+        if notes and self.project_md_path.exists():
+            try:
+                ptext = self.project_md_path.read_text(encoding="utf-8")
+            except OSError:
+                ptext = ""
+            for n in notes:
+                line = f"- {n}"
+                if line not in ptext:
+                    ptext = ptext.replace("## 项目约定", f"## 项目约定\n{line}", 1)
+                    changed = True
+            if changed:
+                self.project_md_path.write_text(ptext, encoding="utf-8")
+        if changed:
+            self.agent_md_path.write_text(text, encoding="utf-8")
+            backup = self.longterm_path.with_suffix(".json.bak")
+            try:
+                self.longterm_path.replace(backup)
+                log.info("旧 memory.json 已迁移并备份: %s", backup)
+            except OSError:
+                log.warn("memory.json 备份失败")
 
     def save_longterm(self, external_handler=None) -> None:
-        """写入长期记忆
-
-        用户参与型：可注入 external_handler 或配置 memory_write 外部 API。
-        """
+        """写入长期记忆（md 为事实来源；json 仅作兼容快照）"""
         self.longterm["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        payload = {"memory": self.longterm, "path": str(self.longterm_path)}
+        payload = {
+            "memory": self.longterm,
+            "path": str(self.longterm_path),
+            "agent_md_path": str(self.agent_md_path),
+            "project_md_path": str(self.project_md_path),
+        }
         hooks.call_user_participating("memory_write", payload, handler=external_handler)
         self.longterm_path.parent.mkdir(parents=True, exist_ok=True)
         self.longterm_path.write_text(
             json.dumps(self.longterm, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        log.debug("长期记忆已保存: %s", self.longterm_path)
+        self._ensure_md_files()
+        log.debug("长期记忆已保存: md=%s", self.agent_md_path)
+
+    def read_agent_md(self) -> str:
+        try:
+            return self.agent_md_path.read_text(encoding="utf-8") if self.agent_md_path.exists() else ""
+        except OSError:
+            return ""
+
+    def read_project_md(self) -> str:
+        try:
+            return self.project_md_path.read_text(encoding="utf-8") if self.project_md_path.exists() else ""
+        except OSError:
+            return ""
+
+    def _append_to_md(self, path: Path, section: str, line: str) -> bool:
+        try:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+        except OSError:
+            text = ""
+        if not text:
+            text = f"# 记忆\n\n## {section}\n"
+        entry = f"- {line}"
+        if entry in text:
+            return False
+        if f"## {section}" in text:
+            text = text.replace(f"## {section}", f"## {section}\n{entry}", 1)
+        else:
+            text = text.rstrip() + f"\n\n## {section}\n{entry}\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return True
 
     def add_message(self, role: str, content: str, **extra) -> dict:
-        """追加一条消息，extra 可含 type/tool_name/step_id"""
+        """追加一条消息，extra 可含 type/tool_name/tool_call_id/tool_calls"""
         message = {"role": role, "content": content}
         message.update(extra)
         self.messages.append(message)
-        log.debug("消息追加: role=%s type=%s 当前%d条", role, extra.get("type") or "-", len(self.messages))
+        log.debug(
+            "消息追加: role=%s type=%s call_id=%s 当前%d条",
+            role,
+            extra.get("type") or "-",
+            extra.get("tool_call_id") or "-",
+            len(self.messages),
+        )
         return message
 
-    def add_fact(self, fact: str) -> None:
-        """写入一条长期记忆事实"""
-        if fact and fact not in self.longterm.get("facts", []):
-            self.longterm.setdefault("facts", []).append(fact)
-            self.save_longterm()
-            log.info("写入长期记忆: %s", fact)
+    def add_fact(self, fact: str, scope: str = "agent") -> None:
+        """写入长期记忆事实；scope=agent → Agent.md，project → 项目 md"""
+        if not fact:
+            return
+        # 兼容旧精确去重
+        if fact in self.longterm.get("facts", []):
+            return
+        self.longterm.setdefault("facts", []).append(fact)
+        path = self.agent_md_path if scope != "project" else self.project_md_path
+        section = "用户偏好" if scope != "project" else "项目约定"
+        ok = self._append_to_md(path, section, fact)
+        self.save_longterm()
+        log.info("写入长期记忆(%s): %s -> %s", scope, fact, path)
+
+    def add_project_note(self, note: str) -> None:
+        if not note:
+            return
+        if note not in self.longterm.get("project_notes", []):
+            self.longterm.setdefault("project_notes", []).append(note)
+        self._append_to_md(self.project_md_path, "项目约定", note)
+        self.save_longterm()
+        log.info("写入项目记忆: %s", note)
 
     def set_plan(self, title: str, content: str, complexity: str = "medium") -> dict:
         """更新任务计划"""
@@ -128,9 +257,7 @@ class Memory:
         normalized = []
         for index, item in enumerate(steps, start=1):
             if isinstance(item, str):
-                normalized.append(
-                    {"id": index, "title": item, "status": "pending", "detail": ""}
-                )
+                normalized.append({"id": index, "title": item, "status": "pending", "detail": ""})
             else:
                 step = dict(item)
                 step.setdefault("id", index)
@@ -139,7 +266,7 @@ class Memory:
                 step.setdefault("title", step.get("name", f"步骤{index}"))
                 normalized.append(step)
         self.steps = normalized
-        log.info("步骤已设置: %d步", len(normalized))
+        log.info("步骤已设置: %d步", len(steps))
 
     def update_step_status(self, step_id: int, status: str, detail: str = "") -> Optional[dict]:
         """更新单步状态；用户参与型可挂 step_update 扩展点"""
@@ -163,16 +290,14 @@ class Memory:
         """粗估当前消息占用字符数，用于是否压缩判断"""
         total = 0
         for message in self.messages:
-            total += len(str(message.get("content", "")))
+            total += len(str(message.get("content") or ""))
         return total
 
     def strip_old_tool_messages(self) -> int:
         """剥离多余的历史工具输出，保留最近若干条，其余替换为占位"""
         if not self.strip_tool_history:
             return 0
-        tool_indexes = [
-            i for i, m in enumerate(self.messages) if m.get("role") == "tool"
-        ]
+        tool_indexes = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
         if len(tool_indexes) <= self.strip_tool_keep:
             return 0
         to_strip = tool_indexes[: -self.strip_tool_keep]
@@ -183,17 +308,11 @@ class Memory:
         return len(to_strip)
 
     def compress(self, llm_fn: Optional[Callable[[str], str]] = None, external_handler=None) -> str:
-        """上下文压缩
-
-        用户参与型：可注入 external_handler 做外部摘要；
-        否则用 llm_fn（如 LLM.chat 单轮）生成摘要并替换旧消息。
-        """
+        """上下文压缩"""
         self.strip_old_tool_messages()
         if not self.messages:
             return ""
-        history_text = "\n".join(
-            f"{m.get('role')}: {m.get('content')}" for m in self.messages
-        )
+        history_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in self.messages)
         summary = hooks.call_user_participating(
             "memory_write",
             {"action": "compress", "history": history_text},
@@ -236,26 +355,27 @@ class Memory:
             log.debug("未达压缩阈值: 约%d字/%d字", estimate, limit)
 
     def build_context_supplements(self) -> List[dict]:
-        """构建对话时注入的记忆补充内容（长期记忆、计划、步骤、RAG）"""
+        """长期记忆（Agent.md + 项目 md）+ 计划/步骤（队首 system 区域）"""
         supplements = []
-        facts = self.longterm.get("facts") or []
-        notes = self.longterm.get("project_notes") or []
-        rag_text = self.rag_query("当前任务相关资料")
         parts = []
-        if facts:
+        agent_md = self.read_agent_md().strip()
+        project_md = self.read_project_md().strip()
+        if agent_md:
+            parts.append(f"[长期记忆 Agent.md]\n{agent_md}")
+        if project_md:
+            parts.append(f"[项目记忆 {self.project_md_path.name}]\n{project_md}")
+        # 兼容字段（若 md 未写入但 json 仍有）
+        facts = self.longterm.get("facts") or []
+        if facts and not agent_md:
             parts.append("长期记忆事实:\n" + "\n".join(f"- {x}" for x in facts[-10:]))
-        if notes:
-            parts.append("项目笔记:\n" + "\n".join(f"- {x}" for x in notes[-10:]))
         if self.plan.get("status") not in ("empty", ""):
             parts.append(
-                f"当前计划[{self.plan.get('status')}]: {self.plan.get('title')}\n"
-                f"{self.plan.get('content')}"
+                f"当前计划[{self.plan.get('status')}]: {self.plan.get('title')}\n{self.plan.get('content')}"
             )
         if self.steps:
-            step_lines = [
-                f"{s.get('id')}. [{s.get('status')}] {s.get('title')}" for s in self.steps
-            ]
+            step_lines = [f"{s.get('id')}. [{s.get('status')}] {s.get('title')}" for s in self.steps]
             parts.append("当前步骤:\n" + "\n".join(step_lines))
+        rag_text = self.rag_query("当前任务相关资料")
         if rag_text:
             parts.append(f"项目RAG补充:\n{rag_text}")
         if parts:
@@ -268,19 +388,61 @@ class Memory:
             )
         return supplements
 
+    @staticmethod
+    def _api_session_item(item: dict) -> dict:
+        """会话消息 → API 消息（DeepSeek Tool Calls 协议）"""
+        role = item.get("role") or "user"
+        content = item.get("content") or ""
+        mtype = item.get("type") or ""
+        # UI 专用注入提示不进 API
+        if mtype in ("system_prompt", "help"):
+            return {}
+        out: dict = {"role": role, "content": content if isinstance(content, str) else str(content)}
+        if role == "tool":
+            out["role"] = "tool"
+            if item.get("tool_call_id"):
+                out["tool_call_id"] = item["tool_call_id"]
+        if role == "assistant" and item.get("tool_calls"):
+            import json as _json
+
+            calls = []
+            for c in item["tool_calls"]:
+                if not isinstance(c, dict):
+                    continue
+                fn_name = c.get("name") or (c.get("function") or {}).get("name") or ""
+                args = c.get("arguments")
+                if args is None:
+                    args = (c.get("function") or {}).get("arguments") or "{}"
+                if not isinstance(args, str):
+                    args = _json.dumps(args, ensure_ascii=False)
+                calls.append(
+                    {
+                        "id": c.get("id") or "",
+                        "type": "function",
+                        "function": {"name": fn_name, "arguments": args},
+                    }
+                )
+            if calls:
+                out["tool_calls"] = calls
+                if not out["content"]:
+                    out["content"] = None
+        return out
+
     def build_messages(self, extra_system: Optional[str] = None) -> List[dict]:
-        """组装发送给 LLM 的完整消息列表"""
+        """组装发送给 LLM 的完整消息列表
+
+        顺序：system提示词 → 长期记忆等补充 → 会话历史（含 tool/tool_calls）。
+        """
         self.maybe_compress()
         self.strip_old_tool_messages()
-        messages = []
+        messages: List[dict] = []
         if extra_system:
             messages.append({"role": "system", "content": extra_system})
         messages.extend(self.build_context_supplements())
         for item in self.messages:
-            role = item.get("role", "user")
-            if role == "tool":
-                role = "system"
-            messages.append({"role": role, "content": item.get("content", "")})
+            mapped = self._api_session_item(item)
+            if mapped:
+                messages.append(mapped)
         return messages
 
     def rag_add(self, text: str, source: str = "", external_handler=None) -> None:
@@ -289,11 +451,7 @@ class Memory:
             {"text": text, "source": source, "time": datetime.now().isoformat(timespec="seconds")}
         )
         log.info("RAG 写入: source=%s 共%d篇", source or "-", len(self.rag_docs))
-        hooks.call_user_participating(
-            "rag_add",
-            {"text": text, "source": source},
-            handler=external_handler,
-        )
+        hooks.call_user_participating("rag_add", {"text": text, "source": source}, handler=external_handler)
 
     def rag_query(self, query: str, external_handler=None) -> str:
         """项目级 RAG 检索；无外部实现时做简单关键词匹配"""

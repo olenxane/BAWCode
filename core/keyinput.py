@@ -614,15 +614,15 @@ class KeyReader:
 
         if ch == "\r":
             self._buf.pop(0)
-            if _kbhit():
-                # 批次中部的回车：粘贴内容，收流绝不触发 submit（教训 4）。
-                # 「IME 上屏后立即回车」的回车必为批次末尾，走正常提交。
+            # 最小改动：仅已在粘贴/爆发收流时，回车视为粘贴内容（教训 4）。
+            # 非粘贴态的 Enter 一律提交，避免控制台残留字节导致真实回车被吞。
+            if self._pasting or self._burst is not None:
                 self._start_burst(b"\r")
                 return TICK
             return ("submit", "")
         if ch == "\n":
             self._buf.pop(0)
-            if _kbhit():
+            if self._pasting or self._burst is not None:
                 self._start_burst(b"\n")
                 return TICK
             return ("submit_ctrl", "")

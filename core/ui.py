@@ -168,6 +168,22 @@ def _pad(text: str, width: int) -> str:
     return text if visible >= width else text + " " * (width - visible)
 
 
+def _split_by_width(text: str, cut: int) -> tuple:
+    """按显示宽度切开：cut 为光标前应占用的列宽（含宽字符）。"""
+    if cut <= 0:
+        return "", text or ""
+    src = text or ""
+    used = 0
+    for i, ch in enumerate(src):
+        w = _char_width(ch)
+        if used + w > cut:
+            return src[:i], src[i:]
+        used += w
+        if used == cut:
+            return src[: i + 1], src[i + 1 :]
+    return src, ""
+
+
 def _wrap(text: str, width: int) -> List[str]:
     if width <= 0:
         return [""]
@@ -343,6 +359,9 @@ class TuiApp:
         self.input_scroll = 0
         self.cand_scroll = 0
         self.tree_cursor = 0
+        # 会话树是否贴底：新消息/内容变长时自动下滑到最新行
+        self._tree_follow_tail = True
+        self._tree_last_msg_n = 0
         self.expanded: Set[str] = set()
         self.collapse_done = True
         self.buffer: List[str] = []
@@ -548,11 +567,34 @@ class TuiApp:
         self.plan = dict(getattr(session, "plan", {}) or {})
         self.steps = list(getattr(session, "steps", []) or [])
         self._tree_sig = None  # 内容已同步，强制重建树缓存
+        msg_n = len(self.messages)
+        if msg_n > self._tree_last_msg_n:
+            # 会话变长：恢复贴底，避免停在顶部看不到新回复
+            self._tree_follow_tail = True
+        self._tree_last_msg_n = msg_n
         if task is not None:
             self.task = task
         elif self.plan.get("title"):
             self.task = self.plan.get("title")
         self.render()
+
+    def _clamp_tree_scroll(self, total: int, tree_h: int) -> int:
+        """按 follow_tail / tree_cursor 计算并夹紧会话树 scroll"""
+        max_scroll = max(0, total - tree_h)
+        if total <= tree_h:
+            self.scroll = 0
+            return 0
+        if self._tree_follow_tail:
+            self.scroll = max_scroll
+        else:
+            # 仅在会话树焦点下保证光标行可见；输入焦点时不要把 scroll 拉回 tree_cursor
+            if self.focus == "tree":
+                if self.tree_cursor < self.scroll:
+                    self.scroll = self.tree_cursor
+                if self.tree_cursor >= self.scroll + tree_h:
+                    self.scroll = self.tree_cursor - tree_h + 1
+            self.scroll = max(0, min(self.scroll, max_scroll))
+        return self.scroll
 
     def _has_conversation_content(self) -> bool:
         """会话区是否已有需要展示的内容（有则隐藏 Logo）"""
@@ -616,7 +658,17 @@ class TuiApp:
     # ----- 树 -----
     def _build_tree(self) -> List[TreeNode]:
         roots = []
-        task_node = TreeNode("task", f"任务 · {_oneline(self.task or '（新会话）', 50)}", "task")
+        # 根节点标题：取「首次」用户消息，避免被新一轮输入替换掉
+        first_user = ""
+        for m in self.messages:
+            if m.get("role") == "user" and str(m.get("content") or "").strip():
+                first_user = str(m.get("content"))
+                break
+        if first_user:
+            root_label = f"任务 · {_oneline(first_user, 40)}"
+        else:
+            root_label = f"任务 · {_oneline(self.task or '（新会话）', 40)}"
+        task_node = TreeNode("task", root_label, "task", default_expanded=True)
         roots.append(task_node)
         plan = self.plan or {}
         if plan.get("status") not in ("empty", "", None) or plan.get("content") or plan.get("title"):
@@ -653,36 +705,87 @@ class TuiApp:
                     node.children.append(TreeNode(f"step:{step.get('id')}:d", _oneline(detail, 50), "step_detail"))
                 step_root.children.append(node)
             task_node.children.append(step_root)
+
+        # 消息按对话轮次挂在树上：每条用户消息都是独立节点（不替换根标题）
+        current_turn: Optional[TreeNode] = None
+
+        def _parent() -> TreeNode:
+            return current_turn if current_turn is not None else task_node
+
         for index, item in enumerate(self.messages[-200:]):
             role = item.get("role")
             content = item.get("content") or ""
             msg_type = item.get("type") or ""
             tool_name = item.get("tool_name") or ""
-            if role == "user" and msg_type == "task":
-                continue
-            if role == "tool" or msg_type == "tool":
-                expanded = len(content) <= _COLLAPSE_THRESHOLD
+            if role == "user":
+                # 正文直接写入节点 label（绿色/强调色折行展示），不另开详情块
                 node = TreeNode(
                     f"msg:{index}",
-                    f"⚙ {tool_name or 'tool'} · {_oneline(content, 30)}",
+                    f"用户 · {content}",
+                    "user",
+                    default_expanded=True,
+                    detail="",
+                )
+                task_node.children.append(node)
+                current_turn = node
+                continue
+            if role == "tool" or msg_type == "tool":
+                node = TreeNode(
+                    f"msg:{index}",
+                    f"⚙ {tool_name or 'tool'} · {content}",
                     "tool",
-                    default_expanded=expanded,
-                    detail=content,
+                    default_expanded=False,
+                    detail="",
+                )
+            elif msg_type == "system_prompt":
+                files = item.get("files") or []
+                label = "注入系统提示词"
+                if files:
+                    label += " · " + ", ".join(str(x) for x in files)
+                node = TreeNode(
+                    f"msg:{index}",
+                    f"⚙ {label}",
+                    "system_prompt",
+                    default_expanded=False,
+                    detail="",
+                )
+            elif msg_type == "tool_call":
+                names = []
+                for c in item.get("tool_calls") or []:
+                    if isinstance(c, dict):
+                        names.append(str(c.get("name") or ""))
+                head = ",".join(names) if names else "工具调用"
+                if content:
+                    head = f"{head} · {content}"
+                node = TreeNode(
+                    f"msg:{index}",
+                    f"⚙ {head}",
+                    "assistant",
+                    default_expanded=False,
+                    detail="",
                 )
             elif role == "assistant":
-                head = _oneline(content, 40)
-                node = TreeNode(f"msg:{index}", f"Agent · {head}", "assistant", detail=content)
-                for i, line in enumerate(_wrap(content, 50)[1:8], start=1):
-                    node.children.append(TreeNode(f"msg:{index}:{i}", _clip(line, 60), "text"))
-            elif role == "user":
-                node = TreeNode(f"msg:{index}", f"用户 · {_oneline(content, 40)}", "user", default_expanded=False, detail=content)
+                # 完整回复写入 label，由 _tree_rows 折行；不建子节点、不开独立详情区
+                node = TreeNode(
+                    f"msg:{index}",
+                    f"Agent · {content}",
+                    "assistant",
+                    default_expanded=True,
+                    detail="",
+                )
             elif msg_type == "help":
                 node = TreeNode(f"msg:{index}", "帮助", "help", detail=content)
                 for i, line in enumerate(content.splitlines()[:10]):
                     node.children.append(TreeNode(f"msg:{index}:{i}", _clip(line, 60), "help_line"))
             else:
-                node = TreeNode(f"msg:{index}", f"系统 · {_oneline(content, 40)}", "system", default_expanded=False, detail=content)
-            task_node.children.append(node)
+                node = TreeNode(
+                    f"msg:{index}",
+                    f"系统 · {content}",
+                    "system",
+                    default_expanded=False,
+                    detail="",
+                )
+            _parent().children.append(node)
         return roots
 
     def _tree_signature(self) -> tuple:
@@ -739,10 +842,12 @@ class TuiApp:
 
     def _tree_rows(self, width: int) -> List[str]:
         # 树行缓存：按键路径（partial 重绘）不重建行字符串，只做窗口切片。
-        # key 覆盖全部影响行内容的输入：宽度/会话内容/折叠态/焦点。
+        # key 必须用「当前实时签名」——不能用 self._tree_sig（它只在
+        # _flatten_tree 重建后才更新，会导致消息已增加仍命中旧树缓存）。
+        sig = self._tree_signature()
         key = (
             width,
-            self._tree_sig,
+            sig,
             self.collapse_done,
             tuple(sorted(self.expanded)),
             self.focus,
@@ -765,23 +870,41 @@ class TuiApp:
             "help": self.c("title"),
             "help_line": self.c("dim"),
             "system": self.c("dim"),
+            "system_prompt": self.c("tool"),
             "text": self.c("dim"),
         }
         rows = []
         if not flat:
             return [self.c("dim") + _clip("  —", width) + self.RESET]
+        # 消息类节点：正文在 label 内直接折行展示（同色连续），不另开详情区
+        inline_kinds = {"assistant", "user", "system", "tool", "system_prompt"}
         for abs_i, (node, depth, expanded) in enumerate(flat):
-            has = bool(node.children or node.detail)
+            has = bool(node.children)
+            if node.detail and node.kind not in inline_kinds:
+                has = True
             marker = "▾" if has and expanded else ("▸" if has else "·")
             indent = " " * (depth * 2)
-            label = f"{indent}{marker} {node.label}"
-            if not expanded and node.summary:
-                label += f" · {node.summary}"
-            if abs_i == self.tree_cursor and tree_focus:
-                rows.append(self.C_HL + _pad(_clip(_ANSI_RE.sub("", label), width), width) + self.RESET)
-            else:
-                rows.append(colors.get(node.kind, self.c("ink")) + _clip(label, width) + self.RESET)
-            if expanded and node.detail and not node.children:
+            first_prefix = f"{indent}{marker} "
+            cont_prefix = " " * (depth * 2 + 2)
+            label = node.label or ""
+            color = colors.get(node.kind, self.c("ink"))
+            # 保留换行；超宽续行缩进对齐，首行带树标记
+            src_lines = label.splitlines() or [""]
+            piece_no = 0
+            for li, src in enumerate(src_lines):
+                # 先用首行前缀估宽；续行前缀稍长，二次 clip 兜底
+                for wline in _wrap(src, max(8, width - _display_width(cont_prefix))) or [""]:
+                    prefix = first_prefix if piece_no == 0 else cont_prefix
+                    raw = prefix + wline
+                    if abs_i == self.tree_cursor and tree_focus and piece_no == 0:
+                        rows.append(self.C_HL + _pad(_ANSI_RE.sub("", raw), width) + self.RESET)
+                    else:
+                        if not expanded and node.summary and piece_no == 0:
+                            raw = raw + f" · {node.summary}"
+                        rows.append(color + _clip(raw, width) + self.RESET)
+                    piece_no += 1
+            # 计划/帮助等仍可能有 detail：仅在无子节点时追加（消息类 inline 已含全文）
+            if expanded and node.detail and not node.children and node.kind not in inline_kinds:
                 for dline in _wrap(str(node.detail), max(10, width - depth * 2 - 4))[:8]:
                     rows.append(self.c("dim") + _clip(" " * (depth * 2 + 2) + dline, width) + self.RESET)
         self._tree_rows_key = key
@@ -839,11 +962,8 @@ class TuiApp:
         else:
             rows = self._tree_rows(w)
             total = len(rows)
-            if self.tree_cursor < self.scroll:
-                self.scroll = self.tree_cursor
-            if self.tree_cursor >= self.scroll + tree_h:
-                self.scroll = self.tree_cursor - tree_h + 1
-            self.scroll = max(0, min(self.scroll, max(0, total - tree_h)))
+            # 内容超出可视区时：默认贴底显示最新会话；用户上滚后取消跟随
+            self._clamp_tree_scroll(total, tree_h)
             visible = rows[self.scroll : self.scroll + tree_h]
             body = list(visible) + [""] * (tree_h - len(visible))
             body = body[:tree_h]
@@ -882,20 +1002,21 @@ class TuiApp:
         # 输入框：显示缓冲与光标
         if not raw.strip():
             input_rows.append(
-                f"{accent}>{self.RESET} {self.c('dim')}{_clip('输入消息或 / 命令 · Enter 提交 · Tab 补全', inner_w)}{self.RESET}{accent}▌{RESET if False else self.RESET}"
+                f"{accent}>{self.RESET} {self.c('dim')}{_clip('输入消息或 / 命令 · Enter 提交 · Tab 补全', inner_w)}{self.RESET}{accent}▌{self.RESET}"
             )
         else:
+            ink = self.c("ink")
+            mark = f"{self.c('accent')}▌{self.RESET}"
             for i, part in enumerate(vis):
                 abs_row = self.input_scroll + i
                 prefix = self._input_prompt if abs_row == 0 else " " * _display_width(self._input_prompt)
-                mark = (
-                    f"{self.c('accent')}▌{self.RESET}"
-                    if (self.focus == "input" and abs_row == cursor_row)
-                    else ""
-                )
-                input_rows.append(
-                    f"{accent}{prefix}{self.RESET}{self.c('ink')}{_clip(part, inner_w)}{self.RESET}{mark}"
-                )
+                head = f"{accent}{prefix}{self.RESET}{ink}"
+                if self.focus == "input" and abs_row == cursor_row:
+                    # 显示光标必须插在逻辑光标列，不能固定贴在行尾
+                    left, right = _split_by_width(part, before_last_w)
+                    input_rows.append(f"{head}{left}{mark}{ink}{_clip(right, inner_w)}{self.RESET}")
+                else:
+                    input_rows.append(f"{head}{_clip(part, inner_w)}{self.RESET}")
         if cand_show:
             if self.candidate_index < self.cand_scroll:
                 self.cand_scroll = self.candidate_index
@@ -983,7 +1104,7 @@ class TuiApp:
         else:
             rows = self._tree_rows(w)
             total = len(rows)
-            self.scroll = max(0, min(self.scroll, max(0, total - tree_h)))
+            self._clamp_tree_scroll(total, tree_h)
             visible = rows[self.scroll : self.scroll + tree_h]
             body = list(visible) + [""] * tree_h
             body = body[:tree_h]
@@ -1190,6 +1311,7 @@ class TuiApp:
                         self.focus = "tree"
                         flat = self._flatten_tree()
                         self.tree_cursor = max(0, len(flat) - 1)
+                        self._tree_follow_tail = True
                         self.scroll = max(0, len(flat) - 4)
                     else:
                         self.focus = "input"
@@ -1216,6 +1338,8 @@ class TuiApp:
                         self.tree_cursor = max(0, self.tree_cursor - step)
                         if self.tree_cursor < self.scroll:
                             self.scroll = self.tree_cursor
+                        # 用户向上浏览：取消自动贴底
+                        self._tree_follow_tail = False
                         self._paint_pending = False
                         self.render()
                     elif self.input_history:
@@ -1235,6 +1359,8 @@ class TuiApp:
                         self.tree_cursor = min(max(0, len(flat) - 1), self.tree_cursor + step)
                         if self.tree_cursor >= self.scroll + 4:
                             self.scroll = self.tree_cursor - 3
+                        if self.tree_cursor >= max(0, len(flat) - 1):
+                            self._tree_follow_tail = True
                         self._paint_pending = False
                         self.render()
                     else:
@@ -1273,10 +1399,13 @@ class TuiApp:
                     self._schedule_paint()
                 elif kind == "scroll_up":
                     self.scroll = max(0, self.scroll - self._scroll_step("pu"))
+                    self._tree_follow_tail = False
                     self._paint_pending = False
                     self.render()
                 elif kind == "scroll_down":
                     self.scroll += self._scroll_step("pd")
+                    # 触底则恢复跟随最新
+                    self._tree_follow_tail = True
                     self._paint_pending = False
                     self.render()
                 elif kind == "escape":

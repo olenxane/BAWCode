@@ -463,23 +463,48 @@ def computer_use(action: str, params: Optional[dict] = None, external_handler=No
 
 @register.register(
     name="memory_add_fact",
-    description="Write a long-term memory fact",
-    usage="memory_add_fact <fact>",
+    description="Write a long-term memory fact to Agent.md or project memory",
+    usage="memory_add_fact <fact> [scope=agent|project]",
     schema={
         "type": "object",
         "properties": {
             "fact": {"type": "string", "description": "Fact to remember"},
+            "scope": {
+                "type": "string",
+                "enum": ["agent", "project"],
+                "description": "agent=Agent.md global, project=current project memory",
+            },
         },
         "required": ["fact"],
     },
 )
-def memory_add_fact(fact: str) -> str:
-    """长期记忆写入工具接口"""
+def memory_add_fact(fact: str, scope: str = "agent") -> str:
+    """长期记忆写入工具接口 → Agent.md / 项目记忆 md"""
     session = _session()
     if session is None:
         return "记忆会话未初始化"
-    session.add_fact(fact)
-    return "已写入长期记忆"
+    session.add_fact(fact, scope=scope if scope in ("agent", "project") else "agent")
+    return f"已写入长期记忆({scope})"
+
+
+@register.register(
+    name="memory_add_project_note",
+    description="Write a note into the current project long-term memory",
+    usage="memory_add_project_note <note>",
+    schema={
+        "type": "object",
+        "properties": {
+            "note": {"type": "string", "description": "Project note / convention"},
+        },
+        "required": ["note"],
+    },
+)
+def memory_add_project_note(note: str) -> str:
+    session = _session()
+    if session is None:
+        return "记忆会话未初始化"
+    session.add_project_note(note)
+    return "已写入项目记忆"
 
 
 @register.register(

@@ -9,11 +9,13 @@ if str(_ROOT) not in sys.path:
 from core import commands
 from core import memory as memory_mod
 from core import policy
+from core import project_identity
+from core import prompt_loader
 from core import register
 from core import tools as tools_mod  # noqa: F401
 from core import ui
 from core.config import Config
-from core.llm import SYSTEM_PROMPT, LLM
+from core.llm import get_system_prompt, LLM
 from core.log import get_logger
 
 log = get_logger("main")
@@ -192,6 +194,23 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp") -> None:
     mode = app.mode
     _sync(app, session, task=user_text, status=f"{policy.MODE_LABELS.get(mode, mode)} · 分析")
 
+    # 系统提示词：从 core/prompts 渲染；chat 窗口可见注入消息
+    system_prompt_text = get_system_prompt(
+        config=llm.config,
+        session=session,
+        project_identity=getattr(session, "project_identity", None),
+    )
+    seg_names = list(prompt_loader.system_prompt_files(llm.config))
+    if not any(m.get("type") == "system_prompt" for m in session.messages):
+        session.add_message(
+            "system",
+            "注入系统提示词",
+            type="system_prompt",
+            files=seg_names or ["system_prompt.md"],
+        )
+        log.info("注入系统提示词: %s", ", ".join(seg_names or ["system_prompt.md"]))
+        _sync(app, session, task=user_text, status="注入系统提示词")
+
     complexity = llm.judge_complexity(user_text)
     if complexity == "high":
         log.info("复杂任务，进入计划流程")
@@ -228,7 +247,7 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp") -> None:
 
     for round_no in range(12):
         _sync(app, session, task=user_text, status=f"推理 · 第{round_no + 1}轮")
-        payload = session.build_messages(extra_system=SYSTEM_PROMPT)
+        payload = session.build_messages(extra_system=system_prompt_text)
         llm.meter.measure_context(payload)
         # 代码编写默认模型（设置页可指定）
         code_model = llm.config.get_task_model("code") if hasattr(llm.config, "get_task_model") else None
@@ -239,7 +258,7 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp") -> None:
             session.add_message("assistant", response["error"])
             _sync(app, session, task=user_text, status="出错")
             return
-        if response.get("content"):
+        if response.get("content") and not response.get("tool_calls"):
             session.add_message("assistant", response["content"])
         tool_calls = response.get("tool_calls") or []
         if not tool_calls:
@@ -268,13 +287,42 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp") -> None:
                     }
                 )
 
+        if tool_calls:
+            # DeepSeek Tool Calls：保留 assistant 工具轮（含 content + tool_calls）
+            session.add_message(
+                "assistant",
+                response.get("content") or "",
+                type="tool_call",
+                tool_calls=[
+                    {
+                        "id": c.get("id"),
+                        "name": c.get("name"),
+                        "arguments": c.get("arguments") or {},
+                        "type": c.get("type") or "function",
+                    }
+                    for c in tool_calls
+                ],
+            )
+
         for item in allowed_results:
-            session.add_message("tool", item["content"], type="tool", tool_name=item.get("tool_name"))
+            session.add_message(
+                "tool",
+                item["content"],
+                type="tool",
+                tool_name=item.get("tool_name"),
+                tool_call_id=item.get("tool_call_id"),
+            )
         _sync(app, session, task=user_text, status=f"工具 {len(allowed_results)} 完成 · 待确认 {len(pending)}")
 
         for call in pending:
             result = _handle_tool_confirm(llm, app, session, call)
-            session.add_message("tool", result["content"], type="tool", tool_name=result.get("tool_name"))
+            session.add_message(
+                "tool",
+                result["content"],
+                type="tool",
+                tool_name=result.get("tool_name"),
+                tool_call_id=result.get("tool_call_id") or call.get("id"),
+            )
             _sync(app, session, task=user_text, status=f"确认完成 · {call.get('name')}")
 
         app.token_meter = llm.meter
@@ -289,8 +337,14 @@ def main() -> None:
     # 尽早开启 Windows 输入/输出 VT，便于 Shift+Tab → ESC [ Z
     ui._enable_windows_ansi()
     config = Config()
-    log.info("BAWCode 启动 · 配置=%s · 模型=%s", config.config_path, config.model_name)
-    session = memory_mod.init_session(config)
+    identity = project_identity.ensure_project_identity(Path.cwd())
+    log.info(
+        "BAWCode 启动 · 配置=%s · 模型=%s · project_id=%s",
+        config.config_path,
+        config.model_name,
+        identity.get("project_id"),
+    )
+    session = memory_mod.init_session(config, project_identity_data=identity)
     llm = LLM(config)
     app = ui.get_app()
     app.bind_config(config)
