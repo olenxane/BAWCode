@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.text import Text
 
     HAS_RICH = True
 except ImportError:
@@ -383,11 +385,9 @@ class TuiApp:
         self._settings_esc_stage = 0
         self._settings_text_dirty = False
         self._input_prompt = "> "
-        self._paint_at = 0.0
-        self._paint_pending = False
-        self._paint_partial = True
-        self._last_paint = 0.0
-        self._last_frame_lines: List[str] = []
+        # 渲染接管：rich Live（enter() 时启动）；_frame_time 为固定帧周期（TMP 同款 20fps）
+        self._live: Optional["Live"] = None
+        self._frame_time = 1.0 / 20
         self._row_meta: Dict[str, int] = {}
         self.keys = {
             "send": "ctrl+enter",
@@ -486,48 +486,55 @@ class TuiApp:
             self.settings_debounce_sec = 0.35
 
     def enter(self) -> None:
-        """进入 TUI：终端模式初始化。
+        """进入 TUI：rich Live 接管渲染（TMP app.py:1584 同构）+ 终端模式初始化。
 
-        - 主屏模式（默认，对齐 music player 的 Live(screen=False)）：
-          不切换备用屏，直接清屏绘制。备用屏（?1049h）下 Windows Terminal
-          的 TSF IME 组合层与行级更新失同步（曾导致删除残影），且主屏与
-          TMP 行为完全一致；代价是退出后 shell 提示符被覆盖（回车重现）。
-          设 BAWCODE_ALT=1 可回退备用屏旧模式。
-        - ?2004h 开 bracketed-paste：终端粘贴包 ESC[200~/201~ 标记，
-          keyinput 由此合成整体 paste 事件（conhost 不支持则走启发式）。
-        - ?25l 隐藏物理光标（绘制后由 _write_cursor_pos 钉位到输入处）。
+        - Live(screen=False, auto_refresh=False)：主屏 + 应用驱动刷新，
+          与 music player 的 Live 用法完全一致——每帧 live.update(refresh=True)，
+          rich 负责光标回卷与整帧输出（LiveRender 无 diff，每帧真实写字节），
+          应用不再手拼 ANSI/diff/节流。
+        - 不开 ?2004h bracketed-paste：conhost 上开启后 TSF IME 的删除序列
+          （孤立 \x00 握手字节之后的 \x1e\x08）会被扣押到下一次按键才放行，
+          表现为"退格删不掉已上屏的中文，再打中文才一起刷新"
+          （minimal_repro 二分：四个开 2004 的模式全卡，唯一不卡的 tmplayer
+          模式无 2004；参照项目 TMP 也不开——这是两进程间唯一的控制台状态差）。
+          粘贴改走 keyinput 的 conhost 启发式（批次中部回车/Tab → paste 事件）。
+          调试可设 BAW_BRACKETED_PASTE=1 强制开启，=0 全平台强制关闭。
+        - 隐藏光标交给 Live（console.show_cursor）。
         """
         _enable_windows_ansi()
         if self._entered:
             return
         log.info("进入 TUI 界面")
-        # ?2004h 开 bracketed-paste：终端粘贴包 ESC[200~/201~ 标记，
-        # keyinput 由此合成整体 paste 事件（conhost 不支持则走启发式）
-        if os.environ.get("BAWCODE_ALT") == "1":
-            sys.stdout.write("\033[?1049h\033[?25l\033[2J\033[H\033[?2004h")
-        else:
-            # 主屏模式（对齐 music player 的 Live(screen=False)）：
-            # Windows Terminal 的 TSF IME（搜狗等）在备用屏(?1049h)下
-            # 组合层与行级更新失同步——删除后残影直到下一键才消失。
-            # 主屏 + 整屏定位绘制无此问题；shell 提示符被覆盖，退出清屏。
-            sys.stdout.write("\033[?25l\033[2J\033[H\033[?2004h")
+        # bracketed-paste 默认关闭（见 docstring）；终端模式直接写 stdout
+        _bp = os.environ.get("BAW_BRACKETED_PASTE", "")
+        _paste_on = _bp == "1" or (_bp == "" and sys.platform != "win32")
+        sys.stdout.write("\033[2J\033[H" + ("\033[?2004h" if _paste_on else ""))
         sys.stdout.flush()
+        if HAS_RICH and _CONSOLE is not None:
+            self._live = Live(
+                console=_CONSOLE,
+                screen=False,        # 主屏（TMP 同款；备用屏有 TSF IME 失同步问题）
+                auto_refresh=False,  # 应用每帧驱动刷新（TMP 同款）
+            )
+            self._live.start()
         self._entered = True
 
     def leave(self) -> None:
-        """退出 TUI：恢复光标/属性，关粘贴协议。
+        """退出 TUI：停 Live、关粘贴协议、清屏恢复。
 
         主屏模式退出时清屏（?2J?H）——本会话的绘制内容覆盖了 shell 提示符，
         清屏比留残屏干净；用户按回车即出新提示符。
-        备用屏模式（BAWCODE_ALT=1）退屏即恢复原 shell 内容。
         """
         if not self._entered:
             return
         log.info("离开 TUI 界面")
-        if os.environ.get("BAWCODE_ALT") == "1":
-            sys.stdout.write("\033[?25h\033[0m\033[?1049l\033[?2004l")
-        else:
-            sys.stdout.write("\033[?25h\033[0m\033[2J\033[H\033[?2004l")
+        try:
+            if self._live is not None:
+                self._live.stop()
+                self._live = None
+        except Exception:
+            pass
+        sys.stdout.write("\033[?25h\033[0m\033[2J\033[H\033[?2004l")
         sys.stdout.flush()
         self._entered = False
 
@@ -1007,89 +1014,42 @@ class TuiApp:
         return lines[:h]
 
     def render(self, *args, **kwargs) -> None:
-        """整帧绘制（对齐 music player Live 方案）：每帧无条件重画所有行。
+        """整帧渲染：rich Live 接管输出（TMP app.py:1632 同构）。
 
-        不做行 diff、不做局部重绘——diff/partial 在主屏上曾产生残留
-        （旧内容未覆盖），且全帧组合成本实测 <1ms，优化是负资产。"""
+        _compose_plain 继续产出带 ANSI 的行字符串（复用全部现有着色/裁剪/
+        换行逻辑），Text.from_ansi 桥接为 rich renderable 后交 Live.update——
+        rich 负责帧缓冲 diff、光标与终端写，应用每帧无条件调用本方法。
+        """
         w, h = _term_size()
         lines = self._compose_plain(w, h)
         if len(lines) < h:
             lines = list(lines) + [""] * (h - len(lines))
         lines = lines[:h]
-        parts = []
-        for i, line in enumerate(lines):
-            parts.append(f"\033[{i + 1};1H\033[2K{_clip_keep_ansi(line, w)}")
-        self._last_frame_lines = lines
-        sys.stdout.write("".join(parts))
-        self._write_cursor_pos()
-        sys.stdout.flush()
-
-    def _write_cursor_pos(self) -> None:
-        """把物理光标钉在输入光标处（不显示）。
-
-        IME 的组合串/候选窗定位、以及部分输入法对退格键的决策都依赖物理
-        光标位置；隐藏且不定位时 IME 拿到的是错误位置，行为可能异常
-        （对齐 qwen-code software-cursor 的 setCursorPosition 方案）。"""
-        if self.settings_mode or self.pending_tool or self.focus != "input":
-            return
-        row = getattr(self, "_cursor_screen_row", None)
-        col = getattr(self, "_cursor_screen_col", None)
-        if row is None or col is None:
-            return
-        h, w = _term_size()
-        try:
-            sys.stdout.write(f"\033[{max(1, min(h, row))};{max(1, min(w, col))}H")
-        except Exception:
-            pass
+        if self._live is not None:
+            renderable = Group(*[Text.from_ansi(_clip_keep_ansi(l, w)) for l in lines])
+            self._live.update(renderable, refresh=True)
+        else:
+            # Live 未启动（理论不达：render 均发生在 enter 之后）；兜底直写
+            parts = [f"\033[{i + 1};1H\033[2K{_clip_keep_ansi(l, w)}" for i, l in enumerate(lines)]
+            sys.stdout.write("".join(parts))
+            sys.stdout.flush()
 
     def render_partial_input(self) -> None:
-        """兼容入口（TMP 方案下与全帧等价）：局部重绘已废弃，统一全帧重画。
-
-        历史上的 partial/diff 路径在主屏上产生过残留（旧内容未被覆盖），
-        全帧组合成本实测 <1ms，保留此入口只为不破坏既有调用点。"""
+        """兼容入口：rich Live 接管后局部重绘概念消失，统一全帧。"""
         self.render()
 
-    _PAINT_MIN_INTERVAL = 0.03  # 绘制最小间隔（≈33fps）；间隔外立即刷，间隔内挂起补刷
-    _IDLE_REPAINT = 0.05        # 空闲重画周期（对齐 TMP 20fps 主循环的兜底行为）
-
     def _do_paint(self, partial: bool = True) -> None:
-        self._last_paint = time.time()
-        try:
-            from core.keyinput import _LOG_ON, _log as _klog
-
-            if _LOG_ON:
-                _klog("paint full")
-        except Exception:
-            pass
+        """兼容入口：帧循环下绘制即 render()。"""
         self.render()
 
     def _schedule_paint(self, partial: bool = True) -> None:
-        """输入绘制：距上次绘制超过最小间隔则**立即刷新**（零延迟，对齐
-        music player 每键即画）；间隔内挂起，由主循环 tick 到点补刷，
-        保证最后一次更新不丢。partial 参数保留兼容，实际统一全帧。"""
-        now = time.time()
-        if not self._paint_pending and (now - self._last_paint) >= self._PAINT_MIN_INTERVAL:
-            # 候选区同步后再画（buffer 刚变，_refresh_candidates 内部有未变跳过）
-            try:
-                self._refresh_candidates(config=self._cand_config)
-            except Exception:
-                pass
-            self._paint_pending = False
-            self._paint_partial = True
-            self._do_paint()
-        else:
-            if not self._paint_pending:
-                self._paint_at = now + self._PAINT_MIN_INTERVAL
-            self._paint_pending = True
-            self._paint_partial = True
+        """兼容入口：固定帧循环每帧无条件渲染，调度概念已由帧节奏取代。
+
+        保留方法本体（大量调用点），实现为空操作——事件只改状态，
+        帧尾统一 render()（TMP handle_key + live.update 同构）。"""
 
     def _flush_paint(self) -> None:
-        if not self._paint_pending:
-            return
-        if time.time() < self._paint_at:
-            return
-        self._paint_pending = False
-        self._do_paint()
+        """兼容入口：空操作（帧尾统一渲染，无需提前冲刷）。"""
 
     # ----- 输入 / 补全 -----
     def _word_start(self) -> int:
@@ -1164,7 +1124,7 @@ class TuiApp:
 
         主循环结构（TMP 对齐）：
           每轮 = 刷新补全候选 → 消费到期的挂起绘制 → 批量读事件 → 分发。
-          事件队列空时：20ms 心跳 + 空闲重画兜底（_IDLE_REPAINT）。
+          帧尾无条件渲染 + 补足 50ms 帧周期（TMP 同款）。
         事件分发要点：
           - char/backspace/delete/光标移动 → 改 buffer/cursor → _schedule_paint
             （leading-edge 节流：间隔外立即画，间隔内挂起 30ms 补刷）
@@ -1183,191 +1143,192 @@ class TuiApp:
         self._paint_pending = False
         self._input_prompt = prompt or "> "
         self.render()
+        frame_deadline = time.time()
         pending_events: List[Tuple[str, Any]] = []
         while True:
             self._refresh_candidates(config=config)
-            self._flush_paint()
-            # 批处理读取：一次抽干输入队列逐个消费；无键时阻塞等待 20ms 心跳。
-            # 绘制频率由 _schedule_paint 节流合并，不随事件数线性增长。
+            # 固定帧循环（TMP app.py:1584 同构）：非阻塞抽干事件逐个消费，
+            # 帧尾无条件渲染 + 补足 50ms 帧周期。帧节奏天然取代了旧的
+            # 节流/挂起/空闲重画/光标钉位四件套——被终端延迟渲染的帧
+            # 下一帧自动覆盖修正，这正是 TMP 无输入卡顿的结构原因。
             if not pending_events:
-                pending_events = _read_events()
-                if not pending_events:
-                    # TMP 式空闲重画兜底：终端（conhost/WT）偶发延迟渲染一帧
-                    # 应用输出，事件驱动下该帧会滞留到下一个键（"删除不消失
-                    # 直到打下一个字"）；低频恒定重画保证被吞的帧自动修正。
-                    # 全帧成本 0.4ms，50ms 周期下 CPU <1%。
-                    if time.time() - self._last_paint >= self._IDLE_REPAINT:
-                        self._paint_pending = False
-                        self._do_paint()
-                    continue
-            key = pending_events.pop(0)
-            kind, value = key
-            if kind == "tick":
-                self._flush_paint()
-                continue
-            if kind == "interrupt":
-                return "/exit"
-            if self._is_mode_switch(kind, value):
-                mode = self.cycle_mode()
-                self.status = f"{policy.MODE_LABELS.get(mode, mode)}"
-                self._paint_pending = False
-                self.render()
-                continue
-            if kind in ("submit_ctrl", "submit"):
-                # Enter / Ctrl+Enter 提交当前行
-                if kind == "submit" and self.focus == "tree":
-                    self.toggle_fold(self.tree_cursor)
+                pending_events = _read_events(0.0)
+            if pending_events:
+                key = pending_events.pop(0)
+                kind, value = key
+                if kind == "interrupt":
+                    return "/exit"
+                if self._is_mode_switch(kind, value):
+                    mode = self.cycle_mode()
+                    self.status = f"{policy.MODE_LABELS.get(mode, mode)}"
                     self._paint_pending = False
                     self.render()
                     continue
-                line = "".join(self.buffer)
-                if line.strip():
-                    self.input_history.append(line)
-                self.hist_index = len(self.input_history)
-                self.buffer = []
-                self.cursor = 0
-                self.candidates = []
-                self._paint_pending = False
-                return line
-            if kind == "tab":
-                if self.candidates:
-                    self._apply_completion()
-                    self._paint_pending = False
-                    self.render()
-                    continue
-                if self.focus == "input":
-                    self.focus = "tree"
-                    flat = self._flatten_tree()
-                    self.tree_cursor = max(0, len(flat) - 1)
-                    self.scroll = max(0, len(flat) - 4)
-                else:
-                    self.focus = "input"
-                self._paint_pending = False
-                self.render()
-                continue
-            if kind == "backspace":
-                if self.focus == "input" and self.cursor > 0:
-                    self.buffer.pop(self.cursor - 1)
-                    self.cursor -= 1
-                    self._schedule_paint()
-            elif kind == "delete":
-                if self.focus == "input" and self.cursor < len(self.buffer):
-                    self.buffer.pop(self.cursor)
-                    self._schedule_paint()
-            dirn = _key_direction(kind, value)
-            if dirn == "up":
-                if self.candidates:
-                    self.candidate_index = max(0, self.candidate_index - 1)
-                    self._paint_pending = False
-                    self.render()
-                elif self.focus == "tree":
-                    step = self._scroll_step("up")
-                    self.tree_cursor = max(0, self.tree_cursor - step)
-                    if self.tree_cursor < self.scroll:
-                        self.scroll = self.tree_cursor
-                    self._paint_pending = False
-                    self.render()
-                elif self.input_history:
-                    self.hist_index = max(0, self.hist_index - 1)
-                    self.buffer = list(self.input_history[self.hist_index])
-                    self.cursor = len(self.buffer)
-                    self._paint_pending = False
-                    self.render()
-            elif dirn == "down":
-                if self.candidates:
-                    self.candidate_index = min(len(self.candidates) - 1, self.candidate_index + 1)
-                    self._paint_pending = False
-                    self.render()
-                elif self.focus == "tree":
-                    step = self._scroll_step("down")
-                    flat = self._flatten_tree()
-                    self.tree_cursor = min(max(0, len(flat) - 1), self.tree_cursor + step)
-                    if self.tree_cursor >= self.scroll + 4:
-                        self.scroll = self.tree_cursor - 3
-                    self._paint_pending = False
-                    self.render()
-                else:
-                    if self.hist_index < len(self.input_history) - 1:
-                        self.hist_index += 1
-                        self.buffer = list(self.input_history[self.hist_index])
-                    else:
-                        self.hist_index = len(self.input_history)
-                        self.buffer = []
-                    self.cursor = len(self.buffer)
-                    self._paint_pending = False
-                    self.render()
-            elif dirn == "left":
-                if self.focus == "tree":
-                    if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
+                if kind in ("submit_ctrl", "submit"):
+                    # Enter / Ctrl+Enter 提交当前行
+                    if kind == "submit" and self.focus == "tree":
                         self.toggle_fold(self.tree_cursor)
                         self._paint_pending = False
                         self.render()
-                else:
-                    self.cursor = max(0, self.cursor - 1)
-                    self._schedule_paint()
-            elif dirn == "right":
-                if self.focus == "tree":
-                    if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
-                        self.toggle_fold(self.tree_cursor)
-                        self._paint_pending = False
-                        self.render()
-                else:
-                    self.cursor = min(len(self.buffer), self.cursor + 1)
-                    self._schedule_paint()
-            elif kind == "home":
-                self.cursor = 0
-                self._schedule_paint()
-            elif kind == "end":
-                self.cursor = len(self.buffer)
-                self._schedule_paint()
-            elif kind == "scroll_up":
-                self.scroll = max(0, self.scroll - self._scroll_step("pu"))
-                self._paint_pending = False
-                self.render()
-            elif kind == "scroll_down":
-                self.scroll += self._scroll_step("pd")
-                self._paint_pending = False
-                self.render()
-            elif kind == "escape":
-                if self.candidates:
-                    self.candidates = []
-                    self._paint_pending = False
-                    self.render()
-                else:
+                        continue
+                    line = "".join(self.buffer)
+                    if line.strip():
+                        self.input_history.append(line)
+                    self.hist_index = len(self.input_history)
                     self.buffer = []
                     self.cursor = 0
-                    self._schedule_paint()
-            elif kind == "clear":
-                self.buffer = []
-                self.cursor = 0
-                self._paint_pending = False
-                self.render()
-            elif kind == "paste":
-                # 粘贴整体插入：换行归一为 \n，绝不触发 submit（管线保证）
-                text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
-                if text and self.focus == "input":
-                    self.buffer[self.cursor : self.cursor] = list(text)
-                    self.cursor += len(text)
-                    self._schedule_paint()
-            elif kind == "char":
-                if self.focus == "tree":
-                    if value == " ":
-                        self.toggle_fold(self.tree_cursor)
+                    self.candidates = []
+                    self._paint_pending = False
+                    return line
+                if kind == "tab":
+                    if self.candidates:
+                        self._apply_completion()
                         self._paint_pending = False
                         self.render()
-                    elif value in ("l", "L") and self._flat_nodes and not self._flat_nodes[self.tree_cursor][2]:
-                        self.toggle_fold(self.tree_cursor)
+                        continue
+                    if self.focus == "input":
+                        self.focus = "tree"
+                        flat = self._flatten_tree()
+                        self.tree_cursor = max(0, len(flat) - 1)
+                        self.scroll = max(0, len(flat) - 4)
+                    else:
+                        self.focus = "input"
+                    self._paint_pending = False
+                    self.render()
+                    continue
+                if kind == "backspace":
+                    if self.focus == "input" and self.cursor > 0:
+                        self.buffer.pop(self.cursor - 1)
+                        self.cursor -= 1
+                        self._schedule_paint()
+                elif kind == "delete":
+                    if self.focus == "input" and self.cursor < len(self.buffer):
+                        self.buffer.pop(self.cursor)
+                        self._schedule_paint()
+                dirn = _key_direction(kind, value)
+                if dirn == "up":
+                    if self.candidates:
+                        self.candidate_index = max(0, self.candidate_index - 1)
                         self._paint_pending = False
                         self.render()
-                    elif value in ("h", "H") and self._flat_nodes and self._flat_nodes[self.tree_cursor][2]:
-                        self.toggle_fold(self.tree_cursor)
+                    elif self.focus == "tree":
+                        step = self._scroll_step("up")
+                        self.tree_cursor = max(0, self.tree_cursor - step)
+                        if self.tree_cursor < self.scroll:
+                            self.scroll = self.tree_cursor
                         self._paint_pending = False
                         self.render()
-                elif value and all(ord(ch) >= 32 for ch in value):
-                    chunk = self._append_text_burst(value)
-                    self.buffer[self.cursor : self.cursor] = list(chunk)
-                    self.cursor += len(chunk)
+                    elif self.input_history:
+                        self.hist_index = max(0, self.hist_index - 1)
+                        self.buffer = list(self.input_history[self.hist_index])
+                        self.cursor = len(self.buffer)
+                        self._paint_pending = False
+                        self.render()
+                elif dirn == "down":
+                    if self.candidates:
+                        self.candidate_index = min(len(self.candidates) - 1, self.candidate_index + 1)
+                        self._paint_pending = False
+                        self.render()
+                    elif self.focus == "tree":
+                        step = self._scroll_step("down")
+                        flat = self._flatten_tree()
+                        self.tree_cursor = min(max(0, len(flat) - 1), self.tree_cursor + step)
+                        if self.tree_cursor >= self.scroll + 4:
+                            self.scroll = self.tree_cursor - 3
+                        self._paint_pending = False
+                        self.render()
+                    else:
+                        if self.hist_index < len(self.input_history) - 1:
+                            self.hist_index += 1
+                            self.buffer = list(self.input_history[self.hist_index])
+                        else:
+                            self.hist_index = len(self.input_history)
+                            self.buffer = []
+                        self.cursor = len(self.buffer)
+                        self._paint_pending = False
+                        self.render()
+                elif dirn == "left":
+                    if self.focus == "tree":
+                        if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
+                            self.toggle_fold(self.tree_cursor)
+                            self._paint_pending = False
+                            self.render()
+                    else:
+                        self.cursor = max(0, self.cursor - 1)
+                        self._schedule_paint()
+                elif dirn == "right":
+                    if self.focus == "tree":
+                        if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
+                            self.toggle_fold(self.tree_cursor)
+                            self._paint_pending = False
+                            self.render()
+                    else:
+                        self.cursor = min(len(self.buffer), self.cursor + 1)
+                        self._schedule_paint()
+                elif kind == "home":
+                    self.cursor = 0
                     self._schedule_paint()
+                elif kind == "end":
+                    self.cursor = len(self.buffer)
+                    self._schedule_paint()
+                elif kind == "scroll_up":
+                    self.scroll = max(0, self.scroll - self._scroll_step("pu"))
+                    self._paint_pending = False
+                    self.render()
+                elif kind == "scroll_down":
+                    self.scroll += self._scroll_step("pd")
+                    self._paint_pending = False
+                    self.render()
+                elif kind == "escape":
+                    if self.candidates:
+                        self.candidates = []
+                        self._paint_pending = False
+                        self.render()
+                    else:
+                        self.buffer = []
+                        self.cursor = 0
+                        self._schedule_paint()
+                elif kind == "clear":
+                    self.buffer = []
+                    self.cursor = 0
+                    self._paint_pending = False
+                    self.render()
+                elif kind == "paste":
+                    # 粘贴整体插入：换行归一为 \n，绝不触发 submit（管线保证）
+                    text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+                    if text and self.focus == "input":
+                        self.buffer[self.cursor : self.cursor] = list(text)
+                        self.cursor += len(text)
+                        self._schedule_paint()
+                elif kind == "char":
+                    if self.focus == "tree":
+                        if value == " ":
+                            self.toggle_fold(self.tree_cursor)
+                            self._paint_pending = False
+                            self.render()
+                        elif value in ("l", "L") and self._flat_nodes and not self._flat_nodes[self.tree_cursor][2]:
+                            self.toggle_fold(self.tree_cursor)
+                            self._paint_pending = False
+                            self.render()
+                        elif value in ("h", "H") and self._flat_nodes and self._flat_nodes[self.tree_cursor][2]:
+                            self.toggle_fold(self.tree_cursor)
+                            self._paint_pending = False
+                            self.render()
+                    elif value and all(ord(ch) >= 32 for ch in value):
+                        chunk = self._append_text_burst(value)
+                        self.buffer[self.cursor : self.cursor] = list(chunk)
+                        self.cursor += len(chunk)
+                        self._schedule_paint()
+
+            # 帧尾：无条件渲染 + 补足帧周期（TMP: live.update + sleep 同构）。
+            # 被终端延迟渲染的帧下一帧自动覆盖修正；处理超期时重新对齐时钟。
+            self.render()
+            frame_deadline += self._frame_time
+            sleep_left = frame_deadline - time.time()
+            if sleep_left > 0:
+                time.sleep(sleep_left)
+            else:
+                frame_deadline = time.time()
 
     def _confirm_loop(self) -> str:
         """工具确认：1 允许一次 / 2 本项目始终允许 / 3 拒绝（可输入原因）"""
@@ -1375,23 +1336,33 @@ class TuiApp:
         self.render()
         pending = self.pending_tool or {}
         tool_name = pending.get("name", "")
-        print(f"工具确认: {tool_name}")
-        print("  1) 允许执行一次")
-        print("  2) 在本项目中始终允许该类指令")
-        print("  3) 拒绝（可输入原因，直接回车则使用默认拒绝）")
+        # 阻塞式 input() 与 Live 刷新互扰：读取前停 Live，finally 里重启
+        live = self._live
         try:
-            choice = input("请选择> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return policy.default_reject_message("")
-        if choice == "1":
-            return "__ALLOW_ONCE__"
-        if choice == "2":
-            return "__ALLOW_ALWAYS__"
-        try:
-            reason = input("拒绝原因> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            reason = ""
-        return policy.default_reject_message(reason)
+            if live is not None:
+                live.stop()
+                self._live = None
+            print(f"工具确认: {tool_name}")
+            print("  1) 允许执行一次")
+            print("  2) 在本项目中始终允许该类指令")
+            print("  3) 拒绝（可输入原因，直接回车则使用默认拒绝）")
+            try:
+                choice = input("请选择> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return policy.default_reject_message("")
+            if choice == "1":
+                return "__ALLOW_ONCE__"
+            if choice == "2":
+                return "__ALLOW_ALWAYS__"
+            try:
+                reason = input("拒绝原因> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                reason = ""
+            return policy.default_reject_message(reason)
+        finally:
+            if live is not None and self._live is None:
+                self._live = live
+                live.start()
 
     def choose(self, options: List[tuple], prompt: str = "") -> str:
         lines = [f"{prompt}:"]
@@ -2374,11 +2345,13 @@ def _read_key():
     return keyinput.read_key_event()
 
 
-def _read_events():
-    """批处理读取：一次抽干输入队列返回事件列表（空列表=本轮无键）"""
+def _read_events(timeout: float = 0.0):
+    """批处理读取：一次抽干输入队列返回事件列表（空列表=本轮无键）。
+
+    timeout=0 非阻塞（固定帧循环供拍，帧尾 sleep 控制节拍）。"""
     from core import keyinput
 
-    return keyinput.read_events()
+    return keyinput.read_events(timeout)
 
 
 def _read_key_windows():
