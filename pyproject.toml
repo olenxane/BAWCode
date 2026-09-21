@@ -1,0 +1,10 @@
+[project]
+name = "bawcode"
+version = "0.1.0"
+description = "BAWCode coding agent"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40.0",
+    "rich>=13.0.0",
+    "tiktoken>=0.7.0",
+]

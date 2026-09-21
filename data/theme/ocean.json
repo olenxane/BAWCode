@@ -1,0 +1,16 @@
+{
+  "name": "ocean",
+  "colors": {
+    "title": "#7FDBFF",
+    "accent": "#39CCCC",
+    "ok": "#2ECC40",
+    "warn": "#FFDC00",
+    "err": "#FF4136",
+    "tool": "#B10DC9",
+    "dim": "#667788",
+    "ink": "#DDDDDD",
+    "line": "#1C3A4A",
+    "highlight_bg": "#004F6A"
+  },
+  "tips_rotate_seconds": 6
+}

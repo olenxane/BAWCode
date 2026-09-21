@@ -1,0 +1,129 @@
+2026-09-19 21:13:17.223 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 21:13:17.224 [INFO ] [memory] 计划已设置: 日志功能验证（复杂度=low，6字）
+2026-09-19 21:13:17.224 [INFO ] [memory] 写入长期记忆: 分级日志已接入
+2026-09-19 21:13:17.224 [INFO ] [tools] 执行命令: echo BAWCode-log-test（cwd=- timeout=10s）
+2026-09-19 21:13:17.247 [WARN ] [llm] warn-默认应可见
+2026-09-19 21:13:17.247 [ERROR] [tools] error-默认应可见
+2026-09-19 21:13:40.967 [DEBUG] [llm] llm-debug-应可见(模块覆盖)
+2026-09-19 21:13:40.967 [INFO ] [badmod] badmod-应可见(非法级别回退全局)
+2026-09-19 22:01:30.583 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:01:30.583 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:01:30.824 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:01:30.824 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:01:33.892 [INFO ] [main] 任务开始: 你好中文测àK/exit
+2026-09-19 22:01:33.894 [INFO ] [llm] 复杂度判定: low（12字）
+2026-09-19 22:01:35.086 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:01:37.403 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:01:37.408 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:01:37.617 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:01:37.617 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:01:40.053 [INFO ] [commands] 执行命令: /exit 
+2026-09-19 22:01:40.053 [INFO ] [ui] 离开 TUI 界面
+2026-09-19 22:01:40.053 [INFO ] [main] BAWCode 已退出
+2026-09-19 22:01:40.068 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:01:40.367 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:01:40.367 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:01:43.459 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:01:43.459 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:01:43.666 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:01:43.666 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:01:55.287 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:01:55.288 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:01:55.474 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:01:55.474 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:01:58.270 [INFO ] [main] 任务开始: 字0字1字/exit
+2026-09-19 22:01:58.270 [INFO ] [llm] 复杂度判定: low（10字）
+2026-09-19 22:01:59.052 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:02:01.637 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:02:01.637 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:02:01.830 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:02:01.830 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:02:04.890 [INFO ] [main] 任务开始: 第一行内容\n第二行内容/exit
+2026-09-19 22:02:04.890 [INFO ] [llm] 复杂度判定: low（16字）
+2026-09-19 22:02:05.921 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:02:08.296 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:02:08.296 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:02:08.514 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:02:08.514 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:02:11.347 [INFO ] [main] 任务开始: [/exit
+2026-09-19 22:02:11.347 [INFO ] [llm] 复杂度判定: low（6字）
+2026-09-19 22:02:12.063 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:04:01.875 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:04:01.875 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:04:02.109 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:04:02.109 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:04:05.104 [INFO ] [main] 任务开始: 你好中文测àK/exit
+2026-09-19 22:04:05.104 [INFO ] [llm] 复杂度判定: low（12字）
+2026-09-19 22:04:05.991 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:04:08.506 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:04:08.506 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:04:08.711 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:04:08.711 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:04:11.278 [INFO ] [commands] 执行命令: /exit 
+2026-09-19 22:04:11.279 [INFO ] [ui] 离开 TUI 界面
+2026-09-19 22:04:11.279 [INFO ] [main] BAWCode 已退出
+2026-09-19 22:04:11.296 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:04:11.497 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:04:11.497 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:04:14.658 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:04:14.659 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:04:14.845 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:04:14.845 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:04:26.773 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:04:26.773 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:04:27.020 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:04:27.020 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:04:29.580 [INFO ] [main] 任务开始: 字0字1字/exit
+2026-09-19 22:04:29.580 [INFO ] [llm] 复杂度判定: low（10字）
+2026-09-19 22:04:30.437 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:04:33.125 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:04:33.125 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:04:33.322 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:04:33.322 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:04:36.368 [INFO ] [main] 任务开始: 第一行内容\n第二行内容/exit
+2026-09-19 22:04:36.368 [INFO ] [llm] 复杂度判定: low（16字）
+2026-09-19 22:04:37.144 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:04:39.774 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:04:39.775 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:04:39.971 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:04:39.971 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 22:04:42.891 [INFO ] [main] 任务开始: [/exit
+2026-09-19 22:04:42.891 [INFO ] [llm] 复杂度判定: low（6字）
+2026-09-19 22:04:44.041 [WARN ] [llm] LLM 调用失败(第1/4次): Error code: 404 - {'error': {'message': 'model is not found', 'type': 'not_found_error', 'code': '5'}}
+2026-09-19 22:34:34.978 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 22:34:34.978 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 22:34:35.195 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 22:34:35.195 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 23:10:57.725 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 23:10:57.725 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 23:10:57.915 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 23:10:57.915 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 23:11:27.999 [INFO ] [main] 用户中断（Ctrl+C）
+2026-09-19 23:11:28.000 [INFO ] [ui] 离开 TUI 界面
+2026-09-19 23:11:28.000 [INFO ] [main] BAWCode 已退出
+2026-09-19 23:11:28.009 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 23:11:28.167 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 23:11:28.167 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 23:11:29.230 [INFO ] [ui] 离开 TUI 界面
+2026-09-19 23:21:37.033 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 23:21:37.034 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 23:21:37.217 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 23:21:37.217 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 23:22:19.711 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 23:22:19.711 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 23:22:19.894 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 23:22:19.894 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 23:27:20.605 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 23:27:20.605 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 23:27:20.804 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 23:27:20.804 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 23:27:25.362 [INFO ] [main] 任务开始: 你好/exit
+2026-09-19 23:27:25.363 [INFO ] [llm] 复杂度判定: low（7字）
+2026-09-19 23:30:28.420 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 23:30:28.420 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 23:30:28.614 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 23:30:28.614 [INFO ] [ui] 进入 TUI 界面
+2026-09-19 23:38:31.003 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite
+2026-09-19 23:38:31.004 [INFO ] [memory] 记忆会话已初始化: 长期记忆=D:\Windows11\桌面\code\BAWCode\data\memory.json 自动压缩=True 阈值=80%
+2026-09-19 23:38:31.196 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-19 23:38:31.196 [INFO ] [ui] 进入 TUI 界面

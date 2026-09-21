@@ -1,0 +1,12 @@
+{
+  "rules": [
+    {
+      "tool": "execute_command",
+      "fingerprint": "execute_command|pytest|-q tests"
+    },
+    {
+      "tool": "execute_command",
+      "fingerprint": "execute_command|pytest"
+    }
+  ]
+}

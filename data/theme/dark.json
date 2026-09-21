@@ -1,0 +1,16 @@
+{
+  "name": "dark",
+  "colors": {
+    "title": "#57C7FF",
+    "accent": "#3DDCFF",
+    "ok": "#3DFFA0",
+    "warn": "#FFD166",
+    "err": "#FF6B7A",
+    "tool": "#C792EA",
+    "dim": "#7F92AD",
+    "ink": "#D6E2F0",
+    "line": "#2A3B55",
+    "highlight_bg": "#1F4E79"
+  },
+  "tips_rotate_seconds": 5
+}
