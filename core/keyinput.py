@@ -61,6 +61,13 @@ except ImportError:
 Event = Tuple[str, str]
 TICK: Event = ("tick", "")
 
+# Windows 控制台 Enter 修饰键（Shift+Enter → newline）
+_INPUT_RECORD_KEY_EVENT = 0x0001
+_VK_RETURN = 0x0D
+_SHIFT_PRESSED = 0x0010
+_CTRL_PRESSED = 0x0008 | 0x0004  # LEFT|RIGHT_CTRL
+_ALT_PRESSED = 0x0002 | 0x0001  # LEFT|RIGHT_ALT
+
 # 半包/缓冲超时出口：任何"等另一半序列"的逻辑都必须有超时（教训 2）
 HALF_TIMEOUT = 0.2      # CSI / 前缀半包保留上限，超时强制决断
 PEND_MAX = 8            # DBCS 重组缓冲字节上限
@@ -212,6 +219,66 @@ def _kbhit() -> bool:
     return bool(msvcrt.kbhit()) if _WINDOWS else False
 
 
+def _peek_enter_mod() -> Optional[str]:
+    """窥视控制台队列中下一个按键是否为 Enter 及修饰键。
+
+    返回 ``enter`` / ``shift+enter`` / ``ctrl+enter``；非 Enter 或失败返回 None。
+    仅 Windows 有效；用于在 getch 消费 ``\\r``/``\\n`` 前区分 Shift+Enter。
+    """
+    if not _WINDOWS:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class KEY_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("bKeyDown", wintypes.BOOL),
+                ("wRepeatCount", ctypes.c_ushort),
+                ("wVirtualKeyCode", ctypes.c_ushort),
+                ("wVirtualScanCode", ctypes.c_ushort),
+                ("uChar", ctypes.c_wchar),
+                ("dwControlKeyState", wintypes.DWORD),
+            ]
+
+        class _INPUT_UNION(ctypes.Union):
+            _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
+
+        class INPUT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("EventType", ctypes.c_ushort),
+                ("Event", _INPUT_UNION),
+            ]
+
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.restype = ctypes.c_void_p
+        handle = k32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        if not handle:
+            return None
+        buf = (INPUT_RECORD * 16)()
+        count = wintypes.DWORD(0)
+        if not k32.PeekConsoleInputW(handle, buf, 16, ctypes.byref(count)):
+            return None
+        for i in range(count.value):
+            rec = buf[i]
+            if rec.EventType != _INPUT_RECORD_KEY_EVENT:
+                continue
+            ke = rec.Event.KeyEvent
+            if not ke.bKeyDown:
+                continue
+            if ke.wVirtualKeyCode != _VK_RETURN:
+                return None
+            state = int(ke.dwControlKeyState)
+            if state & _CTRL_PRESSED:
+                return "ctrl+enter"
+            if state & _SHIFT_PRESSED:
+                return "shift+enter"
+            return "enter"
+        return None
+    except Exception:
+        return None
+
+
 class KeyReader:
     """控制台输入读取器。
 
@@ -240,6 +307,8 @@ class KeyReader:
         # IME 握手放行计时：孤立 \x00 丢弃时刻 → 下一个 raw 单元的间隔，
         # 用于量化 IME/conhost 扣押删除序列的时长（验证日志直接可读）
         self._lone_prefix_at: Optional[float] = None
+        # 预分类事件（如 Shift+Enter → newline），优先于字节解析交付
+        self._pending: List[Event] = []
         _log("KeyReader init")
         _log_console_info()
 
@@ -282,6 +351,7 @@ class KeyReader:
         self._burst = None
         self._burst_text = None
         self._lone_prefix_at = None
+        self._pending.clear()
         if _WINDOWS:
             try:
                 while msvcrt.kbhit():
@@ -423,6 +493,13 @@ class KeyReader:
                 return
             if not _kbhit():
                 return
+            # Enter 修饰键：Shift+Enter 预分类为 newline（产品约定 Enter=提交）
+            enter_mod = _peek_enter_mod()
+            if enter_mod == "shift+enter" and not self._pasting:
+                self._getch_char()  # 消费 \r/\n
+                self._pending.append(("newline", ""))
+                _log("peek shift+enter -> newline")
+                return
             if not self._pasting and self._pending_console_events() >= PASTE_BURST_EVENTS:
                 self._burst = bytearray()
                 self._drain_burst()
@@ -504,6 +581,9 @@ class KeyReader:
         """
         try:
             now = time.time()
+            # 预分类事件（Shift+Enter 等）优先交付
+            if self._pending:
+                return self._pending.pop(0)
             # 已冲洗的爆发粘贴：优先交付
             if self._burst_text is not None:
                 text = self._burst_text
@@ -785,6 +865,18 @@ class KeyReader:
         if final == "Z":
             return ("mode_switch", "")
 
+        # CSI u（kitty/部分终端）：ESC [ 13 ; mod u  → Enter 变体
+        if final == "u":
+            parts = [p for p in params.split(";") if p != ""] if params else []
+            if parts and parts[0] == "13":
+                mod = _MOD.get(parts[-1], "") if len(parts) >= 2 else ""
+                if mod == "shift+":
+                    return ("newline", "")
+                if mod == "ctrl+":
+                    return ("submit_ctrl", "")
+                return ("submit", "")
+            return TICK
+
         if final in _CSI_FINAL:
             name = _CSI_FINAL[final]
             if name == "mode_switch":
@@ -854,6 +946,16 @@ class KeyReader:
                             return _kind_event(name) if name else TICK
                         if code == "Z":
                             return ("mode_switch", "")
+                        if code == "u":
+                            parts = [p for p in params.split(";") if p != ""]
+                            if parts and parts[0] == "13":
+                                mod_u = _MOD.get(parts[-1], "") if len(parts) >= 2 else ""
+                                if mod_u == "shift+":
+                                    return ("newline", "")
+                                if mod_u == "ctrl+":
+                                    return ("submit_ctrl", "")
+                                return ("submit", "")
+                            return TICK
                         name = _CSI_FINAL.get(code)
                         if not name:
                             return TICK
@@ -900,14 +1002,17 @@ def read_key_event(timeout: float = 0.02) -> Event:
 def read_events(timeout: float = 0.02) -> List[Event]:
     """批处理读取（滴灌形，教训 6）：每帧只从控制台队列消费一个逻辑单元，
     队列中积压的键由后续帧逐个交付——瞬间抽干上屏批次会让 conhost/TSF
-    扣押紧随的退格（realreader 二分实证；TMP 形为证）。_buf/爆发收流中
-    已消费的内容同帧交付（那不是队列消费，无扣押风险）。
+    扣押紧随的退格（realreader 二分实证；TMP 形为证）。_buf/爆发收流/
+    _pending 中已消费的内容同帧交付（那不是队列消费，无扣押风险）。
     timeout<=0 真非阻塞（帧循环供拍）。粘贴收流态不视为队列空闲。"""
     reader = get_reader()
     events: List[Event] = []
     ev = reader.read_event(timeout)
     while ev != TICK:
         events.append(ev)
+        if reader._pending:
+            ev = reader.read_event(0.0)
+            continue
         if reader._burst_text is not None:
             # 爆发粘贴已冲洗待交付：同帧交付完（不碰队列）
             ev = reader.read_event(0.0)
@@ -941,7 +1046,8 @@ def direction_of(kind: str, value: str) -> Optional[str]:
 
 def supported_kinds() -> tuple:
     return (
-        "tick", "char", "submit", "submit_ctrl", "tab", "mode_switch",
+        "tick", "char", "submit", "submit_ctrl", "newline", "tab", "mode_switch",
         "backspace", "delete", "up", "down", "left", "right", "home", "end",
         "scroll_up", "scroll_down", "escape", "interrupt", "clear", "hotkey",
+        "paste",
     )

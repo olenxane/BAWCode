@@ -52,7 +52,7 @@ DEFAULT_COLORS = {
 }
 
 TIPS = [
-    "界面输入框：Enter 提交 · Tab 补全/切焦点",
+    "界面输入框：Enter 提交 · Shift+Enter 换行 · Tab 补全/切焦点",
     "Shift+Tab 或 /mode 切换访问模式",
     "/model 切换模型 · /settings 打开设置",
     "设置：↑↓选项 · ←→切换 · 文本项 Enter 后行输入编辑",
@@ -60,6 +60,58 @@ TIPS = [
     "中文输入时绘制合并刷新，候选上屏后自动更新",
     "/theme 列出并载入主题",
 ]
+
+
+def _event_token(kind: str, value: Any) -> str:
+    """事件 → 小写键 token（与 config/设置页快捷键字面量对齐）"""
+    if kind == "mode_switch":
+        return "shift+tab"
+    if kind == "tab":
+        return "tab"
+    if kind == "submit":
+        return "enter"
+    if kind == "submit_ctrl":
+        return "ctrl+enter"
+    if kind == "newline":
+        return "shift+enter"
+    if kind in (
+        "up",
+        "down",
+        "left",
+        "right",
+        "home",
+        "end",
+        "backspace",
+        "delete",
+        "escape",
+    ):
+        return kind
+    if kind == "scroll_up":
+        return "pageup"
+    if kind == "scroll_down":
+        return "pagedown"
+    if kind == "hotkey":
+        return str(value or "").strip().lower()
+    if kind == "char":
+        return str(value or "").strip().lower()
+    return ""
+
+
+def _binding_tokens(binding: Any) -> List[str]:
+    if binding is None:
+        return []
+    items = list(binding) if isinstance(binding, (list, tuple, set)) else [binding]
+    out: List[str] = []
+    for b in items:
+        s = str(b or "").strip().lower()
+        if s:
+            out.append(s)
+    return out
+
+
+def _is_binding(kind: str, value: Any, binding: Any) -> bool:
+    tok = _event_token(kind, value)
+    return bool(tok) and tok in _binding_tokens(binding)
 
 
 def _enable_windows_ansi() -> None:
@@ -410,14 +462,14 @@ class TuiApp:
         self._row_meta: Dict[str, int] = {}
         self.keys = {
             "send": "ctrl+enter",
-            "newline": "enter",
+            "newline": "shift+enter",
             "switch_focus": "tab",
             "switch_mode": "shift+tab",
             "complete": "tab",
             "scroll_up": "pageup",
             "scroll_down": "pagedown",
-            "expand": "right",
-            "collapse": "left",
+            "expand": ["right", "l"],
+            "collapse": ["left", "h"],
             "scroll_v0": 1.0,
             "scroll_hold_ms": 150,
             "scroll_max_step": 20,
@@ -488,10 +540,14 @@ class TuiApp:
             if k in ui_cfg and ui_cfg[k] not in (None, ""):
                 val = ui_cfg[k]
                 if isinstance(val, (list, tuple)):
-                    val = val[0] if val else self.keys.get(k)
-                self.keys[k] = str(val).lower()
+                    # 多绑定保留整组（expand/collapse 等）
+                    self.keys[k] = [str(x).lower() for x in val if x not in (None, "")]
+                else:
+                    self.keys[k] = str(val).lower()
         if not self.keys.get("switch_mode"):
             self.keys["switch_mode"] = "shift+tab"
+        if not self.keys.get("newline"):
+            self.keys["newline"] = "shift+enter"
         self.keys["scroll_v0"] = float(ui_cfg.get("scroll_v0", 1.0))
         self.keys["scroll_hold_ms"] = int(ui_cfg.get("scroll_hold_ms", 150))
         self.keys["scroll_max_step"] = int(ui_cfg.get("scroll_max_step", 20))
@@ -1285,8 +1341,15 @@ class TuiApp:
                     self._paint_pending = False
                     self.render()
                     continue
-                if kind in ("submit_ctrl", "submit"):
-                    # Enter / Ctrl+Enter 提交当前行
+                # 换行（默认 Shift+Enter）：输入框插入 \n，绝不提交
+                if self._should_newline(kind, value):
+                    if self.focus == "input":
+                        self.buffer[self.cursor : self.cursor] = list("\n")
+                        self.cursor += 1
+                        self._schedule_paint()
+                    continue
+                if self._should_submit(kind, value):
+                    # Enter / send 绑定提交；树焦点下裸 Enter 仍折叠
                     if kind == "submit" and self.focus == "tree":
                         self.toggle_fold(self.tree_cursor)
                         self._paint_pending = False
@@ -1301,23 +1364,26 @@ class TuiApp:
                     self.candidates = []
                     self._paint_pending = False
                     return line
-                if kind == "tab":
-                    if self.candidates:
+                want_complete = kind == "tab" or _is_binding(kind, value, self.keys.get("complete"))
+                want_focus = kind == "tab" or _is_binding(kind, value, self.keys.get("switch_focus"))
+                if want_complete or want_focus:
+                    if self.candidates and want_complete:
                         self._apply_completion()
                         self._paint_pending = False
                         self.render()
                         continue
-                    if self.focus == "input":
-                        self.focus = "tree"
-                        flat = self._flatten_tree()
-                        self.tree_cursor = max(0, len(flat) - 1)
-                        self._tree_follow_tail = True
-                        self.scroll = max(0, len(flat) - 4)
-                    else:
-                        self.focus = "input"
-                    self._paint_pending = False
-                    self.render()
-                    continue
+                    if want_focus or kind == "tab":
+                        if self.focus == "input":
+                            self.focus = "tree"
+                            flat = self._flatten_tree()
+                            self.tree_cursor = max(0, len(flat) - 1)
+                            self._tree_follow_tail = True
+                            self.scroll = max(0, len(flat) - 4)
+                        else:
+                            self.focus = "input"
+                        self._paint_pending = False
+                        self.render()
+                        continue
                 if kind == "backspace":
                     if self.focus == "input" and self.cursor > 0:
                         self.buffer.pop(self.cursor - 1)
@@ -1373,22 +1439,22 @@ class TuiApp:
                         self.cursor = len(self.buffer)
                         self._paint_pending = False
                         self.render()
-                elif dirn == "left":
+                elif dirn == "left" or (self.focus == "tree" and _is_binding(kind, value, self.keys.get("collapse"))):
                     if self.focus == "tree":
                         if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
                             self.toggle_fold(self.tree_cursor)
                             self._paint_pending = False
                             self.render()
-                    else:
+                    elif dirn == "left":
                         self.cursor = max(0, self.cursor - 1)
                         self._schedule_paint()
-                elif dirn == "right":
+                elif dirn == "right" or (self.focus == "tree" and _is_binding(kind, value, self.keys.get("expand"))):
                     if self.focus == "tree":
                         if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
                             self.toggle_fold(self.tree_cursor)
                             self._paint_pending = False
                             self.render()
-                    else:
+                    elif dirn == "right":
                         self.cursor = min(len(self.buffer), self.cursor + 1)
                         self._schedule_paint()
                 elif kind == "home":
@@ -1397,12 +1463,12 @@ class TuiApp:
                 elif kind == "end":
                     self.cursor = len(self.buffer)
                     self._schedule_paint()
-                elif kind == "scroll_up":
+                elif kind == "scroll_up" or _is_binding(kind, value, self.keys.get("scroll_up")):
                     self.scroll = max(0, self.scroll - self._scroll_step("pu"))
                     self._tree_follow_tail = False
                     self._paint_pending = False
                     self.render()
-                elif kind == "scroll_down":
+                elif kind == "scroll_down" or _is_binding(kind, value, self.keys.get("scroll_down")):
                     self.scroll += self._scroll_step("pd")
                     # 触底则恢复跟随最新
                     self._tree_follow_tail = True
@@ -1431,16 +1497,25 @@ class TuiApp:
                         self._schedule_paint()
                 elif kind == "char":
                     if self.focus == "tree":
+                        handled_tree = False
                         if value == " ":
                             self.toggle_fold(self.tree_cursor)
-                            self._paint_pending = False
-                            self.render()
-                        elif value in ("l", "L") and self._flat_nodes and not self._flat_nodes[self.tree_cursor][2]:
+                            handled_tree = True
+                        if _is_binding(kind, value, self.keys.get("expand")):
+                            if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
+                                self.toggle_fold(self.tree_cursor)
+                            handled_tree = True
+                        if _is_binding(kind, value, self.keys.get("collapse")):
+                            if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
+                                self.toggle_fold(self.tree_cursor)
+                            handled_tree = True
+                        if not handled_tree and value in ("l", "L") and self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
                             self.toggle_fold(self.tree_cursor)
-                            self._paint_pending = False
-                            self.render()
-                        elif value in ("h", "H") and self._flat_nodes and self._flat_nodes[self.tree_cursor][2]:
+                            handled_tree = True
+                        elif not handled_tree and value in ("h", "H") and self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
                             self.toggle_fold(self.tree_cursor)
+                            handled_tree = True
+                        if handled_tree or value in (" ", "l", "L", "h", "H"):
                             self._paint_pending = False
                             self.render()
                     elif value and all(ord(ch) >= 32 for ch in value):
@@ -1448,6 +1523,7 @@ class TuiApp:
                         self.buffer[self.cursor : self.cursor] = list(chunk)
                         self.cursor += len(chunk)
                         self._schedule_paint()
+                # kind==hotkey 且未命中绑定：忽略，避免误提交/退出
 
             # 帧尾：无条件渲染 + 补足帧周期（TMP: live.update + sleep 同构）。
             # 被终端延迟渲染的帧下一帧自动覆盖修正；处理超期时重新对齐时钟。
@@ -1494,10 +1570,22 @@ class TuiApp:
                 live.start()
 
     def choose(self, options: List[tuple], prompt: str = "") -> str:
-        lines = [f"{prompt}:"]
+        lines = []
+        if prompt:
+            lines.append(f"{prompt}:")
         for key, label in options:
             lines.append(f"  {key}) {label}")
-        self.messages.append({"role": "system", "content": "\n".join(f"{k} {v}" for k, v in options), "type": "help"})
+        content = "\n".join(lines)
+        self.messages.append({"role": "system", "content": content, "type": "help"})
+        # 写入 session，避免随后 _sync 用 session 覆盖后选项消失
+        try:
+            from core import memory as memory_mod
+
+            sess = memory_mod.get_session()
+            if sess is not None:
+                sess.add_message("system", content, type="help")
+        except Exception:
+            pass
         self.render()
         return self.read_line().strip()
 
@@ -1592,26 +1680,48 @@ class TuiApp:
         ],
         "switch_focus": ["tab", "f4", "ctrl+o"],
         "send": ["ctrl+enter", "f5", "ctrl+s"],
-        "newline": ["enter", "shift+enter"],
-        "complete": ["tab", "ctrl+space"],
+        "newline": ["shift+enter", "enter"],
+        "complete": ["tab"],
         "scroll_up": ["pageup", "ctrl+up"],
         "scroll_down": ["pagedown", "ctrl+down"],
         "expand": ["right", "l"],
         "collapse": ["left", "h"],
     }
 
+    def _action_hit(self, kind: str, value: Any, *action_keys: str) -> Optional[str]:
+        for ak in action_keys:
+            if _is_binding(kind, value, self.keys.get(ak)):
+                return ak
+        return None
+
+    def _should_submit(self, kind: str, value: Any) -> bool:
+        """Enter 恒提交；Ctrl+Enter / send 绑定亦可提交（newline 独占的键除外）"""
+        if kind == "submit":
+            # 产品约定：Enter = 提交；即使 newline 误配为 enter 也不改行为
+            return True
+        if _is_binding(kind, value, self.keys.get("newline")):
+            return False
+        if kind == "submit_ctrl":
+            return True
+        return _is_binding(kind, value, self.keys.get("send"))
+
+    def _should_newline(self, kind: str, value: Any) -> bool:
+        """Shift+Enter（或配置的 newline 键）在输入框插入换行"""
+        if kind == "newline":
+            return True
+        if kind == "submit":
+            return False
+        return _is_binding(kind, value, self.keys.get("newline"))
+
     def _is_mode_switch(self, kind: str, value: Any) -> bool:
         """shift+tab 始终切换模式；额外尊重设置中的 switch_mode 映射"""
         if kind == "mode_switch":
             return True
-        binding = str(self.keys.get("switch_mode") or "shift+tab").strip().lower()
-        if not binding or binding == "shift+tab":
+        binding = self.keys.get("switch_mode") or "shift+tab"
+        tokens = _binding_tokens(binding)
+        if not tokens or tokens == ["shift+tab"]:
             return kind == "mode_switch"
-        if kind == "hotkey" and str(value).lower() == binding:
-            return True
-        if kind == "char" and binding not in ("shift+tab",) and str(value).lower() == binding:
-            return True
-        return False
+        return _is_binding(kind, value, binding)
 
     def _mode_key_label(self) -> str:
         return str(self.keys.get("switch_mode") or "shift+tab")
@@ -1872,9 +1982,9 @@ class TuiApp:
             key_defs = [
                 ("switch_mode", "切换模式", "Shift+Tab 始终有效；此为额外映射"),
                 ("switch_focus", "切换焦点", "会话树 ↔ 输入框"),
-                ("send", "发送", "Ctrl+Enter 默认"),
-                ("newline", "换行", "Enter / Shift+Enter"),
-                ("complete", "命令补全", "有候选时 Tab 优先补全"),
+                ("send", "发送", "Enter 恒提交；此为额外发送键"),
+                ("newline", "换行", "默认 Shift+Enter；Enter 不作换行"),
+                ("complete", "命令补全", "有候选时优先补全"),
                 ("expand", "树展开", "焦点在会话树时"),
                 ("collapse", "树折叠", "焦点在会话树时"),
                 ("scroll_up", "滚动上", "会话历史向上"),
