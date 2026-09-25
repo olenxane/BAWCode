@@ -1,47 +1,10 @@
-"""键盘输入统一出口：ui 通过 read_events / read_key_event 读键。
-
-=============================================================================
-架构（Windows 主路径，TMP terminal-music-player 同形）
-=============================================================================
-  ① 采集层  _fill_win —— 滴灌：每次调用至多消费一个逻辑单元
-     msvcrt.getch() 字节读取。0x00/0xE0 前缀立即守卫配对（无配对零等待
-     丢弃——IME 删除时的握手字节）；0x80-0xFF 字节（IME 上屏中文按
-     console CP 拆成逐字节投递）按 TMP 同款守卫读法立即读齐尾字节后统一
-     解码（GBK 优先）。**绝不一帧抽干**：上屏批次按 50ms/字符逐帧消费——
-     realreader 二分实证，瞬间抽干上屏批次会让 conhost/TSF 把紧随的退格
-     扣押到下次上屏才放行（表现：删不掉、打新字时所有积压退格一次生效）。
-     粘贴爆发例外（队列事件数 ≥ PASTE_BURST_EVENTS）：整批快速收流。
-  ② 解析层  _parse_win_buffer
-     前缀+扫描码 → 方向键/功能键；ESC[ → CSI（ConPTY）；控制键；可打印
-     字符。粘贴判定改流式：**批次中部的 \r \n \t 是粘贴内容**（收流合成
-     paste 事件，绝不触发 submit，教训 4），批次末尾的 \r 才是提交——
-     「IME 上屏后立即回车」的回车必为批次末尾，不受影响。
-  ③ 事件层  read_events / read_key_event
-     read_events 每帧只碰一次控制台队列；_buf/爆发收流中已消费的内容
-     同帧交付（那不是队列消费，无扣押风险）。
-
-=============================================================================
-历史教训（改动前必读，详见 review.md）
-=============================================================================
-1. 读键 API 必须 getch/getwch 二选一并全文件一致（含 flush_input）——
-   混用会导致控制台队列 ANSI/宽字符记录错位；
-2. 对"等另一半序列"的任何等待都必须有超时或零等待出口：IME 删除上屏字符
-   时会注入孤立 \x00 握手字节，等待会挂起输入（实测 1.3s+）；
-3. 中文上屏可能被 conhost 按 console CP 拆成逐字节（GBK 2 字节/UTF-8 3 字节），
-   必须重组后统一解码——中途解码会让 GBK 在 UTF-8 多字节中途抢跑解出乱码；
-4. bracketed-paste（ESC[200~/201~）与流式爆发收流的内容是数据不是按键，
-   绝不能触发 submit；
-5. timeout<=0 必须真非阻塞（固定帧循环由帧尾 sleep 控制节拍）；
-6. 读键必须滴灌（TMP 形）：每帧至多一个逻辑单元。抽干/批量消费会触发
-   conhost/TSF 对"上屏后退格"的扣押（2026-09-21 realreader 二分实证）。
-"""
 from __future__ import annotations
 
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 try:
     import termios
@@ -58,125 +21,44 @@ try:
 except ImportError:
     _WINDOWS = False
 
-Event = Tuple[str, str]
-TICK: Event = ("tick", "")
 
-# Windows 控制台 Enter 修饰键（Shift+Enter → newline）
+class KeyEvent(NamedTuple):
+    kind: str
+    value: str = ""
+
+    def __iter__(self):
+        yield self.kind
+        yield self.value
+
+
+TICK = KeyEvent("tick", "")
+Event = KeyEvent  # 别名
+
+# 空闲恢复：不完整 VT / 半截多字节在无后续数据时决断（非主路径）
+IDLE_FLUSH = 0.12
+PASTE_IDLE_TIMEOUT = 1.0
+PASTE_START = "\x1b[200~"
+PASTE_END = "\x1b[201~"
+BURST_DRAIN_LIMIT = 65536
+# 批内中部出现 CR/LF/Tab 且批足够大时合成 paste
+BATCH_PASTE_MIN = 4
+
 _INPUT_RECORD_KEY_EVENT = 0x0001
 _VK_RETURN = 0x0D
 _SHIFT_PRESSED = 0x0010
-_CTRL_PRESSED = 0x0008 | 0x0004  # LEFT|RIGHT_CTRL
-_ALT_PRESSED = 0x0002 | 0x0001  # LEFT|RIGHT_ALT
+_CTRL_PRESSED = 0x0008 | 0x0004
+_ALT_PRESSED = 0x0002 | 0x0001
 
-# 半包/缓冲超时出口：任何"等另一半序列"的逻辑都必须有超时（教训 2）
-HALF_TIMEOUT = 0.2      # CSI / 前缀半包保留上限，超时强制决断
-PEND_MAX = 8            # DBCS 重组缓冲字节上限
-PEND_TIMEOUT = 0.1      # DBCS 重组超时，超时按 latin-1 落地不丢字
-PASTE_IDLE_TIMEOUT = 1.0  # bracketed-paste end 丢失时强制 flush 的空闲超时
-PASTE_START = "\x1b[200~"
-PASTE_END = "\x1b[201~"
-PASTE_BURST_EVENTS = 32   # 队列积压事件数达到此值判为粘贴爆发（整批收流）
-BURST_DRAIN_LIMIT = 65536  # 爆发收流单次抽干字节上限
-
-# ---- 输入诊断日志：BAW_LOG_KEYINPUT=1 时写入 develop/keyinput.log ----
 _LOG_ON = os.environ.get("BAW_LOG_KEYINPUT") == "1"
 _LOG_PATH = Path(__file__).resolve().parent.parent / "develop" / "keyinput.log"
 
-
-def _log(msg: str) -> None:
-    if not _LOG_ON:
-        return
-    try:
-        with _LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(f"{time.time():.3f}\t{msg}\n")
-    except Exception:
-        pass
-
-
-def _log_console_info() -> None:
-    if not _LOG_ON or sys.platform != "win32":
-        return
-    try:
-        import ctypes
-
-        k32 = ctypes.windll.kernel32
-        _log(
-            f"console ACP={k32.GetACP()} OEM={k32.GetOEMCP()} "
-            f"inCP={k32.GetConsoleCP()} outCP={k32.GetConsoleOutputCP()}"
-        )
-        _log(
-            f"python stdout={sys.stdout.encoding!r} stdin={sys.stdin.encoding!r} "
-            f"utf8_mode={sys.flags.utf8_mode} tty={sys.stdin.isatty()}"
-        )
-    except Exception:
-        pass
-
-
-def _decode_encodings() -> List[str]:
-    """conhost DBCS 逐字节重组的解码候选：控制台 CP 优先，再 utf-8 / gbk"""
-    encs: List[str] = []
-    try:
-        import ctypes
-
-        cp = ctypes.windll.kernel32.GetConsoleCP()
-    except Exception:
-        cp = 0
-    if cp == 65001:
-        encs.append("utf-8")
-    elif cp and cp != 65001:
-        encs.append(f"cp{cp}")
-    for fallback in ("utf-8", "gbk"):
-        if fallback not in encs:
-            encs.append(fallback)
-    return encs
-
-
-def _expected_trails(lead: int) -> int:
-    """console CP 决定的多字节尾字节数：GBK 等双字节编码固定 1；
-    UTF-8（inCP=65001）按首字节位宽 1-3。"""
-    if lead < 0x80:
-        return 0
-    try:
-        import ctypes
-
-        cp = ctypes.windll.kernel32.GetConsoleCP()
-    except Exception:
-        cp = 0
-    if cp == 65001:
-        if lead >= 0xF0:
-            return 3
-        if lead >= 0xE0:
-            return 2
-        if lead >= 0xC0:
-            return 1
-        return 0
-    return 1
-
-
-# Windows 扫描码 → kind（与 music player 的 _WIN_SCAN_MAP 同族）
 _WIN_SCAN = {
-    72: "up",
-    80: "down",
-    75: "left",
-    77: "right",
-    83: "delete",
-    71: "home",
-    79: "end",
-    73: "scroll_up",
-    81: "scroll_down",
-    82: "hotkey_insert",
-    59: "hotkey_f1",
-    60: "hotkey_f2",
-    61: "hotkey_f3",
-    62: "hotkey_f4",
-    63: "hotkey_f5",
-    64: "hotkey_f6",
-    65: "hotkey_f7",
-    66: "hotkey_f8",
-    67: "hotkey_f9",
-    68: "hotkey_f10",
-    87: "hotkey_f11",
-    88: "hotkey_f12",
+    72: "up", 80: "down", 75: "left", 77: "right",
+    83: "delete", 71: "home", 79: "end",
+    73: "scroll_up", 81: "scroll_down", 82: "hotkey_insert",
+    59: "hotkey_f1", 60: "hotkey_f2", 61: "hotkey_f3", 62: "hotkey_f4",
+    63: "hotkey_f5", 64: "hotkey_f6", 65: "hotkey_f7", 66: "hotkey_f8",
+    67: "hotkey_f9", 68: "hotkey_f10", 87: "hotkey_f11", 88: "hotkey_f12",
     15: "mode_switch",
 }
 
@@ -204,29 +86,603 @@ _CSI_TILDE = {
 
 _MOD = {"2": "shift+", "3": "alt+", "5": "ctrl+", "6": "ctrl+shift+", "7": "ctrl+alt+"}
 
+# Win VK → 语义（结构化路径，不经扫描码）
+_VK_MAP = {
+    0x08: KeyEvent("backspace", ""),
+    0x09: KeyEvent("tab", ""),
+    0x0D: KeyEvent("submit", ""),
+    0x1B: KeyEvent("escape", ""),
+    0x21: KeyEvent("scroll_up", ""),
+    0x22: KeyEvent("scroll_down", ""),
+    0x23: KeyEvent("end", ""),
+    0x24: KeyEvent("home", ""),
+    0x25: KeyEvent("left", ""),
+    0x26: KeyEvent("up", ""),
+    0x27: KeyEvent("right", ""),
+    0x28: KeyEvent("down", ""),
+    0x2D: KeyEvent("hotkey", "insert"),
+    0x2E: KeyEvent("delete", ""),
+    0x70: KeyEvent("hotkey", "f1"),
+    0x71: KeyEvent("hotkey", "f2"),
+    0x72: KeyEvent("hotkey", "f3"),
+    0x73: KeyEvent("hotkey", "f4"),
+    0x74: KeyEvent("hotkey", "f5"),
+    0x75: KeyEvent("hotkey", "f6"),
+    0x76: KeyEvent("hotkey", "f7"),
+    0x77: KeyEvent("hotkey", "f8"),
+    0x78: KeyEvent("hotkey", "f9"),
+    0x79: KeyEvent("hotkey", "f10"),
+    0x7A: KeyEvent("hotkey", "f11"),
+    0x7B: KeyEvent("hotkey", "f12"),
+}
 
-def _kind_event(name: str) -> Event:
+
+def _log(msg: str) -> None:
+    if not _LOG_ON:
+        return
+    try:
+        with _LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"{time.time():.3f}\t{msg}\n")
+    except Exception:
+        pass
+
+
+def _kind_event(name: str) -> KeyEvent:
     if name.startswith("hotkey_"):
-        return ("hotkey", name.split("_", 1)[1])
-    return (name, "")
+        return KeyEvent("hotkey", name.split("_", 1)[1])
+    return KeyEvent(name, "")
 
 
-def _scan_event(code: int) -> Event:
-    return _kind_event(_WIN_SCAN[code]) if code in _WIN_SCAN else TICK
+def _scan_event(code: int) -> KeyEvent:
+    name = _WIN_SCAN.get(code)
+    return _kind_event(name) if name else TICK
 
 
 def _kbhit() -> bool:
-    return bool(msvcrt.kbhit()) if _WINDOWS else False
+    return bool(msvcrt.kbhit()) if _WINDOWS and msvcrt is not None else False
 
 
-def _peek_enter_mod() -> Optional[str]:
-    """窥视控制台队列中下一个按键是否为 Enter 及修饰键。
+def _console_cp() -> int:
+    try:
+        import ctypes
 
-    返回 ``enter`` / ``shift+enter`` / ``ctrl+enter``；非 Enter 或失败返回 None。
-    仅 Windows 有效；用于在 getch 消费 ``\\r``/``\\n`` 前区分 Shift+Enter。
-    """
-    if not _WINDOWS:
+        return int(ctypes.windll.kernel32.GetConsoleCP())
+    except Exception:
+        return 0
+
+
+def _encoding_candidates() -> List[str]:
+    encs: List[str] = []
+    cp = _console_cp()
+    if cp == 65001:
+        encs.append("utf-8")
+    elif cp:
+        encs.append(f"cp{cp}")
+    for fb in ("utf-8", "gbk"):
+        if fb not in encs:
+            encs.append(fb)
+    return encs
+
+
+def _decode_bytes(data: bytes) -> Optional[str]:
+    if not data:
         return None
+    for enc in _encoding_candidates():
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return None
+
+
+class EncodingStream:
+    """流式多字节重组：完整序列立刻产出；半截挂缓冲，空闲 latin-1 落地。"""
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.at: Optional[float] = None
+
+    def reset(self) -> None:
+        self.buf.clear()
+        self.at = None
+
+    def __bool__(self) -> bool:
+        return bool(self.buf)
+
+    def feed_byte(self, b: int) -> Optional[str]:
+        """喂入 0..255 字节；序列完整则返回解码文本。"""
+        self.buf.append(b & 0xFF)
+        if self.at is None:
+            self.at = time.time()
+        text = self._try_complete()
+        if text is not None:
+            return text
+        if len(self.buf) > 8:
+            return self._force()
+        return None
+
+    def feed_bytes(self, data: bytes) -> str:
+        out: List[str] = []
+        for b in data:
+            t = self.feed_byte(b)
+            if t:
+                out.append(t)
+        return "".join(out)
+
+    def _try_complete(self) -> Optional[str]:
+        data = bytes(self.buf)
+        if not data:
+            return None
+        lead = data[0]
+        cp = _console_cp()
+        if lead < 0x80:
+            self.reset()
+            return chr(lead)
+        if cp == 65001:
+            if lead >= 0xF0:
+                need = 4
+            elif lead >= 0xE0:
+                need = 3
+            elif lead >= 0xC0:
+                need = 2
+            else:
+                need = 1
+            if len(data) < need:
+                return None
+            try:
+                text = data.decode("utf-8")
+                self.reset()
+                return text
+            except UnicodeDecodeError:
+                # 非 UTF-8 完整序列时回退 DBCS
+                if len(data) < 2:
+                    return None
+        else:
+            need = 2
+            if len(data) < need:
+                return None
+        for enc in _encoding_candidates():
+            try:
+                text = data.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+            self.reset()
+            return text
+        return None
+
+    def _force(self, strict: bool = False) -> Optional[str]:
+        data = bytes(self.buf)
+        self.reset()
+        decoded = _decode_bytes(data)
+        if decoded is not None:
+            return decoded
+        if strict:
+            return None
+        return "".join(chr(b) for b in data)
+
+    def timeout_flush(self) -> Optional[str]:
+        if not self.buf:
+            self.at = None
+            return None
+        overdue = self.at is None or (time.time() - self.at) > IDLE_FLUSH
+        if not overdue:
+            return None
+        out = self._force(strict=False)
+        _log(f"enc timeout flush {out!r}")
+        return out
+
+
+class EscapeFSM:
+    """单遍 CSI/SS3/独立 Esc。不完整序列挂缓冲，idle/显式 flush 决断。"""
+
+    GROUND = 0
+    ESC = 1
+    SS3 = 2
+    CSI_PARAM = 3
+
+    def __init__(self) -> None:
+        self.state = self.GROUND
+        self.params = ""
+        self.started_at = 0.0
+        self._carry: List[str] = []
+
+    def reset(self) -> None:
+        self.state = self.GROUND
+        self.params = ""
+        self.started_at = 0.0
+        self._carry.clear()
+
+    def feed(self, ch: str) -> Tuple[Optional[KeyEvent], List[str]]:
+        """返回 (事件|None, 回退字符列表)。"""
+        if self.state == self.GROUND:
+            if ch == "\x1b":
+                self.state = self.ESC
+                self.started_at = time.time()
+                self.params = ""
+                return None, []
+            return KeyEvent("raw", ch), []
+
+        if self.state == self.ESC:
+            if ch == "[":
+                self.state = self.CSI_PARAM
+                self.params = ""
+                return None, []
+            if ch == "O":
+                self.state = self.SS3
+                return None, []
+            self.reset()
+            return KeyEvent("escape", ""), [ch]
+
+        if self.state == self.SS3:
+            self.reset()
+            name = _CSI_FINAL.get(ch)
+            return (_kind_event(name) if name else TICK), []
+
+        if ch.isdigit() or ch == ";" or ch == "<":
+            self.params += ch
+            return None, []
+        params = self.params
+        self.reset()
+        return self._csi_finish(ch, params), []
+
+    def _mouse_sgr(self, params: str, final: str) -> KeyEvent:
+        body = params[1:] if params.startswith("<") else params
+        parts = body.split(";")
+        try:
+            cb = int(parts[0])
+        except (ValueError, IndexError):
+            return TICK
+        if cb & 64:
+            wheel = cb & 3
+            if wheel == 0:
+                return KeyEvent("mouse_wheel", "up")
+            if wheel == 1:
+                return KeyEvent("mouse_wheel", "down")
+        return KeyEvent("mouse", f"{cb};{final}")
+
+    def _csi_finish(self, final: str, params: str) -> KeyEvent:
+        if params.startswith("<") and final in ("M", "m"):
+            return self._mouse_sgr(params, final)
+        if final == "~":
+            num = params.split(";")[0] if params else ""
+            name = _CSI_TILDE.get(num)
+            if not name:
+                return TICK
+            if name == "paste_start":
+                return KeyEvent("paste_start", "")
+            if name == "paste_end":
+                return KeyEvent("paste_end", "")
+            ev = _kind_event(name)
+            parts = [p for p in params.split(";") if p] if params else []
+            if len(parts) >= 2 and ev.kind == "hotkey":
+                mod = _MOD.get(parts[-1], "")
+                if mod:
+                    return KeyEvent("hotkey", mod + ev.value)
+            return ev
+        if final == "Z":
+            return KeyEvent("mode_switch", "")
+        if final == "u":
+            parts = [p for p in params.split(";") if p] if params else []
+            if parts and parts[0] == "13":
+                mod = _MOD.get(parts[-1], "") if len(parts) >= 2 else ""
+                if mod == "shift+":
+                    return KeyEvent("newline", "")
+                if mod == "ctrl+":
+                    return KeyEvent("submit_ctrl", "")
+                return KeyEvent("submit", "")
+            return TICK
+        if final in _CSI_FINAL:
+            name = _CSI_FINAL[final]
+            if name == "mode_switch":
+                return KeyEvent("mode_switch", "")
+            parts = [p for p in params.split(";") if p] if params else []
+            mod = _MOD.get(parts[-1], "") if len(parts) >= 2 else ""
+            if name in ("up", "down", "left", "right", "home", "end"):
+                return KeyEvent("hotkey", mod + name) if mod else KeyEvent(name, "")
+            return _kind_event(name)
+        return TICK
+
+    def timeout_event(self) -> Optional[KeyEvent]:
+        if self.state == self.GROUND:
+            return None
+        if self.started_at and time.time() - self.started_at <= IDLE_FLUSH:
+            return None
+        self.reset()
+        return KeyEvent("escape", "")
+
+    def flush_partial(self) -> Optional[KeyEvent]:
+        if self.state == self.GROUND:
+            return None
+        self.reset()
+        return KeyEvent("escape", "")
+
+
+class PasteAssembler:
+    """bracketed 粘贴 + 突发粘贴。结束标记增量匹配，体内 CR/LF/Tab 不是按键。"""
+
+    def __init__(self) -> None:
+        self.pasting = False
+        self.chunks: List[str] = []
+        self.at = 0.0
+        self.burst: Optional[bytearray] = None
+        self.burst_text: Optional[str] = None
+        self._end_matched = 0  # PASTE_END 前缀已匹配长度
+
+    def reset(self) -> None:
+        self.pasting = False
+        self.chunks.clear()
+        self.at = 0.0
+        self.burst = None
+        self.burst_text = None
+        self._end_matched = 0
+
+    def start_bracketed(self) -> None:
+        self.pasting = True
+        self.at = time.time()
+        self.chunks.clear()
+        self._end_matched = 0
+
+    def flush(self) -> KeyEvent:
+        raw = "".join(self.chunks)
+        if self._end_matched:
+            raw += PASTE_END[: self._end_matched]
+        self.chunks.clear()
+        self.pasting = False
+        self.at = 0.0
+        self._end_matched = 0
+        return KeyEvent("paste", _redecode(raw))
+
+    def feed_body(self, ch: str) -> List[KeyEvent]:
+        if ch == "\x03":
+            ev = self.flush()
+            return [ev, KeyEvent("interrupt", "")]
+        # 增量匹配 PASTE_END
+        if ch == PASTE_END[self._end_matched]:
+            self._end_matched += 1
+            if self._end_matched >= len(PASTE_END):
+                self._end_matched = 0
+                return [self.flush()]
+            self.at = time.time()
+            return []
+        if self._end_matched:
+            # 失配：已匹配前缀回灌为正文
+            prefix = PASTE_END[: self._end_matched]
+            self._end_matched = 0
+            self.chunks.append(prefix)
+            # 当前字符重新走匹配（可能是新前缀起点）
+            return self.feed_body(ch)
+        self.chunks.append(ch)
+        self.at = time.time()
+        return []
+
+    def idle_timeout(self) -> bool:
+        return self.pasting and self.chunks and (time.time() - self.at) > PASTE_IDLE_TIMEOUT
+
+    def start_burst(self, first: str = "") -> None:
+        self.burst = bytearray(first.encode("latin-1", "replace"))
+
+    def drain_burst(self) -> None:
+        if self.burst is None:
+            return
+        try:
+            while _kbhit() and len(self.burst) < BURST_DRAIN_LIMIT:
+                raw = msvcrt.getch()
+                ch = chr(raw[0]) if isinstance(raw, (bytes, bytearray)) and raw else (raw if isinstance(raw, str) else "")
+                if ch:
+                    self.burst += ch.encode("latin-1", "replace")
+        except Exception:
+            pass
+        if not _kbhit() or len(self.burst) >= BURST_DRAIN_LIMIT:
+            raw = bytes(self.burst)
+            self.burst = None
+            self.burst_text = _redecode(raw.decode("latin-1", "replace"))
+
+    def pop_burst_text(self) -> Optional[KeyEvent]:
+        if self.burst_text is None:
+            return None
+        text = self.burst_text
+        self.burst_text = None
+        return KeyEvent("paste", text)
+
+
+def _redecode(s: str) -> str:
+    if not any(0x80 <= ord(c) <= 0xFF for c in s):
+        return s
+    try:
+        data = s.encode("latin-1")
+    except UnicodeEncodeError:
+        return s
+    decoded = _decode_bytes(data)
+    return decoded if decoded is not None else s
+
+
+def _trailing_partial(s: str, marker: str) -> int:
+    for keep in range(min(len(s), len(marker) - 1), 0, -1):
+        if marker.startswith(s[-keep:]):
+            return keep
+    return 0
+
+
+class Decoder:
+    """字符单元 → KeyEvent。可注入单元做纯单测。"""
+
+    def __init__(self) -> None:
+        self.fsm = EscapeFSM()
+        self.enc = EncodingStream()
+        self.paste = PasteAssembler()
+        self.pending: List[KeyEvent] = []
+        self.chars: List[str] = []
+        self.half_at: Optional[float] = None
+        self._prefix: Optional[str] = None
+
+    @property
+    def dbcs(self) -> EncodingStream:
+        return self.enc
+
+    def reset(self) -> None:
+        self.fsm.reset()
+        self.enc.reset()
+        self.paste.reset()
+        self.pending.clear()
+        self.chars.clear()
+        self.half_at = None
+        self._prefix = None
+
+    def push_pending(self, ev: KeyEvent) -> None:
+        self.pending.append(ev)
+
+    def feed_char(self, ch: str) -> List[KeyEvent]:
+        """喂一个逻辑字符单元，产出 0..n 事件。"""
+        if self.paste.pasting:
+            return self.paste.feed_body(ch)
+
+        if self._prefix is not None:
+            prefix, self._prefix = self._prefix, None
+            code = ord(ch) if ch else -1
+            if prefix == "\xe0" and code != 15 and code not in _WIN_SCAN:
+                out = self._classify_char(prefix)
+                out.extend(self._classify_char(ch))
+                return out
+            if code == 15 or ch == "\x0f":
+                return [KeyEvent("mode_switch", "")]
+            if code in _WIN_SCAN:
+                return [_scan_event(code)]
+            return []
+        if ch in ("\x00", "\xe0"):
+            self._prefix = ch
+            return []
+
+        out: List[KeyEvent] = []
+        ev, back = self.fsm.feed(ch)
+        if ev is not None:
+            if ev.kind == "raw":
+                out.extend(self._classify_char(ev.value))
+            elif ev.kind == "paste_start":
+                self.paste.start_bracketed()
+            elif ev.kind == "paste_end":
+                pass
+            elif ev.kind != "tick":
+                out.append(ev)
+        for b in back:
+            out.extend(self._classify_char(b))
+        return out
+
+    def feed_str(self, s: str) -> List[KeyEvent]:
+        out: List[KeyEvent] = []
+        for ch in s:
+            out.extend(self.feed_char(ch))
+        return out
+
+    def _classify_char(self, ch: str) -> List[KeyEvent]:
+        if ch in ("\x00", "\xe0"):
+            self._prefix = ch
+            return []
+        lead = ord(ch)
+        if 0x80 <= lead <= 0xFF:
+            text = self.enc.feed_byte(lead)
+            return [KeyEvent("char", text)] if text else []
+        if ch == "\r":
+            return [KeyEvent("submit", "")]
+        if ch == "\n":
+            return [KeyEvent("submit_ctrl", "")]
+        if ch == "\t":
+            return [KeyEvent("tab", "")]
+        if ch in ("\x08", "\x7f"):
+            return [KeyEvent("backspace", "")]
+        if ch == "\x03":
+            return [KeyEvent("interrupt", "")]
+        if ch == "\x15":
+            return [KeyEvent("clear", "")]
+        ctrl = _CTRL.get(ch)
+        if ctrl:
+            return [KeyEvent("hotkey", ctrl)]
+        if ch and ord(ch) >= 32:
+            return [KeyEvent("char", ch)]
+        return []
+
+    def feed_printable_run(self, s: str) -> List[KeyEvent]:
+        return [KeyEvent("char", s)] if s else []
+
+    def timeout_tick(self) -> List[KeyEvent]:
+        out: List[KeyEvent] = []
+        flushed = self.enc.timeout_flush()
+        if flushed:
+            out.append(KeyEvent("char", flushed))
+        tev = self.fsm.timeout_event()
+        if tev is not None:
+            out.append(tev)
+        if self.paste.idle_timeout():
+            out.append(self.paste.flush())
+        return out
+
+
+def _merge_chars(evs: List[KeyEvent]) -> List[KeyEvent]:
+    """相邻 char 合并为一条（IME 整句上屏）。"""
+    if not evs:
+        return []
+    out: List[KeyEvent] = []
+    buf: List[str] = []
+
+    def flush() -> None:
+        if buf:
+            out.append(KeyEvent("char", "".join(buf)))
+            buf.clear()
+
+    for ev in evs:
+        if ev.kind == "char":
+            buf.append(ev.value)
+        else:
+            flush()
+            out.append(ev)
+    flush()
+    return out
+
+
+def _classify_batch_text(text: str) -> List[KeyEvent]:
+    """整批文本分类；中部 CR/LF/Tab 且批足够大 → 单条 paste。"""
+    if len(text) >= BATCH_PASTE_MIN:
+        for i, ch in enumerate(text[:-1]):
+            if ch in ("\r", "\n", "\t") and any(c not in "\r\n\t" for c in text[i + 1 :]):
+                return [KeyEvent("paste", text)]
+    return _merge_chars(Decoder().feed_str(text))
+
+
+class EventQueue:
+    """FIFO 事件队列。"""
+
+    def __init__(self) -> None:
+        self._q: List[KeyEvent] = []
+
+    def push(self, ev: KeyEvent) -> None:
+        self._q.append(ev)
+
+    def push_many(self, evs: List[KeyEvent]) -> None:
+        self._q.extend(evs)
+
+    def pop(self) -> Optional[KeyEvent]:
+        return self._q.pop(0) if self._q else None
+
+    def clear(self) -> None:
+        self._q.clear()
+
+    def __len__(self) -> int:
+        return len(self._q)
+
+    def __bool__(self) -> bool:
+        return bool(self._q)
+
+
+# ----- Win 结构化句柄缓存 -----
+_k32 = None
+_INPUT_RECORD_ARR = None
+
+
+def _win_console():
+    global _k32, _INPUT_RECORD_ARR
+    if not _WINDOWS:
+        return None, None
+    if _k32 is not None:
+        return _k32, _INPUT_RECORD_ARR
     try:
         import ctypes
         from ctypes import wintypes
@@ -245,14 +701,88 @@ def _peek_enter_mod() -> Optional[str]:
             _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
 
         class INPUT_RECORD(ctypes.Structure):
-            _fields_ = [
-                ("EventType", ctypes.c_ushort),
-                ("Event", _INPUT_UNION),
-            ]
+            _fields_ = [("EventType", ctypes.c_ushort), ("Event", _INPUT_UNION)]
 
         k32 = ctypes.windll.kernel32
         k32.GetStdHandle.restype = ctypes.c_void_p
-        handle = k32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        _k32 = k32
+        _INPUT_RECORD_ARR = INPUT_RECORD
+        return k32, INPUT_RECORD
+    except Exception:
+        return None, None
+
+
+def _vk_event(vk: int, uchar: str, state: int) -> Optional[KeyEvent]:
+    ctrl = bool(state & _CTRL_PRESSED)
+    shift = bool(state & _SHIFT_PRESSED)
+    alt = bool(state & _ALT_PRESSED)
+
+    if vk == _VK_RETURN:
+        if ctrl:
+            return KeyEvent("submit_ctrl", "")
+        if shift:
+            return KeyEvent("newline", "")
+        return KeyEvent("submit", "")
+    if vk == 0x09 and shift:
+        return KeyEvent("mode_switch", "")
+    if vk == 0x03:
+        return KeyEvent("interrupt", "")
+    if vk == 0x15:
+        return KeyEvent("clear", "")
+
+    base = _VK_MAP.get(vk)
+    if base is None:
+        if uchar and ord(uchar) >= 32:
+            return KeyEvent("char", uchar)
+        if uchar == "\r":
+            return KeyEvent("submit", "")
+        if uchar == "\t":
+            return KeyEvent("tab", "")
+        if uchar in ("\x08", "\x7f"):
+            return KeyEvent("backspace", "")
+        return None
+
+    if base.kind == "hotkey":
+        mods = ""
+        if ctrl:
+            mods += "ctrl+"
+        if alt:
+            mods += "alt+"
+        if shift and base.value.startswith("f"):
+            mods += "shift+"
+        return KeyEvent("hotkey", mods + base.value if mods else base.value)
+
+    if base.kind in ("up", "down", "left", "right", "home", "end", "delete", "scroll_up", "scroll_down"):
+        if ctrl or alt:
+            mods = ""
+            if ctrl:
+                mods += "ctrl+"
+            if alt:
+                mods += "alt+"
+            if shift:
+                mods += "shift+"
+            name = base.kind
+            if name == "scroll_up":
+                name = "up"
+            if name == "scroll_down":
+                name = "down"
+            return KeyEvent("hotkey", mods + name)
+        return base
+
+    return base
+
+
+def _peek_enter_mod() -> Optional[str]:
+    if not _WINDOWS:
+        return None
+    k32, INPUT_RECORD = _win_console()
+    if not k32:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        handle = k32.GetStdHandle(-10)
         if not handle:
             return None
         buf = (INPUT_RECORD * 16)()
@@ -279,38 +809,56 @@ def _peek_enter_mod() -> Optional[str]:
         return None
 
 
+def _queue_depth() -> int:
+    if not _WINDOWS:
+        return 0
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.restype = ctypes.c_void_p
+        handle = k32.GetStdHandle(-10)
+        count = ctypes.c_uint32()
+        if k32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(count)):
+            return int(count.value)
+    except Exception:
+        pass
+    return 0
+
+
 class KeyReader:
-    """控制台输入读取器。
+    """控制台读取器：整批抽干 + 流式解析。公开 read_event / flush_input。"""
 
-    状态字段五组：
-    - _buf:            待解析字符队列（_fill_win 采集 → _parse_win_buffer 消费）
-    - _pend/_pend_at:  DBCS 孤立首字节缓冲及时间戳（超时 latin-1 兜底）
-    - _half_at:        半包首次形成时间戳（超时决断防假死）
-    - _pasting/_paste_chunks/_paste_at: bracketed-paste 收流态
-    - _burst/_burst_text: 粘贴爆发收流及已冲洗待交付的 paste 文本
-    """
-
-    def __init__(self):
+    def __init__(self) -> None:
         self._fd = None
         self._old_settings = None
-        self._buf: List[str] = []
-        self._pend: bytes = b""  # DBCS 孤立首字节缓冲
-        self._pend_at: Optional[float] = None
-        self._half_at: Optional[float] = None
-        # bracketed-paste 状态机：paste_start/end 之间字节整体合成一个 paste 事件
-        self._pasting = False
-        self._paste_chunks: List[str] = []
-        self._paste_at = 0.0
-        # 粘贴爆发收流（大段粘贴整批快速收流，与 IME 滴灌互斥）
-        self._burst: Optional[bytearray] = None
-        self._burst_text: Optional[str] = None
-        # IME 握手放行计时：孤立 \x00 丢弃时刻 → 下一个 raw 单元的间隔，
-        # 用于量化 IME/conhost 扣押删除序列的时长（验证日志直接可读）
-        self._lone_prefix_at: Optional[float] = None
-        # 预分类事件（如 Shift+Enter → newline），优先于字节解析交付
-        self._pending: List[Event] = []
-        _log("KeyReader init")
-        _log_console_info()
+        self.dec = Decoder()
+        self.queue = EventQueue()
+        self._use_win_records = _WINDOWS
+
+    # --- 兼容属性（旧测试） ---
+    @property
+    def _out(self) -> List[KeyEvent]:
+        return self.queue._q
+
+    @property
+    def _pend(self) -> Any:
+        """输出队列 / 预分类 / 半包解析未决。"""
+        if self.queue:
+            return self.queue._q
+        if self.dec.pending:
+            return self.dec.pending
+        if self.dec.fsm.state != EscapeFSM.GROUND or self.dec._prefix or self.dec.enc:
+            return True
+        return self.dec.paste.pasting or self.dec.paste.burst is not None
+
+    @property
+    def _pasting(self) -> bool:
+        return self.dec.paste.pasting or self.dec.paste.burst is not None
+
+    @property
+    def _buf(self) -> List[str]:
+        return self.dec.chars
 
     def __enter__(self) -> "KeyReader":
         if _UNIX and sys.stdin.isatty():
@@ -326,32 +874,54 @@ class KeyReader:
 
     def read_key(self, timeout: float = 0.0) -> Optional[Any]:
         ev = self.read_event(timeout)
-        return None if ev == TICK else ev
+        return None if ev == TICK or ev.kind == "tick" else ev
 
-    def read_event(self, timeout: float = 0.02) -> Event:
-        if _WINDOWS:
-            ev = self._read_windows(timeout)
-        else:
-            ev = self._read_unix(timeout)
-        if ev != TICK:
-            _log(f"event {ev[0]} {ev[1]!r}")
-        return ev
+    def read_event(self, timeout: float = 0.02) -> KeyEvent:
+        if self.dec.pending:
+            return self.dec.pending.pop(0)
+        if self.queue:
+            ev = self.queue.pop()
+            return ev if ev is not None else TICK
+        idle = self.dec.timeout_tick()
+        if idle:
+            self.queue.push_many(idle[1:])
+            return idle[0]
+        collected = self._read_windows(timeout) if _WINDOWS else self._read_unix(timeout)
+        if self.dec.pending:
+            ev = self.dec.pending.pop(0)
+            if collected:
+                self.queue.push_many(collected)
+            return ev
+        if collected:
+            self.queue.push_many(collected[1:])
+            return collected[0]
+        return TICK
+
+    def read_events(self, timeout: float = 0.02) -> List[KeyEvent]:
+        """整批抽干：返回本帧全部逻辑事件（空列表=无事件）。不含 tick。"""
+        out: List[KeyEvent] = []
+        while self.dec.pending:
+            out.append(self.dec.pending.pop(0))
+        while self.queue:
+            ev = self.queue.pop()
+            if ev is not None and ev.kind != "tick":
+                out.append(ev)
+        if out:
+            return out
+        out.extend(self.dec.timeout_tick())
+        if out:
+            return [e for e in out if e.kind != "tick"]
+        collected = self._read_windows(timeout) if _WINDOWS else self._read_unix(timeout)
+        out.extend(self.dec.pending)
+        self.dec.pending.clear()
+        for ev in collected:
+            if ev.kind != "tick":
+                out.append(ev)
+        return out
 
     def flush_input(self) -> None:
-        """丢弃缓冲与队列中未处理按键（进入设置等界面时用）。
-
-        清队列必须用 getch（与 _fill_win 同 API，教训 1）。"""
-        self._buf.clear()
-        self._pend = b""
-        self._pend_at = None
-        self._half_at = None
-        self._pasting = False
-        self._paste_chunks = []
-        self._paste_at = 0.0
-        self._burst = None
-        self._burst_text = None
-        self._lone_prefix_at = None
-        self._pending.clear()
+        self.dec.reset()
+        self.queue.clear()
         if _WINDOWS:
             try:
                 while msvcrt.kbhit():
@@ -359,629 +929,239 @@ class KeyReader:
             except Exception:
                 pass
 
-    def _decode_pend(self) -> Optional[str]:
-        """对重组缓冲做严格全量解码；未凑齐/全部失败返回 None"""
-        return self._decode_bytes(self._pend)
-
-    def _decode_bytes(self, data: bytes) -> Optional[str]:
-        """严格全量解码（console CP 优先，utf-8/gbk 兜底）；失败返回 None"""
-        if not data:
-            return None
-        for enc in _decode_encodings():
-            try:
-                return data.decode(enc)
-            except (UnicodeDecodeError, LookupError):
-                continue
-        return None
-
-    # ----- TMP 形滴灌采集原语 -----
-    @staticmethod
-    def _getch_char() -> str:
+    def _getch_char(self) -> str:
         raw = msvcrt.getch()
-        if isinstance(raw, bytes):
+        if isinstance(raw, (bytes, bytearray)):
             return chr(raw[0]) if raw else ""
-        return raw
+        return raw or ""
 
-    @staticmethod
-    def _getch_guarded(grace: float = 0.005) -> Optional[str]:
-        """kbhit 守卫读一字节（TMP _read_mb_char_windows 同款）：
-        无键时等 grace 秒再查一次，仍无返回 None——绝不无界阻塞（教训 2）。"""
-        if _kbhit():
-            return KeyReader._getch_char()
-        if grace > 0:
-            time.sleep(grace)
-            if _kbhit():
-                return KeyReader._getch_char()
-        return None
-
-    @staticmethod
-    def _pending_console_events() -> int:
-        """控制台输入队列积压事件数（粘贴爆发检测用）；失败返回 0 走滴灌"""
+    def _drain_win_records(self) -> List[KeyEvent]:
+        """ReadConsoleInputW 整批抽干 → 结构化 KeyEvent。"""
+        k32, INPUT_RECORD = _win_console()
+        if not k32 or INPUT_RECORD is None:
+            return None  # type: ignore
         try:
             import ctypes
+            from ctypes import wintypes
 
-            k32 = ctypes.windll.kernel32
-            k32.GetStdHandle.restype = ctypes.c_void_p
-            handle = k32.GetStdHandle(-10)  # STD_INPUT_HANDLE
-            count = ctypes.c_uint32()
-            if k32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(count)):
-                return count.value
-        except Exception:
-            pass
-        return 0
-
-    def _pend_timeout_check(self) -> None:
-        """DBCS 重组缓冲超时/超限出口：不可解码时按 latin-1 落地，不丢字不滞留"""
-        if not self._pend:
-            self._pend_at = None
-            return
-        now = time.time()
-        overdue = self._pend_at is None or (now - self._pend_at) > PEND_TIMEOUT
-        if not overdue and len(self._pend) <= PEND_MAX:
-            return
-        decoded = self._decode_pend()
-        if decoded is not None:
-            _log(f"dbcs decoded {decoded!r}")
-            self._buf.append(decoded)
-        else:
-            self._buf.append("".join(chr(b) for b in self._pend))
-            _log(f"dbcs timeout fallback {[hex(b) for b in self._pend]}")
-        self._pend = b""
-        self._pend_at = None
-
-    # ----- bracketed-paste 收流（粘贴走字节层，绝不触发按键语义） -----
-    @staticmethod
-    def _trailing_partial(s: str, marker: str) -> int:
-        """s 尾部与 marker 前缀的最长匹配长度（可能是尚未到齐的 end 标记）"""
-        for keep in range(min(len(s), len(marker) - 1), 0, -1):
-            if marker.startswith(s[-keep:]):
-                return keep
-        return 0
-
-    def _decode_str_maybe_dbcs(self, s: str) -> str:
-        """粘贴内容若含 0x80-0xFF 伪字节，按 console CP 尝试解码还原"""
-        if not any(0x80 <= ord(c) <= 0xFF for c in s):
-            return s
-        try:
-            data = s.encode("latin-1")
-        except UnicodeEncodeError:
-            return s
-        for enc in _decode_encodings():
-            try:
-                return data.decode(enc)
-            except (UnicodeDecodeError, LookupError):
-                continue
-        return s
-
-    def _flush_paste_event(self) -> Event:
-        raw = "".join(self._paste_chunks)
-        self._paste_chunks = []
-        self._pasting = False
-        self._paste_at = 0.0
-        text = self._decode_str_maybe_dbcs(raw)
-        _log(f"paste flushed {len(text)} chars")
-        return ("paste", text)
-
-    # ----- Windows：TMP 形滴灌采集 + DBCS 重组 + 粘贴收流 -----
-    def _fill_win(self, wait: float = 0.0) -> None:
-        """TMP 形滴灌采集：每次调用至多从控制台队列消费一个逻辑单元。
-
-        - 单字节键：kbhit → getch 入 _buf；
-        - 0x00/0xE0 前缀：立即守卫查一次，有配对则成对入 _buf，无则零等待
-          丢弃（IME 握手字节，教训 2）；
-        - 0x80-0xFF（IME 上屏中文按 console CP 拆散的形态）：TMP 同款守卫
-          读法立即读齐尾字节（kbhit→getch，无则 5ms grace）后统一解码入
-          _buf（教训 3）；凑不齐入 _pend 超时兜底，不丢字；
-        - 粘贴爆发（队列积压事件数 ≥ PASTE_BURST_EVENTS，且非 bracketed
-          收流态）：整批抽干入 _burst——粘贴不是 IME 上屏，无扣押风险，
-          且大段文本不能按 50ms/字符滴灌。
-
-        绝不一帧抽干常规键流（教训 6）：realreader 二分实证，上屏批次被
-        瞬间抽干时 conhost/TSF 会扣押紧随的退格到下次上屏才放行。
-        wait>0 时先同步等待至多 wait 秒（CSI 半包续读场景）；主路径 wait=0。
-        """
-        if not _WINDOWS:
-            return
-        try:
-            if wait > 0:
-                end = time.time() + wait
-                while time.time() < end and not msvcrt.kbhit():
-                    time.sleep(0.002)
-            self._pend_timeout_check()
-            if self._burst is not None:
-                self._drain_burst()
-                return
-            if not _kbhit():
-                return
-            # Enter 修饰键：Shift+Enter 预分类为 newline（产品约定 Enter=提交）
-            enter_mod = _peek_enter_mod()
-            if enter_mod == "shift+enter" and not self._pasting:
-                self._getch_char()  # 消费 \r/\n
-                self._pending.append(("newline", ""))
-                _log("peek shift+enter -> newline")
-                return
-            if not self._pasting and self._pending_console_events() >= PASTE_BURST_EVENTS:
-                self._burst = bytearray()
-                self._drain_burst()
-                return
-            ch = self._getch_char()
-            if not ch:
-                return
-            _log(f"raw unit {ch!r} U+{ord(ch):04X}")
-            if self._lone_prefix_at is not None:
-                _log(f"post-handshake unit after {time.time() - self._lone_prefix_at:.3f}s")
-                self._lone_prefix_at = None
-            if self._pasting:
-                # bracketed-paste 收流：一切字节只进粘贴缓冲，不产生按键语义（教训 4）
-                self._paste_chunks.append(ch)
-                self._paste_at = time.time()
-                return
-            if ch in ("\x00", "\xe0"):
-                # 扩展键前缀：立即守卫查一次（不等待），有配对成对入 _buf；
-                # 无配对零等待丢弃——等待会让 IME 挂起（教训 2）
-                nxt = self._getch_guarded(grace=0.0)
-                if nxt is None:
-                    self._lone_prefix_at = time.time()
-                    _log(f"lone prefix {ch!r} dropped (ime-handshake)")
-                    return
-                self._buf.append(ch)
-                self._buf.append(nxt)
-                return
-            lead = ord(ch)
-            if 0x80 <= lead <= 0xFF:
-                # DBCS/UTF-8：TMP 同款立即读齐尾字节后统一解码（教训 3）
-                data = bytearray([lead])
-                for _ in range(_expected_trails(lead)):
-                    nxt = self._getch_guarded(grace=0.005)
-                    if nxt is None:
-                        break
-                    data.append(ord(nxt))
-                decoded = self._decode_bytes(bytes(data))
-                if decoded is not None:
-                    _log(f"dbcs decoded {decoded!r} from {bytes(data).hex(' ')}")
-                    self._buf.append(decoded)
-                else:
-                    self._pend = bytes(data)
-                    self._pend_at = time.time()
-                    _log(f"dbcs pending {[hex(b) for b in data]}")
-                return
-            self._buf.append(ch)
-        except Exception:
-            pass
-
-    def _drain_burst(self) -> None:
-        """爆发收流：把队列中可得的字节整批抽入 _burst（上限 BURST_DRAIN_LIMIT）；
-        队列抽干（或到上限）后合成一个 paste 事件——内容是数据不是按键（教训 4）。"""
-        if self._burst is None:
-            return
-        try:
-            while _kbhit() and len(self._burst) < BURST_DRAIN_LIMIT:
-                self._burst += self._getch_char().encode("latin-1", "replace")
-        except Exception:
-            pass
-        if not _kbhit() or len(self._burst) >= BURST_DRAIN_LIMIT:
-            raw = bytes(self._burst)
-            self._burst = None
-            text = self._decode_str_maybe_dbcs(raw.decode("latin-1"))
-            _log(f"burst paste flushed {len(text)} chars")
-            self._burst_text = text
-
-    def _start_burst(self, first: bytes) -> None:
-        """流式粘贴收流入口：批次中部的 \\r/\\n/\\t 已确定是内容而非按键"""
-        self._burst = bytearray(first)
-        _log(f"burst start from {first!r}")
-        self._drain_burst()
-
-    def _read_windows(self, timeout: float = 0.02) -> Event:
-        """主读取循环：返回一个事件，无键返回 TICK。
-
-        timeout<=0 真非阻塞（帧循环供拍，教训 5）；timeout>0 无键时
-        sleep(timeout)——这是主循环的心跳节拍。采集为 TMP 形滴灌：
-        每帧至多从队列消费一个逻辑单元（教训 6）。
-        """
-        try:
-            now = time.time()
-            # 预分类事件（Shift+Enter 等）优先交付
-            if self._pending:
-                return self._pending.pop(0)
-            # 已冲洗的爆发粘贴：优先交付
-            if self._burst_text is not None:
-                text = self._burst_text
-                self._burst_text = None
-                return ("paste", text)
-            # 粘贴 idle 超时：end 标记丢失（终端 bug）时强制 flush
-            if self._pasting and self._paste_chunks and (now - self._paste_at) > PASTE_IDLE_TIMEOUT:
-                return self._flush_paste_event()
-            self._pend_timeout_check()
-            # 已有半包：先续读再解析，避免方向键/CSI 被丢
-            if self._buf:
-                ev = self._parse_win_buffer()
-                if ev != TICK:
-                    return ev
-                if self._buf:
-                    self._fill_win(max(0.01, timeout))
-                    if self._burst_text is not None:
-                        text = self._burst_text
-                        self._burst_text = None
-                        return ("paste", text)
-                    if self._buf:
-                        return self._parse_win_buffer()
-                return TICK
-
-            if not _kbhit():
-                if timeout <= 0:
-                    return TICK
-                time.sleep(timeout)
-                if not _kbhit():
-                    return TICK
-            self._fill_win(0.0)
-            if self._burst_text is not None:
-                text = self._burst_text
-                self._burst_text = None
-                return ("paste", text)
-            if not self._buf:
-                return TICK
-            ev = self._parse_win_buffer()
-            if ev != TICK:
-                return ev
-            if self._burst_text is not None:
-                text = self._burst_text
-                self._burst_text = None
-                return ("paste", text)
-            return TICK
-        except Exception:
-            self._buf.clear()
-            return TICK
-
-    def _parse_win_buffer(self) -> Event:
-        if not self._buf:
-            return TICK
-
-        # bracketed-paste 收流态：_buf 内容整体进粘贴缓冲，只找 end 标记
-        if self._pasting:
-            s = "".join(self._buf)
-            # Ctrl+C 逃生舱优先于粘贴收流：截断粘贴、flush 已收内容
-            i03 = s.find("\x03")
-            if i03 >= 0:
-                self._paste_chunks.append(s[:i03])
-                self._buf.clear()
-                self._buf.append("\x03")
-                _log("paste interrupted by Ctrl+C")
-                return self._flush_paste_event()
-            end_idx = s.find(PASTE_END)
-            if end_idx >= 0:
-                self._paste_chunks.append(s[:end_idx])
-                self._buf.clear()
-                return self._flush_paste_event()
-            # 尾部可能是半截 end 标记：留在 _buf 等待，其余收流
-            keep = self._trailing_partial(s, PASTE_END)
-            take = len(s) - keep
-            if take > 0:
-                self._paste_chunks.append(s[:take])
-                del self._buf[:take]
-                self._paste_at = time.time()
-            return TICK
-
-        ch = self._buf[0]
-
-        # 扩展键前缀 0x00 / 0xE0
-        # 两个来源：① 真扩展键（方向键等）：前缀+扫描码同批到达；
-        # ② IME 握手字节：删除上屏字符时注入孤立 \x00（无配对字节）。
-        # 处理原则：立即查一次队列，有配对则按扫描码解析；无配对则零等待
-        # 丢弃——任何等待都会让 IME 挂起到自身超时（实测 1.3s+，教训 2）。
-        if ch in ("\x00", "\xe0"):
-            if len(self._buf) < 2:
-                self._fill_win(0.0)  # 立即查一次，不等待
-            if len(self._buf) < 2:
-                self._buf.pop(0)
-                self._lone_prefix_at = time.time()
-                _log(f"lone prefix {ch!r} dropped (ime-handshake)")
-                return TICK
-            self._half_at = None
-            ch2 = self._buf[1]
-            code2 = ord(ch2)
-            if ch == "\xe0" and code2 != 15 and code2 not in _WIN_SCAN:
-                # 0xE0 配对的不是扫描码：按普通字符（à）放行，避免吞字
-                self._buf.pop(0)
-                return ("char", ch)
-            del self._buf[:2]
-            if ch2 == "\x0f" or code2 == 15:
-                return ("mode_switch", "")
-            return _scan_event(code2)
-
-        if ch == "\x1b":
-            return self._parse_csi_win()
-
-        if ch == "\r":
-            self._buf.pop(0)
-            # 最小改动：仅已在粘贴/爆发收流时，回车视为粘贴内容（教训 4）。
-            # 非粘贴态的 Enter 一律提交，避免控制台残留字节导致真实回车被吞。
-            if self._pasting or self._burst is not None:
-                self._start_burst(b"\r")
-                return TICK
-            return ("submit", "")
-        if ch == "\n":
-            self._buf.pop(0)
-            if self._pasting or self._burst is not None:
-                self._start_burst(b"\n")
-                return TICK
-            return ("submit_ctrl", "")
-        if ch == "\t":
-            self._buf.pop(0)
-            if _kbhit():
-                self._start_burst(b"\t")
-                return TICK
-            return ("tab", "")
-        if ch in ("\x08", "\x7f"):
-            self._buf.pop(0)
-            return ("backspace", "")
-        if ch == "\x03":
-            self._buf.pop(0)
-            return ("interrupt", "")
-        if ch == "\x15":
-            self._buf.pop(0)
-            return ("clear", "")
-        ctrl = _CTRL.get(ch)
-        if ctrl:
-            self._buf.pop(0)
-            return ("hotkey", ctrl)
-
-        # 可打印字符（含中文）：合并 _buf 中已收流的连续可打印单元。
-        # 不再向队列追加读取——队列消费必须保持滴灌节拍（教训 6）
-        if ch and all(ord(c) >= 32 for c in ch):
-            parts = [ch]
-            self._buf.pop(0)
-            while self._buf:
-                n = self._buf[0]
-                if not n or n in ("\x00", "\xe0", "\x1b", "\r", "\n", "\t") or not all(
-                    ord(c) >= 32 for c in n
-                ):
+            handle = k32.GetStdHandle(-10)
+            if not handle:
+                return None  # type: ignore
+            out: List[KeyEvent] = []
+            while True:
+                buf = (INPUT_RECORD * 32)()
+                count = wintypes.DWORD(0)
+                if not k32.PeekConsoleInputW(handle, buf, 32, ctypes.byref(count)) or count.value == 0:
                     break
-                parts.append(self._buf.pop(0))
-            return ("char", "".join(parts))
+                # 读走全部
+                got = wintypes.DWORD(0)
+                if not k32.ReadConsoleInputW(handle, buf, 32, ctypes.byref(got)):
+                    break
+                if got.value == 0:
+                    break
+                for i in range(got.value):
+                    rec = buf[i]
+                    if rec.EventType != _INPUT_RECORD_KEY_EVENT:
+                        continue
+                    ke = rec.Event.KeyEvent
+                    if not ke.bKeyDown:
+                        continue
+                    ev = _vk_event(int(ke.wVirtualKeyCode), ke.uChar, int(ke.dwControlKeyState))
+                    if ev is not None:
+                        out.append(ev)
+                if got.value < 32:
+                    break
+            return out
+        except Exception:
+            self._use_win_records = False
+            return None  # type: ignore
 
-        self._buf.pop(0)
-        return TICK
+    def _read_windows(self, timeout: float) -> List[KeyEvent]:
+        try:
+            # msvcrt 字节整批优先（ConPTY / 可 monkeypatch）；否则结构化 KEY_EVENT
+            if _kbhit():
+                return self._drain_msvcrt()
+            if self._use_win_records:
+                recs = self._drain_win_records()
+                if recs:
+                    return recs
+            if timeout <= 0:
+                return []
+            time.sleep(timeout)
+            if _kbhit():
+                return self._drain_msvcrt()
+            if self._use_win_records:
+                recs = self._drain_win_records()
+                if recs:
+                    return recs
+            return []
+        except Exception:
+            self.dec.chars.clear()
+            return []
 
-    def _half_deadline_passed(self) -> bool:
-        """半包超时判断：首次滞留记时间戳，超 HALF_TIMEOUT 返回 True（决断出口）"""
-        if self._half_at is None:
-            self._half_at = time.time()
-            return False
-        if time.time() - self._half_at > HALF_TIMEOUT:
-            self._half_at = None
-            return True
-        return False
+    def _drain_msvcrt(self) -> List[KeyEvent]:
+        raw = bytearray()
+        while _kbhit() and len(raw) < BURST_DRAIN_LIMIT:
+            b = msvcrt.getch()
+            if isinstance(b, (bytes, bytearray)):
+                if b:
+                    raw.append(b[0])
+            elif b:
+                raw.append(ord(b) & 0xFF)
+        return self._parse_byte_batch(bytes(raw))
 
-    def _parse_csi_win(self) -> Event:
-        """解析 ESC 后续序列（CSI/SS3/单独 Esc）。
+    def _parse_byte_batch(self, raw: bytes) -> List[KeyEvent]:
+        """字节批 → 事件。完整序列单遍解出；扫描码/前缀在批内配对。"""
+        if not raw:
+            return []
+        if len(raw) >= 32 or (len(raw) >= BATCH_PASTE_MIN and self._looks_like_paste_bytes(raw)):
+            self.dec.paste.start_burst("")
+            self.dec.paste.burst = bytearray(raw)
+            if not _kbhit():
+                self.dec.paste.drain_burst()
+            pe = self.dec.paste.pop_burst_text()
+            return [pe] if pe else []
 
-        半包策略：可能继续到达的 CSI 前缀保留缓冲返回 TICK，下一帧续读；
-        仅「确认单独 Esc」或「ESC+无法形成序列」返回 escape。
-        超时出口：半包滞留超 HALF_TIMEOUT 强制按 Esc 决断（教训 2）。
-        """
-        if len(self._buf) < 2:
-            self._fill_win(0.04)
-        if len(self._buf) < 2:
-            self._buf.pop(0)
-            self._half_at = None
-            return ("escape", "")
+        out: List[KeyEvent] = []
+        char_run: List[str] = []
 
-        nxt = self._buf[1]
+        def flush_run() -> None:
+            if char_run:
+                out.append(KeyEvent("char", "".join(char_run)))
+                char_run.clear()
 
-        # SS3: ESC O X（应用光标键）
-        if nxt == "O":
-            if len(self._buf) < 3:
-                self._fill_win(0.04)
-            if len(self._buf) < 3:
-                if self._half_deadline_passed():
-                    self._buf.clear()
-                    _log("half timeout ESC O -> escape")
-                    return ("escape", "")
-                return TICK
-            self._half_at = None
-            code = self._buf[2]
-            del self._buf[:3]
-            name = _CSI_FINAL.get(code)
-            return _kind_event(name) if name else TICK
-
-        if nxt != "[":
-            del self._buf[:2]
-            self._half_at = None
-            return ("escape", "")
-
-        # CSI: ESC [ params final
-        if len(self._buf) < 3:
-            self._fill_win(0.04)
-        if len(self._buf) < 3:
-            if self._half_deadline_passed():
-                self._buf.clear()
-                _log("half timeout ESC [ -> escape")
-                return ("escape", "")
-            return TICK
-        self._half_at = None
-
-        idx = 2
-        params = ""
-        while idx < len(self._buf):
-            c = self._buf[idx]
-            if c.isdigit() or c == ";":
-                params += c
-                idx += 1
+        i = 0
+        n = len(raw)
+        while i < n:
+            b = raw[i]
+            # 粘贴体：字节只进 paste，不当按键
+            if self.dec.paste.pasting:
+                if b >= 0x80:
+                    text = self.dec.enc.feed_byte(b)
+                    if text:
+                        for ch in text:
+                            out.extend(self.dec.paste.feed_body(ch))
+                else:
+                    out.extend(self.dec.feed_char(chr(b)))
+                i += 1
                 continue
-            break
 
-        if idx >= len(self._buf):
-            self._fill_win(0.04)
-            idx = 2
-            params = ""
-            while idx < len(self._buf):
-                c = self._buf[idx]
-                if c.isdigit() or c == ";":
-                    params += c
-                    idx += 1
+            if b in (0x00, 0xE0) and i + 1 < n:
+                nxt = raw[i + 1]
+                if nxt == 15:
+                    flush_run()
+                    out.append(KeyEvent("mode_switch", ""))
+                    i += 2
                     continue
-                break
-            if idx >= len(self._buf):
-                # 参数滞留超时出口：强制按 Esc 决断
-                if self._half_deadline_passed():
-                    self._buf.clear()
-                    _log("half timeout CSI params -> escape")
-                    return ("escape", "")
-                return TICK
+                if nxt in _WIN_SCAN:
+                    flush_run()
+                    out.append(_scan_event(nxt))
+                    i += 2
+                    continue
+                if b == 0xE0 and nxt >= 0x80:
+                    text = self.dec.enc.feed_byte(b)
+                    if text:
+                        char_run.append(text)
+                    i += 1
+                    continue
+                if b == 0xE0:
+                    flush_run()
+                    out.append(KeyEvent("char", chr(0xE0)))
+                    i += 1
+                    continue
+                flush_run()
+                i += 2  # 无效扩展键丢弃
+                continue
+            if b in (0x00, 0xE0):
+                flush_run()
+                i += 1
+                continue
+            if b >= 0x80:
+                text = self.dec.enc.feed_byte(b)
+                if text:
+                    char_run.append(text)
+                i += 1
+                continue
+            flush_run()
+            out.extend(self.dec.feed_char(chr(b)))
+            i += 1
 
-        final = self._buf[idx]
-        # 非法终止符：若像新的 ESC，只丢掉 ESC [ 前缀，让后续字节重新解析
-        if final not in _CSI_FINAL and final != "~" and not final.isalpha():
-            if final == "\x1b":
-                del self._buf[:2]
-                return TICK
-            del self._buf[: idx + 1]
-            return TICK
+        flush_run()
+        # 批内中部 CR/Tab 启发式（无 bracketed 时）
+        if out and not self.dec.paste.pasting:
+            if out[0].kind in ("submit", "tab") and len(out) > 1:
+                rebuilt = self._events_to_paste(out)
+                if rebuilt is not None:
+                    return [rebuilt]
+        return out
 
-        del self._buf[: idx + 1]
+    def _looks_like_paste_bytes(self, raw: bytes) -> bool:
+        # ESC[200~ 开头 → bracketed，交给 FSM
+        if raw.startswith(b"\x1b[200~"):
+            return False
+        mid = False
+        for idx, b in enumerate(raw):
+            if b in (0x0D, 0x0A, 0x09) and idx < len(raw) - 1:
+                # 后面还有非空
+                if any(x not in (0x0D, 0x0A, 0x09) for x in raw[idx + 1 :]):
+                    mid = True
+                    break
+        return mid and len(raw) >= BATCH_PASTE_MIN
 
-        if final == "~":
-            num = params.split(";")[0] if params else ""
-            name = _CSI_TILDE.get(num)
-            if not name:
-                return TICK
-            if name == "paste_start":
-                self._pasting = True
-                self._paste_at = time.time()
-                _log("paste start")
-                return TICK
-            if name == "paste_end":
-                _log("paste end (stale)")
-                return TICK
-            ev = _kind_event(name)
-            parts = [p for p in params.split(";") if p != ""] if params else []
-            if len(parts) >= 2 and ev[0] == "hotkey":
-                mod = _MOD.get(parts[-1], "")
-                if mod:
-                    return ("hotkey", mod + ev[1])
-            return ev
+    def _events_to_paste(self, evs: List[KeyEvent]) -> Optional[KeyEvent]:
+        parts: List[str] = []
+        for ev in evs:
+            if ev.kind == "char":
+                parts.append(ev.value)
+            elif ev.kind == "submit":
+                parts.append("\r")
+            elif ev.kind == "submit_ctrl":
+                parts.append("\n")
+            elif ev.kind == "tab":
+                parts.append("\t")
+            else:
+                return None
+        return KeyEvent("paste", "".join(parts))
 
-        if final == "Z":
-            return ("mode_switch", "")
-
-        # CSI u（kitty/部分终端）：ESC [ 13 ; mod u  → Enter 变体
-        if final == "u":
-            parts = [p for p in params.split(";") if p != ""] if params else []
-            if parts and parts[0] == "13":
-                mod = _MOD.get(parts[-1], "") if len(parts) >= 2 else ""
-                if mod == "shift+":
-                    return ("newline", "")
-                if mod == "ctrl+":
-                    return ("submit_ctrl", "")
-                return ("submit", "")
-            return TICK
-
-        if final in _CSI_FINAL:
-            name = _CSI_FINAL[final]
-            if name == "mode_switch":
-                return ("mode_switch", "")
-            parts = [p for p in params.split(";") if p != ""] if params else []
-            mod = ""
-            if len(parts) >= 2:
-                mod = _MOD.get(parts[-1], "")
-            if name in ("up", "down", "left", "right", "home", "end"):
-                if not mod:
-                    return (name, "")
-                return ("hotkey", mod + name)
-            return _kind_event(name)
-
-        return TICK
-
-    # ----- Unix 路径（保留原有实现） -----
-    def _read_unix(self, timeout: float) -> Event:
+    def _read_unix(self, timeout: float) -> List[KeyEvent]:
         import select
 
         if not _UNIX or not sys.stdin.isatty():
-            return TICK
+            return []
         try:
             r, _, _ = select.select([sys.stdin], [], [], max(0.0, timeout))
             if not r:
-                return TICK
-            ch = sys.stdin.read(1)
-            if ch == "\n":
-                return ("submit_ctrl", "")
-            if ch == "\r":
-                return ("submit", "")
-            if ch == "\t":
-                return ("tab", "")
-            if ch in ("\x7f", "\x08"):
-                return ("backspace", "")
-            if ch == "\x03":
-                return ("interrupt", "")
-            if ch == "\x15":
-                return ("clear", "")
-            if ch == "\x1b":
-                r2, _, _ = select.select([sys.stdin], [], [], 0.02)
-                if not r2:
-                    return ("escape", "")
-                nxt = sys.stdin.read(1)
-                if nxt == "Z":
-                    return ("mode_switch", "")
-                if nxt == "O":
-                    r3, _, _ = select.select([sys.stdin], [], [], 0.02)
-                    if not r3:
-                        return ("escape", "")
-                    code = sys.stdin.read(1)
-                    name = _CSI_FINAL.get(code)
-                    return _kind_event(name) if name else TICK
-                if nxt == "[":
-                    params = ""
-                    for _ in range(16):
-                        r3, _, _ = select.select([sys.stdin], [], [], 0.02)
-                        if not r3:
-                            return TICK
-                        code = sys.stdin.read(1)
-                        if code.isdigit() or code == ";":
-                            params += code
-                            continue
-                        if code == "~":
-                            num = params.split(";")[0] if params else ""
-                            name = _CSI_TILDE.get(num)
-                            return _kind_event(name) if name else TICK
-                        if code == "Z":
-                            return ("mode_switch", "")
-                        if code == "u":
-                            parts = [p for p in params.split(";") if p != ""]
-                            if parts and parts[0] == "13":
-                                mod_u = _MOD.get(parts[-1], "") if len(parts) >= 2 else ""
-                                if mod_u == "shift+":
-                                    return ("newline", "")
-                                if mod_u == "ctrl+":
-                                    return ("submit_ctrl", "")
-                                return ("submit", "")
-                            return TICK
-                        name = _CSI_FINAL.get(code)
-                        if not name:
-                            return TICK
-                        parts = [p for p in params.split(";") if p != ""]
-                        mod = _MOD.get(parts[-1], "") if len(parts) >= 2 else ""
-                        if name in ("up", "down", "left", "right", "home", "end") and not mod:
-                            return (name, "")
-                        return _kind_event(name) if not mod else ("hotkey", mod + name)
-                    return TICK
-                return ("escape", "")
-            if ch in _CTRL:
-                return ("hotkey", _CTRL[ch])
-            if ch and all(ord(c) >= 32 for c in ch):
-                if ord(ch) >= 0x80:
-                    extra = 3 if ord(ch) >= 0xF0 else 2 if ord(ch) >= 0xE0 else 1
-                    raw = ch
-                    for _ in range(extra):
-                        r4, _, _ = select.select([sys.stdin], [], [], 0.02)
-                        if not r4:
-                            break
-                        raw += sys.stdin.read(1)
-                    return ("char", raw)
-                return ("char", ch)
-            return TICK
+                return []
+            data = b""
+            try:
+                data = os.read(sys.stdin.fileno(), 4096)
+            except Exception:
+                ch = sys.stdin.read(1)
+                return self.dec.feed_str(ch) if ch else []
+            if not data:
+                return []
+            # 解码为字符再走 VT
+            text = self.dec.enc.feed_bytes(data)
+            leftover = self.dec.enc.timeout_flush()
+            if leftover:
+                text = (text or "") + leftover
+            out: List[KeyEvent] = []
+            if text:
+                # bracketed / 中部控制 → paste
+                if len(text) >= BATCH_PASTE_MIN and self._looks_like_paste_text(text):
+                    return [KeyEvent("paste", text)]
+                out.extend(self.dec.feed_str(text))
+            return out
         except Exception:
-            return TICK
+            return []
+
+    def _looks_like_paste_text(self, text: str) -> bool:
+        if text.startswith(PASTE_START):
+            return False
+        for i, ch in enumerate(text[:-1]):
+            if ch in ("\r", "\n", "\t") and any(c not in "\r\n\t" for c in text[i + 1 :]):
+                return len(text) >= BATCH_PASTE_MIN
+        return False
 
 
 _default_reader: Optional[KeyReader] = None
@@ -1000,32 +1180,13 @@ def read_key_event(timeout: float = 0.02) -> Event:
 
 
 def read_events(timeout: float = 0.02) -> List[Event]:
-    """批处理读取（滴灌形，教训 6）：每帧只从控制台队列消费一个逻辑单元，
-    队列中积压的键由后续帧逐个交付——瞬间抽干上屏批次会让 conhost/TSF
-    扣押紧随的退格（realreader 二分实证；TMP 形为证）。_buf/爆发收流/
-    _pending 中已消费的内容同帧交付（那不是队列消费，无扣押风险）。
-    timeout<=0 真非阻塞（帧循环供拍）。粘贴收流态不视为队列空闲。"""
-    reader = get_reader()
-    events: List[Event] = []
-    ev = reader.read_event(timeout)
-    while ev != TICK:
-        events.append(ev)
-        if reader._pending:
-            ev = reader.read_event(0.0)
-            continue
-        if reader._burst_text is not None:
-            # 爆发粘贴已冲洗待交付：同帧交付完（不碰队列）
-            ev = reader.read_event(0.0)
-            continue
-        if not reader._buf:
-            break  # 队列消费权留给下一帧（滴灌节拍）
-        ev = reader.read_event(0.0)
-    return events
+    """一次整批：返回逻辑事件列表；无事件返回 []（不含 tick）。"""
+    return get_reader().read_events(timeout)
 
 
 def read_key(timeout: float = 0.0) -> Optional[Event]:
     ev = read_key_event(timeout)
-    return None if ev == TICK else ev
+    return None if ev == TICK or ev.kind == "tick" else ev
 
 
 def flush_input() -> None:
@@ -1033,7 +1194,6 @@ def flush_input() -> None:
 
 
 def direction_of(kind: str, value: str) -> Optional[str]:
-    """从事件中取出方向名：支持 kind=up… 与 hotkey=ctrl+up / up。"""
     if kind in ("up", "down", "left", "right"):
         return kind
     if kind == "hotkey":
@@ -1049,5 +1209,5 @@ def supported_kinds() -> tuple:
         "tick", "char", "submit", "submit_ctrl", "newline", "tab", "mode_switch",
         "backspace", "delete", "up", "down", "left", "right", "home", "end",
         "scroll_up", "scroll_down", "escape", "interrupt", "clear", "hotkey",
-        "paste",
+        "paste", "paste_start", "paste_end", "mouse_wheel", "mouse",
     )

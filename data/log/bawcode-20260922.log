@@ -1,0 +1,38 @@
+2026-09-22 13:40:45.266 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-22 13:40:45.266 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-22 13:40:45.278 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-22 13:40:45.495 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-22 13:40:45.495 [INFO ] [ui] 进入 TUI 界面
+2026-09-22 13:41:24.034 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-22 13:41:24.034 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-22 13:41:24.035 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-22 13:41:24.221 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-22 13:41:24.222 [INFO ] [ui] 进入 TUI 界面
+2026-09-22 13:41:27.677 [INFO ] [main] 任务开始: 你好
+2026-09-22 13:41:27.771 [INFO ] [main] 注入系统提示词: system_prompt.md
+2026-09-22 13:41:27.773 [INFO ] [llm] 复杂度判定: low（2字）
+2026-09-22 13:41:30.586 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=119字 tool_calls=0 用时=2.70s（第1次尝试）
+2026-09-22 13:41:30.586 [INFO ] [main] 任务完成（共1轮推理）
+2026-09-22 13:41:37.441 [INFO ] [main] 任务开始: 你有什么工具
+2026-09-22 13:41:37.477 [INFO ] [llm] 复杂度判定: low（6字）
+2026-09-22 13:41:40.979 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=561字 tool_calls=0 用时=3.48s（第1次尝试）
+2026-09-22 13:41:40.979 [INFO ] [main] 任务完成（共1轮推理）
+2026-09-22 21:56:11.782 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-22 21:56:11.782 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-22 21:56:11.782 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-22 21:56:12.002 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-22 21:56:12.002 [INFO ] [ui] 进入 TUI 界面
+2026-09-22 21:56:29.745 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-22 21:56:29.745 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-22 21:56:29.753 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-22 21:56:29.954 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-22 21:56:29.954 [INFO ] [ui] 进入 TUI 界面
+2026-09-22 21:56:31.656 [INFO ] [main] 任务开始: 你好
+2026-09-22 21:56:31.713 [INFO ] [main] 注入系统提示词: system_prompt.md
+2026-09-22 21:56:31.713 [INFO ] [llm] 复杂度判定: low（2字）
+2026-09-22 21:56:34.038 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=206字 tool_calls=0 用时=2.22s（第1次尝试）
+2026-09-22 21:56:34.038 [INFO ] [main] 任务完成（共1轮推理）
+2026-09-22 21:56:39.148 [INFO ] [main] 任务开始: 你有什么工具
+2026-09-22 21:56:39.191 [INFO ] [llm] 复杂度判定: low（6字）
+2026-09-22 21:56:42.742 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=685字 tool_calls=0 用时=3.55s（第1次尝试）
+2026-09-22 21:56:42.742 [INFO ] [main] 任务完成（共1轮推理）

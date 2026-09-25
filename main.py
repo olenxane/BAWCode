@@ -1,5 +1,6 @@
 #该部分为程序的主逻辑，调用各个模块实现完整功能
 import sys
+import uuid
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -7,6 +8,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core import commands
+from core import hooks
 from core import memory as memory_mod
 from core import policy
 from core import project_identity
@@ -29,13 +31,18 @@ def _sync(app: "ui.TuiApp", session, task: str = "", status: str = "") -> None:
     app.tool_count = len(register.list_tools())
 
 
+def _echo(ctx, content: str, mtype: str = "help") -> None:
+    """命令反馈写入 session，避免 _sync 用 session 覆盖 app.messages 时丢失"""
+    ctx["session"].add_message("system", content, type=mtype)
+
+
 def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> None:
     def _ctx():
         return {"llm": llm, "session": session, "config": config, "app": app}
 
     @commands.register("/help", hint="帮助", source="builtin")
     def _help(ctx, args):
-        ctx["app"].messages.append({"role": "system", "content": commands.help_text(), "type": "help"})
+        _echo(ctx, commands.help_text())
         return True
 
     @commands.register("/exit", hint="退出", aliases=["/quit"], source="builtin")
@@ -58,11 +65,11 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
             for row in rows:
                 mark = " *" if row["is_active"] else ""
                 lines.append(f"  {row['model_name']}{mark}")
-            ctx["app"].messages.append({"role": "system", "content": "\n".join(lines), "type": "help"})
+            _echo(ctx, "\n".join(lines))
             return True
         row = ctx["config"].switch_model(name)
         if not row:
-            ctx["app"].messages.append({"role": "system", "content": f"未找到模型: {name}", "type": "help"})
+            _echo(ctx, f"未找到模型: {name}")
             return True
         ctx["llm"].refresh_from_config(ctx["config"])
         ctx["app"].bind_config(ctx["config"])
@@ -76,7 +83,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         if not arg:
             arg = ctx["app"].cycle_mode()
         elif arg not in policy.MODES:
-            ctx["app"].messages.append({"role": "system", "content": "模式: auto | manual | full", "type": "help"})
+            _echo(ctx, "模式: auto | manual | full")
             return True
         else:
             ctx["app"].mode = arg
@@ -91,7 +98,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         name = (args or "").strip()
         themes = ctx["config"].list_themes()
         if not name:
-            ctx["app"].messages.append({"role": "system", "content": "主题: " + ", ".join(themes), "type": "help"})
+            _echo(ctx, "主题: " + ", ".join(themes))
             return True
         if name not in themes:
             # 仍尝试载入，无效会回落默认
@@ -106,7 +113,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
     @commands.register("/tools", hint="工具列表", source="builtin")
     def _tools(ctx, args):
         lines = [f"{t['name']}: {t['description']}" for t in register.list_tools()]
-        ctx["app"].messages.append({"role": "system", "content": "工具:\n" + "\n".join(lines), "type": "help"})
+        _echo(ctx, "工具:\n" + "\n".join(lines))
         return True
 
     @commands.register("/plan", hint="查看计划", source="builtin")
@@ -157,7 +164,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
 
     @commands.register("/commands", hint="命令系统", source="builtin")
     def _cmds(ctx, args):
-        ctx["app"].messages.append({"role": "system", "content": commands.help_text(), "type": "help"})
+        _echo(ctx, commands.help_text())
         return True
 
     commands.load_plugins(str(_ROOT / "data" / "commands"))
@@ -217,29 +224,57 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp") -> None:
         _sync(app, session, task=user_text, status="生成计划")
         plan = llm.generate_plan(user_text)
         session.set_plan(plan.get("title", "任务计划"), plan.get("content", ""), complexity=plan.get("complexity", "high"))
-        choice = app.choose(
-            [("1", "确认计划"), ("2", "直接改计划"), ("3", "反馈修改"), ("0", "取消")],
-            prompt="计划已生成",
-        ).strip()
-        if choice == "0":
-            session.add_message("assistant", "用户取消任务。")
-            _sync(app, session, task=user_text, status="已取消")
+        confirmed = False
+        for _edit_round in range(3):
+            choice = app.choose(
+                [("1", "确认计划"), ("2", "直接改计划"), ("3", "反馈修改"), ("0", "取消")],
+                prompt="计划已生成",
+            ).strip()
+            if choice == "0":
+                session.add_message("assistant", "用户取消任务。")
+                _sync(app, session, task=user_text, status="已取消")
+                return
+            if choice == "2":
+                lines = []
+                while True:
+                    line = app.read_line("计划> ", config=llm.config)
+                    if line.strip() == "END":
+                        break
+                    lines.append(line)
+                session.plan.update(llm.confirm_plan(session.plan, "manual_edit", feedback="\n".join(lines)))
+            elif choice == "3":
+                fb = app.read_line("反馈> ", config=llm.config)
+                session.plan.update(llm.confirm_plan(session.plan, "llm_modify", feedback=fb))
+            elif choice == "1":
+                session.plan.update(llm.confirm_plan(session.plan, "confirm"))
+                session.update_plan_status("confirmed")
+                session.save_longterm()
+                confirmed = True
+                break
+            else:
+                session.add_message("system", "请输入 0/1/2/3", type="help")
+                _sync(app, session, task=user_text, status="请重新选择计划操作")
+                continue
+            # 2/3 修改后必须二次确认，禁止直接执行
+            again = app.choose(
+                [("1", "确认并执行"), ("2", "继续修改"), ("0", "取消")],
+                prompt="计划已修改",
+            ).strip()
+            if again == "0":
+                session.add_message("assistant", "用户取消任务。")
+                _sync(app, session, task=user_text, status="已取消")
+                return
+            if again == "1":
+                session.plan.update(llm.confirm_plan(session.plan, "confirm"))
+                session.update_plan_status("confirmed")
+                session.save_longterm()
+                confirmed = True
+                break
+            # again == "2" 或非法 → 回到 1/2/3 菜单继续改
+        if not confirmed:
+            session.add_message("assistant", "计划未确认，任务中止。")
+            _sync(app, session, task=user_text, status="计划未确认")
             return
-        if choice == "2":
-            lines = []
-            while True:
-                line = app.read_line("计划> ", config=llm.config)
-                if line.strip() == "END":
-                    break
-                lines.append(line)
-            session.plan.update(llm.confirm_plan(session.plan, "manual_edit", feedback="\n".join(lines)))
-        elif choice == "3":
-            fb = app.read_line("反馈> ", config=llm.config)
-            session.plan.update(llm.confirm_plan(session.plan, "llm_modify", feedback=fb))
-        else:
-            session.plan.update(llm.confirm_plan(session.plan, "confirm"))
-            session.update_plan_status("confirmed")
-            session.save_longterm()
         steps = llm.generate_steps(user_text, session.plan.get("content", ""))
         session.set_steps(steps)
         session.add_message("assistant", "计划确认，开始执行。", type="plan")
@@ -295,7 +330,7 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp") -> None:
                 type="tool_call",
                 tool_calls=[
                     {
-                        "id": c.get("id"),
+                        "id": c.get("id") or f"call_{uuid.uuid4().hex[:12]}",
                         "name": c.get("name"),
                         "arguments": c.get("arguments") or {},
                         "type": c.get("type") or "function",
@@ -346,6 +381,8 @@ def main() -> None:
     )
     session = memory_mod.init_session(config, project_identity_data=identity)
     llm = LLM(config)
+    session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
+    hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     app = ui.get_app()
     app.bind_config(config)
     app.token_meter = llm.meter
@@ -372,8 +409,7 @@ def main() -> None:
                     session.save_longterm()
                     break
                 if isinstance(result, dict) and result.get("reason") in ("unknown", "no_handler"):
-                    session.add_message("system", f"命令问题: {result}")
-                    app.messages.append({"role": "system", "content": str(result), "type": "help"})
+                    session.add_message("system", f"命令问题: {result}", type="help")
                 _sync(app, session)
                 continue
             _agent_turn(llm, session, text, app)

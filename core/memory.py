@@ -50,6 +50,7 @@ class Memory:
         self.compress_threshold = memory_cfg.get("compress_threshold", 0.8)
         self.strip_tool_history = memory_cfg.get("strip_tool_history", True)
         self.strip_tool_keep = memory_cfg.get("strip_tool_keep", 6)
+        self._llm_fn: Optional[Callable[[str], str]] = None
         self.messages: List[dict] = []
         self.plan = {
             "title": "",
@@ -286,12 +287,27 @@ class Memory:
             hooks.call_user_participating("step_update", {"step": target}, default=None)
         return target
 
+    def set_llm_fn(self, fn: Optional[Callable[[str], str]]) -> None:
+        """注入上下文压缩用的 LLM 调用，供 build_messages 循环内自动压缩"""
+        self._llm_fn = fn
+
     def estimate_token_chars(self) -> int:
-        """粗估当前消息占用字符数，用于是否压缩判断"""
+        """粗估当前消息占用字符数（仅作 fallback，不直接与 token 阈值比较）"""
         total = 0
         for message in self.messages:
             total += len(str(message.get("content") or ""))
         return total
+
+    def estimate_context_tokens(self) -> int:
+        """当前上下文 token 估计：优先 tiktoken，不可用时按字符粗折算"""
+        from core import tokens as tokenmod
+
+        model = getattr(self.config, "model_name", "") or ""
+        try:
+            return tokenmod.count_message_tokens(self.messages, model)
+        except Exception:
+            chars = self.estimate_token_chars()
+            return max(1, chars // 2)
 
     def strip_old_tool_messages(self) -> int:
         """剥离多余的历史工具输出，保留最近若干条，其余替换为占位"""
@@ -314,7 +330,7 @@ class Memory:
             return ""
         history_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in self.messages)
         summary = hooks.call_user_participating(
-            "memory_write",
+            "memory_compress",
             {"action": "compress", "history": history_text},
             handler=external_handler,
             default=None,
@@ -341,18 +357,20 @@ class Memory:
         return summary
 
     def maybe_compress(self, llm_fn: Optional[Callable[[str], str]] = None) -> None:
-        """按配置阈值自动压缩"""
+        """按配置阈值自动压缩（阈值与估计均为 token 量纲）"""
         if not self.auto_compress:
             return
+        if llm_fn is None:
+            llm_fn = self._llm_fn
         limit = int(self.config.context_window * self.compress_threshold)
         if limit <= 0:
             return
-        estimate = self.estimate_token_chars()
+        estimate = self.estimate_context_tokens()
         if estimate >= limit:
-            log.info("触发自动压缩: 约%d字 >= 阈值%d字", estimate, limit)
+            log.info("触发自动压缩: 约%d token >= 阈值%d token", estimate, limit)
             self.compress(llm_fn=llm_fn)
         else:
-            log.debug("未达压缩阈值: 约%d字/%d字", estimate, limit)
+            log.debug("未达压缩阈值: 约%d token/%d token", estimate, limit)
 
     def build_context_supplements(self) -> List[dict]:
         """长期记忆（Agent.md + 项目 md）+ 计划/步骤（队首 system 区域）"""
@@ -402,8 +420,12 @@ class Memory:
             out["role"] = "tool"
             if item.get("tool_call_id"):
                 out["tool_call_id"] = item["tool_call_id"]
+            else:
+                # 缺 id 的 tool 不进 API（降级为 system 会破坏 tool_calls 配对）
+                return {}
         if role == "assistant" and item.get("tool_calls"):
             import json as _json
+            from uuid import uuid4
 
             calls = []
             for c in item["tool_calls"]:
@@ -417,7 +439,7 @@ class Memory:
                     args = _json.dumps(args, ensure_ascii=False)
                 calls.append(
                     {
-                        "id": c.get("id") or "",
+                        "id": c.get("id") or f"call_{uuid4().hex[:12]}",
                         "type": "function",
                         "function": {"name": fn_name, "arguments": args},
                     }
@@ -433,7 +455,7 @@ class Memory:
 
         顺序：system提示词 → 长期记忆等补充 → 会话历史（含 tool/tool_calls）。
         """
-        self.maybe_compress()
+        self.maybe_compress(llm_fn=self._llm_fn)
         self.strip_old_tool_messages()
         messages: List[dict] = []
         if extra_system:

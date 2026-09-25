@@ -40,7 +40,26 @@ _SAFE_CMD_RE = re.compile(
     r"(?i)(^|\s|/|\\)(ls|dir|pwd|cd|echo|cat|head|tail|tree|where|which|env|set|ver|version|python\s+-V|pip\s+show|git\s+status|git\s+log|git\s+branch|type)(\s|$)",
 )
 _DANGEROUS_CMD_RE = re.compile(
-    r"(?i)(rm|del|rd|rmdir|format|mkfs|shutdown|reboot|halt|dd\s+if=|chmod\s+.*777|reg\s+add|schtasks|powershell.*-enc|curl.+\|\s*sh|wget.+\|\s*sh|net\s+user|taskkill|rm\s+-rf)",
+    r"""(?xi)
+    (?:
+        (?<![a-z0-9_])rm\s+-[rf]*[rf]|
+        (?<![a-z0-9_])rm\s+--recursive|
+        (?<![a-z0-9_])del\s+/|
+        (?<![a-z0-9_])(?:rd|rmdir)\s+/|
+        (?<![a-z0-9_])format\s+[a-z]:|
+        (?<![a-z0-9_])mkfs(?![a-z0-9_])|
+        (?<![a-z0-9_])(?:shutdown|reboot|halt)(?![a-z0-9_])|
+        (?<![a-z0-9_])dd\s+if=|
+        (?<![a-z0-9_])chmod\s+.*777|
+        (?<![a-z0-9_])reg\s+add|
+        (?<![a-z0-9_])schtasks(?![a-z0-9_])|
+        (?<![a-z0-9_])powershell.*-enc|
+        curl.+\|\s*(?:sh|bash|powershell)|
+        wget.+\|\s*(?:sh|bash|powershell)|
+        (?<![a-z0-9_])net\s+user|
+        (?<![a-z0-9_])taskkill(?![a-z0-9_])
+    )
+    """
 )
 
 _VERSION_RE = re.compile(r"(?i)(-v|--version|version)\s*$")

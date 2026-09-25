@@ -1,5 +1,55 @@
 # Changelog
 
+## 2026-09-25 — 修复：单字符树绑定劫持输入框（h/l/` 无法打字）
+
+### 问题
+
+- `expand/collapse` 默认含单字符键 `l`/`h`，keymap 编译时被应用到全部上下文，
+  输入框中键入 h/H/l/L 被解析为折叠/展开（光标移动甚至误翻树节点），
+  实际打不出这两个字母；设置页可选的 `` ` ``/`~`（switch_mode）同理。
+- HEAD（71d2649）旧分发以 `focus == "tree"` 为前提，重构编译表时丢失该门控。
+
+### 修复
+
+| 文件 | 要点 |
+|------|------|
+| `core/keymap.py` | 编译期单字符 token 不再写入 INPUT 上下文（树/对话框/设置保留） |
+| `develop/test_keymap.py` | 回归：input h/l/H 插入、tree h/l 折叠展开、`` ` `` 输入插入 |
+
+### 行为说明
+
+- 单字符快捷键只在会话树（及对话框/设置页）生效；输入框内一律按字符插入。
+- 多键绑定（ctrl+l、方向键等）不受影响。
+
+## 2026-09-22 — 快捷键绑定真正接入 UI 分发
+
+### 产品约定
+
+- **Enter = 提交**（树焦点下 Enter 仍折叠节点）
+- **Shift+Enter = 换行**（输入框插入 `\n`，不提交）
+- Ctrl+Enter / 设置中的 `send` 额外键也可提交
+- 设置页可配置的 `switch_mode` / `complete` / `switch_focus` / `scroll_*` / `expand` / `collapse` 由事件循环按 `self.keys` 匹配
+
+### 修改
+
+| 文件 | 要点 |
+|------|------|
+| `core/keyinput.py` | Windows `PeekConsoleInput` 识别 Shift+Enter → `newline`；CSI `13;2u` 兼容；`_pending` 预分类事件队列 |
+| `core/ui.py` | `_event_token` / `_is_binding`；`read_line` 按绑定分发；`bind_config` 支持列表绑定；tips/设置提示更新 |
+| `core/config.py` / `data/config.json` | 默认 `newline=shift+enter`、`switch_mode=shift+tab`；expand/collapse 为列表 |
+
+### 测试
+
+- `develop/test_key_binding.py`：绑定匹配与 Enter/Shift+Enter 语义
+- `develop/test_keyinput_unit.py`：扫描码/CSI 回归
+
+### 手工验证
+
+1. 主界面：Enter 提交；Shift+Enter 换行；Ctrl+Enter 仍可提交
+2. `/settings → 快捷键`：将发送改为 f5、切换模式改为 f2 后回主界面验证
+3. 中文 IME 上屏后立刻方向键 / Shift+Enter
+4. 若终端（ConPTY）未投递 Shift 修饰，Shift+Enter 可能回退为提交——以设置页可改键兜底
+
 ## 2026-09-20 (六) — 回退：keyinput 恢复为 getch + DBCS 重组层版本
 
 ### 背景

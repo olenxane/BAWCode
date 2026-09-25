@@ -272,3 +272,5 @@
 2026-09-21 21:09:35.600 [INFO ] [llm] 复杂度判定: low（6字）
 2026-09-21 21:09:38.367 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=542字 tool_calls=0 用时=2.77s（第1次尝试）
 2026-09-21 21:09:38.367 [INFO ] [main] 任务完成（共1轮推理）
+2026-09-21 23:23:00.811 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\_default.md 自动压缩=True 阈值=80%
+2026-09-21 23:23:01.037 [WARN ] [llm] 丢弃无 tool_call_id 的 tool 消息: tool=read

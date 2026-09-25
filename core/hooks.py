@@ -58,21 +58,26 @@ def set_external_apis(api_map: Optional[dict]) -> None:
         return
     for event, url in api_map.items():
         if url:
-            _handlers[event] = _make_http_handler(url)
+            _handlers[event] = _make_http_handler(event, url)
             log.info("外部接口已挂接: %s -> %s", event, url)
 
 
 def call_hook(event: str, payload: Optional[dict] = None, default: Any = None) -> Any:
-    """触发扩展点；无处理函数时返回 default"""
+    """触发扩展点；无处理函数时返回 default；自动注入 _event"""
     handler = _handlers.get(event)
     if handler is None:
         return default
-    data = payload if payload is not None else {}
-    result = handler(data)
+    data = dict(payload) if payload is not None else {}
+    data.setdefault("_event", event)
+    try:
+        result = handler(data)
+    except Exception as e:
+        log.warn("扩展点执行失败 event=%s: %s", event, e)
+        return default
     return default if result is None else result
 
 
-def _make_http_handler(url: str) -> Callable[[dict], Any]:
+def _make_http_handler(event: str, url: str) -> Callable[[dict], Any]:
     """构造 POST JSON 的外部接口处理函数
 
     请求体: {"event": <事件名>, "payload": {...}}
@@ -80,7 +85,6 @@ def _make_http_handler(url: str) -> Callable[[dict], Any]:
     """
 
     def _handler(payload: dict) -> Any:
-        event = payload.get("_event", "")
         body = json.dumps({"event": event, "payload": payload}, ensure_ascii=False)
         req = urllib.request.Request(
             url,
@@ -112,8 +116,12 @@ def call_user_participating(
     显式 handler 便于调用方临时注入外部 API，而不修改全局配置。
     """
     data = dict(payload or {})
-    data["_event"] = event
     if handler is not None:
-        result = handler(data)
+        data.setdefault("_event", event)
+        try:
+            result = handler(data)
+        except Exception as e:
+            log.warn("用户参与扩展点失败 event=%s: %s", event, e)
+            return default
         return default if result is None else result
     return call_hook(event, data, default=default)

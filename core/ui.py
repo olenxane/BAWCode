@@ -19,8 +19,12 @@ except ImportError:
     HAS_RICH = False
 
 from core import commands as cmdsys
+from core import keymap as keymap_mod
 from core import policy
 from core import tokens as tokenmod
+from core.keymap import Action, Context, Keymap
+from core.layout import Layout, char_width, display_width as _layout_display_width, split_at_cells, wrap_line
+from core.textbuf import TextBuffer
 from core.config import (
     MODALITY_OPTIONS,
     TASK_ROLES,
@@ -63,50 +67,11 @@ TIPS = [
 
 
 def _event_token(kind: str, value: Any) -> str:
-    """事件 → 小写键 token（与 config/设置页快捷键字面量对齐）"""
-    if kind == "mode_switch":
-        return "shift+tab"
-    if kind == "tab":
-        return "tab"
-    if kind == "submit":
-        return "enter"
-    if kind == "submit_ctrl":
-        return "ctrl+enter"
-    if kind == "newline":
-        return "shift+enter"
-    if kind in (
-        "up",
-        "down",
-        "left",
-        "right",
-        "home",
-        "end",
-        "backspace",
-        "delete",
-        "escape",
-    ):
-        return kind
-    if kind == "scroll_up":
-        return "pageup"
-    if kind == "scroll_down":
-        return "pagedown"
-    if kind == "hotkey":
-        return str(value or "").strip().lower()
-    if kind == "char":
-        return str(value or "").strip().lower()
-    return ""
+    return keymap_mod.event_token(kind, value)
 
 
 def _binding_tokens(binding: Any) -> List[str]:
-    if binding is None:
-        return []
-    items = list(binding) if isinstance(binding, (list, tuple, set)) else [binding]
-    out: List[str] = []
-    for b in items:
-        s = str(b or "").strip().lower()
-        if s:
-            out.append(s)
-    return out
+    return keymap_mod.binding_tokens(binding)
 
 
 def _is_binding(kind: str, value: Any, binding: Any) -> bool:
@@ -150,7 +115,7 @@ def _term_size() -> Tuple[int, int]:
 
 
 def _char_width(ch: str) -> int:
-    return 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+    return char_width(ch)
 
 
 def _display_width(text: str) -> int:
@@ -222,18 +187,7 @@ def _pad(text: str, width: int) -> str:
 
 def _split_by_width(text: str, cut: int) -> tuple:
     """按显示宽度切开：cut 为光标前应占用的列宽（含宽字符）。"""
-    if cut <= 0:
-        return "", text or ""
-    src = text or ""
-    used = 0
-    for i, ch in enumerate(src):
-        w = _char_width(ch)
-        if used + w > cut:
-            return src[:i], src[i:]
-        used += w
-        if used == cut:
-            return src[: i + 1], src[i + 1 :]
-    return src, ""
+    return split_at_cells(text, cut)
 
 
 def _wrap(text: str, width: int) -> List[str]:
@@ -416,8 +370,8 @@ class TuiApp:
         self._tree_last_msg_n = 0
         self.expanded: Set[str] = set()
         self.collapse_done = True
-        self.buffer: List[str] = []
-        self.cursor = 0
+        self.buffer = TextBuffer()
+        self._cursor = 0
         self.input_history: List[str] = []
         self.hist_index = -1
         self.max_display_lines = 3
@@ -460,6 +414,8 @@ class TuiApp:
         self._live: Optional["Live"] = None
         self._frame_time = 1.0 / 20
         self._row_meta: Dict[str, int] = {}
+        self.keymap = Keymap()
+        self.keymap.compile()
         self.keys = {
             "send": "ctrl+enter",
             "newline": "shift+enter",
@@ -481,8 +437,8 @@ class TuiApp:
         self._tree_sig: Optional[tuple] = None
         self._tree_rows_key: Optional[tuple] = None
         self._tree_rows_cache: Optional[List[str]] = None
-        self._input_wrap_key: Optional[tuple] = None
-        self._input_wrap_cache: Optional[List[str]] = None
+        self._input_layout = Layout("", width=40)
+        self._input_layout_width = 0
         self._cursor_row_key: Optional[tuple] = None
         self._cursor_row_val: Optional[int] = None
         self._cursor_seg_w: int = 0
@@ -494,6 +450,16 @@ class TuiApp:
         self._hold_start = 0.0
         self._hold_last = 0.0
         self._logo_done = False
+
+    @property
+    def cursor(self) -> int:
+        return self.buffer.cursor if isinstance(self.buffer, TextBuffer) else self._cursor
+
+    @cursor.setter
+    def cursor(self, value: int) -> None:
+        if isinstance(self.buffer, TextBuffer):
+            self.buffer.set_cursor(value)
+        self._cursor = int(value)
 
     # ----- 颜色 -----
     def c(self, name: str) -> str:
@@ -548,6 +514,8 @@ class TuiApp:
             self.keys["switch_mode"] = "shift+tab"
         if not self.keys.get("newline"):
             self.keys["newline"] = "shift+enter"
+        self.keymap = Keymap()
+        self._sync_keymap()
         self.keys["scroll_v0"] = float(ui_cfg.get("scroll_v0", 1.0))
         self.keys["scroll_hold_ms"] = int(ui_cfg.get("scroll_hold_ms", 150))
         self.keys["scroll_max_step"] = int(ui_cfg.get("scroll_max_step", 20))
@@ -583,7 +551,10 @@ class TuiApp:
         # bracketed-paste 默认关闭（见 docstring）；终端模式直接写 stdout
         _bp = os.environ.get("BAW_BRACKETED_PASTE", "")
         _paste_on = _bp == "1" or (_bp == "" and sys.platform != "win32")
-        sys.stdout.write("\033[2J\033[H" + ("\033[?2004h" if _paste_on else ""))
+        # 鼠标滚轮：SGR(1006)+按键/滚轮(1000)。关闭用 BAW_MOUSE=0
+        _mouse_on = os.environ.get("BAW_MOUSE", "1") != "0"
+        _mouse_seq = "\033[?1000h\033[?1006h" if _mouse_on else ""
+        sys.stdout.write("\033[2J\033[H" + ("\033[?2004h" if _paste_on else "") + _mouse_seq)
         sys.stdout.flush()
         if HAS_RICH and _CONSOLE is not None:
             self._live = Live(
@@ -609,7 +580,7 @@ class TuiApp:
                 self._live = None
         except Exception:
             pass
-        sys.stdout.write("\033[?25h\033[0m\033[2J\033[H\033[?2004l")
+        sys.stdout.write("\033[?25h\033[0m\033[2J\033[H\033[?2004l\033[?1000l\033[?1006l")
         sys.stdout.flush()
         self._entered = False
 
@@ -979,26 +950,19 @@ class TuiApp:
             return self._compose_settings(w, h)
 
         prompt = "> "
-        raw = "".join(self.buffer)
+        raw = self.buffer.to_text() if isinstance(self.buffer, TextBuffer) else "".join(self.buffer)
         inner_w = max(10, w - len(prompt) - 1)
 
         # 确认态：输入区显示三选项
         if self.pending_tool:
             return self._compose_confirm(w, h, inner_w)
 
-        logical = raw.splitlines() or [""]
-        # 输入 wrap 缓存：长文本按键路径只重算变化的行切片，不重折行
-        wkey = (inner_w, raw)
-        if self._input_wrap_key == wkey and self._input_wrap_cache is not None:
-            wrapped = self._input_wrap_cache
-        else:
-            wrapped = []
-            for para in logical:
-                wrapped.extend(_wrap(para, inner_w) or [""])
-            self._input_wrap_key = wkey
-            self._input_wrap_cache = wrapped
-        if not wrapped:
-            wrapped = [""]
+        # 输入 wrap：逻辑行增量（Layout）
+        if self._input_layout_width != inner_w:
+            self._input_layout.set_width(inner_w)
+            self._input_layout_width = inner_w
+        self._input_layout.apply_edit(raw, self.cursor)
+        wrapped = self._input_layout.visual_rows() or [""]
         text_h = min(3, max(1, len(wrapped)))
         cand_show = min(3, len(self.candidates)) if self.candidates else 0
         input_zone_h = min(6, text_h + cand_show)
@@ -1006,6 +970,7 @@ class TuiApp:
         bottom_fixed = 1 + 2 + 1 + 1  # rule + info/mode+tip + rule + status
         top_fixed = 1 + 1
         tree_h = max(4, h - top_fixed - bottom_fixed - input_zone_h)
+        self._row_meta["tree_h"] = tree_h
         tree_focus = self.focus == "tree"
         mode_label = policy.MODE_LABELS.get(self.mode, self.mode)
 
@@ -1032,18 +997,7 @@ class TuiApp:
         lines.append(self._rule(w))
 
         # 输入区
-        before = "".join(self.buffer[: self.cursor]) if self.buffer else ""
-        ckey = (inner_w, before)
-        if self._cursor_row_key == ckey and self._cursor_row_val is not None:
-            cursor_row = self._cursor_row_val
-            before_last_w = self._cursor_seg_w
-        else:
-            before_wrapped = _wrap(before, inner_w)
-            cursor_row = max(0, len(before_wrapped) - 1)
-            before_last_w = _display_width(before_wrapped[-1]) if before_wrapped else 0
-            self._cursor_row_key = ckey
-            self._cursor_row_val = cursor_row
-            self._cursor_seg_w = before_last_w
+        cursor_row, before_last_w = self._input_layout.cursor_visual(raw, self.cursor)
         # 物理光标列（可视行内）：前缀宽 + 光标所在可视行文本宽；IME 组合窗跟随此位置
         self._cursor_col = _display_width(self._input_prompt) + before_last_w
         self._cursor_rel_row = cursor_row - self.input_scroll
@@ -1069,7 +1023,7 @@ class TuiApp:
                 head = f"{accent}{prefix}{self.RESET}{ink}"
                 if self.focus == "input" and abs_row == cursor_row:
                     # 显示光标必须插在逻辑光标列，不能固定贴在行尾
-                    left, right = _split_by_width(part, before_last_w)
+                    left, right = split_at_cells(part, before_last_w)
                     input_rows.append(f"{head}{left}{mark}{ink}{_clip(right, inner_w)}{self.RESET}")
                 else:
                     input_rows.append(f"{head}{_clip(part, inner_w)}{self.RESET}")
@@ -1230,14 +1184,56 @@ class TuiApp:
 
     # ----- 输入 / 补全 -----
     def _word_start(self) -> int:
+        if isinstance(self.buffer, TextBuffer):
+            return self.buffer.word_start()
         text = "".join(self.buffer)
         i = self.cursor
         while i > 0 and not text[i - 1].isspace():
             i -= 1
         return i
 
+    def _buf_text(self) -> str:
+        return self.buffer.to_text() if isinstance(self.buffer, TextBuffer) else "".join(self.buffer)
+
+    def _buf_set(self, text: str, cursor: Optional[int] = None) -> None:
+        if isinstance(self.buffer, TextBuffer):
+            self.buffer.set_text(text, cursor)
+        else:
+            self.buffer = list(text)
+            self.cursor = len(text) if cursor is None else cursor
+
+    def _buf_insert(self, s: str) -> None:
+        if isinstance(self.buffer, TextBuffer):
+            self.buffer.insert(s)
+        else:
+            self.buffer[self.cursor : self.cursor] = list(s)
+            self.cursor += len(s)
+
+    def _buf_backspace(self) -> None:
+        if isinstance(self.buffer, TextBuffer):
+            self.buffer.backspace()
+        elif self.cursor > 0:
+            self.buffer.pop(self.cursor - 1)
+            self.cursor -= 1
+
+    def _buf_delete(self) -> None:
+        if isinstance(self.buffer, TextBuffer):
+            self.buffer.delete()
+        elif self.cursor < len(self.buffer):
+            self.buffer.pop(self.cursor)
+
+    def _buf_clear(self) -> None:
+        if isinstance(self.buffer, TextBuffer):
+            self.buffer.clear()
+        else:
+            self.buffer = []
+        self.cursor = 0
+
+    def _buf_len(self) -> int:
+        return self.buffer.length if isinstance(self.buffer, TextBuffer) else len(self.buffer)
+
     def _refresh_candidates(self, config=None) -> None:
-        text = "".join(self.buffer)
+        text = self._buf_text()
         # 输入循环每帧调用；缓冲与光标未变时跳过补全计算
         if text == self._cand_text and self.cursor == self._cand_cursor and config is self._cand_config:
             return
@@ -1260,7 +1256,7 @@ class TuiApp:
         name = self.candidates[self.candidate_index].get("name") or ""
         if not name:
             return False
-        text = "".join(self.buffer)
+        text = self._buf_text()
         start = self._word_start()
         end = self.cursor
         while end < len(text) and not text[end].isspace():
@@ -1268,12 +1264,10 @@ class TuiApp:
         # /model deepseek-chat 需要整段替换
         if " " in name:
             new_text = name + " " + text[end:]
-            self.buffer = list(new_text)
-            self.cursor = len(name) + 1
+            self._buf_set(new_text, len(name) + 1)
         else:
             new_text = text[:start] + name + " " + text[end:]
-            self.buffer = list(new_text)
-            self.cursor = start + len(name) + 1
+            self._buf_set(new_text, start + len(name) + 1)
         self.candidates = []
         self.candidate_index = 0
         return True
@@ -1297,22 +1291,13 @@ class TuiApp:
         return max(1, min(max_step, step))
 
     def read_line(self, prompt: Optional[str] = None, config=None) -> str:
-        """界面内输入框：回车提交；中文键入合并绘制，避免整屏逐键刷新。
-
-        主循环结构（TMP 对齐）：
-          每轮 = 刷新补全候选 → 消费到期的挂起绘制 → 批量读事件 → 分发。
-          帧尾无条件渲染 + 补足 50ms 帧周期（TMP 同款）。
-        事件分发要点：
-          - char/backspace/delete/光标移动 → 改 buffer/cursor → _schedule_paint
-            （leading-edge 节流：间隔外立即画，间隔内挂起 30ms 补刷）
-          - paste → 整段插入 buffer，绝不触发 submit（keyinput 管线保证）
-          - ↑↓/Tab/PgUp/PgDn 等低频全帧操作 → 直接 render()
-        """
+        """界面内输入框：Action 驱动主循环（Gap Buffer + Keymap O(1)）。"""
         self.settings_mode = False
         if self.pending_tool:
             return self._confirm_loop()
         self.focus = "input"
-        self.buffer = []
+        self._buf_clear()
+        self.buffer = TextBuffer()
         self.cursor = 0
         self.candidates = []
         self.input_scroll = 0
@@ -1324,10 +1309,6 @@ class TuiApp:
         pending_events: List[Tuple[str, Any]] = []
         while True:
             self._refresh_candidates(config=config)
-            # 固定帧循环（TMP app.py:1584 同构）：非阻塞抽干事件逐个消费，
-            # 帧尾无条件渲染 + 补足 50ms 帧周期。帧节奏天然取代了旧的
-            # 节流/挂起/空闲重画/光标钉位四件套——被终端延迟渲染的帧
-            # 下一帧自动覆盖修正，这正是 TMP 无输入卡顿的结构原因。
             if not pending_events:
                 pending_events = _read_events(0.0)
             if pending_events:
@@ -1335,198 +1316,11 @@ class TuiApp:
                 kind, value = key
                 if kind == "interrupt":
                     return "/exit"
-                if self._is_mode_switch(kind, value):
-                    mode = self.cycle_mode()
-                    self.status = f"{policy.MODE_LABELS.get(mode, mode)}"
-                    self._paint_pending = False
-                    self.render()
-                    continue
-                # 换行（默认 Shift+Enter）：输入框插入 \n，绝不提交
-                if self._should_newline(kind, value):
-                    if self.focus == "input":
-                        self.buffer[self.cursor : self.cursor] = list("\n")
-                        self.cursor += 1
-                        self._schedule_paint()
-                    continue
-                if self._should_submit(kind, value):
-                    # Enter / send 绑定提交；树焦点下裸 Enter 仍折叠
-                    if kind == "submit" and self.focus == "tree":
-                        self.toggle_fold(self.tree_cursor)
-                        self._paint_pending = False
-                        self.render()
-                        continue
-                    line = "".join(self.buffer)
-                    if line.strip():
-                        self.input_history.append(line)
-                    self.hist_index = len(self.input_history)
-                    self.buffer = []
-                    self.cursor = 0
-                    self.candidates = []
-                    self._paint_pending = False
-                    return line
-                want_complete = kind == "tab" or _is_binding(kind, value, self.keys.get("complete"))
-                want_focus = kind == "tab" or _is_binding(kind, value, self.keys.get("switch_focus"))
-                if want_complete or want_focus:
-                    if self.candidates and want_complete:
-                        self._apply_completion()
-                        self._paint_pending = False
-                        self.render()
-                        continue
-                    if want_focus or kind == "tab":
-                        if self.focus == "input":
-                            self.focus = "tree"
-                            flat = self._flatten_tree()
-                            self.tree_cursor = max(0, len(flat) - 1)
-                            self._tree_follow_tail = True
-                            self.scroll = max(0, len(flat) - 4)
-                        else:
-                            self.focus = "input"
-                        self._paint_pending = False
-                        self.render()
-                        continue
-                if kind == "backspace":
-                    if self.focus == "input" and self.cursor > 0:
-                        self.buffer.pop(self.cursor - 1)
-                        self.cursor -= 1
-                        self._schedule_paint()
-                elif kind == "delete":
-                    if self.focus == "input" and self.cursor < len(self.buffer):
-                        self.buffer.pop(self.cursor)
-                        self._schedule_paint()
-                dirn = _key_direction(kind, value)
-                if dirn == "up":
-                    if self.candidates:
-                        self.candidate_index = max(0, self.candidate_index - 1)
-                        self._paint_pending = False
-                        self.render()
-                    elif self.focus == "tree":
-                        step = self._scroll_step("up")
-                        self.tree_cursor = max(0, self.tree_cursor - step)
-                        if self.tree_cursor < self.scroll:
-                            self.scroll = self.tree_cursor
-                        # 用户向上浏览：取消自动贴底
-                        self._tree_follow_tail = False
-                        self._paint_pending = False
-                        self.render()
-                    elif self.input_history:
-                        self.hist_index = max(0, self.hist_index - 1)
-                        self.buffer = list(self.input_history[self.hist_index])
-                        self.cursor = len(self.buffer)
-                        self._paint_pending = False
-                        self.render()
-                elif dirn == "down":
-                    if self.candidates:
-                        self.candidate_index = min(len(self.candidates) - 1, self.candidate_index + 1)
-                        self._paint_pending = False
-                        self.render()
-                    elif self.focus == "tree":
-                        step = self._scroll_step("down")
-                        flat = self._flatten_tree()
-                        self.tree_cursor = min(max(0, len(flat) - 1), self.tree_cursor + step)
-                        if self.tree_cursor >= self.scroll + 4:
-                            self.scroll = self.tree_cursor - 3
-                        if self.tree_cursor >= max(0, len(flat) - 1):
-                            self._tree_follow_tail = True
-                        self._paint_pending = False
-                        self.render()
-                    else:
-                        if self.hist_index < len(self.input_history) - 1:
-                            self.hist_index += 1
-                            self.buffer = list(self.input_history[self.hist_index])
-                        else:
-                            self.hist_index = len(self.input_history)
-                            self.buffer = []
-                        self.cursor = len(self.buffer)
-                        self._paint_pending = False
-                        self.render()
-                elif dirn == "left" or (self.focus == "tree" and _is_binding(kind, value, self.keys.get("collapse"))):
-                    if self.focus == "tree":
-                        if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
-                            self.toggle_fold(self.tree_cursor)
-                            self._paint_pending = False
-                            self.render()
-                    elif dirn == "left":
-                        self.cursor = max(0, self.cursor - 1)
-                        self._schedule_paint()
-                elif dirn == "right" or (self.focus == "tree" and _is_binding(kind, value, self.keys.get("expand"))):
-                    if self.focus == "tree":
-                        if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
-                            self.toggle_fold(self.tree_cursor)
-                            self._paint_pending = False
-                            self.render()
-                    elif dirn == "right":
-                        self.cursor = min(len(self.buffer), self.cursor + 1)
-                        self._schedule_paint()
-                elif kind == "home":
-                    self.cursor = 0
-                    self._schedule_paint()
-                elif kind == "end":
-                    self.cursor = len(self.buffer)
-                    self._schedule_paint()
-                elif kind == "scroll_up" or _is_binding(kind, value, self.keys.get("scroll_up")):
-                    self.scroll = max(0, self.scroll - self._scroll_step("pu"))
-                    self._tree_follow_tail = False
-                    self._paint_pending = False
-                    self.render()
-                elif kind == "scroll_down" or _is_binding(kind, value, self.keys.get("scroll_down")):
-                    self.scroll += self._scroll_step("pd")
-                    # 触底则恢复跟随最新
-                    self._tree_follow_tail = True
-                    self._paint_pending = False
-                    self.render()
-                elif kind == "escape":
-                    if self.candidates:
-                        self.candidates = []
-                        self._paint_pending = False
-                        self.render()
-                    else:
-                        self.buffer = []
-                        self.cursor = 0
-                        self._schedule_paint()
-                elif kind == "clear":
-                    self.buffer = []
-                    self.cursor = 0
-                    self._paint_pending = False
-                    self.render()
-                elif kind == "paste":
-                    # 粘贴整体插入：换行归一为 \n，绝不触发 submit（管线保证）
-                    text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
-                    if text and self.focus == "input":
-                        self.buffer[self.cursor : self.cursor] = list(text)
-                        self.cursor += len(text)
-                        self._schedule_paint()
-                elif kind == "char":
-                    if self.focus == "tree":
-                        handled_tree = False
-                        if value == " ":
-                            self.toggle_fold(self.tree_cursor)
-                            handled_tree = True
-                        if _is_binding(kind, value, self.keys.get("expand")):
-                            if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
-                                self.toggle_fold(self.tree_cursor)
-                            handled_tree = True
-                        if _is_binding(kind, value, self.keys.get("collapse")):
-                            if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
-                                self.toggle_fold(self.tree_cursor)
-                            handled_tree = True
-                        if not handled_tree and value in ("l", "L") and self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
-                            self.toggle_fold(self.tree_cursor)
-                            handled_tree = True
-                        elif not handled_tree and value in ("h", "H") and self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and self._flat_nodes[self.tree_cursor][2]:
-                            self.toggle_fold(self.tree_cursor)
-                            handled_tree = True
-                        if handled_tree or value in (" ", "l", "L", "h", "H"):
-                            self._paint_pending = False
-                            self.render()
-                    elif value and all(ord(ch) >= 32 for ch in value):
-                        chunk = self._append_text_burst(value)
-                        self.buffer[self.cursor : self.cursor] = list(chunk)
-                        self.cursor += len(chunk)
-                        self._schedule_paint()
-                # kind==hotkey 且未命中绑定：忽略，避免误提交/退出
+                result = self._dispatch_key(kind, value, config)
+                if result is not None:
+                    return result
 
-            # 帧尾：无条件渲染 + 补足帧周期（TMP: live.update + sleep 同构）。
-            # 被终端延迟渲染的帧下一帧自动覆盖修正；处理超期时重新对齐时钟。
+            # 帧尾：无条件渲染 + 补足帧周期
             self.render()
             frame_deadline += self._frame_time
             sleep_left = frame_deadline - time.time()
@@ -1534,6 +1328,231 @@ class TuiApp:
                 time.sleep(sleep_left)
             else:
                 frame_deadline = time.time()
+
+    def _ui_context(self) -> Context:
+        if self.settings_mode:
+            return Context.SETTINGS
+        if self.focus == "tree":
+            return Context.TREE
+        return Context.INPUT
+
+    def _dispatch_key(self, kind: str, value: Any, config=None) -> Optional[str]:
+        """返回 None 表示继续循环；返回 str 为提交行。"""
+        self._sync_keymap()
+        ctx = self._ui_context()
+        # 模式切换始终优先
+        if kind == "mode_switch" or self._is_mode_switch(kind, value):
+            mode = self.cycle_mode()
+            self.status = f"{policy.MODE_LABELS.get(mode, mode)}"
+            self.render()
+            return None
+
+        act = self.keymap.resolve(ctx, kind, value)
+        # Tab：输入框 complete 优先，再 focus；树上 focus
+        if kind == "tab" or act in (Action.COMPLETE, Action.FOCUS_NEXT):
+            if self.candidates and (kind == "tab" or act == Action.COMPLETE):
+                self._apply_completion()
+                self.render()
+                return None
+            if ctx == Context.TREE or act == Action.FOCUS_NEXT or kind == "tab":
+                self._toggle_focus()
+                self.render()
+                return None
+
+        if act in (Action.NEWLINE,):
+            if self.focus == "input":
+                self._buf_insert("\n")
+            return None
+
+        if act in (Action.SUBMIT, Action.SEND):
+            if act == Action.SUBMIT and self.focus == "tree":
+                self.toggle_fold(self.tree_cursor)
+                self.render()
+                return None
+            # SEND 在树上也提交
+            if self.focus == "tree" and act == Action.SEND:
+                pass
+            line = self._buf_text()
+            if line.strip():
+                self.input_history.append(line)
+            self.hist_index = len(self.input_history)
+            self._buf_clear()
+            self.candidates = []
+            return line
+
+        if act == Action.INSERT:
+            s = value if isinstance(value, str) else ""
+            if s and all(ord(ch) >= 32 for ch in s):
+                if self.focus == "input":
+                    self._buf_insert(s)
+                elif s == " ":
+                    self.toggle_fold(self.tree_cursor)
+                    self.render()
+            return None
+
+        if act == Action.BACKSPACE:
+            if self.focus == "input":
+                self._buf_backspace()
+            return None
+
+        if act == Action.DELETE:
+            if self.focus == "input":
+                self._buf_delete()
+            return None
+
+        if act == Action.CLEAR:
+            self._buf_clear()
+            self.render()
+            return None
+
+        if act == Action.ESCAPE:
+            if self.candidates:
+                self.candidates = []
+                self.render()
+            else:
+                self._buf_clear()
+            return None
+
+        if act == Action.PASTE:
+            text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+            if text and self.focus == "input":
+                self._buf_insert(text)
+            return None
+
+        if act == Action.EXPAND:
+            self._tree_expand()
+            self.render()
+            return None
+        if act == Action.COLLAPSE:
+            self._tree_collapse_or_toggle()
+            self.render()
+            return None
+
+        if act == Action.CARET_UP:
+            self._on_up()
+            return None
+        if act == Action.CARET_DOWN:
+            self._on_down()
+            return None
+        if act == Action.CARET_LEFT:
+            if self.focus == "input":
+                self.cursor = max(0, self.cursor - 1)
+            return None
+        if act == Action.CARET_RIGHT:
+            if self.focus == "input":
+                self.cursor = min(self._buf_len(), self.cursor + 1)
+            return None
+        if act == Action.CARET_HOME:
+            if self.focus == "input":
+                if isinstance(self.buffer, TextBuffer):
+                    self.buffer.move_home()
+                else:
+                    self.cursor = 0
+            return None
+        if act == Action.CARET_END:
+            if self.focus == "input":
+                if isinstance(self.buffer, TextBuffer):
+                    self.buffer.move_end()
+                else:
+                    self.cursor = self._buf_len()
+            return None
+
+        if act == Action.SCROLL_UP:
+            self._scroll_tree_by(-self._scroll_delta(kind, value))
+            return None
+        if act == Action.SCROLL_DOWN:
+            self._scroll_tree_by(self._scroll_delta(kind, value))
+            return None
+
+        # 方向键在树/历史的语义（keymap 已给 CARET_*，按焦点细分）
+        dirn = _key_direction(kind, value)
+        if dirn == "up":
+            self._on_up()
+            return None
+        if dirn == "down":
+            self._on_down()
+            return None
+        return None
+
+    def _scroll_delta(self, kind: str, value: Any) -> int:
+        """鼠标滚轮固定 3 行；键盘滚动沿用长按加速。"""
+        if kind == "mouse_wheel" or _event_token(kind, value) in ("wheel_up", "wheel_down"):
+            return 3
+        direction = "pu" if _event_token(kind, value) == "pageup" else "pd"
+        return self._scroll_step(direction)
+
+    def _scroll_tree_by(self, delta: int) -> None:
+        """调整会话区显示范围。上滚取消贴底；下滚到底后恢复跟随最新。"""
+        self.scroll = max(0, self.scroll + delta)
+        self._tree_follow_tail = False
+        self.render()
+        if delta > 0:
+            rows = self._tree_rows_cache or []
+            total = len(rows)
+            tree_h = int(self._row_meta.get("tree_h") or 4)
+            if total <= tree_h or self.scroll >= total - tree_h:
+                self._tree_follow_tail = True
+
+    def _toggle_focus(self) -> None:
+        if self.focus == "input":
+            self.focus = "tree"
+            flat = self._flatten_tree()
+            self.tree_cursor = max(0, len(flat) - 1)
+            self._tree_follow_tail = True
+            self.scroll = max(0, len(flat) - 4)
+        else:
+            self.focus = "input"
+
+    def _tree_expand(self) -> None:
+        if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
+            self.toggle_fold(self.tree_cursor)
+        elif self.focus == "input":
+            self.cursor = min(self._buf_len(), self.cursor + 1)
+
+    def _tree_collapse_or_toggle(self) -> None:
+        if self.focus == "tree" and self._flat_nodes and self.tree_cursor < len(self._flat_nodes):
+            self.toggle_fold(self.tree_cursor)
+        elif self.focus == "input":
+            self.cursor = max(0, self.cursor - 1)
+
+    def _on_up(self) -> None:
+        if self.candidates:
+            self.candidate_index = max(0, self.candidate_index - 1)
+            self.render()
+        elif self.focus == "tree":
+            step = self._scroll_step("up")
+            self.tree_cursor = max(0, self.tree_cursor - step)
+            if self.tree_cursor < self.scroll:
+                self.scroll = self.tree_cursor
+            self._tree_follow_tail = False
+            self.render()
+        elif self.input_history:
+            self.hist_index = max(0, self.hist_index - 1)
+            self._buf_set(self.input_history[self.hist_index], len(self.input_history[self.hist_index]))
+            self.render()
+
+    def _on_down(self) -> None:
+        if self.candidates:
+            self.candidate_index = min(len(self.candidates) - 1, self.candidate_index + 1)
+            self.render()
+        elif self.focus == "tree":
+            step = self._scroll_step("down")
+            flat = self._flatten_tree()
+            self.tree_cursor = min(max(0, len(flat) - 1), self.tree_cursor + step)
+            if self.tree_cursor >= self.scroll + 4:
+                self.scroll = self.tree_cursor - 3
+            if self.tree_cursor >= max(0, len(flat) - 1):
+                self._tree_follow_tail = True
+            self.render()
+        else:
+            if self.hist_index < len(self.input_history) - 1:
+                self.hist_index += 1
+                line = self.input_history[self.hist_index]
+                self._buf_set(line, len(line))
+            else:
+                self.hist_index = len(self.input_history)
+                self._buf_clear()
+            self.render()
 
     def _confirm_loop(self) -> str:
         """工具确认：1 允许一次 / 2 本项目始终允许 / 3 拒绝（可输入原因）"""
@@ -1694,37 +1713,41 @@ class TuiApp:
                 return ak
         return None
 
+    def _sync_keymap(self) -> None:
+        """由 self.keys 重编译倒排表（O(动作×绑定)，仅配置变更时）"""
+        self.keymap.compile(
+            {
+                "send": self.keys.get("send"),
+                "newline": self.keys.get("newline"),
+                "switch_focus": self.keys.get("switch_focus"),
+                "switch_mode": self.keys.get("switch_mode"),
+                "complete": self.keys.get("complete"),
+                "scroll_up": self.keys.get("scroll_up"),
+                "scroll_down": self.keys.get("scroll_down"),
+                "expand": self.keys.get("expand"),
+                "collapse": self.keys.get("collapse"),
+            }
+        )
+
     def _should_submit(self, kind: str, value: Any) -> bool:
-        """Enter 恒提交；Ctrl+Enter / send 绑定亦可提交（newline 独占的键除外）"""
-        if kind == "submit":
-            # 产品约定：Enter = 提交；即使 newline 误配为 enter 也不改行为
-            return True
-        if _is_binding(kind, value, self.keys.get("newline")):
-            return False
-        if kind == "submit_ctrl":
-            return True
-        return _is_binding(kind, value, self.keys.get("send"))
+        self._sync_keymap()
+        act = self.keymap.resolve(Context.INPUT, kind, value)
+        return act in (Action.SUBMIT, Action.SEND)
 
     def _should_newline(self, kind: str, value: Any) -> bool:
-        """Shift+Enter（或配置的 newline 键）在输入框插入换行"""
-        if kind == "newline":
-            return True
-        if kind == "submit":
-            return False
-        return _is_binding(kind, value, self.keys.get("newline"))
+        self._sync_keymap()
+        return self.keymap.resolve(Context.INPUT, kind, value) == Action.NEWLINE
 
     def _is_mode_switch(self, kind: str, value: Any) -> bool:
         """shift+tab 始终切换模式；额外尊重设置中的 switch_mode 映射"""
         if kind == "mode_switch":
             return True
-        binding = self.keys.get("switch_mode") or "shift+tab"
-        tokens = _binding_tokens(binding)
-        if not tokens or tokens == ["shift+tab"]:
-            return kind == "mode_switch"
-        return _is_binding(kind, value, binding)
+        self._sync_keymap()
+        act = self.keymap.resolve(Context.INPUT, kind, value)
+        return act == Action.MODE_CYCLE
 
     def _mode_key_label(self) -> str:
-        return str(self.keys.get("switch_mode") or "shift+tab")
+        return self.keymap.label("switch_mode") or str(self.keys.get("switch_mode") or "shift+tab")
 
     def _settings_model_names(self, config) -> List[str]:
         names = config.list_model_names() or [config.model_name]

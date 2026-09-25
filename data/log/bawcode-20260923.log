@@ -1,0 +1,17 @@
+2026-09-23 12:43:52.579 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-23 12:43:52.579 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-23 12:43:52.590 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-23 12:43:52.826 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-23 12:43:52.826 [INFO ] [ui] 进入 TUI 界面
+2026-09-23 13:08:35.873 [WARN ] [prompt_loader] 提示词未知占位符: ^{no_such_var}^
+2026-09-23 13:08:36.334 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-23 13:08:36.335 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-23 13:08:36.335 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-23 13:08:36.335 [WARN ] [config] task_models.plan=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-23 13:08:36.335 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-23 13:08:36.335 [WARN ] [config] task_models.code=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-23 13:08:36.335 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-23 13:08:36.335 [WARN ] [config] task_models.review=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-23 13:08:36.336 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-23 13:08:36.357 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-23 13:08:36.357 [WARN ] [llm] 模型 deepseek-deepseek-flash 不可用（无凭证/未找到），回退 sensenova-sensenova-6.8-flash-lite

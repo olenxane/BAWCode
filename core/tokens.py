@@ -113,17 +113,25 @@ class TokenMeter:
             return self.last_context_tokens
 
     @property
-    def used_tokens(self) -> int:
-        """状态栏用量：优先 API total，否则最近一次上下文分词结果"""
-        if self.api_total_tokens > 0:
-            return self.api_total_tokens
+    def context_tokens(self) -> int:
+        """当前上下文占用（用于与 context_window 比）"""
         return self.last_context_tokens
+
+    @property
+    def billed_tokens(self) -> int:
+        """会话累计 API 用量（计费展示，不参与 usage_ratio）"""
+        return self.api_total_tokens
+
+    @property
+    def used_tokens(self) -> int:
+        """状态栏占用：当前上下文，而非会话累计"""
+        return self.context_tokens
 
     @property
     def usage_ratio(self) -> float:
         if not self.context_window:
             return 0.0
-        return min(1.0, self.used_tokens / float(self.context_window))
+        return min(1.0, self.context_tokens / float(self.context_window))
 
     def set_balance(self, amount: Optional[float], currency: str = "", source: str = "") -> None:
         self.balance = amount
@@ -131,14 +139,17 @@ class TokenMeter:
         self.balance_source = source or ("api" if amount is not None else "")
 
     def status_text(self) -> str:
-        used = self.used_tokens
+        ctx = self.context_tokens
+        billed = self.billed_tokens
         cw = self.context_window
         src = self.source
         if cw > 0:
             pct = self.usage_ratio * 100
-            token_part = f"tokens {used}/{cw} ({pct:.1f}%) [{src}]"
+            token_part = f"tokens {ctx}/{cw} ({pct:.1f}%) [{src}]"
         else:
-            token_part = f"tokens {used} [{src}]"
+            token_part = f"tokens {ctx} [{src}]"
+        if billed > 0:
+            token_part += f" · 累计 {billed}"
         if self.balance is not None:
             bal = f" · 余额 {self.balance}"
             if self.balance_currency:

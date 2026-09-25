@@ -4,6 +4,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
@@ -215,6 +216,10 @@ class LLM:
         return amount
 
     @staticmethod
+    def _ensure_call_id(call_id: Any) -> str:
+        return call_id if call_id else f"call_{uuid.uuid4().hex[:12]}"
+
+    @staticmethod
     def _map_api_messages(messages: List[dict]) -> List[dict]:
         """组装 DeepSeek/OpenAI Tool Calls 协议消息，透传 tool_call_id / tool_calls"""
         out: List[dict] = []
@@ -227,16 +232,13 @@ class LLM:
             if m.get("name"):
                 item["name"] = m["name"]
             if role == "tool":
-                # DeepSeek：tool 消息必须携带 tool_call_id
+                # DeepSeek：tool 消息必须携带 tool_call_id；缺 id 不降级为 system（会破坏配对）
                 tcid = m.get("tool_call_id")
                 if tcid:
                     item["tool_call_id"] = tcid
                 else:
-                    # 兼容无 id 的旧消息：降级为 system 注记，避免协议错误
-                    item = {
-                        "role": "system",
-                        "content": f"[tool:{m.get('tool_name') or 'tool'}]\n{item['content']}",
-                    }
+                    log.warn("丢弃无 tool_call_id 的 tool 消息: tool=%s", m.get("tool_name") or m.get("name") or "tool")
+                    continue
             if role == "assistant" and m.get("tool_calls"):
                 calls = []
                 for c in m["tool_calls"]:
@@ -250,7 +252,7 @@ class LLM:
                         args = json.dumps(args, ensure_ascii=False)
                     calls.append(
                         {
-                            "id": c.get("id") or "",
+                            "id": LLM._ensure_call_id(c.get("id")),
                             "type": "function",
                             "function": {"name": fn_name, "arguments": args},
                         }
@@ -343,9 +345,14 @@ class LLM:
 
     def _normalize(self, data: Any) -> dict:
         if isinstance(data, dict) and data.get("content") is not None and "tool_calls" in data:
+            normalized_calls = []
+            for c in data.get("tool_calls") or []:
+                if not isinstance(c, dict):
+                    continue
+                normalized_calls.append({**c, "id": self._ensure_call_id(c.get("id"))})
             return {
                 "content": data.get("content") or "",
-                "tool_calls": data.get("tool_calls") or [],
+                "tool_calls": normalized_calls,
                 "raw": data.get("raw", data),
                 "error": data.get("error"),
             }
@@ -369,7 +376,7 @@ class LLM:
                 args = {}
             tool_calls.append(
                 {
-                    "id": call.get("id"),
+                    "id": self._ensure_call_id(call.get("id")),
                     "name": function.get("name"),
                     "arguments": args,
                     "type": call.get("type") or "function",
