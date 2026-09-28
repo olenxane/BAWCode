@@ -2132,8 +2132,6 @@ class TuiApp:
 
     def show_settings_form(self, config) -> dict:
         """设置页：↑↓ 移动 · ←→ 修改选项 · Tab 切标签 · Enter 保存并退出 · Esc 放弃"""
-        from core import keyinput as _ki
-
         self.settings_mode = True
         self.settings_tab = 0
         self.settings_index = 0
@@ -2147,7 +2145,7 @@ class TuiApp:
         self._settings_baseline = self._settings_snapshot(config)
         self._settings_esc_stage = 0
         try:
-            _ki.flush_input()
+            _flush_input()
         except Exception:
             pass
         self.render()
@@ -2340,7 +2338,6 @@ class TuiApp:
     def show_sessions_form(self, items: List[dict], current_id: str = "", directory=None) -> Optional[dict]:
         """历史会话面板（阻塞）：{"action":"switch","id","title"} / {"action":"new"}；Esc 返回 None"""
         from core import session_store as _store
-        from core import keyinput as _ki
 
         self.sessions_mode = True
         self.sessions_items = list(items)
@@ -2350,7 +2347,7 @@ class TuiApp:
         self._sessions_confirm_delete = False
         self.sessions_notice = "↑↓ 选择 · Enter 切换 · d 删除 · Esc 取消"
         try:
-            _ki.flush_input()
+            _flush_input()
         except Exception:
             pass
         self.render()
@@ -2736,6 +2733,14 @@ class TuiApp:
         updates["model_name"] = config.model_name
         updates["task_models"] = config.task_models()
         return updates
+
+
+# ----- 输入栈：core.keyinput（prompt_toolkit 后端，旧实现在 _recycle/） -----
+
+def _flush_input():
+    from core import keyinput
+
+    keyinput.flush_input()
 
 
 def _key_direction(kind: str, value: str) -> Optional[str]:

@@ -1,5 +1,64 @@
 # Changelog
 
+## 2026-09-28 — 键位定案：Enter 直接发送，Ctrl+Enter 换行
+
+- 用户决策：reader 子类恢复 Shift+Enter/Ctrl+Enter 修饰位的方案实现较复杂、
+  可能引入新问题，不采用（相关草稿已撤销）。
+- `core/keyinput.py`：Escape+ControlM 折叠由 submit_ctrl 改为 **newline**——
+  Ctrl+Enter 物理键 → 换行；Ctrl+J 保持换行（同形 ControlJ，VT 路径下
+  Ctrl+Enter 落为 \n 亦兼容）；**Enter 直接发送**；Shift+Enter 与 Enter
+  同形 → 提交（事件流固有限制）；Alt+Enter 同形 → 换行。
+- submit_ctrl 事件不再产生：keymap 的 `send=ctrl+enter` 绑定随之闲置
+  （如需独立发送键可配置 `send=f5` 等，Enter 始终发送）；
+  `ui.newline` 配置值现为标签，物理键固定。
+- `develop/test_keyinput_pt.py` 断言同步（Ctrl+Enter/树上/回退用例改指 NEWLINE）。
+
+## 2026-09-28 — PT 输入栈转正：input_pt.py 更名 core/keyinput.py，旧实现入回收站
+
+- 真机验证通过后正式切换：`core/input_pt.py` → `core/keyinput.py`（自包含：
+  本地定义 KeyEvent/TICK，去除对旧模块的依赖）；旧实现（msvcrt + 自研
+  解码/FSM/滴灌）迁入 `_recycle/keyinput.py`，其内部单测随之移入
+  `_recycle/develop/`（test_keyinput_unit / test_keyinput_decoder /
+  test_ime_bytes / minimal_repro）。
+- ui.py 摘除双后端开关（`_input_mod`/`_resolve_input_backend`），读取入口
+  直接走 `core.keyinput`；config 默认值还原；prompt_toolkit 转正为必需依赖
+  （requirements `>=3.0.53`）。
+- 快捷键兼容性（翻译层 → keymap 解析集成验证，55 项无头测试）：
+  Enter→SUBMIT、Ctrl+Enter→SEND、Ctrl+J→NEWLINE、Shift+Tab→MODE_CYCLE、
+  Tab→COMPLETE/FOCUS_NEXT、PageUp/滚轮→SCROLL、编辑键→CARET_*/BACKSPACE/
+  DELETE/ESCAPE、字符→INSERT、可配置 send=f5 命中 SEND、Ctrl+Up→SCROLL_UP
+  全部与旧栈一致。interrupt 由读键循环消费（ui.py 1367）、clear 的 ctrl+u
+  token 在编译表无落点均为旧栈既有行为，事件级两栈一致。
+- 测试改造：test_input_pt_adapter → `develop/test_keyinput_pt.py`（追加
+  keymap 集成段）；test_key_binding 摘除旧栈 Decoder/KeyReader 段；
+  test_mouse_wheel 的 SGR 字节段替换为 Win32 鼠标 data 形态断言；
+  test_context_injection 源码断言更新。
+- 已知语义差异（不变）：Shift+Enter 物理键在事件流下不可区分，Ctrl+J 为
+  换行候选（旧栈该键被丢弃）；Ctrl+Enter 折叠回 submit_ctrl 语义不变。
+
+## 2026-09-28 — PT 输入后端（Phase 1）：keyinput 可切换替代实现
+
+- 新增 `core/input_pt.py`：prompt_toolkit（3.0.53）输入后端，公开契约与
+  keyinput 完全一致（read_key_event/read_events/read_key/flush_input/
+  direction_of/supported_kinds + 同一 KeyEvent 类型）；数据源同为 Win32
+  INPUT_RECORD 事件流，差异只在翻译层。
+- 翻译层：KeyPress → KeyEvent 纯函数（`translate_key_presses`），枚举键
+  先于 str 判断（Keys 是 str 混入枚举）；序列折叠 Escape+ControlM→submit_ctrl、
+  Escape+可见字符→char（alt 前缀对齐 legacy）；BracketedPaste 自带 data 或
+  同批可见字符组装为 paste；WindowsMouseEvent "button;type;X;Y" → mouse_* 事件
+  （坐标 0-based 单元格，与 legacy 协议一致）。
+- 读取循环：后台线程阻塞读键 + 队列，`read_events(0)` 非阻塞供拍帧泵；
+  raw_mode 与 legacy get_reader 同生命周期（启动进入，进程结束释放）。
+- 切换开关：`config.json` `system.input_backend = "legacy" | "pt"`
+  （默认 legacy，行为零变化）或环境变量 `BAW_INPUT_BACKEND=pt`；
+  ui.py 读取入口（_read_key/_read_events/_key_direction/_flush_input）
+  统一走后端选择，bind_config 时解析。
+- 已知差异（原型真机验证结论）：Shift+Enter 事件流下与 Enter 不可区分，
+  Ctrl+J 映射为 newline 作为换行候选（legacy 路径该键被丢弃）。
+- 测试：`develop/test_input_pt_adapter.py` 翻译层 30 项无头单测全绿；
+  既有 6 套件（layout/keymap/textbuf/session_store/mouse_wheel/paint_throttle）
+  回归全绿；prompt_toolkit 为可选依赖（requirements 注释行）。
+
 ## 2026-09-28 — 显示宽度改用 wcwidth 库，core/layout.py 移入回收站
 
 - `core/layout.py` 迁入 `_recycle/layout.py`（回收站，保留备查不参与导入）；

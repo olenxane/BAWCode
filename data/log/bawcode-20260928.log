@@ -1,0 +1,46 @@
+2026-09-28 17:07:46.522 [INFO ] [ui] 输入后端: legacy
+2026-09-28 17:07:58.918 [INFO ] [ui] 输入后端: legacy
+2026-09-28 17:07:59.060 [INFO ] [ui] 输入后端: pt
+2026-09-28 17:08:02.153 [INFO ] [memory] 记忆会话已初始化: Agent.md=C:\Users\ADMINI~1\AppData\Local\Temp\tmp78t1wg5w\memory\Agent.md 项目记忆=C:\Users\ADMINI~1\AppData\Local\Temp\tmp78t1wg5w\memory\Projects\Test-00000000.md 自动压缩=True 阈值=80%
+2026-09-28 17:08:02.163 [INFO ] [memory] 已开启新会话: 20260928-170802-0113
+2026-09-28 17:08:02.180 [INFO ] [memory] 会话已切换: 这是一个非常长的中文任务标题… · id=20260928-170802-e89b · 4条消息
+2026-09-28 17:08:02.180 [INFO ] [session_store] 会话已删除: C:\Users\ADMINI~1\AppData\Local\Temp\tmp78t1wg5w\sessions\Test-00000000\20260928-170802-e89b.json
+2026-09-28 17:08:02.666 [INFO ] [ui] 进入 TUI 界面
+2026-09-28 17:08:02.667 [INFO ] [ui] 离开 TUI 界面
+2026-09-28 17:20:30.163 [INFO ] [memory] 记忆会话已初始化: Agent.md=C:\Users\ADMINI~1\AppData\Local\Temp\tmpdl2tpul7\memory\Agent.md 项目记忆=C:\Users\ADMINI~1\AppData\Local\Temp\tmpdl2tpul7\memory\Projects\Test-00000000.md 自动压缩=True 阈值=80%
+2026-09-28 17:20:30.191 [INFO ] [memory] 已开启新会话: 20260928-172030-30aa
+2026-09-28 17:20:30.206 [INFO ] [memory] 会话已切换: 这是一个非常长的中文任务标题… · id=20260928-172030-5286 · 4条消息
+2026-09-28 17:20:30.206 [INFO ] [session_store] 会话已删除: C:\Users\ADMINI~1\AppData\Local\Temp\tmpdl2tpul7\sessions\Test-00000000\20260928-172030-5286.json
+2026-09-28 17:20:53.288 [WARN ] [prompt_loader] 提示词未知占位符: ^{no_such_var}^
+2026-09-28 17:20:53.450 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-28 17:20:53.450 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-28 17:20:53.450 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-28 17:20:53.450 [WARN ] [config] task_models.plan=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-28 17:20:53.450 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-28 17:20:53.450 [WARN ] [config] task_models.code=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-28 17:20:53.450 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-28 17:20:53.450 [WARN ] [config] task_models.review=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-28 17:20:53.686 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-28 17:20:53.815 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-28 17:20:53.815 [WARN ] [llm] 模型 deepseek-deepseek-flash 不可用（无凭证/未找到），回退 sensenova-sensenova-6.8-flash-lite
+2026-09-28 17:22:37.035 [INFO ] [memory] 记忆会话已初始化: Agent.md=C:\Users\ADMINI~1\AppData\Local\Temp\tmpmhvds3ew\memory\Agent.md 项目记忆=C:\Users\ADMINI~1\AppData\Local\Temp\tmpmhvds3ew\memory\Projects\Test-00000000.md 自动压缩=True 阈值=80%
+2026-09-28 17:22:37.049 [INFO ] [memory] 已开启新会话: 20260928-172237-8a9c
+2026-09-28 17:22:37.075 [INFO ] [memory] 会话已切换: 这是一个非常长的中文任务标题… · id=20260928-172237-fc08 · 4条消息
+2026-09-28 17:22:37.075 [INFO ] [session_store] 会话已删除: C:\Users\ADMINI~1\AppData\Local\Temp\tmpmhvds3ew\sessions\Test-00000000\20260928-172237-fc08.json
+2026-09-28 17:22:37.278 [INFO ] [ui] 进入 TUI 界面
+2026-09-28 17:22:37.279 [INFO ] [ui] 离开 TUI 界面
+2026-09-28 17:46:18.187 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-28 17:46:18.187 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-28 17:46:18.188 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-28 17:46:18.386 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-28 17:46:18.386 [INFO ] [ui] 进入 TUI 界面
+2026-09-28 17:46:37.716 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-28 17:46:37.716 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-28 17:46:37.718 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-28 17:46:37.902 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-28 17:46:37.907 [INFO ] [ui] 进入 TUI 界面
+2026-09-28 17:46:42.838 [INFO ] [main] 任务开始: 仨久啊话费卡九分裤阿法\n啊防火墙阿帆白金卡
+2026-09-28 17:46:42.950 [INFO ] [main] 注入系统提示词: system_prompt.md
+2026-09-28 17:46:42.951 [INFO ] [llm] 复杂度判定: low（21字）
+2026-09-28 17:46:47.286 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=190字 tool_calls=0 用时=4.23s（第1次尝试）
+2026-09-28 17:46:47.286 [INFO ] [main] 任务完成（共1轮推理）
