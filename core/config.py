@@ -2,7 +2,7 @@
 import copy
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from core.log import get_logger, init as init_logging
 
@@ -78,7 +78,6 @@ def default_config() -> dict:
             "scroll_hold_ms": 150,
             "scroll_max_step": 20,
             "tip_interval": 5,
-            "settings_debounce_ms": 350,
         },
         "llm": {"retry_times": 3, "retry_delay": 1.0},
         # 分级日志（core/log.py）：level 全局阈值 debug/info/warn/error/off；
@@ -638,66 +637,6 @@ class Config:
             encoding="utf-8",
         )
         log.debug("配置已保存: %s", self.config_path)
-
-    # 设置界面批量更新（不提供外部 API）
-    def update_settings(self, updates: dict) -> None:
-        if not updates:
-            return
-        log.debug("更新设置项: %s", ", ".join(sorted(updates.keys())))
-        if "active_model_name" in updates:
-            self.switch_model(updates["active_model_name"])
-        if "theme" in updates:
-            self.data.setdefault("ui", {})["theme"] = updates["theme"]
-            self.theme = updates["theme"]
-        if "mode" in updates:
-            self.data.setdefault("ui", {})["mode"] = updates["mode"]
-            self.mode = updates["mode"]
-        if "api_key" in updates:
-            provider = self.get_provider()
-            if provider:
-                provider["api_key"] = updates["api_key"]
-        if "base_url" in updates:
-            provider = self.get_provider()
-            if provider:
-                provider["base_url"] = normalize_base_url(str(updates["base_url"] or ""))
-        if "balance_url" in updates:
-            provider = self.get_provider()
-            if provider:
-                provider["balance_url"] = updates["balance_url"]
-        if "temperature" in updates:
-            provider = self.get_provider()
-            if provider:
-                provider["temperature"] = float(updates["temperature"])
-        # 模型表编辑：upsert 当前 active 模型字段
-        provider = self.get_provider()
-        if provider:
-            mid = self.data.get("active_model_id")
-            for model in provider.get("models") or []:
-                if model.get("model_id") == mid:
-                    if "context_window" in updates:
-                        model["context_window"] = int(updates["context_window"])
-                    if "max_tokens" in updates:
-                        model["max_tokens"] = int(updates["max_tokens"])
-                    if "model_id" in updates and updates["model_id"]:
-                        new_mid = str(updates["model_id"])
-                        model["model_id"] = new_mid
-                        self.data["active_model_id"] = new_mid
-                    break
-        self.apply_active()
-
-    def upsert_provider(self, provider: dict) -> None:
-        pid = provider.get("provider_id") or ""
-        if not pid:
-            return
-        providers = self.data.setdefault("providers", [])
-        for i, item in enumerate(providers):
-            if item.get("provider_id") == pid:
-                providers[i] = _deep_merge(item, provider)
-                break
-        else:
-            providers.append(provider)
-        # 自动生成 model_name 仅展示层使用 make_model_name
-        self.apply_active()
 
     def list_themes(self) -> List[str]:
         """扫描 data/theme/*.json；无效文件在 load_theme 过滤"""

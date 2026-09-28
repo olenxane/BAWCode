@@ -53,9 +53,6 @@ class TextBuffer:
         self._text_cache = s
         return s
 
-    def to_list(self) -> List[str]:
-        return list(self.to_text())
-
     def set_text(self, text: str, cursor: Optional[int] = None) -> None:
         gap = max(64, len(text))
         self._data = [""] * gap + list(text)
@@ -96,12 +93,6 @@ class TextBuffer:
             i += 1
         self.set_cursor(i)
 
-    def move_doc_home(self) -> None:
-        self.set_cursor(0)
-
-    def move_doc_end(self) -> None:
-        self.set_cursor(self.length)
-
     def word_left(self) -> None:
         text = self.to_text()
         i = self._gap_start
@@ -127,14 +118,6 @@ class TextBuffer:
         i = self._gap_start
         while i > 0 and not text[i - 1].isspace():
             i -= 1
-        return i
-
-    def word_end(self) -> int:
-        text = self.to_text()
-        i = self._gap_start
-        n = self.length
-        while i < n and not text[i].isspace():
-            i += 1
         return i
 
     # ----- 编辑 -----

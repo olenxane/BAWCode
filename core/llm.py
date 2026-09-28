@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, List, Optional
 
 try:
     import openai
@@ -392,57 +392,6 @@ class LLM:
         action, reason = policy.evaluate(tool_name, args, getattr(self.config, "mode", policy.MODE_AUTO))
         log.debug("工具策略 %s -> %s(%s)", tool_name, action, reason)
         return action, reason
-
-    def run_tool_calls(self, tool_calls: List[dict], mode: Optional[str] = None) -> List[dict]:
-        """执行工具：按策略直接放行；需确认的由外层处理，这里仅执行已放行项"""
-        mode = mode or getattr(self.config, "mode", policy.MODE_AUTO)
-        results = []
-        for call in tool_calls:
-            name = call.get("name")
-            args = call.get("arguments") or {}
-            if not isinstance(args, dict):
-                args = {}
-            action, reason = policy.evaluate(name, args, mode)
-            if action != policy.ALLOW:
-                results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id"),
-                        "tool_name": name,
-                        "content": policy.default_reject_message(reason),
-                        "type": "tool",
-                        "pending": action == policy.CONFIRM,
-                        "call": call,
-                    }
-                )
-                continue
-            if not register.has_tool(name or ""):
-                output = f"工具不存在: {name}"
-                log.warn("调用未注册工具: %s", name)
-            else:
-                started = time.monotonic()
-                try:
-                    output = register.call(name, **args)
-                    log.debug("工具 %s 完成，用时 %.2fs", name, time.monotonic() - started)
-                except TypeError as e:
-                    output = f"工具参数错误: {e}"
-                    log.error("工具 %s 参数错误: %s", name, e)
-                except Exception as e:
-                    output = f"工具执行错误: {e}"
-                    log.error("工具 %s 执行错误: %s", name, e)
-            text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
-            results.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.get("id"),
-                    "tool_name": name,
-                    "content": text,
-                    "type": "tool",
-                    "pending": False,
-                    "call": call,
-                }
-            )
-        return results
 
     def execute_approved_tool(self, call: dict) -> dict:
         """确认通过后执行单个工具"""

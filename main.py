@@ -14,6 +14,7 @@ from core import policy
 from core import project_identity
 from core import prompt_loader
 from core import register
+from core import session_store
 from core import tools as tools_mod  # noqa: F401
 from core import ui
 from core.config import Config
@@ -54,6 +55,40 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         ui.settings(ctx["config"])
         ctx["llm"].refresh_from_config(ctx["config"])
         ctx["app"].bind_config(ctx["config"])
+        return True
+
+    @commands.register("/sessions", hint="历史会话 · 切换/新建/删除", source="builtin")
+    def _sessions(ctx, args):
+        sess = ctx["session"]
+        directory = session_store.sessions_dir(ctx["config"], sess.project_id)
+        rows = [
+            {
+                "id": "",
+                "action": "new",
+                "title": "＋ 新建会话",
+                "created_at": "",
+                "updated_at": "",
+                "message_count": 0,
+                "path": None,
+            }
+        ]
+        rows.extend(session_store.list_sessions(directory))
+        result = ctx["app"].show_sessions_form(rows, current_id=sess.session_id, directory=directory)
+        if not result:
+            return True
+        if result.get("action") == "new":
+            sess.save_session()
+            sess.start_new_session()
+            ctx["app"].status = "新会话已开启"
+            return True
+        data = session_store.load_session_data(directory, result.get("id"))
+        if not data:
+            _echo(ctx, f"会话加载失败: {result.get('id')}")
+            return True
+        sess.save_session()
+        sess.switch_to(data)
+        ctx["app"]._tree_follow_tail = True  # 切换后贴底显示恢复的消息
+        ctx["app"].status = f"已切换: {sess.session_title or sess.session_id}"
         return True
 
     @commands.register("/model", hint="切换模型 /model <model_name>", usage="/model <provider-model>", source="builtin")
@@ -126,11 +161,10 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         ctx["app"].status = f"步骤 {len(ctx['session'].steps)}"
         return True
 
-    @commands.register("/clear", hint="清空会话", source="builtin")
+    @commands.register("/clear", hint="清空并开启新会话", source="builtin")
     def _clear(ctx, args):
-        ctx["session"].messages.clear()
-        ctx["session"].plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
-        ctx["session"].steps = []
+        ctx["session"].save_session()
+        ctx["session"].start_new_session()
         ctx["app"].task = ""
         return True
 
@@ -171,15 +205,10 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
 
 
 def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict) -> dict:
-    """确认框占用输入区；处理三种选择"""
+    """确认走 _confirm_loop 的阻塞行输入（1 允许一次 / 2 始终允许 / 3 拒绝）"""
     app.pending_tool = {"name": call.get("name"), "arguments": call.get("arguments") or {}}
-    app.confirm_index = 0
-    app.confirm_reject_edit = False
-    app.reject_buffer = []
     result = app.read_line(config=None)
     app.pending_tool = None
-    app.confirm_index = 0
-    app.confirm_reject_edit = False
     if result == "__ALLOW_ONCE__":
         return llm.execute_approved_tool(call)
     if result == "__ALLOW_ALWAYS__":
@@ -386,7 +415,6 @@ def main() -> None:
     app = ui.get_app()
     app.bind_config(config)
     app.token_meter = llm.meter
-    _ = tools_mod
     _register_commands(llm, session, config, app)
 
     app.enter()
@@ -407,15 +435,19 @@ def main() -> None:
                 app.token_meter = llm.meter
                 if result == "EXIT":
                     session.save_longterm()
+                    session.save_session()
                     break
                 if isinstance(result, dict) and result.get("reason") in ("unknown", "no_handler"):
                     session.add_message("system", f"命令问题: {result}", type="help")
                 _sync(app, session)
+                session.save_session()
                 continue
             _agent_turn(llm, session, text, app)
+            session.save_session()
     except KeyboardInterrupt:
         log.info("用户中断（Ctrl+C）")
         session.save_longterm()
+        session.save_session()
     finally:
         app.leave()
         print("BAWCode 已退出。")

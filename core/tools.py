@@ -1,6 +1,7 @@
 #该部分是工具的具体实现，需要补齐常用工具，包含：基础的文件编辑、computer-use相关、终端命令调用、程序调用、计划编写、步骤生成、步骤更新、计划更新
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -13,6 +14,20 @@ log = get_logger("tools")
 
 # 子进程默认超时（秒）
 DEFAULT_TIMEOUT = 60
+
+
+def _console_output_encoding() -> str:
+    """控制台输出代码页（中文 Windows 默认 cp936）；子进程输出按它解码"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            cp = ctypes.windll.kernel32.GetConsoleOutputCP()
+            if cp:
+                return f"cp{cp}"
+        except Exception:
+            pass
+    return "utf-8"
 
 
 def _session():
@@ -53,7 +68,7 @@ def execute_command(command: str, cwd: Optional[str] = None, timeout: int = DEFA
             capture_output=True,
             text=True,
             timeout=timeout,
-            encoding="utf-8",
+            encoding=_console_output_encoding(),
             errors="replace",
         )
         output = (result.stdout or "") + (result.stderr or "")
@@ -251,7 +266,7 @@ def run_program(
             capture_output=True,
             text=True,
             timeout=timeout,
-            encoding="utf-8",
+            encoding=_console_output_encoding(),
             errors="replace",
         )
         output = (result.stdout or "") + (result.stderr or "")

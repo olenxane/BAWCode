@@ -1,5 +1,175 @@
 # Changelog
 
+## 2026-09-28 — 显示宽度改用 wcwidth 库，core/layout.py 移入回收站
+
+- `core/layout.py` 迁入 `_recycle/layout.py`（回收站，保留备查不参与导入）；
+- 宽度计算统一走 wcwidth（requirements 新增 `wcwidth>=0.8.0`）：
+  - `core/ui.py`：`_char_width` 直接调用 `wcwidth`（控制字符 -1 记 1 列），
+    `split_at_cells`/`_wrap_line`/`Layout`（增量折行缓存）并入 ui.py，逻辑不变；
+  - `core/memory.py`：`_clip_title` 逐字符调用 `wcwidth`；
+- 行为对比：仅 ZWJ（U+200D）与变体选择符（U+FE0F）由 1 列修正为 0 列
+  （与 rich 渲染口径一致），其余字符宽度逐一比对无差异；
+- `develop/test_input_layout.py` 改从 `core.ui` 导入，17 项全绿。
+
+## 2026-09-26 — 历史会话自动保存 + /sessions 切换面板
+
+### 存储层（core/session_store.py，新文件）
+
+- 按项目隔离目录 `data/sessions/{project_id}/`（project_id 空回落 `_default`），
+  文件名 `{YYYYMMDD-HHMMSS-hexx}.json`（时间可排序、Windows 文件名安全）；
+- 原子写入：`.tmp` + `os.replace`（防 Ctrl+C 写一半损坏），utf-8 + ensure_ascii=False；
+- `list_sessions` 扫描目录按 updated_at 倒序（损坏文件跳过不阻塞面板），
+  `load_session_data` / `delete_session_data`；不做索引文件，磁盘即事实来源。
+
+### 会话状态（core/memory.py）
+
+- `Memory` 增 `session_id/session_created_at/session_title`，目录经
+  `memory.sessions_dir` 配置（默认 `data/sessions`）；
+- `save_session()`：空会话不写盘；标题派生自第一条 `type=="task"` 用户输入
+  （按显示宽度截 30 列，中文占 2 列）；messages/plan/steps 原样落盘，
+  恢复后与 `build_messages`/`_api_session_item` 过滤逻辑天然兼容；
+  OSError 只记日志不上抛（自动保存不拖垮主循环）；
+- `switch_to(data)` 原地替换状态（main/ui 持有同一实例）；`start_new_session()`
+  旋转 ID 并清空。
+
+### UI（core/ui.py）
+
+- 照设置页模态范式新增历史会话面板：`sessions_mode` 标志 + `_compose_plain`
+  渲染分支 + `show_sessions_form` 独立按键循环（不进 keymap/keyinput）；
+- ↑↓ 选择 · Enter 切换/新建 · d 或 Del 删除（二次确认，当前会话与"＋ 新建会话"
+  行不可删）· Esc/Ctrl+C 取消；视口滚动与选中反白复用设置页算法。
+
+### 主循环（main.py）
+
+- 新增 `/sessions` 命令（"＋ 新建会话" 置顶 + 磁盘列表）；
+- `/clear` 改为"保存并开启新会话"（旧会话可随时 /sessions 切回）；
+- 自动保存：每轮命令/对话结束 + `/exit` + Ctrl+C 均写盘。
+
+### 测试
+
+- `develop/test_session_store.py`：空会话不写盘、round-trip 保真
+  （tool_calls/tool 消息）、switch_to 原地替换、标题截断、删除生效——19 项全绿；
+- 真实运行（Windows Terminal + cmd）：/help 触发自动落盘 → /sessions 面板渲染 →
+  /clear 开新会话 → 切回恢复消息 → d×2 删除（当前会话正确拒绝）→ /exit 干净退出。
+
+## 2026-09-25 — 滚动条滑块鼠标拖拽 + 轨道点击翻页
+
+### 事件层（core/keyinput.py）
+
+- `_mouse_record_event(button_state, event_flags, x, y)` 扩展：左键按下/抬起 →
+  `mouse_down/mouse_up`，移动 → `mouse_move`（坐标 0-based "x,y"），
+  双击与右/中键忽略，滚轮行为不变；
+- SGR 字节路径 `_mouse_sgr` 同步语义化（cb&32=移动、M=按下、m=抬起，
+  坐标 1-based→0-based 归一）；
+- `supported_kinds` 增加 mouse_down/mouse_move/mouse_up。
+
+### UI 层（core/ui.py）
+
+- `_compose_plain` 滚动条分支每帧向 `_row_meta` 写几何快照
+  （scrollbar_on/x/body_top/scroll_total/thumb_h/thumb_top）；
+- 滑块几何抽为模块级 `_scrollbar_geometry(total, tree_h, scroll)`（渲染与拖拽共用）；
+- `_dispatch_key` 顶部路由 `mouse_*` → `_on_mouse`（不进键表、不触发键位重编译）；
+- `_on_mouse` 拖拽状态机：down 命中滑块记录 grab_offset 进入拖拽，命中轨道
+  上/下段翻页 ±tree_h；move 按滑块几何反算 scroll（`_set_scroll` 共用：
+  光标同步夹进视口、到底恢复贴底）；up 结束；列外/设置页/Logo 占位忽略；
+- 坐标 y 与 compose 行号按 1:1 映射，`_MOUSE_Y_OFFSET` 常量预留校准；
+- `_scroll_tree_by` 收敛为 `_set_scroll` 的薄包装。
+
+### 测试
+
+- 记录/SGR 新用例（按下/抬起/移动/双击忽略/右键忽略/坐标归一）；
+- 拖拽模拟：快照注入 → 抓滑块连续 move 单调滚动 → up 后 move 失效 →
+  渲染后滑块跟随 → 轨道翻页不进拖拽态 → 列外点击无副作用；
+- 全部套件通过（test_mouse_wheel 40 断言）。
+
+## 2026-09-25 — 滚动延迟修复 + 会话区滚动条（替代 ↑N/↓N 行数）
+
+### 滚动延迟（真机反馈：快滚明显滞后于手）
+
+- 根因：`read_line` 每帧只分发 1 个事件（20fps → 20 事件/秒上限），WT 滚轮
+  可达 ~25 事件/秒（探针实测），积压线性增长；`_scroll_tree_by` 每事件
+  各自 render 又放大开销。
+- 修复：
+  - `read_line` 每帧分发本批**全部**事件（遇 submit/interrupt 返回即退出），
+    顺带消除长按退格/方向键的同类回放滞后；
+  - `_scroll_tree_by` 不再逐事件渲染，帧尾统一渲染（一帧 N 个滚轮事件只画一帧）。
+
+### 会话区滚动条
+
+- 取消原「↑N / ↓N」行数提示，改为右侧 1 列滚动条（用户选定样式）：
+  `█` 滑块（accent）+ `│` 轨道（dim）+ `▲▼` 端点箭头（dim）；
+- 会话区内容列宽 w→w-1 固定预留，内容不足一屏时该列留空（宽度不跳变）；
+- 滑块长度 `max(1, round(tree_h²/total))`，位置随 scroll 比例映射；
+- 树行按显示宽度裁剪/pad，宽字符不劈裂。
+
+### 测试
+
+- `test_mouse_wheel.py`：树焦点回归改为显式 render（分发不再自带渲染）；
+  新增 compose 断言——超高内容出现 `█│▲▼` 且无 `[↑↓]数字`、不足一屏无滚动条；
+- 全部套件通过。
+
+## 2026-09-25 — 修复：会话区鼠标滚轮滚动在 WT/ConPTY 下不生效
+
+### 取证（develop/probe_mouse_input.py，真实 WT 窗口）
+
+- 仅开 `?1000h+?1006h`：8 秒滚动期间控制台输入队列 **0 条滚轮记录**——
+  WT 未把滚轮转发给程序（被终端自己消费）；
+- 补开 `?1002h`（按钮事件跟踪）后：滚轮以原生 `MOUSE_EVENT` 记录到达
+  （每格 `delta=±128`，点击/移动同样到达）。
+
+### 修复
+
+| 层 | 改动 |
+|----|------|
+| `core/ui.py` enter/leave | 鼠标声明补 `?1002h`（对应 `?1002l` 关闭） |
+| `core/keyinput.py` | INPUT_RECORD union 补 MOUSE_EVENT_RECORD；结构化读键路径解析滚轮记录 → `mouse_wheel` 事件（`_mouse_record_event`，移动/按钮忽略） |
+| `core/ui.py` `_scroll_tree_by` | 滚动视口时把树光标同步夹进视口——否则树焦点下「光标行可见」夹紧把上滚立即弹回贴底 |
+
+### 行为说明
+
+- 鼠标捕获开启后，终端内文本选择改用 **Shift+拖拽**（WT 保留 Shift 给原生选择）。
+- 点击/移动事件被忽略，不产生副作用；`BAW_MOUSE=0` 仍可整体关闭。
+
+### 测试
+
+- `test_mouse_wheel.py` 新增：记录解析（±128/±120、移动/按钮忽略）+ 树焦点滚动回归（上滚持续有效不回弹）
+- 全部套件通过；pyflakes 零告警
+
+## 2026-09-25 — 确认框收敛 / 设置页与宽度修复 / RAG 独立 / 死代码清理
+
+### 修复
+
+| # | 问题 | 修复 |
+|---|------|------|
+| #3 | 确认框 TUI 版（`_compose_confirm` + confirm_* 状态 + keymap DIALOG 上下文）从未参与交互——实际确认一直走 `_confirm_loop` 阻塞行输入 | 删除死路径；保留阻塞版为唯一实现；`main._handle_tool_confirm` 不再设置死状态 |
+| #4 | `_compose_plain` 输入区宽度用硬编码 `"> "` 计算，自定义提示符（待完善> / 计划> 等）下折行与光标错位 | `inner_w` 改按 `_display_width(self._input_prompt)` |
+| #7 | 设置页可退格删字符却无法输入（char 分支空操作） | 删除内联 backspace 编辑分支，文本编辑统一走 Enter 后行输入 |
+| #8 | `_settings_apply` 模型段 `updates` 字典被系统段无条件覆盖 | 模型段改名 `model_updates`，返回值语义不再误导 |
+| #10 | `execute_command`/`run_program` 以 utf-8 解码子进程输出，中文 Windows（cp936）下乱码 | 按控制台输出代码页（`GetConsoleOutputCP`）解码，非 win32 回落 utf-8 |
+| #12 | 结构化读键路径丢弃 Ctrl 字母组合（uChar 为控制字符时返回 None） | 补 `_CTRL` 表映射为 hotkey |
+
+### 重构
+
+- **RAG 独立成 `core/rag.py`**：`RagStore`（内存文档 + 关键词兜底检索，外部接口挂点不变）；
+  `memory.py` 的 `rag_add/rag_query` 变为委托。行为不变，后续向量库实现落在 rag.py。
+- **死代码删除**（此前审查批准的批次）：
+  - ui：`_compose_confirm`、`confirm_index/confirm_reject_edit/reject_buffer/reject_cursor`、
+    `_schedule_paint/_flush_paint/_do_paint/render_partial_input`、`_append_text_burst`、
+    `_read_key_windows/_read_key_posix`、`set_commands_source`、`_event_token/_binding_tokens/_is_binding/_action_hit/_should_submit/_should_newline`（测试改用 keymap 公开 API）、
+    `_mode_key_label`、`isinstance(buffer, TextBuffer)` 双路径（buffer 恒为 TextBuffer）、
+    `_cursor/_cursor_screen_row/_cursor_screen_col/_logo_done/_paint_at/_paint_pending/_last_frame_lines`、
+    设置页防抖机制（`settings_debounce_*`/`_settings_text_dirty`/paint 防抖——随 #7 失去全部触发点）
+  - keyinput：`_peek_enter_mod`、`_queue_depth`、`Decoder.chars`、`_buf`、`feed_printable_run`、`KeyEvent.__iter__`
+  - textbuf：`move_doc_home/move_doc_end/to_list/word_end`；layout：`total_rows`
+  - config：`update_settings/upsert_provider`、默认配置中 `settings_debounce_ms`；llm：`run_tool_calls`；commands：`_plugins_loaded`
+  - 各文件未使用导入清理；`Context.DIALOG` 枚举移除（UI 无产生路径）
+
+### 测试
+
+- 全部 10 个套件通过（textbuf/keymap/keyinput_unit/key_binding/input_layout/mouse_wheel/keyinput_decoder/context_injection/paint_throttle/ime_bytes）
+- `test_key_binding.py` 改为对 `core.keymap` 公开 API 断言；`test_paint_throttle.py` 移除兼容空壳场景
+- 冒烟：h/l/中文端到端键入、自定义提示符渲染、确认路由、rag 读写、设置页组合渲染
+
 ## 2026-09-25 — 修复：单字符树绑定劫持输入框（h/l/` 无法打字）
 
 ### 问题

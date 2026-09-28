@@ -1,0 +1,59 @@
+2026-09-26 12:15:09.578 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-26 12:15:09.578 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-26 12:15:09.578 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-26 12:15:09.813 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-26 12:15:09.813 [INFO ] [ui] 进入 TUI 界面
+2026-09-26 12:15:12.417 [INFO ] [main] 任务开始: 111
+2026-09-26 12:15:12.506 [INFO ] [main] 注入系统提示词: system_prompt.md
+2026-09-26 12:15:12.508 [INFO ] [llm] 复杂度判定: low（3字）
+2026-09-26 12:15:14.640 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=72字 tool_calls=0 用时=2.02s（第1次尝试）
+2026-09-26 12:15:14.640 [INFO ] [main] 任务完成（共1轮推理）
+2026-09-26 12:15:23.842 [INFO ] [main] 任务开始: main.py是啥
+2026-09-26 12:15:23.871 [INFO ] [llm] 复杂度判定: low（9字）
+2026-09-26 12:15:25.229 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=2字 tool_calls=1 用时=1.36s（第1次尝试）
+2026-09-26 12:15:25.242 [INFO ] [llm] 执行工具 read（已确认）
+2026-09-26 12:15:33.188 [INFO ] [llm] LLM 响应 model=sensenova-6.8-flash-lite content=1072字 tool_calls=0 用时=7.92s（第1次尝试）
+2026-09-26 12:15:33.188 [INFO ] [main] 任务完成（共2轮推理）
+2026-09-26 12:24:49.914 [WARN ] [prompt_loader] 提示词未知占位符: ^{no_such_var}^
+2026-09-26 12:24:50.032 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-26 12:24:50.032 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-26 12:24:50.032 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-26 12:24:50.032 [WARN ] [config] task_models.plan=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-26 12:24:50.032 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-26 12:24:50.032 [WARN ] [config] task_models.code=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-26 12:24:50.032 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-26 12:24:50.032 [WARN ] [config] task_models.review=deepseek-deepseek-flash 不可用，回退激活模型 sensenova-sensenova-6.8-flash-lite
+2026-09-26 12:24:50.260 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-26 12:25:24.976 [WARN ] [config] 任务模型无 api_key，视为不可用: deepseek-deepseek-flash
+2026-09-26 12:25:24.976 [WARN ] [llm] 模型 deepseek-deepseek-flash 不可用（无凭证/未找到），回退 sensenova-sensenova-6.8-flash-lite
+2026-09-26 12:25:25.309 [INFO ] [ui] 进入 TUI 界面
+2026-09-26 12:25:25.309 [INFO ] [ui] 离开 TUI 界面
+2026-09-26 13:09:22.672 [INFO ] [memory] 记忆会话已初始化: Agent.md=C:\Users\ADMINI~1\AppData\Local\Temp\tmp7bbhw10s\memory\Agent.md 项目记忆=C:\Users\ADMINI~1\AppData\Local\Temp\tmp7bbhw10s\memory\Projects\Test-00000000.md 自动压缩=True 阈值=80%
+2026-09-26 13:09:22.690 [INFO ] [memory] 已开启新会话: 20260926-130922-437b
+2026-09-26 13:09:22.700 [INFO ] [memory] 会话已切换: 这是一个非常长的中文任务标题… · id=20260926-130922-2064 · 4条消息
+2026-09-26 13:09:22.700 [INFO ] [session_store] 会话已删除: C:\Users\ADMINI~1\AppData\Local\Temp\tmp7bbhw10s\sessions\Test-00000000\20260926-130922-2064.json
+2026-09-26 13:10:01.828 [INFO ] [ui] 进入 TUI 界面
+2026-09-26 13:10:01.828 [INFO ] [ui] 离开 TUI 界面
+2026-09-26 13:23:32.738 [INFO ] [project_identity] 项目标识复用: BAWCode-0f877acb
+2026-09-26 13:23:32.738 [INFO ] [main] BAWCode 启动 · 配置=D:\Windows11\桌面\code\BAWCode\data\config.json · 模型=sensenova-sensenova-6.8-flash-lite · project_id=BAWCode-0f877acb
+2026-09-26 13:23:32.739 [INFO ] [memory] 记忆会话已初始化: Agent.md=D:\Windows11\桌面\code\BAWCode\data\memory\Agent.md 项目记忆=D:\Windows11\桌面\code\BAWCode\data\memory\Projects\BAWCode-0f877acb.md 自动压缩=True 阈值=80%
+2026-09-26 13:23:32.975 [INFO ] [commands] 插件加载完成: 0个（目录 D:\Windows11\桌面\code\BAWCode\data\commands）
+2026-09-26 13:23:32.976 [INFO ] [ui] 进入 TUI 界面
+2026-09-26 13:24:24.535 [INFO ] [commands] 执行命令: /help 
+2026-09-26 13:25:08.147 [INFO ] [commands] 执行命令: /sessions 
+2026-09-26 13:25:39.157 [INFO ] [commands] 执行命令: /clear 
+2026-09-26 13:25:39.162 [INFO ] [memory] 已开启新会话: 20260926-132539-0320
+2026-09-26 13:26:11.668 [INFO ] [commands] 执行命令: /sessions 
+2026-09-26 13:26:27.673 [INFO ] [memory] 会话已切换: （无标题会话） · id=20260926-132332-2693 · 1条消息
+2026-09-26 13:27:20.186 [INFO ] [commands] 执行命令: /clear 
+2026-09-26 13:27:20.191 [INFO ] [memory] 已开启新会话: 20260926-132720-e1b1
+2026-09-26 13:27:38.195 [INFO ] [commands] 执行命令: /help 
+2026-09-26 13:28:04.704 [INFO ] [commands] 执行命令: /sessions 
+2026-09-26 13:29:08.555 [INFO ] [session_store] 会话已删除: D:\Windows11\桌面\code\BAWCode\data\sessions\BAWCode-0f877acb\20260926-132332-2693.json
+2026-09-26 13:30:03.210 [INFO ] [commands] 执行命令: /exit 
+2026-09-26 13:30:03.219 [INFO ] [ui] 离开 TUI 界面
+2026-09-26 13:30:03.220 [INFO ] [main] BAWCode 已退出
+2026-09-26 13:31:21.173 [INFO ] [memory] 记忆会话已初始化: Agent.md=C:\Users\ADMINI~1\AppData\Local\Temp\tmpdzy4yfac\memory\Agent.md 项目记忆=C:\Users\ADMINI~1\AppData\Local\Temp\tmpdzy4yfac\memory\Projects\Test-00000000.md 自动压缩=True 阈值=80%
+2026-09-26 13:31:21.196 [INFO ] [memory] 已开启新会话: 20260926-133121-c6e1
+2026-09-26 13:31:21.213 [INFO ] [memory] 会话已切换: 这是一个非常长的中文任务标题… · id=20260926-133121-cbbf · 4条消息
+2026-09-26 13:31:21.213 [INFO ] [session_store] 会话已删除: C:\Users\ADMINI~1\AppData\Local\Temp\tmpdzy4yfac\sessions\Test-00000000\20260926-133121-cbbf.json

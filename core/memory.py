@@ -1,14 +1,14 @@
 #该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.不必要的工具调用历史剥离3.长期记忆写入配置4.在agent对话时提供记忆补充内容5.针对特定项目的RAG模块
 import json
-import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Callable, List, Optional
 
 from core import hooks
-from core import prompt_loader
-from core import project_identity
+from core import rag as rag_mod
+from core import session_store
 from core.log import get_logger
+from wcwidth import wcwidth as _char_width
 
 log = get_logger("memory")
 
@@ -50,6 +50,10 @@ class Memory:
         self.compress_threshold = memory_cfg.get("compress_threshold", 0.8)
         self.strip_tool_history = memory_cfg.get("strip_tool_history", True)
         self.strip_tool_keep = memory_cfg.get("strip_tool_keep", 6)
+        self.sessions_dir = session_store.sessions_dir(config, self.project_id)
+        self.session_id = session_store.new_session_id()
+        self.session_created_at = datetime.now().isoformat(timespec="seconds")
+        self.session_title = ""
         self._llm_fn: Optional[Callable[[str], str]] = None
         self.messages: List[dict] = []
         self.plan = {
@@ -59,7 +63,7 @@ class Memory:
             "status": "empty",
         }
         self.steps: List[dict] = []
-        self.rag_docs: List[dict] = []
+        self.rag = rag_mod.get_store()
         self.longterm = self._load_longterm()
         self._ensure_md_files()
         self._migrate_legacy_json()
@@ -225,7 +229,7 @@ class Memory:
         self.longterm.setdefault("facts", []).append(fact)
         path = self.agent_md_path if scope != "project" else self.project_md_path
         section = "用户偏好" if scope != "project" else "项目约定"
-        ok = self._append_to_md(path, section, fact)
+        self._append_to_md(path, section, fact)
         self.save_longterm()
         log.info("写入长期记忆(%s): %s -> %s", scope, fact, path)
 
@@ -468,31 +472,84 @@ class Memory:
         return messages
 
     def rag_add(self, text: str, source: str = "", external_handler=None) -> None:
-        """项目级 RAG 写入；向量检索预留外部接口"""
-        self.rag_docs.append(
-            {"text": text, "source": source, "time": datetime.now().isoformat(timespec="seconds")}
-        )
-        log.info("RAG 写入: source=%s 共%d篇", source or "-", len(self.rag_docs))
-        hooks.call_user_participating("rag_add", {"text": text, "source": source}, handler=external_handler)
+        """项目级 RAG 写入；实现见 core/rag.py（占位：内存 + 外部接口）"""
+        self.rag.add(text, source=source, external_handler=external_handler)
 
     def rag_query(self, query: str, external_handler=None) -> str:
-        """项目级 RAG 检索；无外部实现时做简单关键词匹配"""
-        result = hooks.call_user_participating(
-            "rag_query",
-            {"query": query},
-            handler=external_handler,
-            default=None,
-        )
-        if isinstance(result, dict) and result.get("content"):
-            return result["content"]
-        if isinstance(result, str) and result:
-            return result
-        keywords = [w for w in query.replace("\n", " ").split() if len(w) >= 2]
-        hits = []
-        for doc in self.rag_docs:
-            text = doc.get("text", "")
-            if any(k in text for k in keywords):
-                hits.append(text[:200])
-            if len(hits) >= 3:
-                break
-        return "\n---\n".join(hits)
+        """项目级 RAG 检索；实现见 core/rag.py"""
+        return self.rag.query(query, external_handler=external_handler)
+
+    # ----- 历史会话保存/切换 -----
+
+    @staticmethod
+    def _clip_title(text: str, limit: int = 30) -> str:
+        """按显示宽度截断标题（中文占 2 列），超长补省略号"""
+        out: List[str] = []
+        used = 0
+        for ch in text:
+            cw = _char_width(ch)
+            if cw < 0:  # wcwidth 对控制字符返回 -1，按 1 列记
+                cw = 1
+            if used + cw > limit - 1:
+                return "".join(out) + "…"
+            out.append(ch)
+            used += cw
+        return "".join(out)
+
+    def _derive_session_title(self) -> str:
+        """标题 = 第一条用户任务输入（折叠空白后截断）；无任务输入时用占位"""
+        for item in self.messages:
+            if item.get("type") == "task" and item.get("role") == "user":
+                text = " ".join(str(item.get("content") or "").split())
+                if text:
+                    return self._clip_title(text)
+        return "（无标题会话）"
+
+    def save_session(self) -> Optional[Path]:
+        """自动保存当前会话；空会话不写盘（避免堆积空文件）"""
+        if not self.messages:
+            return None
+        self.session_title = self._derive_session_title()
+        data = {
+            "version": session_store.SESSION_VERSION,
+            "id": self.session_id,
+            "title": self.session_title,
+            "project_id": self.project_id,
+            "created_at": self.session_created_at,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "message_count": len(self.messages),
+            "messages": self.messages,
+            "plan": self.plan,
+            "steps": self.steps,
+        }
+        try:
+            path = session_store.save_session_data(self.sessions_dir, data)
+        except OSError as e:
+            log.error("会话保存失败 %s: %s", self.session_id, e)
+            return None
+        log.debug("会话已保存: %s (%d条消息)", path, len(self.messages))
+        return path
+
+    def switch_to(self, data: dict) -> None:
+        """切换到历史会话：原地替换状态（main/ui 持有同一 Memory 实例，不可换对象）"""
+        plan_default = {"title": "", "complexity": "low", "content": "", "status": "empty"}
+        self.session_id = data.get("id") or session_store.new_session_id()
+        self.session_created_at = data.get("created_at") or datetime.now().isoformat(timespec="seconds")
+        self.session_title = data.get("title") or ""
+        messages = data.get("messages")
+        self.messages = list(messages) if isinstance(messages, list) else []
+        plan = data.get("plan")
+        self.plan = dict(plan) if isinstance(plan, dict) else plan_default
+        steps = data.get("steps")
+        self.steps = list(steps) if isinstance(steps, list) else []
+        log.info("会话已切换: %s · id=%s · %d条消息", self.session_title, self.session_id, len(self.messages))
+
+    def start_new_session(self) -> None:
+        """开启新会话：旋转 ID 并清空对话状态（旧会话已落盘，可 /sessions 切回）"""
+        self.session_id = session_store.new_session_id()
+        self.session_created_at = datetime.now().isoformat(timespec="seconds")
+        self.session_title = ""
+        self.messages.clear()
+        self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
+        self.steps = []
+        log.info("已开启新会话: %s", self.session_id)

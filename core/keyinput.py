@@ -26,10 +26,6 @@ class KeyEvent(NamedTuple):
     kind: str
     value: str = ""
 
-    def __iter__(self):
-        yield self.kind
-        yield self.value
-
 
 TICK = KeyEvent("tick", "")
 Event = KeyEvent  # 别名
@@ -44,6 +40,11 @@ BURST_DRAIN_LIMIT = 65536
 BATCH_PASTE_MIN = 4
 
 _INPUT_RECORD_KEY_EVENT = 0x0001
+_INPUT_RECORD_MOUSE_EVENT = 0x0002
+_MOUSE_MOVED = 0x0001
+_MOUSE_DOUBLE_CLICK = 0x0002
+_MOUSE_WHEELED = 0x0004
+_MOUSE_LEFT_BTN = 0x0001
 _VK_RETURN = 0x0D
 _SHIFT_PRESSED = 0x0010
 _CTRL_PRESSED = 0x0008 | 0x0004
@@ -326,10 +327,13 @@ class EscapeFSM:
         return self._csi_finish(ch, params), []
 
     def _mouse_sgr(self, params: str, final: str) -> KeyEvent:
+        """SGR 鼠标：<cb;cx;cy M/m。坐标 1-based → 归一为 0-based "x,y"。"""
         body = params[1:] if params.startswith("<") else params
         parts = body.split(";")
         try:
             cb = int(parts[0])
+            cx = int(parts[1]) - 1 if len(parts) > 1 else 0
+            cy = int(parts[2]) - 1 if len(parts) > 2 else 0
         except (ValueError, IndexError):
             return TICK
         if cb & 64:
@@ -338,6 +342,13 @@ class EscapeFSM:
                 return KeyEvent("mouse_wheel", "up")
             if wheel == 1:
                 return KeyEvent("mouse_wheel", "down")
+        pos = f"{max(0, cx)},{max(0, cy)}"
+        if cb & 32:  # 按住移动
+            return KeyEvent("mouse_move", pos)
+        if final == "M" and (cb & 3) == 0:
+            return KeyEvent("mouse_down", pos)
+        if final == "m":
+            return KeyEvent("mouse_up", pos)
         return KeyEvent("mouse", f"{cb};{final}")
 
     def _csi_finish(self, final: str, params: str) -> KeyEvent:
@@ -511,7 +522,6 @@ class Decoder:
         self.enc = EncodingStream()
         self.paste = PasteAssembler()
         self.pending: List[KeyEvent] = []
-        self.chars: List[str] = []
         self.half_at: Optional[float] = None
         self._prefix: Optional[str] = None
 
@@ -524,7 +534,6 @@ class Decoder:
         self.enc.reset()
         self.paste.reset()
         self.pending.clear()
-        self.chars.clear()
         self.half_at = None
         self._prefix = None
 
@@ -599,9 +608,6 @@ class Decoder:
         if ch and ord(ch) >= 32:
             return [KeyEvent("char", ch)]
         return []
-
-    def feed_printable_run(self, s: str) -> List[KeyEvent]:
-        return [KeyEvent("char", s)] if s else []
 
     def timeout_tick(self) -> List[KeyEvent]:
         out: List[KeyEvent] = []
@@ -697,8 +703,17 @@ def _win_console():
                 ("dwControlKeyState", wintypes.DWORD),
             ]
 
+        class MOUSE_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [
+                ("dwMousePositionX", ctypes.c_ushort),
+                ("dwMousePositionY", ctypes.c_ushort),
+                ("dwButtonState", ctypes.c_uint),
+                ("dwControlKeyState", ctypes.c_uint),
+                ("dwEventFlags", ctypes.c_uint),
+            ]
+
         class _INPUT_UNION(ctypes.Union):
-            _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
+            _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("MouseEvent", MOUSE_EVENT_RECORD)]
 
         class INPUT_RECORD(ctypes.Structure):
             _fields_ = [("EventType", ctypes.c_ushort), ("Event", _INPUT_UNION)]
@@ -710,6 +725,35 @@ def _win_console():
         return k32, INPUT_RECORD
     except Exception:
         return None, None
+
+
+def _mouse_record_event(button_state: int, event_flags: int, x: int = 0, y: int = 0) -> Optional[KeyEvent]:
+    """MOUSE_EVENT 记录 → 鼠标事件。
+
+    滚轮(flags=4)→ mouse_wheel；左键按下/抬起(flags=0)→ mouse_down/up；
+    移动(flags=1)→ mouse_move；双击(flags=2)与右/中键忽略。
+    坐标为控制台 0-based 单元格，以 "x,y" 随事件携带。
+    WT/ConPTY 实测滚轮 delta=±128（2026-09-25 探针）。
+    """
+    pos = f"{x},{y}"
+    if event_flags & _MOUSE_WHEELED:
+        delta = (button_state >> 16) & 0xFFFF
+        if delta >= 0x8000:
+            delta -= 0x10000
+        if delta > 0:
+            return KeyEvent("mouse_wheel", "up")
+        if delta < 0:
+            return KeyEvent("mouse_wheel", "down")
+        return None
+    if event_flags & _MOUSE_DOUBLE_CLICK:
+        return None
+    if event_flags & _MOUSE_MOVED:
+        return KeyEvent("mouse_move", pos)
+    if button_state & _MOUSE_LEFT_BTN:
+        return KeyEvent("mouse_down", pos)
+    if button_state == 0:
+        return KeyEvent("mouse_up", pos)
+    return None  # 右键/中键按下忽略
 
 
 def _vk_event(vk: int, uchar: str, state: int) -> Optional[KeyEvent]:
@@ -740,6 +784,10 @@ def _vk_event(vk: int, uchar: str, state: int) -> Optional[KeyEvent]:
             return KeyEvent("tab", "")
         if uchar in ("\x08", "\x7f"):
             return KeyEvent("backspace", "")
+        # 结构化路径的 Ctrl 字母组合：uChar 是控制字符，按 _CTRL 表还原
+        ctrl = _CTRL.get(uchar or "")
+        if ctrl:
+            return KeyEvent("hotkey", ctrl)
         return None
 
     if base.kind == "hotkey":
@@ -772,60 +820,6 @@ def _vk_event(vk: int, uchar: str, state: int) -> Optional[KeyEvent]:
     return base
 
 
-def _peek_enter_mod() -> Optional[str]:
-    if not _WINDOWS:
-        return None
-    k32, INPUT_RECORD = _win_console()
-    if not k32:
-        return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        handle = k32.GetStdHandle(-10)
-        if not handle:
-            return None
-        buf = (INPUT_RECORD * 16)()
-        count = wintypes.DWORD(0)
-        if not k32.PeekConsoleInputW(handle, buf, 16, ctypes.byref(count)):
-            return None
-        for i in range(count.value):
-            rec = buf[i]
-            if rec.EventType != _INPUT_RECORD_KEY_EVENT:
-                continue
-            ke = rec.Event.KeyEvent
-            if not ke.bKeyDown:
-                continue
-            if ke.wVirtualKeyCode != _VK_RETURN:
-                return None
-            state = int(ke.dwControlKeyState)
-            if state & _CTRL_PRESSED:
-                return "ctrl+enter"
-            if state & _SHIFT_PRESSED:
-                return "shift+enter"
-            return "enter"
-        return None
-    except Exception:
-        return None
-
-
-def _queue_depth() -> int:
-    if not _WINDOWS:
-        return 0
-    try:
-        import ctypes
-
-        k32 = ctypes.windll.kernel32
-        k32.GetStdHandle.restype = ctypes.c_void_p
-        handle = k32.GetStdHandle(-10)
-        count = ctypes.c_uint32()
-        if k32.GetNumberOfConsoleInputEvents(handle, ctypes.byref(count)):
-            return int(count.value)
-    except Exception:
-        pass
-    return 0
-
-
 class KeyReader:
     """控制台读取器：整批抽干 + 流式解析。公开 read_event / flush_input。"""
 
@@ -855,10 +849,6 @@ class KeyReader:
     @property
     def _pasting(self) -> bool:
         return self.dec.paste.pasting or self.dec.paste.burst is not None
-
-    @property
-    def _buf(self) -> List[str]:
-        return self.dec.chars
 
     def __enter__(self) -> "KeyReader":
         if _UNIX and sys.stdin.isatty():
@@ -961,14 +951,23 @@ class KeyReader:
                     break
                 for i in range(got.value):
                     rec = buf[i]
-                    if rec.EventType != _INPUT_RECORD_KEY_EVENT:
-                        continue
-                    ke = rec.Event.KeyEvent
-                    if not ke.bKeyDown:
-                        continue
-                    ev = _vk_event(int(ke.wVirtualKeyCode), ke.uChar, int(ke.dwControlKeyState))
-                    if ev is not None:
-                        out.append(ev)
+                    if rec.EventType == _INPUT_RECORD_KEY_EVENT:
+                        ke = rec.Event.KeyEvent
+                        if not ke.bKeyDown:
+                            continue
+                        ev = _vk_event(int(ke.wVirtualKeyCode), ke.uChar, int(ke.dwControlKeyState))
+                        if ev is not None:
+                            out.append(ev)
+                    elif rec.EventType == _INPUT_RECORD_MOUSE_EVENT:
+                        me = rec.Event.MouseEvent
+                        ev = _mouse_record_event(
+                            int(me.dwButtonState),
+                            int(me.dwEventFlags),
+                            int(me.dwMousePositionX),
+                            int(me.dwMousePositionY),
+                        )
+                        if ev is not None:
+                            out.append(ev)
                 if got.value < 32:
                     break
             return out
@@ -996,7 +995,6 @@ class KeyReader:
                     return recs
             return []
         except Exception:
-            self.dec.chars.clear()
             return []
 
     def _drain_msvcrt(self) -> List[KeyEvent]:
@@ -1210,4 +1208,5 @@ def supported_kinds() -> tuple:
         "backspace", "delete", "up", "down", "left", "right", "home", "end",
         "scroll_up", "scroll_down", "escape", "interrupt", "clear", "hotkey",
         "paste", "paste_start", "paste_end", "mouse_wheel", "mouse",
+        "mouse_down", "mouse_move", "mouse_up",
     )

@@ -13,7 +13,6 @@ _ROOT = Path(__file__).resolve().parent.parent
 _handlers: Dict[str, Callable] = {}
 _metas: Dict[str, dict] = {}
 _aliases: Dict[str, str] = {}
-_plugins_loaded = False
 # 命令参数补全器：name -> fn(config, arg) -> list[dict]
 _ARG_COMPLETERS: Dict[str, Callable] = {}
 
@@ -276,12 +275,10 @@ def execute(line: str, ctx: Any = None) -> Any:
 
 
 def load_plugins(directory: Optional[str] = None) -> List[str]:
-    global _plugins_loaded
     plugin_dir = Path(directory) if directory else _ROOT / "data" / "commands"
     loaded: List[str] = []
     if not plugin_dir.exists():
         log.debug("插件目录不存在: %s", plugin_dir)
-        _plugins_loaded = True
         return loaded
     for path in sorted(plugin_dir.glob("*.py")):
         if path.name.startswith("_"):
@@ -304,7 +301,6 @@ def load_plugins(directory: Optional[str] = None) -> List[str]:
         except Exception as e:
             log.warn("插件加载失败 %s: %s: %s", path.name, type(e).__name__, e)
             continue
-    _plugins_loaded = True
     log.info("插件加载完成: %d个（目录 %s）", len(loaded), plugin_dir)
     return loaded
 

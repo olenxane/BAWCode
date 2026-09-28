@@ -39,7 +39,6 @@ class Action(str, Enum):
 class Context(str, Enum):
     INPUT = "input"
     TREE = "tree"
-    DIALOG = "dialog"
     SETTINGS = "settings"
 
 
@@ -202,11 +201,11 @@ class Keymap:
             table[(ctx.value, "wheel_up")] = Action.SCROLL_UP
             table[(ctx.value, "wheel_down")] = Action.SCROLL_DOWN
 
-        # 2) 可配置绑定（全上下文；树/对话框按需覆盖）
+        # 2) 可配置绑定（全上下文；树/设置按需覆盖）
         for setting, tokens in merged.items():
             act = _ACTION_OF_SETTING[setting]
             for tok in tokens:
-                for ctx in (Context.INPUT.value, Context.TREE.value, Context.DIALOG.value, Context.SETTINGS.value):
+                for ctx in (Context.INPUT.value, Context.TREE.value, Context.SETTINGS.value):
                     # complete 与 switch_focus 同键（tab）：输入框优先 complete，树优先 focus
                     if tok == "tab" and act == Action.COMPLETE and ctx == Context.TREE.value:
                         continue
@@ -228,7 +227,6 @@ class Keymap:
                 table[(Context.TREE.value, tok)] = Action.NEWLINE
             if tok == "ctrl+enter":
                 table[(Context.TREE.value, tok)] = Action.SEND
-                table[(Context.DIALOG.value, tok)] = Action.SEND
             if tok == "shift+tab":
                 for ctx in Context:
                     table[(ctx.value, tok)] = Action.MODE_CYCLE
@@ -241,10 +239,6 @@ class Keymap:
         for tok in merged.get("collapse", []):
             if len(tok) == 1:
                 table[(Context.TREE.value, tok)] = Action.COLLAPSE
-
-        # 5) 对话框确认数字
-        for ch in "123":
-            table[(Context.DIALOG.value, ch)] = Action.INSERT
 
         self._table = table
 

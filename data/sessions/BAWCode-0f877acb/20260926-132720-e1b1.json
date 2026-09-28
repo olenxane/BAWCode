@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "id": "20260926-132720-e1b1",
+  "title": "（无标题会话）",
+  "project_id": "BAWCode-0f877acb",
+  "created_at": "2026-09-26T13:27:20",
+  "updated_at": "2026-09-26T13:30:03",
+  "message_count": 1,
+  "messages": [
+    {
+      "role": "system",
+      "content": "命令:\n  /balance         查询余额\n  /clear           清空并开启新会话\n  /commands        命令系统\n  /exit            退出\n  /help            帮助\n  /mode            访问模式 auto|manual|full · 也可按 ~\n  /model           切换模型 /model <model_name>\n  /plan            查看计划\n  /refine          完善输入后执行\n  /run             执行任务\n  /sessions        历史会话 · 切换/新建/删除\n  /settings        设置\n  /steps           查看步骤\n  /theme           主题 /theme [名称]\n  /tools           工具列表",
+      "type": "help"
+    }
+  ],
+  "plan": {
+    "title": "",
+    "complexity": "low",
+    "content": "",
+    "status": "empty"
+  },
+  "steps": []
+}

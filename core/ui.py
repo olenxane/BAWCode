@@ -1,13 +1,12 @@
-#此文件为ui的渲染交互脚本：无边框分区、主题、确认框、token状态
+#此文件为ui的渲染交互脚本：无边框分区、主题、确认流程、token状态
 import json
 import os
 import re
 import shutil
 import sys
 import time
-import unicodedata
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     from rich.console import Console, Group
@@ -23,11 +22,9 @@ from core import keymap as keymap_mod
 from core import policy
 from core import tokens as tokenmod
 from core.keymap import Action, Context, Keymap
-from core.layout import Layout, char_width, display_width as _layout_display_width, split_at_cells, wrap_line
 from core.textbuf import TextBuffer
+from wcwidth import wcwidth
 from core.config import (
-    MODALITY_OPTIONS,
-    TASK_ROLES,
     THEME_DIR,
     THINKING_OPTIONS,
     make_model_name,
@@ -41,6 +38,8 @@ _app: Optional["TuiApp"] = None
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _COLLAPSE_THRESHOLD = 160
 _STATUS_ICON = {"pending": "○", "running": "◐", "done": "●", "failed": "✗"}
+# 控制台鼠标 y → compose 行号偏移（rich Live 主屏模式 1:1；真机如有固定偏差在此校准）
+_MOUSE_Y_OFFSET = 0
 
 DEFAULT_COLORS = {
     "title": (87, 199, 255),
@@ -64,19 +63,6 @@ TIPS = [
     "中文输入时绘制合并刷新，候选上屏后自动更新",
     "/theme 列出并载入主题",
 ]
-
-
-def _event_token(kind: str, value: Any) -> str:
-    return keymap_mod.event_token(kind, value)
-
-
-def _binding_tokens(binding: Any) -> List[str]:
-    return keymap_mod.binding_tokens(binding)
-
-
-def _is_binding(kind: str, value: Any, binding: Any) -> bool:
-    tok = _event_token(kind, value)
-    return bool(tok) and tok in _binding_tokens(binding)
 
 
 def _enable_windows_ansi() -> None:
@@ -115,11 +101,31 @@ def _term_size() -> Tuple[int, int]:
 
 
 def _char_width(ch: str) -> int:
-    return char_width(ch)
+    if not ch:
+        return 0
+    w = wcwidth(ch)
+    # wcwidth 对控制字符返回 -1，按 1 列记（与终端占位一致的保守值）
+    return w if w >= 0 else 1
 
 
 def _display_width(text: str) -> int:
     return sum(_char_width(ch) for ch in _ANSI_RE.sub("", text or ""))
+
+
+def split_at_cells(text: str, cut: int) -> tuple:
+    """按显示列宽切开；cut 为左段应占单元格数。宽字符不折半。"""
+    if cut <= 0:
+        return "", text or ""
+    src = text or ""
+    used = 0
+    for i, ch in enumerate(src):
+        w = _char_width(ch)
+        if used + w > cut:
+            return src[:i], src[i:]
+        used += w
+        if used == cut:
+            return src[: i + 1], src[i + 1 :]
+    return src, ""
 
 
 def _hex_rgb(value: str) -> Optional[Tuple[int, int, int]]:
@@ -180,6 +186,14 @@ def _clip_keep_ansi(text: str, width: int) -> str:
     return "".join(out)
 
 
+def _scrollbar_geometry(total: int, tree_h: int, scroll: int) -> Tuple[int, int]:
+    """滚动条滑块几何：(thumb_h, thumb_top)。"""
+    max_scroll = max(1, total - tree_h)
+    thumb_h = max(1, round(tree_h * tree_h / total))
+    thumb_top = round(max(0, min(scroll, max_scroll)) * (tree_h - thumb_h) / max_scroll)
+    return thumb_h, min(thumb_top, tree_h - thumb_h)
+
+
 def _pad(text: str, width: int) -> str:
     visible = _display_width(text)
     return text if visible >= width else text + " " * (width - visible)
@@ -210,6 +224,148 @@ def _wrap(text: str, width: int) -> List[str]:
         if cur:
             lines.append(cur)
     return lines or [""]
+
+
+def _wrap_line(text: str, width: int) -> List[str]:
+    """单条逻辑行按显示宽度贪心折断；宽字符不折半。"""
+    if width <= 0:
+        return [""]
+    if not text:
+        return [""]
+    lines: List[str] = []
+    cur, used = "", 0
+    for ch in text:
+        w = _char_width(ch)
+        if w > width:
+            # 单字就超宽：单独成行
+            if cur:
+                lines.append(cur)
+            lines.append(ch)
+            cur, used = "", 0
+            continue
+        if used + w > width:
+            lines.append(cur)
+            cur, used = ch, w
+        else:
+            cur += ch
+            used += w
+    lines.append(cur)
+    return lines or [""]
+
+
+class Layout:
+    """多行输入布局：按逻辑行缓存 visual 行，编辑只重折脏行（宽度来自 wcwidth）。"""
+
+    __slots__ = ("width", "_paras", "_visuals", "_dirty")
+
+    def __init__(self, text: str = "", width: int = 40) -> None:
+        self.width = max(1, width)
+        self._paras: List[str] = (text or "").split("\n")
+        self._visuals: List[List[str]] = []
+        self._dirty: set = set(range(len(self._paras)))
+        self._reflow_dirty()
+
+    def set_width(self, width: int) -> None:
+        width = max(1, width)
+        if width == self.width:
+            return
+        self.width = width
+        self._dirty = set(range(len(self._paras)))
+        self._reflow_dirty()
+
+    def set_text(self, text: str) -> None:
+        self._paras = (text or "").split("\n")
+        self._dirty = set(range(len(self._paras)))
+        self._visuals = []
+        self._reflow_dirty()
+
+    def apply_edit(self, text: str, cursor: int) -> None:
+        """用完整文本 + 光标做增量：仅重折内容变化的逻辑行。"""
+        new = (text or "").split("\n")
+        # 对齐前缀
+        i = 0
+        while i < len(self._paras) and i < len(new) and self._paras[i] == new[i]:
+            i += 1
+        # 对齐后缀
+        j = 0
+        while (
+            j < len(self._paras) - i
+            and j < len(new) - i
+            and self._paras[len(self._paras) - 1 - j] == new[len(new) - 1 - j]
+        ):
+            j += 1
+        old_mid_end = len(self._paras) - j
+        new_mid_end = len(new) - j
+        self._dirty = set(range(i, max(i, new_mid_end)))
+        # visuals 对齐切片
+        head = self._visuals[:i] if i <= len(self._visuals) else []
+        tail = self._visuals[old_mid_end:] if old_mid_end <= len(self._visuals) else []
+        mid_slots = max(0, new_mid_end - i)
+        self._paras = new
+        self._visuals = head + [[] for _ in range(mid_slots)] + tail
+        # 长度校正
+        if len(self._visuals) != len(self._paras):
+            self._dirty = set(range(len(self._paras)))
+            self._visuals = [[] for _ in self._paras]
+        self._reflow_dirty()
+        _ = cursor
+
+    def _reflow_dirty(self) -> None:
+        if len(self._visuals) != len(self._paras):
+            self._visuals = [[] for _ in self._paras]
+            self._dirty = set(range(len(self._paras)))
+        for i in list(self._dirty):
+            if 0 <= i < len(self._paras):
+                self._visuals[i] = _wrap_line(self._paras[i], self.width)
+        self._dirty.clear()
+
+    def visual_rows(self) -> List[str]:
+        rows: List[str] = []
+        for vs in self._visuals:
+            rows.extend(vs if vs else [""])
+        return rows or [""]
+
+    def cursor_visual(self, text: str, cursor: int) -> Tuple[int, int]:
+        """返回 (visual_row, cells_before_cursor)。"""
+        text = text or ""
+        cursor = max(0, min(len(text), cursor))
+        before = text[:cursor]
+        # 光标所在逻辑行序号与行内偏移
+        para_index = before.count("\n")
+        last_nl = before.rfind("\n")
+        col_in_para = cursor - (last_nl + 1)
+        para = self._paras[para_index] if para_index < len(self._paras) else ""
+        prefix = para[:col_in_para]
+        wrapped = self._visuals[para_index] if para_index < len(self._visuals) else _wrap_line(para, self.width)
+        if not wrapped:
+            wrapped = [""]
+        # 重建前缀折行以定位（仅短前缀）
+        if prefix:
+            pre_wrapped = _wrap_line(prefix, self.width)
+            row_in_para = len(pre_wrapped) - 1
+            cells = _display_width(pre_wrapped[-1]) if pre_wrapped else 0
+        else:
+            row_in_para = 0
+            cells = 0
+        # 绝对 visual 行 = 前面逻辑行的 visual 行数 + row_in_para
+        visual_row = 0
+        for k in range(para_index):
+            vs = self._visuals[k] if k < len(self._visuals) else [""]
+            visual_row += max(1, len(vs))
+        visual_row += row_in_para
+        # 校正：_wrap_line 与 pre_wrapped 在恰好贴边时可能差一行
+        if wrapped and row_in_para >= len(wrapped):
+            row_in_para = len(wrapped) - 1
+            visual_row = sum(max(1, len(self._visuals[k] if k < len(self._visuals) else [""])) for k in range(para_index)) + row_in_para
+            cells = _display_width(prefix) - _display_width("".join(wrapped[:row_in_para]))
+            cells = max(0, cells)
+        return visual_row, cells
+
+    def window(self, start_row: int, height: int) -> List[str]:
+        rows = self.visual_rows()
+        start = max(0, min(start_row, max(0, len(rows) - 1)))
+        vis = rows[start : start + max(1, height)]
+        return list(vis) + [""] * max(0, height - len(vis))
 
 
 def _fold(text: str, limit: int = _COLLAPSE_THRESHOLD) -> str:
@@ -371,7 +527,6 @@ class TuiApp:
         self.expanded: Set[str] = set()
         self.collapse_done = True
         self.buffer = TextBuffer()
-        self._cursor = 0
         self.input_history: List[str] = []
         self.hist_index = -1
         self.max_display_lines = 3
@@ -385,10 +540,6 @@ class TuiApp:
         self.settings_index = 0
         self.settings_scratch: Dict[str, Any] = {}
         self.pending_tool: Optional[dict] = None
-        self.confirm_index = 0
-        self.confirm_reject_edit = False
-        self.reject_buffer: List[str] = []
-        self.reject_cursor = 0
         self.token_meter = tokenmod.TokenMeter()
         self.logo_enabled = True
         self.settings_tab = 0
@@ -398,17 +549,15 @@ class TuiApp:
         self._settings_scroll = 0
         self.settings_notice = ""
         self.settings_model_work: Dict[str, List[dict]] = {}
-        # 设置页模型列表刷新防抖（秒）
-        self.settings_debounce_sec = 0.35
-        self._settings_debounce_at = 0.0
-        self._settings_debounce_pending = False
-        # 设置页文本绘制防抖：控制全屏刷新频率，减轻 IME 提交时的卡顿
-        self.settings_paint_sec = 0.06
-        self._settings_paint_at = 0.0
-        self._settings_paint_pending = False
         self._settings_baseline: Dict[str, Any] = {}
         self._settings_esc_stage = 0
-        self._settings_text_dirty = False
+        self.sessions_mode = False
+        self.sessions_items: List[dict] = []
+        self.sessions_index = 0
+        self._sessions_scroll = 0
+        self._sessions_current_id = ""
+        self._sessions_confirm_delete = False
+        self.sessions_notice = ""
         self._input_prompt = "> "
         # 渲染接管：rich Live（enter() 时启动）；_frame_time 为固定帧周期（TMP 同款 20fps）
         self._live: Optional["Live"] = None
@@ -444,22 +593,18 @@ class TuiApp:
         self._cursor_seg_w: int = 0
         self._cursor_col: int = 0
         self._cursor_rel_row: int = 0
-        self._cursor_screen_row: Optional[int] = None
-        self._cursor_screen_col: Optional[int] = None
         self._hold_dir = ""
         self._hold_start = 0.0
         self._hold_last = 0.0
-        self._logo_done = False
+        self._scroll_drag_grab: Optional[int] = None
 
     @property
     def cursor(self) -> int:
-        return self.buffer.cursor if isinstance(self.buffer, TextBuffer) else self._cursor
+        return self.buffer.cursor
 
     @cursor.setter
     def cursor(self, value: int) -> None:
-        if isinstance(self.buffer, TextBuffer):
-            self.buffer.set_cursor(value)
-        self._cursor = int(value)
+        self.buffer.set_cursor(value)
 
     # ----- 颜色 -----
     def c(self, name: str) -> str:
@@ -523,10 +668,6 @@ class TuiApp:
         self.token_meter.set_model(config.model_name, getattr(config, "context_window", 0) or 0)
         self.token_meter.context_window = getattr(config, "context_window", 0) or 0
         self.logo_enabled = bool(ui_cfg.get("logo", True))
-        try:
-            self.settings_debounce_sec = max(0.05, float(ui_cfg.get("settings_debounce_ms", 350)) / 1000.0)
-        except (TypeError, ValueError):
-            self.settings_debounce_sec = 0.35
 
     def enter(self) -> None:
         """进入 TUI：rich Live 接管渲染（TMP app.py:1584 同构）+ 终端模式初始化。
@@ -551,9 +692,12 @@ class TuiApp:
         # bracketed-paste 默认关闭（见 docstring）；终端模式直接写 stdout
         _bp = os.environ.get("BAW_BRACKETED_PASTE", "")
         _paste_on = _bp == "1" or (_bp == "" and sys.platform != "win32")
-        # 鼠标滚轮：SGR(1006)+按键/滚轮(1000)。关闭用 BAW_MOUSE=0
+        # 鼠标：1000h 普通 + 1002h 按钮事件 + 1006h SGR 编码。
+        # WT/ConPTY 实测（2026-09-25 探针）：仅 1000h+1006h 时终端不转发滚轮
+        # （滚轮被 WT 自己消费），加 1002h 后以 MOUSE_EVENT 记录到达。
+        # 开启鼠标捕获后，终端内文本选择需 Shift+拖拽。关闭用 BAW_MOUSE=0
         _mouse_on = os.environ.get("BAW_MOUSE", "1") != "0"
-        _mouse_seq = "\033[?1000h\033[?1006h" if _mouse_on else ""
+        _mouse_seq = "\033[?1000h\033[?1002h\033[?1006h" if _mouse_on else ""
         sys.stdout.write("\033[2J\033[H" + ("\033[?2004h" if _paste_on else "") + _mouse_seq)
         sys.stdout.flush()
         if HAS_RICH and _CONSOLE is not None:
@@ -580,14 +724,13 @@ class TuiApp:
                 self._live = None
         except Exception:
             pass
-        sys.stdout.write("\033[?25h\033[0m\033[2J\033[H\033[?2004l\033[?1000l\033[?1006l")
+        sys.stdout.write("\033[?25h\033[0m\033[2J\033[H\033[?2004l\033[?1000l\033[?1002l\033[?1006l")
         sys.stdout.flush()
         self._entered = False
 
     def show_logo(self, seconds: float = 1.5) -> None:
         """兼容入口：转发到启动 Logo（主屏幕）"""
         show_startup_logo(seconds, self.project_name)
-        self._logo_done = True
 
     def refresh_from_session(self, session, task: Optional[str] = None) -> None:
         self.messages = list(getattr(session, "messages", []) or [])
@@ -937,7 +1080,6 @@ class TuiApp:
         self._tree_rows_key = key
         self._tree_rows_cache = rows
         return rows
-        return rows
 
     def _rotating_tip(self) -> str:
         interval = float(self.keys.get("tip_interval") or 5)
@@ -948,14 +1090,11 @@ class TuiApp:
         h = max(20, height)
         if self.settings_mode:
             return self._compose_settings(w, h)
+        if self.sessions_mode:
+            return self._compose_sessions(w, h)
 
-        prompt = "> "
-        raw = self.buffer.to_text() if isinstance(self.buffer, TextBuffer) else "".join(self.buffer)
-        inner_w = max(10, w - len(prompt) - 1)
-
-        # 确认态：输入区显示三选项
-        if self.pending_tool:
-            return self._compose_confirm(w, h, inner_w)
+        raw = self.buffer.to_text()
+        inner_w = max(10, w - _display_width(self._input_prompt) - 1)
 
         # 输入 wrap：逻辑行增量（Layout）
         if self._input_layout_width != inner_w:
@@ -980,8 +1119,10 @@ class TuiApp:
         # 空会话：Logo 占位会话区；有内容后切回树
         if self._show_splash_logo():
             body = self._compose_logo_body(w, tree_h)
+            self._row_meta["scrollbar_on"] = 0
         else:
-            rows = self._tree_rows(w)
+            # 右侧固定预留 1 列滚动条（内容不足一屏时该列留空，宽度稳定不跳变）
+            rows = self._tree_rows(w - 1)
             total = len(rows)
             # 内容超出可视区时：默认贴底显示最新会话；用户上滚后取消跟随
             self._clamp_tree_scroll(total, tree_h)
@@ -989,10 +1130,18 @@ class TuiApp:
             body = list(visible) + [""] * (tree_h - len(visible))
             body = body[:tree_h]
             if total > tree_h:
-                if self.scroll > 0:
-                    body[0] = self.c("dim") + _clip(f"  ↑{self.scroll}", w) + self.RESET
-                if self.scroll + tree_h < total:
-                    body[-1] = self.c("dim") + _clip(f"  ↓{total - self.scroll - tree_h}", w) + self.RESET
+                thumb_h, thumb_top = _scrollbar_geometry(total, tree_h, self.scroll)
+                # 几何快照：鼠标拖拽事件按此换算（每帧刷新）
+                meta = self._row_meta
+                meta["scrollbar_on"] = 1
+                meta["scrollbar_x"] = w - 1
+                meta["body_top"] = 1
+                meta["scroll_total"] = total
+                meta["thumb_h"] = thumb_h
+                meta["thumb_top"] = thumb_top
+                body = self._with_scrollbar(body, total, tree_h, w - 1)
+            else:
+                self._row_meta["scrollbar_on"] = 0
         lines.extend(body)
         lines.append(self._rule(w))
 
@@ -1072,7 +1221,7 @@ class TuiApp:
             # 从后往前找「→项目」信息行，其前为输入区
             for i, ln in enumerate(lines):
                 plain = _ANSI_RE.sub("", ln)
-                if plain.startswith("→") or plain.startswith("→"):
+                if plain.startswith("→"):
                     self._row_meta["info"] = i
                     self._row_meta["status"] = min(h - 1, i + 3)
                     self._row_meta["tip"] = min(h - 1, i + 1)
@@ -1082,66 +1231,8 @@ class TuiApp:
                 input_start = max(0, h - input_zone_h - 5)
             self._row_meta["input_start"] = input_start
             self._row_meta["input_h"] = input_zone_h
-            # 物理光标的屏幕位置（VT 1-based）：输入区可视首行 + 光标相对行
-            self._cursor_screen_row = input_start + 2 + max(0, self._cursor_rel_row)
-            self._cursor_screen_col = self._cursor_col + 1
         except Exception:
             pass
-        return lines[:h]
-
-    def _compose_confirm(self, w: int, h: int, inner_w: int) -> List[str]:
-        """确认框：占用输入区，三选项"""
-        pending = self.pending_tool or {}
-        tool_name = pending.get("name", "")
-        args = pending.get("arguments") or pending.get("args") or {}
-        arg_text = _oneline(json.dumps(args, ensure_ascii=False), max(20, w - 30))
-        tree_focus = self.focus == "tree"
-        mode_label = policy.MODE_LABELS.get(self.mode, self.mode)
-        options = [
-            "允许执行一次",
-            "在本项目中始终允许执行该类指令",
-            "拒绝并说明",
-        ]
-        bottom_fixed = 1 + 2 + 1 + 1
-        confirm_h = 5  # 标题 + 3选项 + reject输入行
-        top_fixed = 1 + 1
-        tree_h = max(4, h - top_fixed - bottom_fixed - confirm_h)
-
-        lines = []
-        lines.append(self.C_HL + _pad(_clip(" 会话", w), w) + self.RESET if tree_focus else self.c("title") + "会话" + self.RESET)
-        if self._show_splash_logo():
-            body = self._compose_logo_body(w, tree_h)
-        else:
-            rows = self._tree_rows(w)
-            total = len(rows)
-            self._clamp_tree_scroll(total, tree_h)
-            visible = rows[self.scroll : self.scroll + tree_h]
-            body = list(visible) + [""] * tree_h
-            body = body[:tree_h]
-        lines.extend(body[:tree_h])
-        lines.append(self._rule(w))
-
-        lines.append(self.c("warn") + _clip(f"工具确认 · {tool_name} · {arg_text}", w) + self.RESET)
-        for i, opt in enumerate(options):
-            if i == self.confirm_index:
-                lines.append(self.C_HL + _pad(_clip(f"  ▸ {opt}", w), w) + self.RESET)
-            else:
-                lines.append(self.c("ink") + _clip(f"    {opt}", w) + self.RESET)
-        if self.confirm_reject_edit and self.confirm_index == 2:
-            reason = "".join(self.reject_buffer)
-            lines.append(self.c("accent") + f"原因> {self.RESET}{self.c('ink')}{_clip(reason, inner_w)}{self.RESET}{self.c('accent')}▌{self.RESET}")
-        else:
-            lines.append(self.c("dim") + _clip("  ↑↓选择 · Enter确认 · 空原因=默认拒绝文案", w) + self.RESET)
-        lines.append(self._rule(w))
-
-        info = f"→{self.project_name} · git:({self.git_branch}) · {self.model_name} · {mode_label}"
-        lines.append(self.c("accent") + _clip(info, w) + self.RESET)
-        lines.append(self.c("dim") + _clip("工具调用待确认（占用输入区）", w) + self.RESET)
-        lines.append(self._rule(w))
-        status = f" 等待确认 · {tool_name} · {self.token_meter.status_text()} "
-        lines.append(self.c("dim") + _pad(_clip(status, w), w) + self.RESET)
-        while len(lines) < h:
-            lines.append(" ")
         return lines[:h]
 
     def render(self, *args, **kwargs) -> None:
@@ -1165,72 +1256,31 @@ class TuiApp:
             sys.stdout.write("".join(parts))
             sys.stdout.flush()
 
-    def render_partial_input(self) -> None:
-        """兼容入口：rich Live 接管后局部重绘概念消失，统一全帧。"""
-        self.render()
-
-    def _do_paint(self, partial: bool = True) -> None:
-        """兼容入口：帧循环下绘制即 render()。"""
-        self.render()
-
-    def _schedule_paint(self, partial: bool = True) -> None:
-        """兼容入口：固定帧循环每帧无条件渲染，调度概念已由帧节奏取代。
-
-        保留方法本体（大量调用点），实现为空操作——事件只改状态，
-        帧尾统一 render()（TMP handle_key + live.update 同构）。"""
-
-    def _flush_paint(self) -> None:
-        """兼容入口：空操作（帧尾统一渲染，无需提前冲刷）。"""
-
     # ----- 输入 / 补全 -----
     def _word_start(self) -> int:
-        if isinstance(self.buffer, TextBuffer):
-            return self.buffer.word_start()
-        text = "".join(self.buffer)
-        i = self.cursor
-        while i > 0 and not text[i - 1].isspace():
-            i -= 1
-        return i
+        return self.buffer.word_start()
 
     def _buf_text(self) -> str:
-        return self.buffer.to_text() if isinstance(self.buffer, TextBuffer) else "".join(self.buffer)
+        return self.buffer.to_text()
 
     def _buf_set(self, text: str, cursor: Optional[int] = None) -> None:
-        if isinstance(self.buffer, TextBuffer):
-            self.buffer.set_text(text, cursor)
-        else:
-            self.buffer = list(text)
-            self.cursor = len(text) if cursor is None else cursor
+        self.buffer.set_text(text, cursor)
 
     def _buf_insert(self, s: str) -> None:
-        if isinstance(self.buffer, TextBuffer):
-            self.buffer.insert(s)
-        else:
-            self.buffer[self.cursor : self.cursor] = list(s)
-            self.cursor += len(s)
+        self.buffer.insert(s)
 
     def _buf_backspace(self) -> None:
-        if isinstance(self.buffer, TextBuffer):
-            self.buffer.backspace()
-        elif self.cursor > 0:
-            self.buffer.pop(self.cursor - 1)
-            self.cursor -= 1
+        self.buffer.backspace()
 
     def _buf_delete(self) -> None:
-        if isinstance(self.buffer, TextBuffer):
-            self.buffer.delete()
-        elif self.cursor < len(self.buffer):
-            self.buffer.pop(self.cursor)
+        self.buffer.delete()
 
     def _buf_clear(self) -> None:
-        if isinstance(self.buffer, TextBuffer):
-            self.buffer.clear()
-        else:
-            self.buffer = []
+        self.buffer.clear()
         self.cursor = 0
 
     def _buf_len(self) -> int:
-        return self.buffer.length if isinstance(self.buffer, TextBuffer) else len(self.buffer)
+        return self.buffer.length
 
     def _refresh_candidates(self, config=None) -> None:
         text = self._buf_text()
@@ -1301,8 +1351,6 @@ class TuiApp:
         self.cursor = 0
         self.candidates = []
         self.input_scroll = 0
-        self._paint_at = 0.0
-        self._paint_pending = False
         self._input_prompt = prompt or "> "
         self.render()
         frame_deadline = time.time()
@@ -1311,7 +1359,9 @@ class TuiApp:
             self._refresh_candidates(config=config)
             if not pending_events:
                 pending_events = _read_events(0.0)
-            if pending_events:
+            # 每帧分发本批全部事件：滚轮/按键高速到达（>20/秒）时若每帧只
+            # 消费一个，积压线性增长，表现为滚动/删字明显滞后于手。
+            while pending_events:
                 key = pending_events.pop(0)
                 kind, value = key
                 if kind == "interrupt":
@@ -1338,6 +1388,10 @@ class TuiApp:
 
     def _dispatch_key(self, kind: str, value: Any, config=None) -> Optional[str]:
         """返回 None 表示继续循环；返回 str 为提交行。"""
+        # 鼠标事件不走键表（也不必重编译键位表：拖拽中 move 事件高频）
+        if kind in ("mouse_down", "mouse_move", "mouse_up"):
+            self._on_mouse(kind, value)
+            return None
         self._sync_keymap()
         ctx = self._ui_context()
         # 模式切换始终优先
@@ -1444,17 +1498,11 @@ class TuiApp:
             return None
         if act == Action.CARET_HOME:
             if self.focus == "input":
-                if isinstance(self.buffer, TextBuffer):
-                    self.buffer.move_home()
-                else:
-                    self.cursor = 0
+                self.buffer.move_home()
             return None
         if act == Action.CARET_END:
             if self.focus == "input":
-                if isinstance(self.buffer, TextBuffer):
-                    self.buffer.move_end()
-                else:
-                    self.cursor = self._buf_len()
+                self.buffer.move_end()
             return None
 
         if act == Action.SCROLL_UP:
@@ -1476,22 +1524,97 @@ class TuiApp:
 
     def _scroll_delta(self, kind: str, value: Any) -> int:
         """鼠标滚轮固定 3 行；键盘滚动沿用长按加速。"""
-        if kind == "mouse_wheel" or _event_token(kind, value) in ("wheel_up", "wheel_down"):
+        tok = keymap_mod.event_token(kind, value)
+        if kind == "mouse_wheel" or tok in ("wheel_up", "wheel_down"):
             return 3
-        direction = "pu" if _event_token(kind, value) == "pageup" else "pd"
+        direction = "pu" if tok == "pageup" else "pd"
         return self._scroll_step(direction)
 
+    def _set_scroll(self, new_scroll: int) -> None:
+        """设置会话区滚动并同步树光标进视口（滚轮/翻页/拖拽共用）。
+
+        到底自动恢复贴底跟随；行数与视口取 _row_meta 快照（无则回退树行缓存）。
+        不在此处渲染：read_line 帧尾统一渲染。"""
+        meta = self._row_meta
+        tree_h = int(meta.get("tree_h") or 4)
+        total = int(meta.get("scroll_total") or 0)
+        if total <= 0:
+            total = len(self._tree_rows_cache or [])
+        max_scroll = max(0, total - tree_h)
+        self.scroll = max(0, min(int(new_scroll), max_scroll))
+        self._tree_follow_tail = self.scroll >= max_scroll
+        if self.tree_cursor < self.scroll:
+            self.tree_cursor = self.scroll
+        elif self.tree_cursor >= self.scroll + tree_h:
+            self.tree_cursor = min(self.scroll + tree_h - 1, max(0, total - 1))
+
     def _scroll_tree_by(self, delta: int) -> None:
-        """调整会话区显示范围。上滚取消贴底；下滚到底后恢复跟随最新。"""
-        self.scroll = max(0, self.scroll + delta)
-        self._tree_follow_tail = False
-        self.render()
-        if delta > 0:
-            rows = self._tree_rows_cache or []
-            total = len(rows)
-            tree_h = int(self._row_meta.get("tree_h") or 4)
-            if total <= tree_h or self.scroll >= total - tree_h:
-                self._tree_follow_tail = True
+        """按步长调整会话区显示范围（滚轮/翻页/长按加速）。"""
+        self._set_scroll(self.scroll + delta)
+
+    def _on_mouse(self, kind: str, value: Any) -> None:
+        """滚动条鼠标交互：down 抓取滑块/轨道翻页，move 连动，up 结束。
+
+        坐标为控制台 0-based 单元格，几何换算基于 _row_meta 每帧快照；
+        控制台 y 与 compose 行号按 1:1 映射（_MOUSE_Y_OFFSET 可校准）。"""
+        try:
+            x_s, y_s = str(value or "").split(",", 1)
+            x, y = int(x_s), int(y_s) + _MOUSE_Y_OFFSET
+        except (ValueError, IndexError):
+            return
+        meta = self._row_meta
+        if self.settings_mode or not meta.get("scrollbar_on"):
+            return
+        tree_h = int(meta.get("tree_h") or 4)
+        body_top = int(meta.get("body_top") or 1)
+        scrollbar_x = int(meta.get("scrollbar_x") or -1)
+        if kind == "mouse_down":
+            if x != scrollbar_x:
+                return
+            y_rel = y - body_top
+            if not (0 <= y_rel < tree_h):
+                return
+            thumb_top = int(meta.get("thumb_top") or 0)
+            thumb_h = int(meta.get("thumb_h") or 1)
+            if thumb_top <= y_rel < thumb_top + thumb_h:
+                self._scroll_drag_grab = y_rel - thumb_top
+            elif y_rel < thumb_top:
+                self._set_scroll(self.scroll - tree_h)  # 轨道上段：上翻页
+            else:
+                self._set_scroll(self.scroll + tree_h)  # 轨道下段：下翻页
+        elif kind == "mouse_move":
+            if self._scroll_drag_grab is None:
+                return
+            thumb_h = int(meta.get("thumb_h") or 1)
+            total = int(meta.get("scroll_total") or 0)
+            if total <= 0:
+                return
+            y_rel = y - body_top
+            usable = max(1, tree_h - thumb_h)
+            new_thumb = max(0, min(y_rel - self._scroll_drag_grab, usable))
+            self._set_scroll(round(new_thumb * max(1, total - tree_h) / usable))
+        elif kind == "mouse_up":
+            self._scroll_drag_grab = None
+
+    def _with_scrollbar(self, body: List[str], total: int, tree_h: int, width: int) -> List[str]:
+        """会话区右侧 1 列滚动条：█ 滑块(accent) + │ 轨道(dim) + ▲▼ 端点(dim)。
+
+        body 各行已按显示宽度 ≤ width；此处补齐到 width 再拼滚动条字符，
+        合计恰好占满终端宽。"""
+        thumb_h, thumb_top = _scrollbar_geometry(total, tree_h, self.scroll)
+        accent, dim = self.c("accent"), self.c("dim")
+        out: List[str] = []
+        for i, row in enumerate(body):
+            if i == 0 and self.scroll > 0:
+                glyph, color = "▲", dim
+            elif i == tree_h - 1 and self.scroll + tree_h < total:
+                glyph, color = "▼", dim
+            elif thumb_top <= i < thumb_top + thumb_h:
+                glyph, color = "█", accent
+            else:
+                glyph, color = "│", dim
+            out.append(_pad(row, width) + color + glyph + self.RESET)
+        return out
 
     def _toggle_focus(self) -> None:
         if self.focus == "input":
@@ -1644,7 +1767,6 @@ class TuiApp:
                 ftype = field.get("type", "text")
                 value = self.settings_scratch.get(field["key"], field.get("current"))
                 if ftype == "choice":
-                    options = field.get("options") or []
                     show = "" if value is None else str(value)
                     hint_lr = " ←→"
                     display = _clip(f"{label:20}  < {show} >{hint_lr}", w - 4)
@@ -1707,12 +1829,6 @@ class TuiApp:
         "collapse": ["left", "h"],
     }
 
-    def _action_hit(self, kind: str, value: Any, *action_keys: str) -> Optional[str]:
-        for ak in action_keys:
-            if _is_binding(kind, value, self.keys.get(ak)):
-                return ak
-        return None
-
     def _sync_keymap(self) -> None:
         """由 self.keys 重编译倒排表（O(动作×绑定)，仅配置变更时）"""
         self.keymap.compile(
@@ -1729,15 +1845,6 @@ class TuiApp:
             }
         )
 
-    def _should_submit(self, kind: str, value: Any) -> bool:
-        self._sync_keymap()
-        act = self.keymap.resolve(Context.INPUT, kind, value)
-        return act in (Action.SUBMIT, Action.SEND)
-
-    def _should_newline(self, kind: str, value: Any) -> bool:
-        self._sync_keymap()
-        return self.keymap.resolve(Context.INPUT, kind, value) == Action.NEWLINE
-
     def _is_mode_switch(self, kind: str, value: Any) -> bool:
         """shift+tab 始终切换模式；额外尊重设置中的 switch_mode 映射"""
         if kind == "mode_switch":
@@ -1746,20 +1853,12 @@ class TuiApp:
         act = self.keymap.resolve(Context.INPUT, kind, value)
         return act == Action.MODE_CYCLE
 
-    def _mode_key_label(self) -> str:
-        return self.keymap.label("switch_mode") or str(self.keys.get("switch_mode") or "shift+tab")
-
     def _settings_model_names(self, config) -> List[str]:
         names = config.list_model_names() or [config.model_name]
         return names
 
     # 焦点离开时才重建模型列表的文本字段
     _MODEL_LIST_TEXT_KEYS = frozenset({"provider_id", "model_id"})
-
-    def _schedule_settings_refresh(self) -> None:
-        """登记一次防抖重建，到期后仅执行一次 _build_settings_fields"""
-        self._settings_debounce_at = time.time() + float(self.settings_debounce_sec)
-        self._settings_debounce_pending = True
 
     def _settings_snapshot(self, config) -> dict:
         s = self.settings_scratch
@@ -1811,42 +1910,9 @@ class TuiApp:
             return active
         return ""
 
-    def _cancel_settings_refresh(self) -> None:
-        self._settings_debounce_pending = False
-        self._settings_debounce_at = 0.0
-
-    def _flush_settings_refresh(self, config, force: bool = False) -> bool:
-        """若防抖到期或 force，则重建设置字段表；返回是否发生了重建"""
-        if force or self._settings_debounce_pending:
-            if force or time.time() >= self._settings_debounce_at:
-                self._settings_debounce_pending = False
-                self._build_settings_fields(config)
-                return True
-        return False
-
     def _immediate_settings_refresh(self, config) -> None:
-        """立刻重建（切标签/保存/切换提供商等），并取消未完成的防抖"""
-        self._cancel_settings_refresh()
+        """立刻重建（切标签/保存/切换提供商等）"""
         self._build_settings_fields(config)
-
-    def _schedule_settings_paint(self, delay: Optional[float] = None) -> None:
-        self._settings_paint_at = time.time() + (self.settings_paint_sec if delay is None else delay)
-        self._settings_paint_pending = True
-
-    def _flush_settings_paint(self) -> bool:
-        if self._settings_paint_pending and time.time() >= self._settings_paint_at:
-            self._settings_paint_pending = False
-            self.render()
-            return True
-        return False
-
-    def _append_text_burst(self, first: str) -> str:
-        """keyinput 已合并可打印字符；此处禁止再从 msvcrt 抽队列。
-
-        二次 drain 会吃掉 0xE0/0x00 扩展键前缀，导致后续扫描码被当成
-        普通字符，表现为设置页/输入框方向键失效（对齐 music player：只走一条读键路径）。
-        """
-        return first or ""
 
     def _build_settings_fields(self, config) -> None:
         """按当前标签生成字段列表"""
@@ -2041,7 +2107,6 @@ class TuiApp:
                 {"key": "logo", "label": "会话区Logo", "type": "bool", "current": bool(ui_cfg.get("logo", True)), "hint": "←→ 开/关"},
                 {"key": "font_size", "label": "字体大小", "type": "text", "current": getattr(config, "font_size", 16)},
                 {"key": "tip_interval", "label": "提示间隔秒", "type": "text", "current": ui_cfg.get("tip_interval", 5)},
-                {"key": "settings_debounce_ms", "label": "设置防抖ms", "type": "text", "current": ui_cfg.get("settings_debounce_ms", 350), "hint": "模型列表实时刷新防抖，默认 350"},
                 {"key": "retry_times", "label": "LLM重试次数", "type": "text", "current": llm_cfg.get("retry_times", 3)},
                 {"key": "retry_delay", "label": "LLM重试延迟", "type": "text", "current": llm_cfg.get("retry_delay", 1.0)},
                 {"key": "scroll_v0", "label": "滚动v0", "type": "text", "current": ui_cfg.get("scroll_v0", 1.0)},
@@ -2078,39 +2143,20 @@ class TuiApp:
         self.settings_model_name = config.model_name
         self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
         self.settings_model_work = getattr(self, "settings_model_work", {}) or {}
-        self._cancel_settings_refresh()
         self._build_settings_fields(config)
         self._settings_baseline = self._settings_snapshot(config)
         self._settings_esc_stage = 0
-        self._settings_text_dirty = False
-        self._last_frame_lines = []  # 进入设置时强制全量绘制
         try:
             _ki.flush_input()
         except Exception:
             pass
         self.render()
-        ticks = 0
         while True:
             key = _read_key()
             if key is None:
                 key = ("tick", "")
             kind, value = key
             if kind == "tick":
-                ticks += 1
-                # 空闲不退出；仅处理防抖
-                if self._settings_text_dirty:
-                    if self._flush_settings_paint():
-                        self._settings_text_dirty = False
-                        self._schedule_settings_refresh()
-                    continue
-                if self._settings_debounce_pending and time.time() >= self._settings_debounce_at:
-                    self._settings_debounce_pending = False
-                    self._build_settings_fields(config)
-                    self._settings_paint_pending = False
-                    self._last_frame_lines = []
-                    self.render()
-                elif self._flush_settings_paint():
-                    pass
                 continue
             if kind == "interrupt":
                 if self._settings_is_dirty(config) and self._settings_esc_stage == 0:
@@ -2145,15 +2191,11 @@ class TuiApp:
             if self._is_mode_switch(kind, value) and kind != "tab":
                 continue
             if kind == "tab":
-                if self._settings_text_dirty:
-                    self._schedule_settings_refresh()
-                self._settings_text_dirty = False
                 self.settings_tab = (self.settings_tab + 1) % len(self.settings_tabs)
                 self.settings_index = 0
                 self._settings_scroll = 0
                 self._immediate_settings_refresh(config)
                 self._clamp_settings_index()
-                self._last_frame_lines = []
                 self.render()
                 continue
             if kind in ("submit", "submit_ctrl"):
@@ -2167,13 +2209,11 @@ class TuiApp:
                         self.settings_notice = msg
                         self._immediate_settings_refresh(config)
                         self._clamp_settings_index()
-                        self._last_frame_lines = []
                         self.render()
                         continue
                     self._settings_run_action(config, field.get("key"))
                     self._immediate_settings_refresh(config)
                     self._clamp_settings_index()
-                    self._last_frame_lines = []
                     self.render()
                     continue
                 if ftype == "text":
@@ -2181,7 +2221,6 @@ class TuiApp:
                     label = field.get("label", key_name)
                     cur = self.settings_scratch.get(key_name, field.get("current"))
                     self.settings_mode = False
-                    self._last_frame_lines = []
                     self.render()
                     try:
                         raw = input(f"{label} [{cur}]: ")
@@ -2190,14 +2229,12 @@ class TuiApp:
                     self.settings_mode = True
                     if raw != "":
                         self.settings_scratch[key_name] = raw
-                    self._settings_text_dirty = False
                     if key_name in self._MODEL_LIST_TEXT_KEYS:
                         self._immediate_settings_refresh(config)
                     else:
                         self._build_settings_fields(config)
                     self.settings_notice = f"{label} 已更新 · Enter 保存退出"
                     self._clamp_settings_index()
-                    self._last_frame_lines = []
                     self.render()
                     continue
                 if ftype == "bool":
@@ -2208,47 +2245,24 @@ class TuiApp:
                 # choice / 其它：Enter = 保存并退出设置
                 updates = self._settings_apply(config)
                 self.settings_mode = False
-                self._cancel_settings_refresh()
                 self.bind_config(config)
-                self._last_frame_lines = []
                 self.render()
                 return updates
             dirn = _key_direction(kind, value)
             if dirn == "up":
-                if self._settings_text_dirty:
-                    self._schedule_settings_refresh()
-                self._settings_text_dirty = False
                 self._settings_move_selection(-1)
                 self.render()
             elif dirn == "down":
-                if self._settings_text_dirty:
-                    self._schedule_settings_refresh()
-                self._settings_text_dirty = False
                 self._settings_move_selection(1)
                 self.render()
             elif dirn == "left":
                 self._settings_cycle_choice(-1, config)
-                self._settings_text_dirty = False
                 self.render()
             elif dirn == "right":
                 self._settings_cycle_choice(1, config)
-                self._settings_text_dirty = False
                 self.render()
-            elif kind == "backspace":
-                field = self.settings_fields[self.settings_index] if self.settings_fields else {}
-                if field.get("type") == "text":
-                    val = list(str(self.settings_scratch.get(field["key"], "") or ""))
-                    if val:
-                        val.pop()
-                    self.settings_scratch[field["key"]] = "".join(val)
-                    self._settings_text_dirty = True
-                    self._schedule_settings_paint(0.15)
-            elif kind == "char" and value and all(ord(ch) >= 32 for ch in value):
-                field = self.settings_fields[self.settings_index] if self.settings_fields else {}
-                if field.get("type") == "choice" and value in ("\x1b",):
-                    continue
             else:
-                # 其它键（hotkey 等）仅重绘，避免异常退出
+                # 其它键（含 backspace/char——文本编辑统一走 Enter 后的行输入）仅重绘
                 self.render()
 
     def _clamp_settings_index(self) -> None:
@@ -2260,6 +2274,146 @@ class TuiApp:
             self.settings_index = 0
         if self.settings_index >= n:
             self.settings_index = n - 1
+
+    # ----- 历史会话面板 -----
+
+    def _compose_sessions(self, w: int, h: int) -> List[str]:
+        """历史会话：列表选择；Enter 切换 / 新建，d 删除，Esc 取消"""
+        items = self.sessions_items
+        lines = []
+        lines.append(self.c("title") + _pad(_clip(f" {self.project_name} · 历史会话", w), w) + self.RESET)
+        lines.append(self.c("dim") + _clip(" ↑↓ 选择 · Enter 切换 · d 删除 · Esc 取消", w) + self.RESET)
+        lines.append(self._rule(w))
+
+        list_h = max(6, h - 7)
+        if self.sessions_index < self._sessions_scroll:
+            self._sessions_scroll = self.sessions_index
+        if self.sessions_index >= self._sessions_scroll + list_h:
+            self._sessions_scroll = self.sessions_index - list_h + 1
+        self._sessions_scroll = max(0, min(self._sessions_scroll, max(0, len(items) - list_h)))
+
+        body = []
+        if not items:
+            body.append(self.c("dim") + "  （暂无历史会话，对话后自动保存）" + self.RESET)
+        else:
+            visible = items[self._sessions_scroll : self._sessions_scroll + list_h]
+            for offset, item in enumerate(visible):
+                i = self._sessions_scroll + offset
+                is_new = item.get("action") == "new"
+                is_cur = item.get("id") == self._sessions_current_id
+                if is_new:
+                    text = _pad(_clip(item.get("title") or "＋ 新建会话", w - 4), w - 4)
+                else:
+                    title = (item.get("title") or "（无标题会话）") + (" *" if is_cur else "")
+                    meta = f"{item.get('message_count', 0)}条 · {str(item.get('updated_at') or '')[:16].replace('T', ' ')}"
+                    text = _clip(title, max(8, w - 6 - _display_width(meta)))
+                    text += " " * max(1, w - 6 - _display_width(text) - _display_width(meta)) + meta
+                    text = _pad(text, w - 4)
+                prefix = f"▸ {text}" if i == self.sessions_index else f"  {text}"
+                if i == self.sessions_index:
+                    body.append(self.C_HL + _pad(prefix, w) + self.RESET)
+                elif is_new:
+                    body.append(self.c("accent") + prefix + self.RESET)
+                else:
+                    body.append(self.c("ink") + prefix + self.RESET)
+        body.extend([""] * (list_h - len(body)))
+        lines.extend(body[:list_h])
+        lines.append(self._rule(w))
+        if self.sessions_notice:
+            lines.append(self.c("ok") + _clip(" " + self.sessions_notice, w) + self.RESET)
+        else:
+            cur = items[self.sessions_index] if 0 <= self.sessions_index < len(items) else {}
+            hint = f" {cur.get('title', '')}" if cur else " （空）"
+            if cur and cur.get("action") != "new":
+                hint += f" · {cur.get('message_count', 0)}条消息 · {cur.get('updated_at', '')}"
+            lines.append(self.c("dim") + _clip(hint, w) + self.RESET)
+        lines.append(self._rule(w))
+        lines.append(
+            self.c("accent")
+            + _pad(_clip(f"→{self.project_name} · {self.model_name} · {policy.MODE_LABELS.get(self.mode, self.mode)}", w), w)
+            + self.RESET
+        )
+        while len(lines) < h:
+            lines.append(" ")
+        return lines[:h]
+
+    def show_sessions_form(self, items: List[dict], current_id: str = "", directory=None) -> Optional[dict]:
+        """历史会话面板（阻塞）：{"action":"switch","id","title"} / {"action":"new"}；Esc 返回 None"""
+        from core import session_store as _store
+        from core import keyinput as _ki
+
+        self.sessions_mode = True
+        self.sessions_items = list(items)
+        self.sessions_index = 0
+        self._sessions_scroll = 0
+        self._sessions_current_id = current_id
+        self._sessions_confirm_delete = False
+        self.sessions_notice = "↑↓ 选择 · Enter 切换 · d 删除 · Esc 取消"
+        try:
+            _ki.flush_input()
+        except Exception:
+            pass
+        self.render()
+        while True:
+            key = _read_key()
+            if key is None:
+                key = ("tick", "")
+            kind, value = key
+            if kind == "tick":
+                continue
+            if kind in ("interrupt", "escape"):
+                self.sessions_mode = False
+                return None
+            if kind == "mode_switch":
+                continue
+            if kind in ("submit", "submit_ctrl"):
+                if not self.sessions_items:
+                    continue
+                item = self.sessions_items[self.sessions_index]
+                self.sessions_mode = False
+                if item.get("action") == "new":
+                    return {"action": "new"}
+                return {"action": "switch", "id": item.get("id"), "title": item.get("title")}
+            if kind == "delete" or (kind == "char" and str(value).lower() == "d"):
+                item = self.sessions_items[self.sessions_index] if self.sessions_items else None
+                if not item or item.get("action") == "new":
+                    self.render()
+                    continue
+                if item.get("id") == self._sessions_current_id:
+                    self._sessions_confirm_delete = False
+                    self.sessions_notice = "当前会话不可删除"
+                    self.render()
+                    continue
+                if not self._sessions_confirm_delete:
+                    self._sessions_confirm_delete = True
+                    self.sessions_notice = f"确认删除「{_oneline(str(item.get('title') or ''))}」？再按 d 确认，其它键取消"
+                    self.render()
+                    continue
+                removed = False
+                if directory is not None and item.get("id"):
+                    removed = _store.delete_session_data(directory, item["id"])
+                if removed:
+                    self.sessions_items.pop(self.sessions_index)
+                    if self.sessions_index >= len(self.sessions_items):
+                        self.sessions_index = max(0, len(self.sessions_items) - 1)
+                    self.sessions_notice = "会话已删除"
+                else:
+                    self.sessions_notice = "删除失败"
+                self._sessions_confirm_delete = False
+                self.render()
+                continue
+            if self._sessions_confirm_delete:
+                # 任意其它键取消删除确认
+                self._sessions_confirm_delete = False
+                self.sessions_notice = "↑↓ 选择 · Enter 切换 · d 删除 · Esc 取消"
+            dirn = _key_direction(kind, value)
+            if dirn == "up":
+                if self.sessions_index > 0:
+                    self.sessions_index -= 1
+            elif dirn == "down":
+                if self.sessions_index < len(self.sessions_items) - 1:
+                    self.sessions_index += 1
+            self.render()
 
     def _settings_move_selection(self, direction: int) -> None:
         """↑↓ 移动选中项，跳过 sep 分隔行"""
@@ -2504,20 +2658,20 @@ class TuiApp:
         select_model = s.get("select_model") or self.settings_model_name
         row = config.find_model(select_model) if select_model else None
         if row:
-            updates = {
+            model_updates = {
                 "model_id": str(s.get("model_id") or row.get("model_id")),
                 "modalities": [x.strip() for x in str(s.get("modalities") or "text").split(",") if x.strip()],
                 "thinking_effort": str(s.get("thinking_effort") or "none"),
             }
             try:
-                updates["context_window"] = int(float(s.get("context_window", row.get("context_window", 0))))
-                updates["max_tokens"] = int(float(s.get("max_tokens", row.get("max_tokens", 0))))
-                updates["temperature"] = float(s.get("model_temperature", row.get("temperature", 1.0)))
+                model_updates["context_window"] = int(float(s.get("context_window", row.get("context_window", 0))))
+                model_updates["max_tokens"] = int(float(s.get("max_tokens", row.get("max_tokens", 0))))
+                model_updates["temperature"] = float(s.get("model_temperature", row.get("temperature", 1.0)))
             except (TypeError, ValueError):
                 pass
-            config.update_model(row["provider_id"], row["model_id"], updates)
+            config.update_model(row["provider_id"], row["model_id"], model_updates)
             config.data["active_provider_id"] = row["provider_id"]
-            config.data["active_model_id"] = updates.get("model_id", row["model_id"])
+            config.data["active_model_id"] = model_updates.get("model_id", row["model_id"])
         # 任务模型
         if s.get("task_plan"):
             config.set_task_model("plan", s["task_plan"])
@@ -2550,18 +2704,12 @@ class TuiApp:
             ("scroll_v0", float),
             ("scroll_hold_ms", int),
             ("scroll_max_step", int),
-            ("settings_debounce_ms", float),
         ):
             if key in s and s[key] is not None and str(s[key]) != "":
                 try:
                     ui_cfg[key] = cast(float(s[key]))
                 except (TypeError, ValueError):
                     pass
-        if "settings_debounce_ms" in ui_cfg:
-            try:
-                self.settings_debounce_sec = max(0.05, float(ui_cfg["settings_debounce_ms"]) / 1000.0)
-            except (TypeError, ValueError):
-                pass
         if "font_size" in ui_cfg:
             config.data.setdefault("system", {})["font_size"] = ui_cfg["font_size"]
         llm_cfg = config.data.setdefault("llm", {})
@@ -2589,9 +2737,6 @@ class TuiApp:
         updates["task_models"] = config.task_models()
         return updates
 
-    def set_commands_source(self, *args, **kwargs) -> None:
-        return None
-
 
 def _key_direction(kind: str, value: str) -> Optional[str]:
     """归一化方向键事件：kind=up… 或 hotkey=ctrl+up 均映射为 up/down/left/right。"""
@@ -2614,18 +2759,6 @@ def _read_events(timeout: float = 0.0):
     from core import keyinput
 
     return keyinput.read_events(timeout)
-
-
-def _read_key_windows():
-    from core import keyinput
-
-    return keyinput.read_key_event()
-
-
-def _read_key_posix():
-    from core import keyinput
-
-    return keyinput.read_key_event()
 
 
 def get_app() -> TuiApp:
