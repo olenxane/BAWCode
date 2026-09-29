@@ -120,10 +120,20 @@ def default_config() -> dict:
             ],
             "whitelist_budget_tokens": 32768,
             "inline_limit_tokens": 4096,
-            "large_tools": ["read", "search", "write", "edit_file"],
+            "large_tools": ["read", "search", "write", "edit_file", "load_skill"],
             "inline_limit_tokens_large": 32768,
             "persist_dir": "data/toolcalls",
             "strip_keep_recent": 6,
+        },
+        # 技能加载系统（core/skills.py + tools.load_skill）：SKILL.md+YAML frontmatter，
+        # 双层目录 全局 dir + 项目 {workspace}/.bawcode/skills（项目级同名覆盖全局）；
+        # 启动仅扫元数据进 [可用技能] 补充（memory.build_context_supplements），
+        # 总预算 metadata_budget_tokens 超限降级为仅名称；正文经 load_skill 按需返回，
+        # 行内限额沿用 context.large_tools（load_skill 已列入，32k），超限外置 toolstore
+        "skills": {
+            "enabled": True,
+            "dir": "data/skills",
+            "metadata_budget_tokens": 1024,
         },
         "command_plugins": ["data/commands"],
         # 核心功能外部 API（UI/改配置不挂接口）

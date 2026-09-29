@@ -163,6 +163,32 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         _echo(ctx, "工具:\n" + "\n".join(lines))
         return True
 
+    @commands.register("/skill", hint="技能系统 · 列表/查看/重载", usage="/skill [名称|reload]", source="builtin")
+    def _skill(ctx, args):
+        from core import skills as skills_mod
+
+        arg = (args or "").strip()
+        loader = skills_mod.get_loader(ctx["config"])
+        if loader is None:
+            _echo(ctx, "技能系统未启用（config.skills.enabled 或缺少 pyyaml）")
+            return True
+        if arg == "reload":
+            _echo(ctx, f"技能已重扫: {loader.reload()} 个")
+            return True
+        if arg:
+            sk = loader.load(arg)
+            if sk is None:
+                _echo(ctx, f"技能不存在: {arg}\n可用:\n{loader.listing()}")
+            else:
+                _echo(ctx, f"[{sk.name}] {sk.path}\n正文约 {sk.token_count} tokens\n\n{sk.body}")
+            return True
+        listing = loader.listing()
+        _echo(
+            ctx,
+            f"可用技能 {len(loader)} 个:\n{listing}" if listing else "暂无技能（放置 data/skills/<name>/SKILL.md）",
+        )
+        return True
+
     @commands.register("/plan", hint="查看计划", source="builtin")
     def _plan(ctx, args):
         ctx["app"].status = f"计划 {ctx['session'].plan.get('status')}"

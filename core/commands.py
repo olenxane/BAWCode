@@ -94,12 +94,27 @@ def _complete_plugin_echo(config, arg: str) -> List[dict]:
     return _filter_arg_items(items, arg)
 
 
+def _complete_skill(config, arg: str) -> List[dict]:
+    from core import skills as skills_mod
+
+    loader = skills_mod.get_loader(config)
+    if loader is None:
+        return []
+    items = [
+        {"name": f"/skill {name}", "hint": meta["description"][:40], "source": "arg", "callable": True}
+        for name, meta in loader._metadata.items()
+    ]
+    items.append({"name": "/skill reload", "hint": "重扫技能目录", "source": "arg", "callable": True})
+    return _filter_arg_items(items, arg)
+
+
 # 内置参数补全
 register_arg_completer("/mode", _complete_mode)
 register_arg_completer("/theme", _complete_theme)
 register_arg_completer("/model", _complete_model)
 register_arg_completer("/use", _complete_model)
 register_arg_completer("/plugin_echo", _complete_plugin_echo)
+register_arg_completer("/skill", _complete_skill)
 
 
 def set_handler(name: str, handler: Callable) -> None:

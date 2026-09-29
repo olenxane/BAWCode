@@ -1121,3 +1121,35 @@ def rag_add(text: str, source: str = "", external_handler=None) -> str:
         return "记忆会话未初始化"
     session.rag_add(text, source=source, external_handler=external_handler)
     return "已写入项目 RAG"
+
+
+@register.register(
+    name="load_skill",
+    description="Load the full SKILL.md guide of a skill listed in [可用技能]; call it when the task matches a listed skill, then follow its instructions",
+    usage="load_skill <skill>",
+    schema={
+        "type": "object",
+        "properties": {
+            "skill": {"type": "string", "description": "技能名（见 [可用技能] 清单）"},
+        },
+        "required": ["skill"],
+    },
+)
+def load_skill(skill: str) -> str:
+    """技能正文按需加载（渐进式披露第二层）；超限由 add_tool_result 行内限额统一外置"""
+    from core import skills as skills_mod
+
+    session = _session()
+    loader = skills_mod.get_loader(session.config if session is not None else None)
+    if loader is None:
+        return "技能系统未启用（config.skills.enabled 或缺少 pyyaml）"
+    loaded = loader.load(skill)
+    if loaded is None:
+        names = ", ".join(loader.list_names()) or "（无）"
+        return f"技能不存在: {skill}。可用技能: {names}"
+    parts = [f"[技能: {loaded.name}] 来源 {loaded.path}", "", loaded.body]
+    extras = loaded.scripts + loaded.references
+    if extras:
+        lines = "\n".join(f"- {p}" for p in extras)
+        parts.append(f"\n[配套资源（按需用 read 工具查看；脚本经 run_command 执行）]\n{lines}")
+    return "\n".join(parts)

@@ -35,6 +35,7 @@ SAFE_TOOLS = {
     "list_directory",
     "memory_add_fact",
     "rag_add",
+    "load_skill",
 }
 
 # 命令白名单片段（manual/auto 判为相对安全）

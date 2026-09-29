@@ -763,6 +763,29 @@ class Memory:
                     "type": "memory",
                 }
             )
+        # 技能元数据清单（core/skills.py）：每回合重建，不进会话历史，
+        # 故不参与回合末剥离与压缩；正文由模型按需 load_skill 取用
+        try:
+            from core import skills as skills_mod
+
+            loader = skills_mod.get_loader(self.config)
+            if loader is not None:
+                listing = loader.listing()
+                if listing:
+                    supplements.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "[可用技能]\n"
+                                "以下技能可按需加载完整操作指南：当任务匹配某技能时，"
+                                "先调用 load_skill 工具读取其正文，遵循其中的流程与约定执行。\n"
+                                + listing
+                            ),
+                            "type": "memory",
+                        }
+                    )
+        except Exception as e:
+            log.debug("技能清单注入失败: %s", e)
         return supplements
 
     @staticmethod

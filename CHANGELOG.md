@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-09-29 — 技能加载系统：SKILL.md 双层目录 + load_skill 工具 + /skill 命令
+
+- **渐进式披露三层**（core/skills.py）：启动仅扫 SKILL.md frontmatter 元数据（每条
+  百 token 级）进 [可用技能] 清单，正文经 load_skill 工具按需读取并缓存，
+  scripts/references 由模型经 read/run_command 自行取用；pyyaml 为新增依赖
+  （requirements.txt），缺失时技能系统降级关闭并告警，不影响主流程。
+- **双层目录**：全局 data/skills + 项目 {workspace}/.bawcode/skills（项目级同名覆盖
+  全局，与 Agent.md/Projects 记忆范式一致）；格式兼容 SKILL.md+YAML frontmatter
+  规范，附 data/skills/example 示例技能作为新技能模板。
+- **注入通道**（memory.build_context_supplements）：[可用技能] 清单为独立 system
+  补充，每回合重建、不进会话历史——不参与回合末剥离与阈值压缩，常驻成本仅清单
+  预算（skills.metadata_budget_tokens，超限先降级为仅名称再截断）。
+- **load_skill 工具**（core/tools.py）：只读（policy.SAFE_TOOLS 放行 manual 模式）；
+  行内限额沿用 context.large_tools（已列入，32k），超限部分由 add_tool_result 统一
+  外置 toolstore 附回读指针；不加入 tool_whitelist——技能内容生命周期=回合内，
+  需要时模型重读（幂等、纯磁盘读）。技能脚本不新开执行通道，正文引导经 run_command
+  走现有 policy 确认流：技能外化知识，不外化权限。
+- **/skill 命令**（main.py 注册 + core/commands.py 参数补全器）：无参列表、
+  `/skill <名>` 查看正文（含 token 数）、`/skill reload` 热重载；补全列出技能名。
+- **单例语义**：skills.get_loader 按配置签名（enabled/全局目录/项目目录/预算）复用
+  或重建，配置变更即时生效；/skill reload 仅重扫目录不改配置。
+- **测试**：develop/test_skills.py 17 项全绿（扫描/项目级覆盖/坏技能跳过/清单预算
+  降级/懒加载缓存/热重载/禁用短路/工具正文与配套资源/未知名带可用清单/补充注入与
+  禁用不注入）；真实链路冒烟：工具表 18 项含 load_skill 且 schema 带公共 description
+  参数、policy manual 判定放行、/skill 四分支输出正确、build_messages 头部
+  [记忆补充]→[可用技能] 顺序正确。
+
 ## 2026-09-29 — 树节点 Enter 切换定案：已展开再按即收回，toggle 后光标钉回原节点
 
 - **问题定性**：树上下文裸 Enter 在 keymap 固定契约中映射为 `Action.EXPAND`
