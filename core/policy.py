@@ -30,6 +30,8 @@ DENY = "deny"
 # 只读安全工具（manual 也放行）
 SAFE_TOOLS = {
     "read",
+    "search",
+    "glob",
     "list_directory",
     "memory_add_fact",
     "rag_add",

@@ -1,5 +1,211 @@
 # Changelog
 
+## 2026-09-29 — 树节点 Enter 切换定案：已展开再按即收回，toggle 后光标钉回原节点
+
+- **问题定性**：树上下文裸 Enter 在 keymap 固定契约中映射为 `Action.EXPAND`
+  （core/keymap.py "树上裸 Enter = 展开/折叠"），而 ui 侧 `_tree_expand`
+  是**单向展开**——节点已展开时再按 Enter 条件不成立、动作落空，无法收回。
+- **双向切换**（core/ui.py `_tree_expand`）：树焦点下无条件 toggle_fold，
+  裸 Enter/l/→ 语义统一为「展开↔收起」；`h`/`←`/空格原本即 toggle，现在
+  全部树切换键对称。输入焦点下 →/← 仍为光标移动——顺带修复原实现的隐患：
+  首分支不查焦点，输入框按 → 若树光标恰停在收起节点上会误切树节点而不动
+  光标（折叠改动令 user 节点默认收起后此误触面大增）。
+- **光标钉回**（`toggle_fold`）：帮助/计划/步骤等子节点型节点展开会改变
+  flat 布局、后续索引整体漂移，「再按一次」会作用到子节点上。toggle 后
+  重新展平并按节点 id 把 tree_cursor 钉回被切换的节点（消息类节点子树恒
+  walk、布局不变，钉回为幂等空操作）。
+- **测试**：新增 develop/test_tree_toggle.py（13 项：Enter 展开→再按收回
+  且光标不动、h/l 对称 toggle、帮助节点展开 flat 变长+光标钉回+再按收回、
+  输入焦点 →/← 不误切树）；tree_nav 13 项、tree_fold 23 项、tree_refresh
+  11 项、tree_autoscroll 8 项、key_binding 33 项、keymap/mouse_wheel/
+  paint_throttle/textbuf/input_layout/session_store/backspace_refresh/
+  input_cursor_display 及 e2e_mock_llm 回归全绿。
+
+## 2026-09-29 — P1/P2 工具补齐：read 行号化、glob 文件查找、multi_edit 批量编辑
+
+- **read 增强**（core/tools.py）：输出改为 `行号| 内容` 前缀（与 edit_file 变更
+  片段、search 上下文块同一视觉语言），模型可直接拿行号锚定编辑；字节级读取加
+  NUL 嗅探，二进制文件直接拒绝而非回乱码；解码探测复用 utf-8→gbk 链路，GBK 文
+  件此前 utf-8 replace 出乱码，现正确解码（与 edit_file/search 口径一致）；空
+  文件返回"（空文件）"而非误导性的"offset 超出范围：文件共 0 行"。
+- **glob 工具新增**：文件名模式查找，`**` 跨目录（零层也可），含 `/` 的 pattern
+  对相对路径匹配、否则对文件名；24h 内修改的按新→旧置顶、其余按路径，上限 200
+  附截断提示；复用 search 的 `_file_matcher`/`_SKIP_DIRS`（原 `_SEARCH_SKIP_DIRS`
+  改名共用），非 glob 字符经 re.escape 字面匹配，`a[1].txt` 这类特殊文件名可直
+  接命中。
+- **multi_edit 工具新增**：单文件多项替换，按数组顺序逐项校验并应用（后项可引
+  用前项产物），任一项失败即中止且不写盘（原子），错误标识项序号并附 0 匹配近
+  似定位/多匹配行号；全部通过后一次性写回，回显原文件→最终内容的变更片段；逐
+  项 replace_all；行尾/编码保留与 edit_file 共用新抽出的
+  `_load_editable`/`_save_editable`。
+- **配套**：policy.SAFE_TOOLS 加入 glob（只读放行；multi_edit 有写副作用，与
+  edit_file 同走确认）；system_prompt 工具清单补 multi_edit/glob 两条指引。
+- **测试**：develop/test_p1p2_tools.py 36 项全绿（read 行号/分页/二进制/GBK/空
+  文件/越界，glob 基本与跨目录/近期优先/特殊字符/截断/skip 目录，multi_edit 成
+  功计数/原子性/顺序依赖/逐项 replace_all/GBK/边界，策略集成）；回归
+  test_edit_search 43 项全绿；真实文件锚定闭环冒烟（read 定位→edit→search 验
+  证）通过。
+
+## 2026-09-29 — 用词调整：简明记录标签「已剥离」→「已省略」（用户要求）
+
+- 影响模型可见记录与 TUI 显示：memory.finalize_turn 的简明记录前缀改为
+  `[已省略·工具名] description call_id=… 完整输出: 路径`；system_prompt.md
+  「已省略的调用记录」规则同步改写；develop/考核文档.md、realtest 脚本与三个
+  测试脚本的断言字符串同步。机制内部命名（finalize_turn/_strip_tool_message/
+  stripped 标志/日志「剥离工具记录 N 条」）不变；白名单预算外置的
+  「[白名单外置·…]」标签语义不同，保留原样。历史会话里已落盘的旧
+  「[已剥离·…]」记录不迁移（历史事实，模型两种格式均可理解）。
+- 验证：context_mgmt / integration / session_store / e2e 四套件全绿；
+  全仓 grep 无「已剥离」残留（CHANGELOG/记忆中的历史记录除外）。
+
+## 2026-09-29 — edit_file 反馈层重构 + search 内容搜索工具落地
+
+- **edit_file 重写**（core/tools.py）：此前按 `read_text/write_text` 整体读写，
+  LF 文件编辑一次即被 universal newlines 静默改写成 CRLF，非 UTF-8 文件直接抛
+  UnicodeDecodeError，失败只回"未找到待替换内容"无定位信息，成功只回"编辑成功"
+  无法自校验。现改为字节级读写：解码探测 utf-8→gbk→有损兜底（有损即拒绝编辑防
+  损坏），行尾归一匹配后按原文件风格恢复（字节写回不走平台翻译）。
+- **失败行号级反馈**：0 匹配时对 old_str 较长行做 difflib 相似度扫描，报近似
+  位置行号（L1: 内容），免去整文件重读；多匹配未开 replace_all 时列出每处匹配
+  行号，模型扩展上下文即可自行锚定消歧。
+- **成功回显变更片段**：定位新旧内容首个差异区间，前后各扩 3 行、超 30 行截断，
+  格式"变更片段（第 x-y 行 / 共 N 行）"+ 行号内容；GBK 等非 utf-8 编码保留时
+  附注记。
+- **search 工具新增**（core/tools.py）：正则内容搜索，按文件分组返回相对路径 +
+  行号 + 行文本，参数 pattern/path/glob/context(0-5 上下文块)/max_matches(默认
+  50)/case_sensitive。rg 快路径（--json 流式解析，达上限即杀进程；rust 正则不
+  兼容退出码 2 → 落兜底）+ 纯 Python 兜底（os.walk + 逐行扫描，支持 GBK，NUL
+  嗅探跳二进制，单文件 8MB 上限），两者共用渲染器：context=0 逐行 L行号: 内容，
+  context>0 合并相邻匹配为 `--- 路径 Lx-y ---` 上下文块（> 标匹配行），与 read
+  的 offset/limit 分页对齐形成"search 定位→read 精读→edit 修改"闭环。跳
+  .git/node_modules/__pycache__ 等目录；rg 需 `!**/dir/**` 形式负 glob（绝对
+  路径搜索根下 glob 对完整路径匹配，锚根的 `!dir/**` 不生效）。
+- **配套接线**：policy.SAFE_TOOLS 加入 search（manual/auto 均免确认）；config
+  的 context.large_tools 加入 search（行内上限走 32k 档，超限外置落盘+指针复用
+  既有管线）；system_prompt.md"使用你的工具"一节残留的 gemini-cli 工具名
+  （read_file/edit/write_file/grep_search/run_shell_command）统一改为实际注册名
+  （read/edit_file/write/search/execute_command），glob 条目改为 list_directory。
+- **测试**：develop/test_edit_search.py 43 项全绿（真实 rg 14.1.1 双路径等价、
+  LF/CRLF/GBK 保留、非文本拒绝、0 匹配近似定位、多匹配行号、片段回显、上下文
+  块、glob 过滤、skip 目录、二进制/GBK、截断、无效正则、单文件、注册与策略集
+  成）；另对本仓库真实冒烟 SAFE_TOOLS/pointer_line 搜索与 demo 编辑通过。
+
+## 2026-09-29 — 会话树光标导航修复：节点号与行号两套索引经 _node_spans 统一换算
+
+- **问题定性**：树焦点下 ↑↓ 高亮乱跳、滚轮/翻页后光标错位到任意节点。
+  根因是索引空间混用——`scroll` 按**渲染行**计数，`tree_cursor` 按**扁平
+  节点**计数，而 `_on_up/_on_down/_set_scroll/_clamp_tree_scroll/
+  _toggle_focus` 一直互相拿节点号当行号做算术。早期每节点恰渲染 1 行时
+  两者等价，消息正文 inline 多行渲染（本次折叠改动后节点行高差异更大）
+  后等价关系彻底失效。用户视频取证确认：滚轮大幅滚动为正常操作，
+  异常仅在光标导航。
+- **换算表**（core/ui.py `_tree_rows`）：渲染时记录 `_node_spans[节点号] =
+  (起始行, 行数)`，与行缓存同 key 同生命周期（命中复用、空树重置），
+  作为节点空间↔行空间的唯一映射。
+- **换算方法**：新增 `_ensure_cursor_visible`（光标节点标题行不可见时最小
+  滚动：高于视口的节点顶对齐、否则贴底露出标题；不强求整节点入窗，避免
+  与滚轮/翻页互抢滚动位置）与 `_node_at_row`（行→节点，越界夹端点）。
+- **导航修正**：`_on_up/_on_down` 只按节点移动光标（保留长按加速步长），
+  scroll 可见性统一交给帧循环 `_clamp_tree_scroll`（树焦点下走
+  `_ensure_cursor_visible`）；`_set_scroll`（滚轮/翻页/拖拽共用）滚动后把
+  光标夹回可见节点区间；`_toggle_focus` 进树光标落尾节点、scroll 交给
+  clamp，去掉 `len(flat)-4` 的节点号当行号写法。
+- **测试**：新增 develop/test_tree_nav.py（13 项：spans 等长/连续、高亮
+  落在光标节点标题行、↑↓ 逐节点移动标题行始终可见、到顶归零/到底贴底、
+  滚轮后光标同步进可见节点区间、Tab 进树落尾节点可见）；key_binding 33
+  项、tree_autoscroll 8 项、tree_refresh 11 项、tree_fold 23 项、
+  mouse_wheel/paint_throttle/keymap/textbuf/input_layout/session_store/
+  backspace_refresh/input_cursor_display 及 e2e_mock_llm 回归全绿。
+
+## 2026-09-29 — 会话树长内容折叠落地：消息类节点收起 3 行 + 溢出指示，assistant/plan 全文
+
+- **问题定性**：长消息折叠自消息正文 inline 化重构起即未生效——`_fold`/
+  `_COLLAPSE_THRESHOLD`/`max_display_lines` 三个孤儿从未被任何版本接线
+  （旧快照 BAWCode_test 中 tool/user/system 的一行摘要+detail 展开范式在
+  inline 化时被整体丢弃，折叠能力随之丢失，仅流式思考尾 3 行窗口幸存）。
+- **折叠渲染**（core/ui.py `_tree_rows`）：新增 `_TREE_INLINE_CAP = 3` 与
+  `_TREE_FOLD_KINDS = {user, tool, system, system_prompt}`（tool 含工具调用
+  轮）。可折叠节点收起时正文最多显示 3 个视觉行，超出追加 dim 色
+  「… (+N 行)」指示行；marker 仅在正文超限时显示 ▸/▾，短消息保持 ·。
+  折行先全量计算再切片，与既有逐帧渲染成本持平；行缓存 key 已含 expanded
+  集合，toggle 后正确失效。
+- **折叠与子树解耦**（`_flatten_tree`）：折叠类消息节点（user 等回合根）
+  收起的只是正文溢出行，其子节点（本回合 Agent 回复/工具记录/流式直播）
+  始终 walk 展示——否则 user 默认收起会把整轮对话藏掉。
+- **树构建**（`_build_tree`）：user 节点 default_expanded 改 False（短消息
+  收起渲染与全文相同，无感知）；help/命令反馈改为 ≤3 行默认展开、更长默认
+  收起且子行去掉 [:10] 截断（修复 /model 等短回显被藏）；plan 子行去掉
+  [:12] 截断（计划全文不限行数）。assistant 与 stream_content 全文渲染、
+  无折叠指示；stream_thinking 尾 3 行窗口原样保留。
+- **死代码清理**：删除从未调用的 `_fold()`、`_COLLAPSE_THRESHOLD`、
+  `max_display_lines`。
+- **测试**：新增 develop/test_tree_fold.py（23 项：长用户消息/工具输出收起
+  3 行+指示行+toggle 展开、回合子树不随折叠隐藏、assistant 30 行与 plan
+  20 行全文、流式思考尾窗、help 短可见长收起）；回归 test_tree_refresh 11
+  项、test_tree_autoscroll 8 项、paint_throttle/mouse_wheel/key_binding/
+  keymap/textbuf/session_store/backspace_refresh/e2e_mock_llm 全绿；
+  test_input_cursor_display 修复陈旧 buffer 赋值（适配 TextBuffer API）。
+
+## 2026-09-29 — 压缩摘要结构化：qwen 式 state_snapshot 提示词 + 程序解析校验
+
+- **提示词**（core/prompts/compress.md 重写）：参考 qwen-code 0.24.1
+  `getCompressionPrompt()`（packages/core/src/core/prompts.ts）的两段式结构——
+  先 `<analysis>` 草稿块（按时间线梳理请求/决策/细节/错误/用户反馈，生效前被
+  程序剥离），再严格输出 `<state_snapshot>` XML（9 节：primary_request_and_
+  intent / key_technical_concepts / files_and_code_sections / errors_and_fixes /
+  problem_solving / all_user_messages / pending_tasks / current_work /
+  next_step，中文注释说明各节要求）。保留管线既有设定：`^{summary_token_target}^`
+  占位符（程序按旧段 5% 钳制 [150,800] 计算）、"摘要 + 最近几轮原文"框架、
+  用户原话最高优先级逐条保留。
+- **解析器**（core/memory.py 新增模块级 `parse_state_snapshot()`）：剥除首尾
+  代码围栏与 `<analysis>` 草稿块 → 提取 `<state_snapshot>` → 按 9 节逐一
+  抓取 → 至少 3 节非空才有效（防模型原样回显模板注释的空壳结构）。
+- **管线接入**（memory.compress）：钩子纯文本契约不变（能解析则结构化、不能
+  则按原样接受）；LLM 路径强制结构化——解析失败自动重试一次（重试提示词明确
+  指出缺失结构），仍失败走 `_compress_fail` 熔断、历史保持不变，不可解析的
+  摘要绝不入库。摘要 token 上限改按剥除草稿后的 XML 计；摘要消息新增
+  `sections` 字典（程序可直接读取各节）与 `metadata.structured` 标记。
+- **测试**（test_context_mgmt.py 断言 12 组新增）：解析容错（无结构/全空壳/
+  围栏与草稿剥除）、结构化成功（提示词含模板+历史、产出剥除草稿、摘要+尾段
+  替换、sections 可读、旧段归档）、失败重试一次后成功、两次不可解析则失败
+  不动历史且熔断计数。连同既有断言共 51 项全绿；其余 4 套件回归无恙。
+
+## 2026-09-29 — 流式输出适配：SSE 双路径聚合 + 树尾直播 + 阶段状态行
+
+- **llm 层**（core/llm.py）：`chat()` 新增 `on_delta(kind, piece)` 回调（kind ∈
+  reasoning/content）；config `llm.stream`（默认 true）开启时走 SSE 流式——
+  SDK 路径 `_native_chat_stream`（stream=True + stream_options include_usage，
+  逐 chunk 聚合回调）与 urllib 降级路径 `_http_chat_stream`（SSE 行迭代解析，
+  请求体补 stream 字段；Content-Type 非 event-stream 时同一聚合器优雅降级）。
+  聚合器 `_StreamAggregate` 产出伪 OpenAI 响应复用现有 `_normalize`（arguments
+  解析/id 补齐/reasoning 分流零改动），usage 从终块进现有计量。取消：每 chunk
+  检查 _cancel，cancel() 增加关闭 urllib 在途句柄 `_inflight_resp`（补上原盲区）。
+  失败语义：首个 chunk 前失败自动回落非流式（本次尝试内）；已产出后中断 midway
+  定格不重试（partial 已上屏），错误随结果返回。`_build_client` 显式
+  max_retries=0（消除 SDK 默认 2 次 × 外层 3 次的双层重试叠加）。
+- **树尾直播**（main.py + core/ui.py，按用户图示规格）：流式对象为纯 UI 侧属性
+  `app.streaming_msg`（agent 线程单写者、不进 session.messages——半成品不落盘/
+  不进 API，中断丢弃语义与在途回合一致）；`_build_tree` 生成两个直播节点——
+  思考过程（kind=stream_thinking，**过长折叠为尾部 3 行动态窗口**，随流式滚动）
+  与正文（stream_content，全文折行）；贴底跟随沿用 follow_tail。签名加流式
+  长度使每帧失效重画。消息配色为**用户指定色值**：用户消息 3ca2a2、Agent 消息
+  （含流式正文与完成态）80944e、思考过程 045f62（新增主题键 user_msg/agent/
+  thinking）；工具调用节点双色渲染——标题 14babc + 内容纯白（同一物理行双色，
+  tool_call 轮节点 kind 改 tool 与工具结果一致；新增主题键 tool_title/
+  tool_content），DEFAULT_COLORS 为默认值、主题文件可覆盖。
+- **阶段状态行**（用户图示规格）：树底常驻 1 行（tree_h 预算 -1）——产出阶段
+  "思考中"（红/err 色）、工具执行"工具调用中"、完成空行占位（布局稳定）；
+  main 在轮循环 chat 前/工具执行前/完成分支设置，wrapper finally 兜底清空。
+- **测试**（develop/mock_llm_server.py + test_e2e_mock_llm.py 扩展）：mock 支持
+  SSE（reasoning 2 片/content 3 片/arguments 3 片/usage 终块/[DONE]，逐帧
+  flush + 可配延迟）、reject_stream 强制回落。场景二 13 项断言：同脚本流式/
+  非流式会话逐字段等价（对拍不变式）、on_delta 逐片累积快照、SSE 多片切分、
+  阶段行变迁、出站 payload 无 streaming 半成品、usage 计量、urllib SSE 路径
+  等价、回落、中途取消（Timer 注入 → 注记中断/partial 丢弃/树尾清空/日志取证）。
+  修复：urllib 流式请求体缺 stream 字段导致静默空响应（SSE 解析器静默跳过
+  整段 JSON——现加 Content-Type 守卫 + 请求体补字段）。无头渲染冒烟：思考
+  尾窗折叠/正文节点/阶段行/收口无残留。全量回归 5 套件全绿。
+
 ## 2026-09-29 — 端到端测试基建：本地 OpenAI 协议 mock LLM 服务器 + 日志分析断言
 
 - `develop/mock_llm_server.py`（新增，可独立复用）：stdlib 实现的 OpenAI 兼容

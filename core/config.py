@@ -80,7 +80,9 @@ def default_config() -> dict:
             "scroll_max_step": 20,
             "tip_interval": 5,
         },
-        "llm": {"retry_times": 3, "retry_delay": 1.0},
+        # stream: 流式输出开关（SSE 增量上屏）；首个 chunk 前失败自动回落非流式，
+        # 已收 chunk 后失败不回落不重试（内容已上屏）；false 完全走整段路径
+        "llm": {"retry_times": 3, "retry_delay": 1.0, "stream": True},
         # 分级日志（core/log.py）：level 全局阈值 debug/info/warn/error/off；
         # modules 按模块覆盖粒度（如 {"llm": "debug", "ui": "off"}）；
         # console 同步输出 stderr；days_to_keep 保留天数（0 永久）
@@ -95,6 +97,10 @@ def default_config() -> dict:
             "longterm_dir": "data/memory",
             "auto_compress": True,
             "compress_threshold": 0.8,
+            # 压缩保留尾段 token 预算（最近轮次原文不压缩，按轮次边界切尾，至少保留最后一轮）
+            "compress_keep_recent_tokens": 16384,
+            # 摘要硬上限 token（超限视为摘要失控，放弃压缩保持历史不变）
+            "compress_summary_max_tokens": 1024,
         },
         # 上下文管理（core/toolstore.py + memory.finalize_turn）：
         # tool_whitelist 白名单内工具完整调用历史跨回合保留，会话累计超
@@ -114,7 +120,7 @@ def default_config() -> dict:
             ],
             "whitelist_budget_tokens": 32768,
             "inline_limit_tokens": 4096,
-            "large_tools": ["read", "write", "edit_file"],
+            "large_tools": ["read", "search", "write", "edit_file"],
             "inline_limit_tokens_large": 32768,
             "persist_dir": "data/toolcalls",
             "strip_keep_recent": 6,

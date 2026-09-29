@@ -254,7 +254,8 @@ def _bridge_line(app: "ui.TuiApp", prompt: str, config, cancelled=None):
 
 
 def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
-    """回合入口：无论正常结束/出错/中断，回合末执行上下文维护（剥离+预算外置）"""
+    """回合入口：无论正常结束/出错/中断，回合末执行上下文维护（剥离+预算外置），
+    并清掉流式树尾消息（partial 丢弃，与在途回合丢弃语义一致）"""
     try:
         _agent_turn_impl(llm, session, user_text, app, runner=runner)
     finally:
@@ -262,6 +263,8 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
             session.finalize_turn()
         except Exception as exc:
             log.error("回合末上下文维护失败: %r", exc)
+        app.streaming_msg = None
+        app.phase_hint = ""
 
 
 def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
@@ -278,6 +281,18 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     def _aborted():
         session.add_message("system", "[本轮已被新消息中断]", type="help")
         _syncq(status="已中断")
+
+    def _on_delta(kind: str, piece: str) -> None:
+        # 流式回调（agent 线程）：只改 UI 状态不渲染——流式对象挂在 app.streaming_msg，
+        # 不进 session.messages（半成品不落盘/不进 API），帧循环每帧读它画树尾直播
+        msg = getattr(app, "streaming_msg", None)
+        if msg is None:
+            msg = {"role": "assistant", "content": "", "thinking": "", "type": "streaming"}
+            app.streaming_msg = msg
+        if kind == "reasoning":
+            msg["thinking"] += piece
+        else:
+            msg["content"] += piece
 
     log.info("任务开始: %s", user_text)
     session.add_message("user", user_text, type="task")
@@ -402,11 +417,13 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
             _aborted()
             return
         _syncq(status=f"推理 · 第{round_no + 1}轮")
+        app.phase_hint = "思考中"
         payload = session.build_messages(extra_system=system_prompt_text)
         llm.meter.measure_context(payload)
         # 代码编写默认模型（设置页可指定）
         code_model = llm.config.get_task_model("code") if hasattr(llm.config, "get_task_model") else None
-        response = llm.chat(payload, tools=register.get_tool_defs(), model=code_model)
+        response = llm.chat(payload, tools=register.get_tool_defs(), model=code_model, on_delta=_on_delta)
+        app.streaming_msg = None  # 树尾直播收口：正式消息按现有路径入库
         app.token_meter = llm.meter
         if response.get("error") == CANCELLED or _cancelled():
             _aborted()
@@ -422,6 +439,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
             session.add_message("assistant", response["content"], **extra)
         tool_calls = response.get("tool_calls") or []
         if not tool_calls:
+            app.phase_hint = ""  # 回合完成：状态行空行占位
             log.info("任务完成（共%d轮推理）", round_no + 1)
             if not _cancelled():
                 session.maybe_compress(llm_fn=lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
@@ -435,6 +453,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
             if isinstance(args, dict) and "description" in args:
                 call["description"] = str(args.pop("description") or "")
 
+        app.phase_hint = "工具调用中"
         pending = []
         allowed_results = []
         log.debug("第%d轮返回 %d 个工具调用", round_no + 1, len(tool_calls))

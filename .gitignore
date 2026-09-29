@@ -6,3 +6,7 @@ __pycache__
 BAWCode_test
 _recycle
 develop
+data/log
+data/sessions
+data/toolcalls
+新建文件夹

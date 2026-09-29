@@ -59,6 +59,94 @@ class _SystemPromptProxy(str):
 SYSTEM_PROMPT = _SystemPromptProxy(_fallback_system_prompt())
 
 
+class _StreamAggregate:
+    """流式 chunk 聚合器：content/reasoning_content/tool_calls 增量累积，
+    产出伪 OpenAI 响应（复用 _normalize 第三分支做 arguments 解析/id 补齐/reasoning 分流）。
+    parts 列表 + 末次 join，规避 str += 的 O(n²)。"""
+
+    def __init__(self, on_delta=None):
+        self.on_delta = on_delta
+        self.content_parts: list = []
+        self.reasoning_parts: list = []
+        self.tool_buckets: dict = {}
+        self.tool_order: list = []
+        self.usage = None
+        self.error = None      # midway 错误：已产出内容后传输中断（不重试，partial 定格）
+        self.produced = 0      # 已回调 delta 数（reasoning/content），>0 即"已上屏"
+
+    def _emit(self, kind: str, piece: str) -> None:
+        if not piece:
+            return
+        if self.on_delta is not None:
+            try:
+                self.on_delta(kind, piece)
+            except Exception as e:
+                log.warn("流式回调异常（忽略）: %s", e)
+        self.produced += 1
+
+    def add_reasoning(self, piece: str) -> None:
+        if not piece:
+            return
+        self.reasoning_parts.append(piece)
+        self._emit("reasoning", piece)
+
+    def add_content(self, piece: str) -> None:
+        if not piece:
+            return
+        self.content_parts.append(piece)
+        self._emit("content", piece)
+
+    def add_tool_delta(self, index: int, call_delta: dict) -> None:
+        bucket = self.tool_buckets.get(index)
+        if bucket is None:
+            bucket = {"id": "", "name": "", "arguments": ""}
+            self.tool_buckets[index] = bucket
+            self.tool_order.append(index)
+        if call_delta.get("id"):
+            bucket["id"] = call_delta["id"]
+        fn = call_delta.get("function") or {}
+        if fn.get("name"):
+            bucket["name"] = fn["name"]
+        if fn.get("arguments"):
+            bucket["arguments"] += fn["arguments"]
+
+    def set_usage(self, usage) -> None:
+        if usage:
+            self.usage = usage
+
+    @property
+    def produced_any(self) -> bool:
+        return self.produced > 0 or bool(self.tool_buckets)
+
+    def to_response(self) -> dict:
+        tool_calls = [
+            {
+                "id": self.tool_buckets[index]["id"],
+                "type": "function",
+                "function": {
+                    "name": self.tool_buckets[index]["name"],
+                    "arguments": self.tool_buckets[index]["arguments"] or "{}",
+                },
+            }
+            for index in self.tool_order
+        ]
+        return {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "".join(self.content_parts),
+                        "reasoning_content": "".join(self.reasoning_parts),
+                        "tool_calls": tool_calls,
+                    },
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                }
+            ],
+            "usage": self.usage or {},
+        }
+
+
 class LLM:
     def __init__(self, config):
         self.config = config
@@ -67,13 +155,14 @@ class LLM:
         self.meter.model = config.model_name
         self.client = None
         self._client_provider_id = None
+        self._inflight_resp = None
         self._cancel = threading.Event()
         self._build_client()
 
     # ----- 取消（异步回合中断） -----
 
     def cancel(self) -> None:
-        """请求中断：置标记并关闭在途连接（openai SDK/httpx 路径立即生效）。"""
+        """请求中断：置标记并关闭在途连接（openai SDK/httpx 与 urllib SSE 句柄均立即生效）。"""
         self._cancel.set()
         client = self.client
         if client is not None and hasattr(client, "close"):
@@ -83,6 +172,13 @@ class LLM:
                 pass
         self.client = None
         self._client_provider_id = None
+        resp = self._inflight_resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            self._inflight_resp = None
         log.info("LLM 请求取消：已关闭在途连接")
 
     def cancelled(self) -> bool:
@@ -101,7 +197,8 @@ class LLM:
         base = normalize_base_url(base or "")
         if HAS_OPENAI and key:
             try:
-                self.client = openai.OpenAI(api_key=key, base_url=base)
+                # max_retries=0：重试统一由外层 retry_times 控制（避免 SDK 默认 2 次叠加成 12 次最坏重试）
+                self.client = openai.OpenAI(api_key=key, base_url=base, max_retries=0)
                 self._client_provider_id = pid
                 log.debug("OpenAI 客户端已构建 provider=%s base=%s", pid, base)
             except Exception as e:
@@ -185,7 +282,101 @@ class LLM:
         with urllib.request.urlopen(request, timeout=120) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _native_chat(self, payload: dict, req: Optional[dict] = None) -> dict:
+    # ----- 流式（SSE）：双路径聚合，产出伪 OpenAI 响应复用 _normalize -----
+
+    @staticmethod
+    def _feed_chunk(agg: "_StreamAggregate", data: dict) -> None:
+        """把单个 SSE chunk / SDK chunk / 完整响应 dict 喂给聚合器（delta 与 message 形态兼容）"""
+        if data.get("usage"):
+            agg.set_usage(data["usage"])
+        choices = data.get("choices") or []
+        if not choices:
+            return  # usage 终块 choices 为空
+        head = choices[0] or {}
+        delta = head.get("delta") or head.get("message") or {}
+        agg.add_reasoning(delta.get("reasoning_content") or "")
+        agg.add_content(delta.get("content") or "")
+        for i, tc in enumerate(delta.get("tool_calls") or []):
+            if isinstance(tc, dict):
+                # 流式 delta 带 index；完整响应无 index 时按位置分桶
+                agg.add_tool_delta(tc.get("index") if tc.get("index") is not None else i, tc)
+
+    def _finish_stream(self, agg: "_StreamAggregate", exc: Optional[Exception]) -> Optional["_StreamAggregate"]:
+        """流循环异常的统一收口：取消→None；已产出→midway 定格；未产出→抛给 chat 回落/重试"""
+        if exc is not None and self._cancel.is_set():
+            return None
+        if exc is None:
+            return agg
+        if agg.produced_any:
+            agg.error = f"流式传输中断: {exc}"
+            log.warn("流式传输中断（已产出 %d 片，不重试）: %s", agg.produced, exc)
+            return agg
+        raise exc
+
+    def _native_chat_stream(self, payload: dict, req: dict, on_delta) -> Optional["_StreamAggregate"]:
+        """openai SDK 流式：逐 chunk 聚合并回调增量；返回 None 表示已取消"""
+        agg = _StreamAggregate(on_delta)
+        resp = self.client.chat.completions.create(
+            **payload, stream=True, stream_options={"include_usage": True}
+        )
+        try:
+            for chunk in resp:
+                if self._cancel.is_set():
+                    return None
+                data = chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+                self._feed_chunk(agg, data if isinstance(data, dict) else {})
+            return self._finish_stream(agg, None)
+        except Exception as e:
+            return self._finish_stream(agg, e)
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _http_chat_stream(self, payload: dict, req: Optional[dict], on_delta) -> Optional["_StreamAggregate"]:
+        """urllib 降级流式：SSE 行迭代解析（timeout=120 语义自动变为块间超时）；None 表示已取消"""
+        agg = _StreamAggregate(on_delta)
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        stream_payload["stream_options"] = {"include_usage": True}
+        body = json.dumps(stream_payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self._chat_url(req), data=body, headers=self._headers(req), method="POST"
+        )
+        resp = urllib.request.urlopen(request, timeout=120)
+        self._inflight_resp = resp
+        try:
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if "text/event-stream" not in content_type:
+                # 服务端不支持流式（回了整段 JSON）：同一聚合器优雅降级
+                self._feed_chunk(agg, json.loads(resp.read().decode("utf-8")))
+                return self._finish_stream(agg, None)
+            for raw_line in resp:
+                if self._cancel.is_set():
+                    return None
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data_text = line[5:].strip()
+                if data_text == "[DONE]":
+                    break
+                try:
+                    data = json.loads(data_text)
+                except json.JSONDecodeError:
+                    continue
+                self._feed_chunk(agg, data)
+            return self._finish_stream(agg, None)
+        except Exception as e:
+            return self._finish_stream(agg, e)
+        finally:
+            self._inflight_resp = None
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _native_chat(self, payload: dict, req: Optional[dict] = None, on_delta=None):
         req = req or {}
         provider_id = req.get("provider_id")
         api_key = req.get("api_key")
@@ -194,8 +385,12 @@ class LLM:
             if self.client is None or self._client_provider_id != provider_id:
                 self._build_client(provider_id=provider_id, api_key=api_key, base_url=base_url)
             if self.client is not None:
+                if on_delta is not None:
+                    return self._native_chat_stream(payload, req, on_delta)
                 resp = self.client.chat.completions.create(**payload)
                 return resp.model_dump() if hasattr(resp, "model_dump") else resp
+        if on_delta is not None:
+            return self._http_chat_stream(payload, req, on_delta)
         return self._http_chat(payload, req)
 
     def query_balance(self) -> Optional[float]:
@@ -296,8 +491,14 @@ class LLM:
         tools: Optional[List[dict]] = None,
         temperature: Optional[float] = None,
         model: Optional[str] = None,
+        on_delta=None,
     ) -> dict:
-        """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型"""
+        """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型。
+
+        on_delta(kind, piece) 提供（kind ∈ reasoning/content）且 config.llm.stream
+        开启时走 SSE 流式：增量经回调上屏，聚合结果与非流式逐字段等价。
+        首个 chunk 前失败自动回落非流式；已产出后失败 midway 定格不重试。
+        """
         if self._cancel.is_set():
             return {"content": "", "tool_calls": [], "error": CANCELLED}
         self.meter.measure_context(messages)
@@ -313,6 +514,7 @@ class LLM:
             payload["tools"] = tools
             # DeepSeek 思考模式不支持 required/指定 function，固定 auto
             payload["tool_choice"] = "auto"
+        streaming = bool(on_delta) and bool((self.config.data or {}).get("llm", {}).get("stream", True))
         if not req.get("api_key"):
             log.warn("未配置可用 api_key，LLM 请求被拒绝 model=%s", model_id)
             hooked = hooks.call_hook(
@@ -343,7 +545,29 @@ class LLM:
                     {"messages": messages, "tools": tools, "payload": payload},
                     default=None,
                 )
-                data = external if external is not None else self._native_chat(payload, req)
+                if external is not None:
+                    data = external  # 外部 hook 整段转发，保持非流式语义
+                elif streaming:
+                    try:
+                        agg = self._native_chat(payload, req, on_delta=on_delta)
+                    except Exception as stream_err:
+                        if self._cancel.is_set():
+                            return {"content": "", "tool_calls": [], "error": CANCELLED}
+                        # 首个 chunk 前失败：回落非流式（本次尝试内完成；回落自身异常交外层重试）
+                        log.warn("流式请求失败，回落非流式: %s", stream_err)
+                        data = self._native_chat(payload, req)
+                    else:
+                        if agg is None:
+                            return {"content": "", "tool_calls": [], "error": CANCELLED}
+                        if agg.error:
+                            # midway：partial 已上屏，不重试，错误随结果返回
+                            result = self._normalize(agg.to_response(), keep_reasoning=bool(tools))
+                            self.meter.record_api_usage(result.get("raw", {}).get("usage"))
+                            result["error"] = agg.error
+                            return result
+                        data = agg.to_response()
+                else:
+                    data = self._native_chat(payload, req)
                 result = self._normalize(data, keep_reasoning=bool(tools))
                 usage = result.get("raw", {}).get("usage") if isinstance(result.get("raw"), dict) else None
                 self.meter.record_api_usage(usage)

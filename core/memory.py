@@ -1,10 +1,13 @@
 #该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.工具调用记录管理（白名单保留/回合末剥离/结果外置磁盘）3.长期记忆写入配置4.在agent对话时提供记忆补充内容5.针对特定项目的RAG模块
 import json
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
 
 from core import hooks
+from core import prompt_loader
 from core import rag as rag_mod
 from core import session_store
 from core import toolstore
@@ -17,6 +20,49 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 # 工具结果视为"已是简明记录"的长度阈值：拒绝原因/短错误不再剥离改写
 _CONCISE_CONTENT_CHARS = 200
+
+# 压缩摘要的 state_snapshot 结构节（与 core/prompts/compress.md 模板一一对应；程序按节解析校验）
+_SNAPSHOT_SECTIONS = (
+    "primary_request_and_intent",
+    "key_technical_concepts",
+    "files_and_code_sections",
+    "errors_and_fixes",
+    "problem_solving",
+    "all_user_messages",
+    "pending_tasks",
+    "current_work",
+    "next_step",
+)
+
+_COMPRESS_RETRY_HINT = (
+    "\n\n注意：上一次输出无法被程序解析为 <state_snapshot> 结构。"
+    "请重新输出：先 <analysis> 草稿，随后严格按模板输出 <state_snapshot> XML，"
+    "XML 之外不要有任何文字（也不要代码围栏）。"
+)
+
+
+def parse_state_snapshot(text: str) -> Optional[dict]:
+    """解析压缩模型输出的 <state_snapshot> 结构；返回 {"sections": dict, "xml": str} 或 None
+
+    容错：剥除首尾代码围栏与 <analysis> 草稿块（参考 qwen-code 的草稿-定稿两段式）；
+    至少 3 个节非空才认定有效——防止模型原样回显模板注释产出的空壳结构。
+    """
+    if not text or not text.strip():
+        return None
+    cleaned = re.sub(r"^\s*```[a-zA-Z]*\s*", "", text.strip())
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    cleaned = re.sub(r"<analysis>.*?</analysis>", "", cleaned, flags=re.DOTALL)
+    match = re.search(r"<state_snapshot>.*?</state_snapshot>", cleaned, flags=re.DOTALL)
+    if not match:
+        return None
+    xml = match.group(0).strip()
+    sections = {}
+    for tag in _SNAPSHOT_SECTIONS:
+        sm = re.search(rf"<{tag}>(.*?)</{tag}>", xml, flags=re.DOTALL)
+        sections[tag] = sm.group(1).strip() if sm else ""
+    if sum(1 for v in sections.values() if v) < 3:
+        return None
+    return {"sections": sections, "xml": xml}
 
 # 会话级记忆单例，由 main 初始化
 _session: Optional["Memory"] = None
@@ -52,6 +98,10 @@ class Memory:
         )
         self.auto_compress = memory_cfg.get("auto_compress", True)
         self.compress_threshold = memory_cfg.get("compress_threshold", 0.8)
+        # 压缩管线：尾段保留预算（最近轮次原文）与摘要硬上限；连续失败熔断计数
+        self.compress_keep_recent_tokens = int(memory_cfg.get("compress_keep_recent_tokens", 16384))
+        self.compress_summary_max_tokens = int(memory_cfg.get("compress_summary_max_tokens", 1024))
+        self._compress_fail_streak = 0
         # 上下文管理（core/toolstore.py）：白名单/预算/行内限额/回合末剥离保护
         ctx_cfg = config.data.get("context", {})
         self.tool_whitelist = set(ctx_cfg.get("tool_whitelist") or [])
@@ -220,6 +270,10 @@ class Memory:
         message = {"role": role, "content": content}
         message.update(extra)
         self.messages.append(message)
+        if role == "user" and self._compress_fail_streak:
+            # 新用户回合复位压缩熔断：上轮的 API 故障可能已恢复，重试频率限制为每回合一轮
+            self._compress_fail_streak = 0
+            log.debug("新用户回合，压缩熔断计数复位")
         log.debug(
             "消息追加: role=%s type=%s call_id=%s 当前%d条",
             role,
@@ -395,7 +449,7 @@ class Memory:
             message = self.messages[index]
             if message.get("stripped") or message.get("tool_name") in self.tool_whitelist:
                 continue
-            if self._strip_tool_message(message, prefix="已剥离"):
+            if self._strip_tool_message(message, prefix="已省略"):
                 stripped += 1
         evicted = self._evict_whitelist_overflow(model)
         think_stripped = 0
@@ -467,41 +521,203 @@ class Memory:
                 evicted += 1
         return evicted
 
+    # ----- 上下文压缩（轮次切尾 + 软目标摘要 + 校验 + 归档，失败不动历史） -----
+
+    @staticmethod
+    def _api_visible(item: dict) -> bool:
+        """与 _api_session_item 同规则的可见性判断（UI 专用注入不参与压缩与轮次统计）"""
+        return (item.get("type") or "") not in ("system_prompt", "help")
+
+    def _count_tokens(self, messages: List[dict]) -> int:
+        """tiktoken 计消息列表 token；不可用时字符数减半兜底（与 estimate_context_tokens 同策略）"""
+        from core import tokens as tokenmod
+
+        model = getattr(self.config, "model_name", "") or ""
+        try:
+            return tokenmod.count_message_tokens(messages, model)
+        except Exception:
+            chars = sum(len(str(m.get("content") or "")) for m in messages)
+            return max(1, chars // 2)
+
+    def _round_boundaries(self) -> List[int]:
+        """轮次起始索引：一条可见 user 消息开启一轮，轮内包含完整的 tool_calls→tool 序列"""
+        return [
+            i
+            for i, m in enumerate(self.messages)
+            if m.get("role") == "user" and self._api_visible(m)
+        ]
+
+    def _tail_start_index(self, budget_tokens: int) -> int:
+        """定位尾段起点：从最新轮次向前累积，预算内保留尽量多的轮次（至少保留最后一轮）"""
+        boundaries = self._round_boundaries()
+        if not boundaries:
+            return len(self.messages)
+        tail_start = boundaries[-1]
+        accumulated = self._count_tokens(self.messages[boundaries[-1]:])
+        for i in range(len(boundaries) - 2, -1, -1):
+            start = boundaries[i]
+            end = boundaries[i + 1]
+            round_tokens = self._count_tokens(self.messages[start:end])
+            if accumulated + round_tokens > budget_tokens:
+                break
+            accumulated += round_tokens
+            tail_start = start
+        return tail_start
+
+    def _compress_fail(self, reason: str) -> str:
+        """压缩失败统一出口：计数熔断，历史保持不变"""
+        self._compress_fail_streak += 1
+        suffix = "，自动压缩暂停" if self._compress_fail_streak >= 2 else ""
+        log.warn(
+            "压缩中止: %s，历史保持不变（连续失败%d次%s）",
+            reason, self._compress_fail_streak, suffix,
+        )
+        return ""
+
+    def _archive_old_segment(self, old_segment: List[dict]) -> Optional[Path]:
+        """旧段原文归档落盘（内存替换后原文仅存于此）；失败不阻塞压缩"""
+        try:
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = self.sessions_dir / f"{self.session_id}-precompact-{ts}.json"
+            data = {
+                "version": session_store.SESSION_VERSION,
+                "id": self.session_id,
+                "kind": "precompact-archive",
+                "archived_at": datetime.now().isoformat(timespec="seconds"),
+                "message_count": len(old_segment),
+                "messages": old_segment,
+            }
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+            return path
+        except OSError as e:
+            log.warn("压缩归档写入失败（压缩继续）: %s", e)
+            return None
+
+    def _delete_precompact_archives(self) -> None:
+        """删除本会话压缩归档（与 /clear 同步，防 /resume 复活旧内容，同 toolstore.clear_session 范式）"""
+        if not self.sessions_dir.exists():
+            return
+        for path in self.sessions_dir.glob(f"{self.session_id}-precompact-*.json"):
+            try:
+                path.unlink()
+                log.debug("压缩归档已删除: %s", path.name)
+            except OSError as e:
+                log.warn("压缩归档删除失败 %s: %s", path.name, e)
+
     def compress(self, llm_fn: Optional[Callable[[str], str]] = None, external_handler=None) -> str:
-        """上下文压缩"""
+        """上下文压缩：旧段 LLM 结构化摘要 + 保留预算内最近轮次原文
+
+        管线：按轮次边界切尾（预算 compress_keep_recent_tokens，至少保留最后一轮）
+        → 旧段先走 memory_compress 钩子，无结果再走 LLM（提示词由 core/prompts 加载，
+        token 目标按旧段规模程序计算：5% 钳制到 [150, 800]）
+        → 解析校验 state_snapshot 结构（失败重试一次，仍失败按压缩失败处理不替换历史）
+        → 旧段归档落盘 → 新上下文 = [摘要] + 尾段。
+        任何一步失败返回 "" 且不替换历史。
+        """
         if not self.messages:
             return ""
-        history_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in self.messages)
+        tail_start = self._tail_start_index(self.compress_keep_recent_tokens)
+        old_segment = self.messages[:tail_start]
+        tail = self.messages[tail_start:]
+        if not old_segment:
+            log.debug("压缩跳过: 旧段为空（最近轮次已覆盖全部历史）")
+            return ""
+        old_tokens = self._count_tokens(old_segment)
+
+        history_text = "\n".join(
+            f"{m.get('role')}: {m.get('content')}"
+            for m in old_segment
+            if self._api_visible(m)
+        )
         summary = hooks.call_user_participating(
             "memory_compress",
             {"action": "compress", "history": history_text},
             handler=external_handler,
             default=None,
         )
-        if not isinstance(summary, str) or not summary:
-            if isinstance(summary, dict) and summary.get("summary"):
-                summary = summary["summary"]
-            elif llm_fn is not None:
-                prompt = (
-                    "请将以下对话历史压缩为简明摘要，保留任务目标、已完成步骤、"
-                    "关键结论与未决问题，不超过300字：\n\n" + history_text
-                )
+        if isinstance(summary, dict) and summary.get("summary"):
+            summary = summary["summary"]
+        structured = None
+        if isinstance(summary, str) and summary.strip():
+            structured = parse_state_snapshot(summary)
+        if not (isinstance(summary, str) and summary.strip()):
+            if llm_fn is None:
+                return self._compress_fail("无钩子结果且未注入 llm_fn")
+            # 软目标：旧段 token 的 5%，钳制到 [150, 800]；硬上限另由校验执行
+            target = min(800, max(150, int(old_tokens * 0.05)))
+            prompt = (
+                prompt_loader.get_compress_prompt(target, config=self.config)
+                + "\n\n## 对话历史\n"
+                + history_text
+            )
+            try:
                 summary = llm_fn(prompt)
-            else:
-                return ""
-        self.messages = [
-            {
-                "role": "system",
-                "content": f"[上下文压缩摘要]\n{summary}",
-                "type": "summary",
-            }
-        ]
-        log.info("上下文压缩完成: %d字 -> 摘要%d字（%d条消息）", len(history_text), len(summary), len(self.messages))
-        return summary
+            except Exception as e:
+                return self._compress_fail(f"摘要 LLM 调用异常 ({e})")
+            structured = parse_state_snapshot(summary)
+            if structured is None:
+                # 结构校验失败重试一次；仍失败走 _compress_fail 熔断，不可解析的摘要绝不入库
+                try:
+                    retry_summary = llm_fn(prompt + _COMPRESS_RETRY_HINT)
+                except Exception as e:
+                    return self._compress_fail(f"摘要重试 LLM 调用异常 ({e})")
+                retry_structured = parse_state_snapshot(retry_summary)
+                if retry_structured is not None:
+                    summary, structured = retry_summary, retry_structured
+            if structured is None:
+                return self._compress_fail("摘要无法解析为 state_snapshot 结构（已重试一次）")
+
+        # 钩子提供的纯文本摘要保持既有契约（非结构化但可用）；LLM 路径必为结构化
+        summary_text = structured["xml"] if structured is not None else summary.strip()
+        if len(summary_text.strip()) < 50:
+            return self._compress_fail("摘要为空或过短")
+        from core import tokens as tokenmod
+
+        model = getattr(self.config, "model_name", "") or ""
+        try:
+            summary_tokens = tokenmod.count_tokens(summary_text, model)
+        except Exception:
+            summary_tokens = max(1, len(summary_text) // 2)
+        if summary_tokens > self.compress_summary_max_tokens:
+            return self._compress_fail(
+                f"摘要 {summary_tokens} token 超过上限 {self.compress_summary_max_tokens}"
+            )
+
+        self._compress_fail_streak = 0
+        archive_path = self._archive_old_segment(old_segment)
+        pointer = f"\n\n[完整历史已归档: {archive_path}]" if archive_path else ""
+        summary_msg = {
+            "role": "system",
+            "content": f"[上下文压缩摘要]\n{summary_text}{pointer}",
+            "type": "summary",
+            "metadata": {
+                "compressed_at": datetime.now().isoformat(timespec="seconds"),
+                "archived_messages": len(old_segment),
+                "retained_messages": len(tail),
+                "structured": structured is not None,
+            },
+        }
+        if structured is not None:
+            summary_msg["sections"] = structured["sections"]
+        self.messages = [summary_msg] + tail
+        log.info(
+            "上下文压缩完成: 旧段%d条(约%d token) -> 摘要%d token(%s) + 尾段%d条原文%s",
+            len(old_segment), old_tokens, summary_tokens,
+            "结构化" if structured is not None else "纯文本", len(tail),
+            f"，归档={archive_path.name}" if archive_path else "（归档失败，摘要继续）",
+        )
+        return summary_text
 
     def maybe_compress(self, llm_fn: Optional[Callable[[str], str]] = None) -> None:
-        """按配置阈值自动压缩（阈值与估计均为 token 量纲）"""
+        """按配置阈值自动压缩（阈值与估计均为 token 量纲）；连续失败≥2次熔断，
+        新用户回合自动复位（add_message）"""
         if not self.auto_compress:
+            return
+        if self._compress_fail_streak >= 2:
+            log.debug("自动压缩已熔断（连续失败%d次），跳过", self._compress_fail_streak)
             return
         if llm_fn is None:
             llm_fn = self._llm_fn
@@ -694,9 +910,10 @@ class Memory:
         log.info("已开启新会话: %s", self.session_id)
 
     def clear(self) -> None:
-        """清空当前会话内容：原地恢复为空对话（保留 id），并删除落盘文件与外置工具记录防 /resume 复活旧内容"""
+        """清空当前会话内容：原地恢复为空对话（保留 id），并删除落盘文件、外置工具记录与压缩归档防 /resume 复活旧内容"""
         session_store.delete_session_data(self.sessions_dir, self.session_id)
         toolstore.clear_session(self.config, self.project_id, self.session_id)
+        self._delete_precompact_archives()
         self.messages.clear()
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []

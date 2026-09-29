@@ -40,7 +40,10 @@ CANCEL_RESULT = "__CANCELLED__"
 _CONSOLE = Console(soft_wrap=True, force_terminal=True) if HAS_RICH else None
 _app: Optional["TuiApp"] = None
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-_COLLAPSE_THRESHOLD = 160
+# 会话树收起渲染：消息类节点最多显示的视觉行数，超出部分折叠并附「… (+N 行)」指示行
+_TREE_INLINE_CAP = 3
+# 参与 3 行折叠的消息类节点；assistant/stream_* 全文显示，plan/help 走子节点机制
+_TREE_FOLD_KINDS = {"user", "tool", "system", "system_prompt"}
 _STATUS_ICON = {"pending": "○", "running": "◐", "done": "●", "failed": "✗"}
 # 控制台鼠标 y → compose 行号偏移（rich Live 主屏模式 1:1；真机如有固定偏差在此校准）
 _MOUSE_Y_OFFSET = 0
@@ -56,6 +59,12 @@ DEFAULT_COLORS = {
     "ink": (214, 226, 240),
     "line": (42, 59, 85),
     "highlight_bg": (31, 78, 121),
+    # 会话消息配色（用户指定色值）：用户消息 / Agent 消息 / 思考过程 / 工具调用标题与内容
+    "user_msg": (60, 162, 162),      # 3ca2a2
+    "agent": (128, 148, 78),         # 80944e
+    "thinking": (4, 95, 98),         # 045f62
+    "tool_title": (20, 186, 188),    # 14babc
+    "tool_content": (255, 255, 255), # 纯白
 }
 
 TIPS = [
@@ -372,11 +381,6 @@ class Layout:
         return list(vis) + [""] * max(0, height - len(vis))
 
 
-def _fold(text: str, limit: int = _COLLAPSE_THRESHOLD) -> str:
-    plain = _ANSI_RE.sub("", str(text or ""))
-    return plain if len(plain) <= limit else plain[:limit] + f" …(+{len(plain) - limit})"
-
-
 def _oneline(text: str, limit: int = 80) -> str:
     plain = _ANSI_RE.sub("", str(text or "")).replace("\n", " ")
     return plain if len(plain) <= limit else plain[:limit] + "…"
@@ -533,7 +537,6 @@ class TuiApp:
         self.buffer = TextBuffer()
         self.input_history: List[str] = []
         self.hist_index = -1
-        self.max_display_lines = 3
         self.candidates: List[dict] = []
         self.candidate_index = 0
         self._cand_text: Optional[str] = None
@@ -545,6 +548,10 @@ class TuiApp:
         self.settings_scratch: Dict[str, Any] = {}
         self.pending_tool: Optional[dict] = None
         self.token_meter = tokenmod.TokenMeter()
+        # 流式树尾直播状态（agent 线程单写者、帧循环只读，与 app.status 同模式）：
+        # streaming_msg 为 {"role","content","thinking","type":"streaming"} dict，不进 session.messages
+        self.streaming_msg = None
+        self.phase_hint = ""  # 树底阶段提示：思考中/工具调用中/空（完成）
         self.logo_enabled = True
         self.settings_tab = 0
         self.settings_tabs = ["提供商", "模型", "系统", "快捷键"]
@@ -598,6 +605,8 @@ class TuiApp:
         self._tree_sig: Optional[tuple] = None
         self._tree_rows_key: Optional[tuple] = None
         self._tree_rows_cache: Optional[List[str]] = None
+        # 节点号 → 渲染行区间 (start, count)：树光标（节点空间）与滚动（行空间）的唯一换算表
+        self._node_spans: List[Tuple[int, int]] = []
         self._input_layout = Layout("", width=40)
         self._input_layout_width = 0
         self._cursor_row_key: Optional[tuple] = None
@@ -771,14 +780,41 @@ class TuiApp:
         if self._tree_follow_tail:
             self.scroll = max_scroll
         else:
-            # 仅在会话树焦点下保证光标行可见；输入焦点时不要把 scroll 拉回 tree_cursor
+            # 仅在会话树焦点下保证光标节点可见；输入焦点时不要把 scroll 拉回 tree_cursor
             if self.focus == "tree":
-                if self.tree_cursor < self.scroll:
-                    self.scroll = self.tree_cursor
-                if self.tree_cursor >= self.scroll + tree_h:
-                    self.scroll = self.tree_cursor - tree_h + 1
+                self._ensure_cursor_visible(tree_h)
             self.scroll = max(0, min(self.scroll, max_scroll))
         return self.scroll
+
+    def _ensure_cursor_visible(self, tree_h: int) -> None:
+        """把树光标所在节点的标题行滚进视口。
+
+        光标是节点号、scroll 是渲染行号，经 _node_spans 换算；
+        仅在标题行不可见时最小滚动（节点高于视口时顶对齐，否则贴底露出标题），
+        不强求整个节点入窗——避免与滚轮/翻页互相抢滚动位置。"""
+        spans = self._node_spans
+        if spans and 0 <= self.tree_cursor < len(spans):
+            first, count = spans[self.tree_cursor]
+            if first < self.scroll:
+                self.scroll = first
+            elif first >= self.scroll + tree_h:
+                self.scroll = first if count >= tree_h else max(0, first + count - tree_h)
+        else:
+            # 行区间缺失（尚无渲染缓存）时按节点号近似兜底
+            if self.tree_cursor < self.scroll:
+                self.scroll = self.tree_cursor
+            elif self.tree_cursor >= self.scroll + tree_h:
+                self.scroll = self.tree_cursor - tree_h + 1
+
+    def _node_at_row(self, row: int) -> int:
+        """渲染行号 → 树节点号（经 _node_spans；越界夹到端点）"""
+        spans = self._node_spans
+        if not spans:
+            return 0
+        for i, (first, count) in enumerate(spans):
+            if first <= row < first + count:
+                return i
+        return len(spans) - 1 if row >= 0 else 0
 
     def _has_conversation_content(self) -> bool:
         """会话区是否已有需要展示的内容（有则隐藏 Logo）"""
@@ -866,7 +902,8 @@ class TuiApp:
                 detail=plan.get("content") or "",
             )
             if plan_node.detail:
-                for i, line in enumerate(_wrap(plan_node.detail, 50)[:12]):
+                # 计划不限行数：全部子行展示，不截断
+                for i, line in enumerate(_wrap(plan_node.detail, 50)):
                     plan_node.children.append(TreeNode(f"plan:{i}", line, "plan_line"))
             task_node.children.append(plan_node)
         if self.steps:
@@ -902,12 +939,12 @@ class TuiApp:
             msg_type = item.get("type") or ""
             tool_name = item.get("tool_name") or ""
             if role == "user":
-                # 正文直接写入节点 label（绿色/强调色折行展示），不另开详情块
+                # 正文写入节点 label 折行展示；超 3 行默认收起，树内手动展开
                 node = TreeNode(
                     f"msg:{index}",
                     f"用户 · {content}",
                     "user",
-                    default_expanded=True,
+                    default_expanded=False,
                     detail="",
                 )
                 task_node.children.append(node)
@@ -944,12 +981,13 @@ class TuiApp:
                 node = TreeNode(
                     f"msg:{index}",
                     f"⚙ {head}",
-                    "assistant",
+                    "tool",  # 工具调用轮：与工具结果同用「标题青 + 内容白」双色渲染
                     default_expanded=False,
                     detail="",
                 )
             elif role == "assistant":
-                # 完整回复写入 label，由 _tree_rows 折行；不建子节点、不开独立详情区
+                # 完整回复写入 label，由 _tree_rows 折行；LLM 输出不限行数、无折叠指示
+                # 不建子节点、不开独立详情区
                 node = TreeNode(
                     f"msg:{index}",
                     f"Agent · {content}",
@@ -958,8 +996,15 @@ class TuiApp:
                     detail="",
                 )
             elif msg_type == "help":
-                node = TreeNode(f"msg:{index}", "帮助", "help", detail=content)
-                for i, line in enumerate(content.splitlines()[:10]):
+                # 帮助/命令反馈：≤3 行直接可见，更长默认收起、树内手动展开
+                node = TreeNode(
+                    f"msg:{index}",
+                    "帮助",
+                    "help",
+                    default_expanded=len(content.splitlines()) <= 3,
+                    detail=content,
+                )
+                for i, line in enumerate(content.splitlines()):
                     node.children.append(TreeNode(f"msg:{index}:{i}", _clip(line, 60), "help_line"))
             else:
                 node = TreeNode(
@@ -970,15 +1015,30 @@ class TuiApp:
                     detail="",
                 )
             _parent().children.append(node)
+
+        # 流式树尾直播（纯 UI 状态，不在 session.messages 里）：思考过程折叠为尾部窗口，正文全文折行
+        streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
+        if streaming is not None:
+            thinking = str(streaming.get("thinking") or "")
+            content = str(streaming.get("content") or "")
+            if thinking:
+                _parent().children.append(
+                    TreeNode("stream:thinking", thinking, "stream_thinking", default_expanded=True, detail="")
+                )
+            if content:
+                _parent().children.append(
+                    TreeNode("stream:content", content, "stream_content", default_expanded=True, detail="")
+                )
         return roots
 
     def _tree_signature(self) -> tuple:
-        """会话内容签名：命中则复用 _build_tree 结果，避免每帧全量重建"""
+        """会话内容签名：命中则复用 _build_tree 结果，避免每帧全量重建（流式增长亦靠它失效）"""
         msgs = self.messages[-200:]
         total = 0
         for m in msgs:
             total += len(m.get("content") or "")
         plan = self.plan or {}
+        streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
         return (
             len(msgs),
             total,
@@ -987,6 +1047,8 @@ class TuiApp:
             plan.get("status") or "",
             len(plan.get("content") or ""),
             self.collapse_done,
+            len(streaming.get("thinking") or "") if streaming else -1,
+            len(streaming.get("content") or "") if streaming else -1,
         )
 
     def _flatten_tree(self) -> List[Tuple[TreeNode, int, bool]]:
@@ -1005,7 +1067,9 @@ class TuiApp:
                 else:
                     expanded = node.default_expanded
                 flat.append((node, depth, expanded))
-                if expanded and node.children:
+                # 折叠类消息节点（user 等）收起的只是正文溢出行，
+                # 其子节点（本回合的 Agent 回复/流式直播）始终展示
+                if node.children and (expanded or node.kind in _TREE_FOLD_KINDS):
                     walk(node.children, depth + 1)
 
         walk(self._tree_nodes, 0)
@@ -1023,6 +1087,13 @@ class TuiApp:
         else:
             self.expanded.discard(f"!{node.id}")
             self.expanded.add(node.id)
+        # 帮助/计划/步骤等子节点型节点展开会改变 flat 布局（消息类子树恒 walk 不变）：
+        # 重新展平并把光标钉回被切换的节点，保证“再按一次”仍作用于同一节点
+        flat = self._flatten_tree()
+        for i, (n, _, _) in enumerate(flat):
+            if n.id == node.id:
+                self.tree_cursor = i
+                break
 
     def _tree_rows(self, width: int) -> List[str]:
         # 树行缓存：按键路径（partial 重绘）不重建行字符串，只做窗口切片。
@@ -1049,48 +1120,110 @@ class TuiApp:
             "step": self.c("ink"),
             "step_detail": self.c("dim"),
             "tool": self.c("tool"),
-            "assistant": self.c("ok"),
-            "user": self.c("accent"),
+            "assistant": self.c("agent"),
+            "user": self.c("user_msg"),
             "help": self.c("title"),
             "help_line": self.c("dim"),
             "system": self.c("dim"),
             "system_prompt": self.c("tool"),
             "text": self.c("dim"),
+            "stream_thinking": self.c("thinking"),
+            "stream_content": self.c("agent"),
         }
         rows = []
         if not flat:
+            self._node_spans = []
             return [self.c("dim") + _clip("  —", width) + self.RESET]
         # 消息类节点：正文在 label 内直接折行展示（同色连续），不另开详情区
         inline_kinds = {"assistant", "user", "system", "tool", "system_prompt"}
+        def _marker(has: bool, is_expanded: bool) -> str:
+            return "▾" if has and is_expanded else ("▸" if has else "·")
+
+        spans: List[Tuple[int, int]] = []
         for abs_i, (node, depth, expanded) in enumerate(flat):
+            span_start = len(rows)
             has = bool(node.children)
             if node.detail and node.kind not in inline_kinds:
                 has = True
-            marker = "▾" if has and expanded else ("▸" if has else "·")
             indent = " " * (depth * 2)
-            first_prefix = f"{indent}{marker} "
             cont_prefix = " " * (depth * 2 + 2)
             label = node.label or ""
             color = colors.get(node.kind, self.c("ink"))
-            # 保留换行；超宽续行缩进对齐，首行带树标记
-            src_lines = label.splitlines() or [""]
-            piece_no = 0
-            for li, src in enumerate(src_lines):
-                # 先用首行前缀估宽；续行前缀稍长，二次 clip 兜底
-                for wline in _wrap(src, max(8, width - _display_width(cont_prefix))) or [""]:
-                    prefix = first_prefix if piece_no == 0 else cont_prefix
-                    raw = prefix + wline
-                    if abs_i == self.tree_cursor and tree_focus and piece_no == 0:
-                        rows.append(self.C_HL + _pad(_ANSI_RE.sub("", raw), width) + self.RESET)
+            foldable = node.kind in _TREE_FOLD_KINDS
+            if foldable:
+                # 折叠只作用于正文溢出行（子节点照常展示），marker 仅反映正文是否超限
+                has = False
+            if node.kind == "tool":
+                # 工具调用（含工具轮）：标题青色（14babc）+ 内容纯白，同一物理行双色
+                title, sep, content_text = label.partition(" · ")
+                has_content = bool(sep) and content_text != ""
+                # 先按占位 marker（恒 1 字符，不影响估宽）折行，再据总行数定折叠与真实 marker
+                probe_title = f"{indent}· {title}"
+                budget = max(8, width - _display_width(probe_title) - _display_width(" · "))
+                wrapped = _wrap(content_text, budget) if has_content else []
+                total_rows = len(wrapped)
+                truncated = foldable and not expanded and total_rows > _TREE_INLINE_CAP
+                if foldable and total_rows > _TREE_INLINE_CAP:
+                    has = True
+                first_prefix = f"{indent}{_marker(has, expanded)} "
+                title_part = f"{first_prefix}{title}"
+                if has_content:
+                    if truncated:
+                        wrapped = wrapped[:_TREE_INLINE_CAP]
+                    first = wrapped[0] if wrapped else ""
+                    rest = wrapped[1:]
+                    row = (self.c("tool_title") + _clip(title_part, width) + self.RESET
+                           + self.c("tool_content") + _clip(" · " + first, width) + self.RESET)
+                    if abs_i == self.tree_cursor and tree_focus:
+                        rows.append(self.C_HL + _pad(_ANSI_RE.sub("", row), width) + self.RESET)
                     else:
-                        if not expanded and node.summary and piece_no == 0:
-                            raw = raw + f" · {node.summary}"
-                        rows.append(color + _clip(raw, width) + self.RESET)
-                    piece_no += 1
+                        rows.append(row)
+                    for wline in rest:
+                        rows.append(self.c("tool_content") + _clip(cont_prefix + wline, width) + self.RESET)
+                    if truncated:
+                        hint = f"… (+{total_rows - _TREE_INLINE_CAP} 行)"
+                        rows.append(self.c("dim") + _clip(cont_prefix + hint, width) + self.RESET)
+                else:
+                    rows.append(self.c("tool_title") + _clip(title_part, width) + self.RESET)
+                spans.append((span_start, len(rows) - span_start))
+                continue
+            if node.kind == "stream_thinking":
+                # 思考过程：过长折叠为尾部 3 行动态窗口（随流式追加滚动）
+                win = _wrap(label, max(8, width - _display_width(cont_prefix)))
+                for wline in win[-3:]:
+                    rows.append(color + _clip(cont_prefix + wline, width) + self.RESET)
+                spans.append((span_start, len(rows) - span_start))
+                continue
+            # 消息类正文：全文折行；可折叠节点收起时最多 3 行，超出以指示行提示手动展开
+            # 保留换行；超宽续行缩进对齐，首行带树标记
+            vis = _wrap(label, max(8, width - _display_width(cont_prefix)))
+            total_rows = len(vis)
+            truncated = foldable and not expanded and total_rows > _TREE_INLINE_CAP
+            if foldable and total_rows > _TREE_INLINE_CAP:
+                has = True
+            first_prefix = f"{indent}{_marker(has, expanded)} "
+            if truncated:
+                vis = vis[:_TREE_INLINE_CAP]
+            piece_no = 0
+            for wline in vis:
+                prefix = first_prefix if piece_no == 0 else cont_prefix
+                raw = prefix + wline
+                if abs_i == self.tree_cursor and tree_focus and piece_no == 0:
+                    rows.append(self.C_HL + _pad(_ANSI_RE.sub("", raw), width) + self.RESET)
+                else:
+                    if not expanded and node.summary and piece_no == 0:
+                        raw = raw + f" · {node.summary}"
+                    rows.append(color + _clip(raw, width) + self.RESET)
+                piece_no += 1
+            if truncated:
+                hint = f"… (+{total_rows - _TREE_INLINE_CAP} 行)"
+                rows.append(self.c("dim") + _clip(cont_prefix + hint, width) + self.RESET)
             # 计划/帮助等仍可能有 detail：仅在无子节点时追加（消息类 inline 已含全文）
             if expanded and node.detail and not node.children and node.kind not in inline_kinds:
                 for dline in _wrap(str(node.detail), max(10, width - depth * 2 - 4))[:8]:
                     rows.append(self.c("dim") + _clip(" " * (depth * 2 + 2) + dline, width) + self.RESET)
+            spans.append((span_start, len(rows) - span_start))
+        self._node_spans = spans
         self._tree_rows_key = key
         self._tree_rows_cache = rows
         return rows
@@ -1125,8 +1258,9 @@ class TuiApp:
             input_zone_h = len(confirm_panel)
 
         bottom_fixed = 1 + 2 + 1 + 1  # rule + info/mode+tip + rule + status
+        phase_fixed = 1               # 树底阶段提示行：思考中/工具调用中/完成空行占位
         top_fixed = 1 + 1
-        tree_h = max(4, h - top_fixed - bottom_fixed - input_zone_h)
+        tree_h = max(4, h - top_fixed - bottom_fixed - input_zone_h - phase_fixed)
         self._row_meta["tree_h"] = tree_h
         tree_focus = self.focus == "tree"
         mode_label = policy.MODE_LABELS.get(self.mode, self.mode)
@@ -1161,6 +1295,12 @@ class TuiApp:
             else:
                 self._row_meta["scrollbar_on"] = 0
         lines.extend(body)
+        # 树底阶段提示（用户规格）：Agent 产出阶段"思考中"、工具执行"工具调用中"、完成空行占位
+        hint = (self.phase_hint or "").strip()
+        if hint:
+            lines.append(self.c("err") + _pad(_clip(f" {hint}", w), w) + self.RESET)
+        else:
+            lines.append("")
         lines.append(self._rule(w))
 
         # 输入区
@@ -1564,10 +1704,14 @@ class TuiApp:
         max_scroll = max(0, total - tree_h)
         self.scroll = max(0, min(int(new_scroll), max_scroll))
         self._tree_follow_tail = self.scroll >= max_scroll
-        if self.tree_cursor < self.scroll:
-            self.tree_cursor = self.scroll
-        elif self.tree_cursor >= self.scroll + tree_h:
-            self.tree_cursor = min(self.scroll + tree_h - 1, max(0, total - 1))
+        # 滚动后把光标同步回可见节点区间（行→节点换算，防止节点号被当行号错位）
+        if self._node_spans and tree_h > 0:
+            first_node = self._node_at_row(self.scroll)
+            last_node = self._node_at_row(self.scroll + tree_h - 1)
+            if self.tree_cursor < first_node:
+                self.tree_cursor = first_node
+            elif self.tree_cursor > last_node:
+                self.tree_cursor = last_node
 
     def _scroll_tree_by(self, delta: int) -> None:
         """按步长调整会话区显示范围（滚轮/翻页/长按加速）。"""
@@ -1641,14 +1785,15 @@ class TuiApp:
         if self.focus == "input":
             self.focus = "tree"
             flat = self._flatten_tree()
+            # 光标落最后一个节点；scroll 交给帧循环 clamp（贴底后尾节点必然可见）
             self.tree_cursor = max(0, len(flat) - 1)
             self._tree_follow_tail = True
-            self.scroll = max(0, len(flat) - 4)
         else:
             self.focus = "input"
 
     def _tree_expand(self) -> None:
-        if self._flat_nodes and self.tree_cursor < len(self._flat_nodes) and not self._flat_nodes[self.tree_cursor][2]:
+        """树焦点下展开↔收起双向切换（裸 Enter/l/→ 同义）；输入焦点为右移光标"""
+        if self.focus == "tree" and self._flat_nodes and self.tree_cursor < len(self._flat_nodes):
             self.toggle_fold(self.tree_cursor)
         elif self.focus == "input":
             self.cursor = min(self._buf_len(), self.cursor + 1)
@@ -1665,9 +1810,9 @@ class TuiApp:
             self.render()
         elif self.focus == "tree":
             step = self._scroll_step("up")
-            self.tree_cursor = max(0, self.tree_cursor - step)
-            if self.tree_cursor < self.scroll:
-                self.scroll = self.tree_cursor
+            flat = self._flatten_tree()
+            # 光标按节点移动；scroll 的可见性修正统一由帧循环 _clamp_tree_scroll 完成
+            self.tree_cursor = max(0, min(len(flat) - 1, self.tree_cursor - step))
             self._tree_follow_tail = False
             self.render()
         elif self.input_history:
@@ -1682,11 +1827,9 @@ class TuiApp:
         elif self.focus == "tree":
             step = self._scroll_step("down")
             flat = self._flatten_tree()
-            self.tree_cursor = min(max(0, len(flat) - 1), self.tree_cursor + step)
-            if self.tree_cursor >= self.scroll + 4:
-                self.scroll = self.tree_cursor - 3
-            if self.tree_cursor >= max(0, len(flat) - 1):
-                self._tree_follow_tail = True
+            last = max(0, len(flat) - 1)
+            self.tree_cursor = min(last, self.tree_cursor + step)
+            self._tree_follow_tail = self.tree_cursor >= last
             self.render()
         else:
             if self.hist_index < len(self.input_history) - 1:
@@ -2288,6 +2431,8 @@ class TuiApp:
                 {"key": "scroll_max_step", "label": "滚动最大步长", "type": "text", "current": ui_cfg.get("scroll_max_step", 20)},
                 {"key": "auto_compress", "label": "自动压缩上下文", "type": "bool", "current": bool(mem_cfg.get("auto_compress", True)), "hint": "←→"},
                 {"key": "compress_threshold", "label": "压缩阈值", "type": "text", "current": mem_cfg.get("compress_threshold", 0.8)},
+                {"key": "compress_keep_recent_tokens", "label": "压缩保留尾段token", "type": "text", "current": mem_cfg.get("compress_keep_recent_tokens", 16384)},
+                {"key": "compress_summary_max_tokens", "label": "摘要上限token", "type": "text", "current": mem_cfg.get("compress_summary_max_tokens", 1024)},
                 {"key": "log_level", "label": "日志等级", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "current": "关闭" if log_level == "off" else log_level, "hint": "←→ 关闭=不记录任何日志（含写盘）"},
                 {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 切换当前模型"},
             ]
@@ -2903,6 +3048,16 @@ class TuiApp:
         if "compress_threshold" in s:
             try:
                 mem_cfg["compress_threshold"] = float(s["compress_threshold"])
+            except (TypeError, ValueError):
+                pass
+        if "compress_keep_recent_tokens" in s:
+            try:
+                mem_cfg["compress_keep_recent_tokens"] = max(0, int(float(s["compress_keep_recent_tokens"])))
+            except (TypeError, ValueError):
+                pass
+        if "compress_summary_max_tokens" in s:
+            try:
+                mem_cfg["compress_summary_max_tokens"] = max(100, int(float(s["compress_summary_max_tokens"])))
             except (TypeError, ValueError):
                 pass
         if "log_level" in s and s["log_level"]:

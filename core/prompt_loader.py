@@ -57,6 +57,14 @@ def plan_prompt_files(config=None) -> List[str]:
     return ["plan.md"]
 
 
+def compress_prompt_files(config=None) -> List[str]:
+    if config is not None:
+        files = ((config.data or {}).get("prompt") or {}).get("compress_files")
+        if files:
+            return list(files)
+    return ["compress.md"]
+
+
 def memory_paths(config=None) -> Dict[str, Path]:
     root = _ROOT
     if config is not None:
@@ -270,5 +278,25 @@ def get_plan_prompt(
             f"项目：{variables.get('project_name', '')}（id={variables.get('project_id', '')}）\n"
             f"任务：{summary}\n\n"
             "输出 markdown 计划：目标、步骤、风险、验收。不要执行任务。"
+        )
+    return join_segments(segs)
+
+
+def get_compress_prompt(
+    summary_token_target: int,
+    config=None,
+    extra_variables: Optional[Dict[str, Any]] = None,
+    **ctx_kwargs,
+) -> str:
+    """供 memory.compress 使用：渲染上下文压缩提示词（程序计算的 token 目标经占位符注入）"""
+    variables = build_variable_context(config=config, extra=extra_variables, **ctx_kwargs)
+    variables["summary_token_target"] = str(int(summary_token_target))
+    segs = load_prompt_bundle(compress_prompt_files(config), variables, config=config)
+    if not segs:
+        return (
+            "请将以下对话历史压缩为结构化摘要，保留：任务目标（引用用户原话）、"
+            "所有用户消息原文（逐条）、关键决策与结论、已完成工作、未决问题、"
+            f"当前工作与下一步。总长约 {int(summary_token_target)} token 以内，"
+            "信息密度优先，省略寒暄。只输出摘要本身。"
         )
     return join_segments(segs)
