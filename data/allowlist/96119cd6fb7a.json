@@ -7,6 +7,22 @@
     {
       "tool": "execute_command",
       "fingerprint": "execute_command|pytest"
+    },
+    {
+      "tool": "memory_search",
+      "fingerprint": "ebfe61afa1cae0b3"
+    },
+    {
+      "tool": "memory_search",
+      "fingerprint": "ebfe61afa1cae0b3|*"
+    },
+    {
+      "tool": "execute_command",
+      "fingerprint": "execute_command|pwd"
+    },
+    {
+      "tool": "execute_command",
+      "fingerprint": "execute_command|pwd|&& ls"
     }
   ]
 }

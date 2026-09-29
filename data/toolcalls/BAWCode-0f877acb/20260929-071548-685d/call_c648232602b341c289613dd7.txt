@@ -1,0 +1,64 @@
+[BAWCode 工具调用记录]
+call_id: call_c648232602b341c289613dd7
+tool: list_directory
+time: 2026-09-29 07:29:24
+arguments: {}
+description: list_directory({"path": "develop"})
+total_chars: 1036
+total_lines: 54
+
+--- content ---
+__pycache__/
+ctx_e2e/
+docs/
+sim_out/
+_launch_probe.py
+_tmp_listpipes.py
+_tmp_reader.py
+Agent.md
+changelog.md
+config.pre-realttest.bak.json
+conhost_dbcs_test.py
+conpty_input_test.py
+conpty_out1.bin
+conpty_out2.bin
+conpty_out3.bin
+debug_tree_display.py
+keyinput.log
+launch_bawcode_window.py
+probe_mouse_input.py
+proto_pt_input.log
+proto_pt_input.py
+pt_input.log
+qwen-code系统提示词.md
+qwen-code输入框与键盘输入实现分析报告.md
+realtest_context_mgmt.py
+review_result.md
+run_bawcode_under_test.bat
+run_test.bat
+sim_chat_probe.py
+sim_user_chat_suite.py
+sim_user_conversation_test.py
+test_backspace_refresh.py
+test_context_injection.py
+test_context_mgmt.py
+test_context_turn_integration.py
+test_getch_vs_getwch.py
+test_input_cursor_display.py
+test_input_layout.py
+test_key_binding.py
+test_keyinput_pt.py
+test_keymap.py
+test_log.py
+test_mouse_wheel.py
+test_paint_throttle.py
+test_pyautogui_real.py
+test_real_ime_probe.py
+test_session_store.py
+test_textbuf.py
+test_tree_autoscroll.py
+test_tree_refresh.py
+workflow.md
+修改计划-上下文注入机制.md
+修改计划-输入系统重构.md
+输入系统最优设计-从零规划.md

@@ -1,0 +1,30 @@
+[BAWCode 工具调用记录]
+call_id: call_14e6181f96954938ac48a8ef
+tool: list_directory
+time: 2026-09-29 07:29:24
+arguments: {}
+description: 查看当前项目根目录结构
+total_chars: 220
+total_lines: 20
+
+--- content ---
+.bawcode/
+.git/
+.zcode/
+__pycache__/
+_recycle/
+BAWCode_test/
+core/
+data/
+develop/
+新建文件夹/
+.gitignore
+BAWCode.zip
+BAWCode_fixed.zip
+BAWCode_ime_fix.zip
+CHANGELOG.md
+main.py
+pyproject.toml
+requirements.txt
+review.md
+考核文档.md

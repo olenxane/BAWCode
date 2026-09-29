@@ -1,0 +1,339 @@
+[BAWCode 工具调用记录]
+call_id: call_4f5e1379559d404591bbbd1c
+tool: read
+time: 2026-09-29 07:29:24
+arguments: {}
+description: read({"file_path": "D:\\Windows11\\桌面\\code\\BAWCode\\考核文档.md"})
+total_chars: 13389
+total_lines: 329
+
+--- content ---
+# BAWCode 考核交付文档
+
+> 考核目标：使用编程语言编写、交付一个自己的垂直子类智能体，要求至少达成一项产出，并满足 **能运行 / 能讲清 / 能共享** 三项要求。
+> 本文档逐项回答这三问，全部内容以仓库实际代码为准（关键处标注文件位置）。
+
+---
+
+## 0. 交付物是什么
+
+**BAWCode：一个运行在终端里的垂直编码 Agent（CLI/TUI 形态）。** 对应考核交付形态中的「CLI Agent：一个能在终端里干活的 Agent」，并在此基础上做了完整 TUI（会话树、确认面板、设置页、历史会话面板）。
+
+- **垂直领域**：编码/终端作业。它不是闲聊机器人，核心循环围绕「读代码 → 改文件 → 跑命令 → 验证结果」。
+- **技术栈**：Python ≥ 3.10；LLM 走 OpenAI 兼容协议（DeepSeek / SenseNova 等多 provider 可配）；输入栈 prompt_toolkit；宽度计算 wcwidth；token 计量 tiktoken；界面以 ANSI/VT 序列自绘为主，rich 负责启动 Logo 与 Live 动态渲染。
+- **核心能力**：
+  - 14 个内置工具（文件读写/编辑、目录列表、终端命令、程序调用、计划与步骤管理、长期记忆写入、RAG 写入、computer-use 外部接口）；
+  - 三档权限模式（自动/手动/完全访问）+ 命令指纹白名单 + 工具调用确认面板；
+  - 复杂任务「计划 → 确认 → 步骤 → 执行」工作流，计划需用户确认后才执行；
+  - 四层记忆：会话消息 / 历史会话落盘 / 长期记忆（Agent.md + 项目记忆 md）/ 项目 RAG 扩展点；
+  - 多 provider 管理、任务分模型（规划/写码/审查可各配一个模型）、token 与余额计量。
+
+**达成的产出**：① 可运行、可交付的完整产品（本仓库）；② 本文档；③ 一套可独立复用的核心模块（`core/register.py` 通用工具注册器、`core/policy.py` 权限策略、`core/session_store.py` 原子化会话存储等，均可拆出去复用）。
+
+```
+                 ┌───────────────────────────────────────────────┐
+                 │                  main.py 主循环                │
+                 │  读输入 ──► /命令 分发 ──► _agent_turn 任务回合  │
+                 └───────┬──────────────────────────┬────────────┘
+                         │                          │
+              ┌──────────▼──────────┐    ┌──────────▼──────────┐
+              │  ui.py   TUI 渲染    │    │  llm.py  LLM 网关    │
+              │  keyinput.py 输入栈  │    │  重试 / 多provider   │
+              │  keymap.py 键位契约  │    │  tools定义注入       │
+              └──────────┬──────────┘    └──────────┬──────────┘
+                         │ 确认面板 / 模式            │ chat(tools=…)
+              ┌──────────▼──────────┐    ┌──────────▼──────────┐
+              │ policy.py 权限策略    │    │ register.py 工具注册表│
+              │ 指纹白名单/危险正则    │    │ tools.py  14个工具实现│
+              └──────────┬──────────┘    └──────────┬──────────┘
+                         └────────────┬─────────────┘
+              ┌───────────────────────▼────────────────────────┐
+              │ memory.py 会话/压缩/长期记忆   tokens.py token计量 │
+              │ session_store.py 历史落盘     rag.py 检索扩展点   │
+              │ hooks.py 外部API扩展点        prompts/ 提示词模板  │
+              └────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. 能运行：在别人的机器上跑得起来
+
+### 1.1 环境要求
+
+| 项目 | 要求 | 说明 |
+|---|---|---|
+| 操作系统 | Windows 10/11（推荐 Windows Terminal） | 本项目 Windows 优先：启动即开启 VT（`main.py` → `ui._enable_windows_ansi()`），输入栈适配 Win32/VT 双路径与中文 IME |
+| Python | ≥ 3.10 | `pyproject.toml` 声明 |
+| 网络 | 能访问所选 LLM API | 所有推理走 API，本地不跑模型 |
+| 依赖 | 见 `requirements.txt`，共 5 个 | openai / rich / tiktoken / wcwidth / prompt_toolkit |
+
+### 1.2 部署步骤（4 步）
+
+```bat
+:: ① 获取代码（git clone 或直接解压 zip）
+git clone <仓库地址> BAWCode && cd BAWCode
+
+:: ② （可选但推荐）建虚拟环境
+python -m venv .venv && .venv\Scripts\activate
+
+:: ③ 装依赖
+pip install -r requirements.txt
+
+:: ④ 启动
+python main.py
+```
+
+### 1.3 配置 API Key（二选一）
+
+**方式 A：改配置文件** — 打开 `data/config.json`，给 provider 填 key：
+
+```json
+"providers": [
+  {
+    "provider_id": "deepseek",
+    "name": "DeepSeek",
+    "api_key": "sk-你的key",          ← 只需改这里
+    "base_url": "https://api.deepseek.com",
+    "models": [ … ]
+  }
+]
+```
+
+**方式 B：界面配置** — 启动后输入 `/settings`，在设置页新增/编辑 provider、填 key、选模型，保存即生效（设置页改完无需重启，`llm.refresh_from_config` 热更新）。
+
+配置要点（`core/config.py`）：
+
+- 模型对外命名 `model_name = provider_id-model_id`（如 `deepseek-deepseek-flash`），`/model` 切换时用它；
+- `base_url` 自动规范化：忘写 `https://` 会补全，结尾少/多 `/v1` 都会修正（`normalize_base_url`），降低了填错率；
+- `task_models` 可为「规划 / 写码 / 审查」分别指定模型；
+- `llm.retry_times / retry_delay` 控制请求重试。
+
+### 1.4 首次运行验证清单
+
+1. 启动出现 Logo 动画 → 进入 TUI，底部状态栏显示模型、上下文占用 `tokens x/y (z%)`、余额（provider 配了 `balance_url` 才有）；
+2. 输入 `你好` → 直接文字回复（不触发工具）；
+3. 输入 `列出当前目录的文件` → 触发 `list_directory`：自动/手动模式下若被策略拦截会弹出**确认面板**（↑↓ 选择、Enter 确认、可选「拒绝并输入原因」）；
+4. `/help` 查看命令，`/tools` 查看已注册工具，`/settings` 打开设置，`/resume` 查看/切换历史会话。
+
+常用键位（`core/keymap.py`，产品契约固定）：**Enter=发送**、Shift+Enter=换行、Ctrl+Enter=发送（别名）、Shift+Tab=循环切换权限模式、Tab=焦点切换、PageUp/PageDown=滚动、Ctrl+C=中断当前回合。
+
+### 1.5 常见问题排查
+
+| 现象 | 原因与处理 |
+|---|---|
+| 中文乱码 / 花屏 | 用 Windows Terminal；或 `chcp 65001` 切 UTF-8 后重启 |
+| 提示「未配置 api_key」 | 按 1.3 配置；配置保存后立即生效 |
+| HTTP 401/403 | key 无效或欠费 |
+| HTTP 404 | base_url 填错——程序会自动补 `/v1`，若仍 404 检查 provider 是否填了错误路径 |
+| 回合无响应想中断 | Ctrl+C：程序关闭在途连接、丢弃该回合（退出前会自动保存会话） |
+| 想看详细过程 | `data/config.json` → `log.level` 改 `debug`，日志在 `data/log/bawcode-日期.log` |
+
+---
+
+## 2. 能讲清：工具调度 · 上下文管理 · 失败点
+
+### 2.1 工具怎么调度
+
+**(a) 注册 —— 装饰器注册表，插件化**
+
+任何函数挂上装饰器即成为 LLM 可用工具（`core/register.py`），主循环零改动：
+
+```python
+@register.register(
+    name="read",
+    description="Read the content of specified file",   # 供模型选择
+    schema={...JSON Schema 参数结构...},                 # 供模型生成参数
+)
+def read(file_path: str) -> str:
+    ...
+```
+
+启动时 `import core.tools` 完成 14 个工具注册；`get_tool_defs()` 把注册表导出为 OpenAI function calling 格式，随每轮请求发给模型。
+
+**(b) 调度回合 —— 单回合循环，策略闸门在模型与工具之间**
+
+`main.py: _agent_turn` 是核心循环（硬上限 12 轮，防失控）：
+
+```
+用户任务 ─► 组装上下文(见2.2) ─► llm.chat(payload, tools)
+              ▲                        │
+              │                        ▼
+              │              无 tool_calls？──是──► 回复入会话，回合结束
+              │                        │否
+              │                        ▼
+              │        对每个 tool_call 做策略判定（policy.evaluate）
+              │         ├─ ALLOW  ─► execute_approved_tool 立即执行
+              │         ├─ CONFIRM ─► 挂起；先写入 assistant 工具轮，
+              │         │             再弹确认面板（↑↓选择/拒绝可输原因/
+              │         │             「始终允许」写入白名单指纹）
+              │         └─ DENY   ─► 构造「用户拒绝执行该指令: 原因」tool消息
+              │                        │
+              └────────────────────────┘
+                 工具结果以 role=tool + tool_call_id 回填会话，进入下一轮
+```
+
+**(c) 权限策略（`core/policy.py`）—— 三模式 + 白名单指纹**
+
+- 三档模式：`auto` 自动 / `manual` 手动 / `full` 完全访问（`/mode` 或 Shift+Tab 切换）。full 全放行；auto 与 manual 均为「安全调用放行、其余弹确认」；
+- 安全判定两条正则：安全命令白名单（`ls/dir/cat/git status/pip show` 等只读操作）与危险命令黑名单（`rm -rf`、`format x:`、`reg add`、`powershell -enc`、`curl | sh` 等直接进确认）；
+- **命令指纹白名单**：用户按「始终允许」后，把 `工具名 + 归一化参数指纹`（如 `execute_command|git|status log`，宽指纹只取命令首词）写入 `data/allowlist/{项目hash}.json`，按项目隔离，后续同指纹调用自动放行；
+- 工具执行全程隔离：工具不存在 / 参数错误 / 执行抛异常，一律转成文本 tool 消息回给模型自纠，**任何工具失败都不会崩掉主循环**。
+
+### 2.2 上下文怎么管
+
+**(a) 每轮请求的消息组装（`memory.py: build_messages`）**，固定三段：
+
+```
+① system 提示词     ← core/prompts/system_prompt.md，占位符渲染注入
+                      （workspace/项目id/系统/模型/权限模式/工具清单）
+② [记忆补充] system ← Agent.md 全局长期记忆
+                      + Projects/{project_id}.md 项目记忆
+                      + 当前计划（标题/状态/正文）与步骤列表（含各步状态）
+                      + RAG 检索结果
+③ 会话历史          ← user/assistant/tool 消息，含 assistant.tool_calls
+                      与 role=tool 的 tool_call_id 严格配对（DeepSeek 协议）
+```
+
+协议兼容细节：仅 UI 展示用的注入消息（`type=system_prompt/help`）不进 API；丢失 `tool_call_id` 的 tool 消息**直接丢弃而不是降级为 system**——降级会破坏 tool_calls 配对导致 400。
+
+**(b) 长度控制 —— 白名单保留 · 回合末剥离 · 结果外置 · 压缩闸 · 精确计量**
+
+- **白名单保留**：状态/记忆类工具（write_plan/update_plan/generate_steps/update_step_status/memory_add_fact/memory_add_project_note/rag_add，`context.tool_whitelist` 可配）的完整调用历史跨回合保留，会话累计超过 32k tokens 时最老的先外置磁盘；
+- **结果外置**：每次工具调用生成专有 call_id，结果行内限额普通工具 4k tokens / read·write·edit_file 32k tokens，超限部分以 call_id 为文件名原子写入 `data/toolcalls/{项目}/{会话}/`，行内保留头部切片 + 落盘指针，模型可用 read 工具（offset/limit 行分页）分批回读；
+- **回合末剥离**：白名单外工具的调用记录生命周期为一轮——回合结束（含出错/中断）将 content 改写为简明记录 `[已剥离·工具名] description call_id=… 完整输出: 路径`（消息本体保留维持 tool_call/tool_result 配对；最近 6 条保护不剥离，短内容不改写）。模型调用工具时必带的 `description` 参数（一句话意图说明）在执行前剥除并随记录留档，缺失时兜底「工具名+参数摘要」；
+- **压缩闸**：token 估算 ≥ `context_window × 0.8` 时触发 LLM 摘要压缩——全部历史压成 ≤300 字摘要，替换为一条 system 摘要消息，任务目标/已完成步骤/关键结论/未决问题保留；
+- 计量优先用 API 返回的 usage，无 usage 时用 tiktoken 真实分词估算（按模型回落 encoding；tiktoken 缺失退化为字符数÷2）。状态栏实时显示 `当前上下文/窗口(百分比)` 与累计计费 token、余额。
+
+**(c) 记忆分层**
+
+| 层 | 载体 | 生命周期 |
+|---|---|---|
+| 会话消息 | `Memory.messages` | 当前会话 |
+| 历史会话 | `data/sessions/{project_id}/时间戳-随机.json`，`.tmp + os.replace` 原子写 | 持久，`/resume` 恢复、`/new` 旋转新会话 |
+| 长期记忆 | `data/memory/Agent.md`（全局偏好/规范）+ `data/memory/Projects/{id}.md`（项目约定），工具 `memory_add_fact` 写入，旧 memory.json 自动迁移并留 .bak | 永久，每轮注入 |
+| 项目 RAG | 内存文档 + 关键词匹配兜底；`external_apis.rag_add/rag_query` 填 URL 即可整体接管为真实向量库 | 永久（外部实现时） |
+
+多项目隔离：启动时按 cwd 生成 `project_id`（`core/project_identity.py`），会话目录、项目记忆、白名单均按项目分开。
+
+### 2.3 哪里会失败（失败点矩阵）
+
+| # | 环节 | 失败条件 | 系统行为 |
+|---|---|---|---|
+| 1 | LLM 请求 | 超时/断网/限流 | 按 `retry_times=3` 重试、延迟递增并重建客户端；仍失败→错误写入会话、状态「出错」，回合终止不崩溃 |
+| 2 | 鉴权 | key 缺失/无效 | 缺 key 在请求前拒绝；401/403 如实透出给用户 |
+| 3 | 多 provider 凭证错配 | 指定模型无凭证 | `resolve_request` 按 model 所属 provider 取 key/base_url（防「模型换了、client 还是别家」的 404）；无凭证回退激活模型并告警 |
+| 4 | 工具参数 | 模型输出非法 JSON | arguments 解析失败→空参，工具报「参数错误」回给模型自纠 |
+| 5 | 工具名幻觉 | 调用未注册工具 | 返回「工具不存在: xxx」tool 消息 |
+| 6 | 消息配对 | tool 消息缺 tool_call_id | 该条不进 API（防 400），日志告警 |
+| 7 | 终端命令 | 非零退出/超时 60s/OSError | 全部转文本（含退出码）反馈模型，回合继续 |
+| 8 | 轮次失控 | 任务无限循环 | 12 轮硬上限，写「达到最大工具轮次」中止 |
+| 9 | 上下文溢出 | 超窗口 80% | 回合末先剥离/外置工具记录，再 LLM 摘要压缩；计量失效退化为字符估算 |
+| 10 | 会话写盘 | 写一半被杀/Ctrl+C | `.tmp + os.replace` 原子写；`/resume` 扫描遇损坏文件跳过不阻塞 |
+| 11 | 记忆文件损坏 | memory.json 非法 JSON | 告警并回落空结构（md 是事实来源，损失有限） |
+| 12 | 外部扩展点不可达 | external_apis URL 挂了 | 告警并回落本地默认逻辑（扩展点失败不阻断主流程） |
+| 13 | 终端环境差异 | 老 conhost / VT 未开 / IME | 启动即开启 Windows VT；输入栈 prompt_toolkit Win32/VT 双路径（经真机 IME 取证验证）；建议 Windows Terminal |
+| 14 | 用户中断 | Ctrl+C | 关闭在途连接，`__CANCELLED__` 哨兵丢弃在途回合；退出前自动保存会话与长期记忆 |
+
+### 2.4 已知限制（诚实清单）
+
+- **RAG 是占位实现**：关键词包含匹配（前 3 篇×200 字），非向量检索——架构上预留了外部接口整体接管；
+- **edit_file 是精确字符串替换**：old_str 需唯一匹配（多处须 `replace_all=true`），无模糊/补丁匹配；
+- **安全性依赖策略层**：`execute_command` 为 `shell=True`，full 模式下无任何拦截；auto/manual 的安全判定是正则启发式，可被构造性命令绕过——不可在不受信环境开 full；
+- manual 与 auto 两档当前判定逻辑相同（安全放行/其余确认），区分度属于预留设计；
+- 无流式输出（整段返回）；工具顺序执行，不并行；
+- 复杂度判定是关键词+长度启发式（`core/llm.py: judge_complexity`），不是模型判断；
+- Windows-first：Windows Terminal/conhost 深度适配（VT、代码页、IME），Linux/macOS 未充分测试；
+- 会话为进程内单例（`memory.get_session()`），不支持多实例并行操作同一 data 目录。
+
+---
+
+## 3. 能共享：别人能直接用、改、再分享
+
+### 3.1 目录导览
+
+```
+BAWCode/
+├── main.py                  # 入口：主循环 + 命令注册 + 任务回合调度
+├── requirements.txt         # 5 个运行依赖
+├── core/
+│   ├── llm.py               # LLM 网关：多provider解析/重试/协议归一化/计划步骤
+│   ├── tools.py             # 14 个工具实现（加新工具就在这里）
+│   ├── register.py          # 工具注册器（装饰器注册表，可独立复用）
+│   ├── policy.py            # 权限策略：三模式/安全正则/指纹白名单
+│   ├── memory.py            # 会话消息/上下文组装/压缩/长期记忆
+│   ├── session_store.py     # 历史会话原子落盘（可独立复用）
+│   ├── rag.py               # RAG 占位 + 外部接口接管
+│   ├── hooks.py             # 外部 API 扩展点（URL 即插即用）
+│   ├── tokens.py            # token 计量
+│   ├── config.py            # 多 provider 配置
+│   ├── commands.py          # /命令 框架 + 插件加载
+│   ├── ui.py / keyinput.py / keymap.py   # TUI 渲染 / prompt_toolkit 输入栈 / 键位契约
+│   ├── log.py               # 分级日志（全局阈值+按模块覆盖）
+│   └── prompts/             # system_prompt.md / plan.md（占位符模板）
+├── data/
+│   ├── config.json          # 配置（含 key，勿外传！）
+│   ├── allowlist/           # 按项目哈希的「始终允许」指纹
+│   ├── memory/              # Agent.md + Projects/{id}.md 长期记忆
+│   ├── sessions/{project}/  # 历史会话 JSON
+│   ├── commands/            # /命令 插件目录（有 _example_plugin.py 示例）
+│   └── theme/               # 主题（dark/ocean）
+├── _recycle/                # 退役模块归档（layout.py、旧输入管线）
+└── CHANGELOG.md             # 全程开发记录（含每次修复的取证与根因）
+```
+
+### 3.2 直接用
+
+按第 1 节 4 步即可跑起来；日常操作全部有 `/命令`（`/help /run /refine /resume /new /clear /rename /model /mode /theme /tools /settings /balance /plan /steps`）。
+
+### 3.3 二次开发（改）
+
+**加一个工具（最常见的扩展，约 10 行）**——在 `core/tools.py` 里：
+
+```python
+@register.register(
+    name="open_browser",
+    description="Open a URL in the default browser",
+    schema={
+        "type": "object",
+        "properties": {"url": {"type": "string", "description": "URL to open"}},
+        "required": ["url"],
+    },
+)
+def open_browser(url: str) -> str:
+    import webbrowser
+    webbrowser.open(url)
+    return "已打开"
+```
+
+保存重启即生效：自动进入 `/tools` 列表与每轮请求的工具定义；权限上会按「未知工具→确认」处理，也可在 `policy.SAFE_TOOLS` 里登记为只读安全工具。
+
+**挂外部 API（不改代码的扩展）**——`data/config.json → external_apis` 任何一项填 URL，该功能即整体转发到你的服务（POST JSON：`{"event":..., "payload":...}`，响应 JSON 作为返回值；失败自动回落本地逻辑）。可挂接点：`llm_request / prompt_refine / complexity_judge / plan_generate / plan_confirm / step_generate / step_update / memory_read / memory_write / rag_add / rag_query / computer_use / tool_confirm`。例如把 `rag_query` 指到你的向量库服务，RAG 立刻从占位变成真实检索。
+
+**换提示词**：`core/prompts/system_prompt.md`，占位符 `^{name}^` 运行时渲染；**加 /命令**：`data/commands/` 放插件文件（参考 `_example_plugin.py`）；**换主题**：`data/theme/*.json`；**调权限**：`ui.mode` 默认值、`policy.py` 正则与白名单。
+
+### 3.4 再分享（发布前必做清理）
+
+当前仓库把运行时数据也纳入了 git 跟踪，**对外分享前务必处理**：
+
+1. **`data/config.json` 含真实 api_key** —— 换成 `""` 或提供 `config.example.json` 模板（最高优先级）；
+2. 删除/忽略个人数据：`data/log/`、`data/sessions/`、`data/memory/`、`data/memory.json*`、`data/allowlist/`（含你的会话内容与使用习惯）；
+3. 建议 `.gitignore` 增加：`data/config.json、data/log/、data/sessions/、data/memory/、data/allowlist/、__pycache__/、_recycle/`；
+4. 补一个开源协议文件（如 MIT）并在 `pyproject.toml` 标注，明确「用/改/再分享」的授权；
+5. 清理仓库根的临时产物（`BAWCode*.zip`、`新建文件夹/`，已在 .gitignore 的确认删除物理文件）。
+
+完成 1–5 后即可打 zip 或推送 git 仓库，接收方按第 1 节步骤运行。
+
+---
+
+## 4. 考核要求自查表
+
+| 考核要求 | 本文回答 | 关键证据 |
+|---|---|---|
+| 至少一项产出 | 第 0 节 | 可运行产品 + 本文档 + 可复用核心模块 |
+| 能运行：文档讲清楚 | 第 1 节 | 4 步部署、两种 key 配置、验证清单、FAQ |
+| 能讲清：工具怎么调度 | 2.1 | 装饰器注册表、12 轮回合循环、三档策略+指纹白名单 |
+| 能讲清：上下文怎么管 | 2.2 | 三段式组装、白名单+回合末剥离+结果外置+压缩闸、四层记忆、按项目隔离 |
+| 能讲清：哪里会失败 | 2.3 / 2.4 | 14 项失败点矩阵（含兜底行为）+ 8 条已知限制 |
+| 能共享：直接用 | 3.2 | /命令 全覆盖 |
+| 能共享：能改 | 3.3 | 加工具 10 行示例、external_apis 零代码扩展 |
+| 能共享：再分享 | 3.4 | 发布清理清单（key 与隐私数据） |

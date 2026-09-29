@@ -62,6 +62,7 @@ def default_config() -> dict:
         "ui": {
             "theme": "dark",
             "mode": "auto",
+            "busy_send_mode": "queue",
             "logo": True,
             "send": "ctrl+enter",
             "newline": "shift+enter",
@@ -94,8 +95,29 @@ def default_config() -> dict:
             "longterm_dir": "data/memory",
             "auto_compress": True,
             "compress_threshold": 0.8,
-            "strip_tool_history": True,
-            "strip_tool_keep": 6,
+        },
+        # 上下文管理（core/toolstore.py + memory.finalize_turn）：
+        # tool_whitelist 白名单内工具完整调用历史跨回合保留，会话累计超
+        # whitelist_budget_tokens 后最老的先外置磁盘；白名单外工具回合末剥离，
+        # 仅保留 description+调用id（最近 strip_keep_recent 条不剥离，0=严格全剥）；
+        # 行内限额：普通工具 inline_limit_tokens，large_tools 类
+        # inline_limit_tokens_large，超限部分外置并在结果中附落盘指针
+        "context": {
+            "tool_whitelist": [
+                "write_plan",
+                "update_plan",
+                "generate_steps",
+                "update_step_status",
+                "memory_add_fact",
+                "memory_add_project_note",
+                "rag_add",
+            ],
+            "whitelist_budget_tokens": 32768,
+            "inline_limit_tokens": 4096,
+            "large_tools": ["read", "write", "edit_file"],
+            "inline_limit_tokens_large": 32768,
+            "persist_dir": "data/toolcalls",
+            "strip_keep_recent": 6,
         },
         "command_plugins": ["data/commands"],
         # 核心功能外部 API（UI/改配置不挂接口）

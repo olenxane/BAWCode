@@ -1,5 +1,6 @@
 # Agent 核心：LLM 调用、工具策略、token/余额
 import json
+import threading
 import time
 import traceback
 import urllib.error
@@ -27,6 +28,9 @@ from core.log import get_logger
 log = get_logger("llm")
 
 _ROOT = Path(__file__).resolve().parent.parent
+
+# chat() 取消哨兵：异步回合中断时返回，调用方据此丢弃在途回合
+CANCELLED = "__CANCELLED__"
 
 
 def _fallback_system_prompt() -> str:
@@ -63,7 +67,29 @@ class LLM:
         self.meter.model = config.model_name
         self.client = None
         self._client_provider_id = None
+        self._cancel = threading.Event()
         self._build_client()
+
+    # ----- 取消（异步回合中断） -----
+
+    def cancel(self) -> None:
+        """请求中断：置标记并关闭在途连接（openai SDK/httpx 路径立即生效）。"""
+        self._cancel.set()
+        client = self.client
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.client = None
+        self._client_provider_id = None
+        log.info("LLM 请求取消：已关闭在途连接")
+
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def reset_cancel(self) -> None:
+        self._cancel.clear()
 
     def _build_client(self, provider_id: Optional[str] = None, api_key: Optional[str] = None,
                       base_url: Optional[str] = None) -> None:
@@ -272,6 +298,8 @@ class LLM:
         model: Optional[str] = None,
     ) -> dict:
         """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型"""
+        if self._cancel.is_set():
+            return {"content": "", "tool_calls": [], "error": CANCELLED}
         self.meter.measure_context(messages)
         req = self.resolve_request(model)
         model_id = req.get("model_id") or req.get("model_name") or ""
@@ -292,7 +320,7 @@ class LLM:
             )
             if hooked is None:
                 return {"content": "", "tool_calls": [], "error": "未配置 api_key"}
-            return self._normalize(hooked)
+            return self._normalize(hooked, keep_reasoning=bool(tools))
 
         retry_times = int(self.config.data.get("llm", {}).get("retry_times", 3))
         retry_delay = float(self.config.data.get("llm", {}).get("retry_delay", 1.0))
@@ -307,6 +335,8 @@ class LLM:
             len(tools or []),
         )
         while attempt <= max(retry_times, 0):
+            if self._cancel.is_set():
+                return {"content": "", "tool_calls": [], "error": CANCELLED}
             try:
                 external = hooks.call_hook(
                     "llm_request",
@@ -314,7 +344,7 @@ class LLM:
                     default=None,
                 )
                 data = external if external is not None else self._native_chat(payload, req)
-                result = self._normalize(data)
+                result = self._normalize(data, keep_reasoning=bool(tools))
                 usage = result.get("raw", {}).get("usage") if isinstance(result.get("raw"), dict) else None
                 self.meter.record_api_usage(usage)
                 log.info(
@@ -327,6 +357,8 @@ class LLM:
                 )
                 return result
             except Exception as e:
+                if self._cancel.is_set():
+                    return {"content": "", "tool_calls": [], "error": CANCELLED}
                 last_error = e
                 attempt += 1
                 log.warn("LLM 调用失败(第%d/%d次): %s", attempt, max(retry_times, 0) + 1, e)
@@ -343,7 +375,7 @@ class LLM:
         log.error("LLM 调用最终失败: %s", last_error)
         return {"content": "", "tool_calls": [], "error": f"LLM 调用失败: {last_error}"}
 
-    def _normalize(self, data: Any) -> dict:
+    def _normalize(self, data: Any, keep_reasoning: bool = False) -> dict:
         if isinstance(data, dict) and data.get("content") is not None and "tool_calls" in data:
             normalized_calls = []
             for c in data.get("tool_calls") or []:
@@ -384,9 +416,13 @@ class LLM:
             )
         content = message.get("content") or ""
         reasoning = message.get("reasoning_content") or ""
-        if reasoning and not content:
+        if reasoning and not content and not keep_reasoning:
+            # 无工具的内部文本调用（计划/压缩/判定/refine）：仅思考时顶替 content，保住下游取得到文本；
+            # agent 工具轮（keep_reasoning=True）不顶替——思考进 thinking 字段，回合末可整体剥离
             content = reasoning
-        return {"content": content, "tool_calls": tool_calls, "raw": data}
+            reasoning = ""
+        # 思考与正文并存时 reasoning 单独返回，由调用方以 thinking 字段随消息留档
+        return {"content": content, "reasoning": reasoning, "tool_calls": tool_calls, "raw": data}
 
     def evaluate_tool(self, tool_name: str, args: dict) -> tuple:
         action, reason = policy.evaluate(tool_name, args, getattr(self.config, "mode", policy.MODE_AUTO))
@@ -399,6 +435,7 @@ class LLM:
         args = call.get("arguments") or {}
         if not isinstance(args, dict):
             args = {}
+        args = {k: v for k, v in args.items() if k != "description"}
         log.info("执行工具 %s（已确认）", name)
         if not register.has_tool(name or ""):
             output = f"工具不存在: {name}"

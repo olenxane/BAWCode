@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -29,9 +30,12 @@ from core.config import (
     THINKING_OPTIONS,
     make_model_name,
 )
-from core.log import get_logger
+from core.log import get_logger, init as init_logging
 
 log = get_logger("ui")
+
+# UI 请求桥的取消哨兵（与 core.llm.CANCELLED 同值：桥等待被取消时回填给 agent 线程）
+CANCEL_RESULT = "__CANCELLED__"
 
 _CONSOLE = Console(soft_wrap=True, force_terminal=True) if HAS_RICH else None
 _app: Optional["TuiApp"] = None
@@ -558,6 +562,14 @@ class TuiApp:
         self._sessions_current_id = ""
         self._sessions_confirm_delete = False
         self.sessions_notice = ""
+        # 工具确认面板：取代输入框位置，↑↓ 选择 · Enter 确认 · 可输入拒绝原因
+        self.confirm_mode = False
+        self.confirm_tool: dict = {}
+        self.confirm_index = 0
+        self.confirm_reason_mode = False
+        self._confirm_buf = TextBuffer()
+        # UI 请求桥：agent 线程的交互弹窗移交主线程执行（单读者保证）
+        self._ui_req: Optional[dict] = None
         self._input_prompt = "> "
         # 渲染接管：rich Live（enter() 时启动）；_frame_time 为固定帧周期（TMP 同款 20fps）
         self._live: Optional["Live"] = None
@@ -732,7 +744,7 @@ class TuiApp:
         """兼容入口：转发到启动 Logo（主屏幕）"""
         show_startup_logo(seconds, self.project_name)
 
-    def refresh_from_session(self, session, task: Optional[str] = None) -> None:
+    def refresh_from_session(self, session, task: Optional[str] = None, render: bool = True) -> None:
         self.messages = list(getattr(session, "messages", []) or [])
         self.plan = dict(getattr(session, "plan", {}) or {})
         self.steps = list(getattr(session, "steps", []) or [])
@@ -746,7 +758,9 @@ class TuiApp:
             self.task = task
         elif self.plan.get("title"):
             self.task = self.plan.get("title")
-        self.render()
+        if render:
+            # agent 线程传 render=False：渲染统一由主线程帧循环完成（线程安全）
+            self.render()
 
     def _clamp_tree_scroll(self, total: int, tree_h: int) -> int:
         """按 follow_tail / tree_cursor 计算并夹紧会话树 scroll"""
@@ -1105,6 +1119,10 @@ class TuiApp:
         text_h = min(3, max(1, len(wrapped)))
         cand_show = min(3, len(self.candidates)) if self.candidates else 0
         input_zone_h = min(6, text_h + cand_show)
+        # 确认面板：取代输入框位置，行数更多时向上拓展（压缩会话区）
+        confirm_panel = self._compose_confirm(w) if self.confirm_mode else None
+        if confirm_panel is not None:
+            input_zone_h = len(confirm_panel)
 
         bottom_fixed = 1 + 2 + 1 + 1  # rule + info/mode+tip + rule + status
         top_fixed = 1 + 1
@@ -1158,12 +1176,12 @@ class TuiApp:
         vis = wrapped[self.input_scroll : self.input_scroll + text_h]
         input_rows = []
         accent = self.c("accent") if self.focus == "input" else self.c("dim")
-        # 输入框：显示缓冲与光标
-        if not raw.strip():
+        # 输入框：显示缓冲与光标（确认面板模式下跳过，行位由面板取代）
+        if confirm_panel is None and not raw.strip():
             input_rows.append(
                 f"{accent}>{self.RESET} {self.c('dim')}{_clip('输入消息或 / 命令 · Enter 提交 · Tab 补全', inner_w)}{self.RESET}{accent}▌{self.RESET}"
             )
-        else:
+        elif confirm_panel is None:
             ink = self.c("ink")
             mark = f"{self.c('accent')}▌{self.RESET}"
             for i, part in enumerate(vis):
@@ -1176,7 +1194,7 @@ class TuiApp:
                     input_rows.append(f"{head}{left}{mark}{ink}{_clip(right, inner_w)}{self.RESET}")
                 else:
                     input_rows.append(f"{head}{_clip(part, inner_w)}{self.RESET}")
-        if cand_show:
+        if cand_show and confirm_panel is None:
             if self.candidate_index < self.cand_scroll:
                 self.cand_scroll = self.candidate_index
             if self.candidate_index >= self.cand_scroll + cand_show:
@@ -1194,7 +1212,11 @@ class TuiApp:
                     input_rows.append(self.c("ok") + label + self.RESET)
         while len(input_rows) < input_zone_h:
             input_rows.append(" ")
-        lines.extend(input_rows[:input_zone_h])
+        if confirm_panel is not None:
+            # 面板行取代输入框行位（高度已在 tree_h 计算中向上拓展）
+            lines.extend(confirm_panel)
+        else:
+            lines.extend(input_rows[:input_zone_h])
         lines.append(self._rule(w))
 
         # 底部：项目 · git · 模型 · 模式（同一行）
@@ -1343,8 +1365,6 @@ class TuiApp:
     def read_line(self, prompt: Optional[str] = None, config=None) -> str:
         """界面内输入框：Action 驱动主循环（Gap Buffer + Keymap O(1)）。"""
         self.settings_mode = False
-        if self.pending_tool:
-            return self._confirm_loop()
         self.focus = "input"
         self._buf_clear()
         self.buffer = TextBuffer()
@@ -1370,7 +1390,8 @@ class TuiApp:
                 if result is not None:
                     return result
 
-            # 帧尾：无条件渲染 + 补足帧周期
+            # 帧尾：UI 请求桥 + 无条件渲染 + 补足帧周期
+            self._serve_ui_request()
             self.render()
             frame_deadline += self._frame_time
             sleep_left = frame_deadline - time.time()
@@ -1677,39 +1698,187 @@ class TuiApp:
                 self._buf_clear()
             self.render()
 
-    def _confirm_loop(self) -> str:
-        """工具确认：1 允许一次 / 2 本项目始终允许 / 3 拒绝（可输入原因）"""
-        self.settings_mode = False
-        self.render()
-        pending = self.pending_tool or {}
-        tool_name = pending.get("name", "")
-        # 阻塞式 input() 与 Live 刷新互扰：读取前停 Live，finally 里重启
-        live = self._live
+    # ----- UI 请求桥：agent 线程经此把交互弹窗移交主线程执行 -----
+
+    def request_ui(self, kind: str, payload: dict) -> dict:
+        """agent 线程发起交互请求（confirm/choose/line）；结果经 wait_ui 取回"""
+        req = {
+            "kind": kind,
+            "payload": payload or {},
+            "result": None,
+            "event": threading.Event(),
+            "served": False,
+        }
+        self._ui_req = req
+        return req
+
+    def wait_ui(self, req: dict, cancelled=None, poll: float = 0.05):
+        """agent 线程等待主线程完成交互；cancelled() 为真时回填取消哨兵"""
+        while not req["event"].wait(poll):
+            if cancelled is not None and cancelled():
+                req["result"] = CANCEL_RESULT
+                req["event"].set()
+        return req["result"]
+
+    def _serve_ui_request(self) -> None:
+        """主线程（read_line 帧循环）执行待处理的交互请求；同刻最多一个"""
+        req = self._ui_req
+        if req is None or req.get("served"):
+            return
+        req["served"] = True
         try:
-            if live is not None:
-                live.stop()
-                self._live = None
-            print(f"工具确认: {tool_name}")
-            print("  1) 允许执行一次")
-            print("  2) 在本项目中始终允许该类指令")
-            print("  3) 拒绝（可输入原因，直接回车则使用默认拒绝）")
+            kind = req["kind"]
+            payload = req["payload"] or {}
+            if kind == "confirm":
+                result = self.show_confirm_form(
+                    str(payload.get("name") or ""), payload.get("arguments") or {}
+                )
+            elif kind == "choose":
+                result = self.choose(
+                    list(payload.get("options") or []), str(payload.get("prompt") or "")
+                )
+            elif kind == "line":
+                result = self.read_line(payload.get("prompt"), config=payload.get("config"))
+            else:
+                result = None
+        except Exception as exc:
+            log.error("UI 请求执行失败: %r", exc)
+            result = CANCEL_RESULT
+        req["result"] = result
+        req["event"].set()
+
+    def _compose_confirm(self, w: int) -> List[str]:
+        """确认面板内容：显示在输入框位置，行数多时向上拓展（压缩会话区）。"""
+        tool = self.confirm_tool or {}
+        name = str(tool.get("name") or "?")
+        args = tool.get("arguments") or {}
+        try:
+            arg_line = json.dumps(args, ensure_ascii=False)
+        except Exception:
+            arg_line = str(args)
+        rows: List[str] = []
+        rows.append(self.c("accent") + _clip(f" 工具确认: {name}", w - 1) + self.RESET)
+        if arg_line and arg_line != "{}":
+            rows.append(self.c("dim") + " " + _clip(_oneline(arg_line, w - 3), w - 2) + self.RESET)
+        if self.confirm_reason_mode:
+            # 拒绝原因输入：块光标跟随文本
+            text = self._confirm_buf.to_text()
+            cur = max(0, min(self._confirm_buf.cursor, len(text)))
+            left, right = text[:cur], text[cur:]
+            prompt = " 拒绝原因> "
+            inner = max(4, w - _display_width(prompt) - 3)
+            left_c = _clip(left, inner)
+            used = _display_width(left_c)
+            right_c = _clip(right, max(0, inner - used))
+            rows.append(
+                f"{self.c('accent')}{prompt}{self.RESET}"
+                f"{self.c('ink')}{left_c}{self.C_HL} {self.RESET}{right_c}{self.RESET}"
+            )
+            rows.append(self.c("dim") + _clip(" Enter 提交（空=默认理由） · Esc 返回选项", w - 1) + self.RESET)
+            return rows
+        labels = (
+            ("allow_once", "允许执行一次"),
+            ("allow_always", "在本项目中始终允许该类指令"),
+            ("reject", "拒绝（默认理由）"),
+            ("reason", "拒绝并输入原因"),
+        )
+        idx = self.confirm_index % len(labels)
+        for i, (_act, label) in enumerate(labels):
+            line = f" {'❯' if i == idx else ' '} {label}"
+            if i == idx:
+                rows.append(self.C_HL + _pad(_clip(line, w - 1), w - 1) + self.RESET)
+            else:
+                rows.append(self.c("ink") + _clip(line, w - 1) + self.RESET)
+        rows.append(self.c("dim") + _clip(" ↑↓ 选择 · Enter 确认 · Esc 拒绝", w - 1) + self.RESET)
+        return rows
+
+    def show_confirm_form(self, tool_name: str, tool_args: Optional[dict] = None) -> dict:
+        """工具确认面板（阻塞）：↑↓ 选择 · Enter 确认 · Esc 拒绝。
+
+        选中「拒绝并输入原因」回车后进入行内输入状态，Enter 提交（空=默认理由）。
+        返回 {"action": "allow_once"|"allow_always"|"reject", "reason": str}。"""
+        options = ("allow_once", "allow_always", "reject", "reason")
+        self.confirm_mode = True
+        self.confirm_tool = {"name": tool_name, "arguments": tool_args or {}}
+        self.confirm_index = 0
+        self.confirm_reason_mode = False
+        self._confirm_buf = TextBuffer()
+        try:
             try:
-                choice = input("请选择> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return policy.default_reject_message("")
-            if choice == "1":
-                return "__ALLOW_ONCE__"
-            if choice == "2":
-                return "__ALLOW_ALWAYS__"
-            try:
-                reason = input("拒绝原因> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                reason = ""
-            return policy.default_reject_message(reason)
+                _flush_input()
+            except Exception:
+                pass
+            self.render()
+            while True:
+                ev = _read_key()
+                kind, value = ev if ev is not None else ("tick", "")
+                if kind in ("tick", "mode_switch"):
+                    continue
+                if self.confirm_reason_mode:
+                    # 拒绝原因输入态
+                    if kind == "interrupt":
+                        return {"action": "reject", "reason": ""}
+                    if kind == "escape":
+                        self.confirm_reason_mode = False
+                        self._confirm_buf.clear()
+                        self.render()
+                        continue
+                    if kind in ("submit", "newline"):
+                        return {"action": "reject", "reason": self._confirm_buf.to_text().strip()}
+                    if kind == "char":
+                        if isinstance(value, str) and value and all(ord(c) >= 32 for c in value):
+                            self._confirm_buf.insert(value)
+                            self.render()
+                        continue
+                    if kind == "backspace":
+                        self._confirm_buf.backspace()
+                        self.render()
+                        continue
+                    if kind == "paste":
+                        flat = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+                        self._confirm_buf.insert(flat)
+                        self.render()
+                        continue
+                    continue
+                # 选项模式
+                if kind in ("interrupt", "escape"):
+                    return {"action": "reject", "reason": ""}
+                if kind == "up" or (kind == "hotkey" and str(value).endswith("up")):
+                    self.confirm_index = (self.confirm_index - 1) % len(options)
+                    self.render()
+                    continue
+                if kind == "down" or (kind == "hotkey" and str(value).endswith("down")):
+                    self.confirm_index = (self.confirm_index + 1) % len(options)
+                    self.render()
+                    continue
+                if kind == "mouse_wheel":
+                    step = 1 if value == "down" else -1
+                    self.confirm_index = (self.confirm_index + step) % len(options)
+                    self.render()
+                    continue
+                if kind == "submit":
+                    action = options[self.confirm_index]
+                    if action == "reason":
+                        self.confirm_reason_mode = True
+                        self._confirm_buf = TextBuffer()
+                        self.render()
+                        continue
+                    return {"action": action, "reason": ""}
+                # 数字快捷键（兼容旧习惯 1/2/3）
+                if kind == "char" and value in ("1", "2", "3"):
+                    idx = int(value) - 1
+                    action = options[idx]
+                    if action == "reason":
+                        self.confirm_index = idx
+                        self.confirm_reason_mode = True
+                        self._confirm_buf = TextBuffer()
+                        self.render()
+                        continue
+                    return {"action": action, "reason": ""}
         finally:
-            if live is not None and self._live is None:
-                self._live = live
-                live.start()
+            self.confirm_mode = False
+            self.confirm_reason_mode = False
+            self.render()
 
     def choose(self, options: List[tuple], prompt: str = "") -> str:
         lines = []
@@ -1874,6 +2043,7 @@ class TuiApp:
             "model_id": s.get("model_id"),
             "theme": s.get("theme", getattr(config, "theme", "")),
             "mode": s.get("mode", getattr(config, "mode", "")),
+            "log_level": s.get("log_level"),
             "select_model": s.get("select_model"),
             "task_plan": s.get("task_plan"),
             "task_code": s.get("task_code"),
@@ -2100,10 +2270,14 @@ class TuiApp:
             ui_cfg = (config.data or {}).get("ui") or {}
             mem_cfg = (config.data or {}).get("memory") or {}
             llm_cfg = (config.data or {}).get("llm") or {}
+            log_level = str((config.data or {}).get("log", {}).get("level") or "info").strip().lower()
+            if log_level not in ("debug", "info", "warn", "error", "off"):
+                log_level = "info"
             themes = ["dark"] + [t for t in config.list_themes() if t != "dark"]
             fields = [
                 {"key": "theme", "label": "主题", "type": "choice", "options": themes, "current": config.theme, "hint": "←→ 切换主题"},
                 {"key": "mode", "label": "访问模式", "type": "choice", "options": list(policy.MODES), "current": config.mode, "hint": "auto/manual/full"},
+                {"key": "busy_send_mode", "label": "等待时新消息", "type": "choice", "options": ["queue", "interrupt"], "current": str(ui_cfg.get("busy_send_mode") or "queue"), "hint": "queue=排队等本轮结束 · interrupt=中断插入"},
                 {"key": "logo", "label": "会话区Logo", "type": "bool", "current": bool(ui_cfg.get("logo", True)), "hint": "←→ 开/关"},
                 {"key": "font_size", "label": "字体大小", "type": "text", "current": getattr(config, "font_size", 16)},
                 {"key": "tip_interval", "label": "提示间隔秒", "type": "text", "current": ui_cfg.get("tip_interval", 5)},
@@ -2114,6 +2288,7 @@ class TuiApp:
                 {"key": "scroll_max_step", "label": "滚动最大步长", "type": "text", "current": ui_cfg.get("scroll_max_step", 20)},
                 {"key": "auto_compress", "label": "自动压缩上下文", "type": "bool", "current": bool(mem_cfg.get("auto_compress", True)), "hint": "←→"},
                 {"key": "compress_threshold", "label": "压缩阈值", "type": "text", "current": mem_cfg.get("compress_threshold", 0.8)},
+                {"key": "log_level", "label": "日志等级", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "current": "关闭" if log_level == "off" else log_level, "hint": "←→ 关闭=不记录任何日志（含写盘）"},
                 {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 切换当前模型"},
             ]
         self.settings_fields = fields
@@ -2221,7 +2396,7 @@ class TuiApp:
                     self.settings_mode = False
                     self.render()
                     try:
-                        raw = input(f"{label} [{cur}]: ")
+                        raw = _paused_input(f"{label} [{cur}]: ")
                     except (EOFError, KeyboardInterrupt):
                         raw = ""
                     self.settings_mode = True
@@ -2581,7 +2756,7 @@ class TuiApp:
         if action == "add_provider":
             self.settings_mode = False
             self.render()
-            pid = input("新 provider_id: ").strip()
+            pid = _paused_input("新 provider_id: ").strip()
             self.settings_mode = True
             if pid:
                 config.add_or_update_provider(
@@ -2603,7 +2778,7 @@ class TuiApp:
             )
             self.settings_mode = False
             self.render()
-            mid = input(f"新 model_id ({pid}): ").strip()
+            mid = _paused_input(f"新 model_id ({pid}): ").strip()
             self.settings_mode = True
             if mid:
                 entry = {
@@ -2693,6 +2868,8 @@ class TuiApp:
             ui_cfg["theme"] = str(s["theme"])
         if "mode" in s:
             ui_cfg["mode"] = str(s["mode"])
+        if "busy_send_mode" in s and str(s["busy_send_mode"]) in ("queue", "interrupt"):
+            ui_cfg["busy_send_mode"] = str(s["busy_send_mode"])
         if "logo" in s:
             ui_cfg["logo"] = bool(s["logo"] in (True, "true", "1", 1) if isinstance(s["logo"], str) else bool(s["logo"]))
         for key, cast in (
@@ -2728,6 +2905,14 @@ class TuiApp:
                 mem_cfg["compress_threshold"] = float(s["compress_threshold"])
             except (TypeError, ValueError):
                 pass
+        if "log_level" in s and s["log_level"]:
+            level = str(s["log_level"]).strip()
+            level = {"关闭": "off"}.get(level, level.lower())
+            if level in ("debug", "info", "warn", "error", "off"):
+                log_cfg = config.data.setdefault("log", {})
+                if log_cfg.get("level") != level:
+                    log_cfg["level"] = level
+                    init_logging(config.data.get("log") or {})
         config.apply_active()
         config.save()
         updates["model_name"] = config.model_name
@@ -2741,6 +2926,17 @@ def _flush_input():
     from core import keyinput
 
     keyinput.flush_input()
+
+
+def _paused_input(prompt: str) -> str:
+    """暂停输入泵并恢复行缓冲后用内建 input() 读一行（设置页文本项等场景）。
+
+    新输入栈 raw_mode 关闭了行缓冲/回显，且后台泵线程会抽干控制台输入，
+    内建 input() 必须在 keyinput.paused() 内使用。"""
+    from core import keyinput
+
+    with keyinput.paused():
+        return input(prompt)
 
 
 def _key_direction(kind: str, value: str) -> Optional[str]:

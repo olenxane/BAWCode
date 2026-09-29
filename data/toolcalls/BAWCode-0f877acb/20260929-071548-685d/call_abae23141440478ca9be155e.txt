@@ -1,0 +1,32 @@
+[BAWCode 工具调用记录]
+call_id: call_abae23141440478ca9be155e
+tool: list_directory
+time: 2026-09-29 07:29:24
+arguments: {}
+description: list_directory({"path": "core"})
+total_chars: 242
+total_lines: 22
+
+--- content ---
+__pycache__/
+prompts/
+__init__.py
+commands.py
+config.py
+hooks.py
+keyinput.py
+keymap.py
+llm.py
+log.py
+memory.py
+policy.py
+project_identity.py
+prompt_loader.py
+rag.py
+register.py
+session_store.py
+textbuf.py
+tokens.py
+tools.py
+toolstore.py
+ui.py

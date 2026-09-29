@@ -1,68 +1,14 @@
+[BAWCode 工具调用记录]
+call_id: call_72822b2c92094b58a98f5f15
+tool: read
+time: 2026-09-29 07:29:24
+arguments: {}
+description: read({"file_path": "D:\\Windows11\\桌面\\code\\BAWCode\\CHANGELOG.md"})
+total_chars: 31834
+total_lines: 914
+
+--- content ---
 # Changelog
-
-## 2026-09-29 — 端到端测试基建：本地 OpenAI 协议 mock LLM 服务器 + 日志分析断言
-
-- `develop/mock_llm_server.py`（新增，可独立复用）：stdlib 实现的 OpenAI 兼容
-  `/v1/chat/completions` 服务器——按脚本 JSON 顺序返回预定内容（支持
-  reasoning_content / tool_calls），带 tools 的 agent 请求与无 tools 的内部调用
-  分流路由，脚本耗尽返回保底响应（靠请求数断言发现超发）；每个请求的完整
-  payload 记录到 JSONL。独立运行：`python develop/mock_llm_server.py --port
-  8123 --script s.json --log req.jsonl`，也可被真实 TUI 配置指向做真机测试。
-- `develop/test_e2e_mock_llm.py`（新增）：临时目录隔离环境（配置 base_url 指向
-  mock、log.level=debug、full 权限模式），驱动两个真实回合（list_directory →
-  read 4.6k-token 大文件触发超限外置 → 收尾；第二回合直接收尾），LLM 链路全程
-  真实 HTTP（openai SDK/urllib → localhost）。断言全部来自"分析日志结果"，
-  三类证据 30 项：A 出站 payload（请求 JSONL，A1-A12：请求数/工具定义注入
-  description/思维链逐轮并回/description 剥除/超限指针与行内截断/跨回合思维链
-  零残留/简明记录格式/<200 字守卫）；B 应用日志段（按字节偏移截取本次运行，
-  B1-B8：复杂度启发式/回合完成/真实调用计数/工具执行/外置落盘/回合末维护计数）；
-  C 磁盘产物（C1-C6：外置记录元数据+完整输出、会话存档 thinking 保留与剥离标）。
-- 教训：日志文件含中文（UTF-8 多字节），`st_size` 是字节而 `read_text()` 切片
-  是字符——按偏移截取日志段必须两侧同单位，否则中文文件切片恒为空。
-- 顺带验证了既有行为在真实协议下的表现：<200 字工具输出守卫（ls 结果原样
-  保留）、reasoning_content 经 openai SDK `model_dump()` 保留、日志段单位。
-- 验证：e2e 30 项全绿（真实 HTTP 往返 4 次 <1.5s）；context_mgmt /
-  context_turn_integration / session_store 套件回归无恙。
-
-## 2026-09-29 — thinking 生命周期定稿：回合内拼接思维链，跨回合剥离（对齐 DeepSeek 多轮工具调用规范）
-
-- 目标形态（用户给定图）：单回合内每次请求携带之前各轮思维链（请求 1.2 输入含
-  思维链 1.1，请求 1.3 含 1.1+1.2）；发起第二轮对话起，上一回合思维链不再进上下文。
-- 相对上一条目的修正（`core/llm.py`）："仅思考无正文顶替 content" 改为按
-  **是否携带 tools 分流**——agent 工具轮（`keep_reasoning=True`）不顶替，思考一律进
-  thinking 字段（否则仅思考轮的思维链以 content 身份入库，回合末无法识别剥离）；
-  无工具的内部文本调用（计划/步骤/复杂度判定/压缩/refine）保持顶替兜底，下游取文本
-  零回归。
-- 剥离实现（`core/memory.py`）：`finalize_turn` 回合末给所有 assistant 消息的
-  thinking 字段打 `thinking_stripped` 标——**会话记录保留，仅停止出站并回**；
-  `_api_session_item` 遇标跳过合并。幂等；正常结束/出错/Ctrl+C 全路径生效。
-- 收尾轮守卫放宽（`main.py`）：`content or reasoning` 非空即入库——仅思考收尾
-  也有记录（content 为空 + thinking 字段）。
-- thinking 仍无行内限额/保护条数（与工具记录不同），回合内多轮长思考会累积，
-  80% 压缩闸兜底；回合内 thinking 随每轮请求全量回传（含计费）。
-- 验证：test_context_mgmt.py 增 3 项（工具轮不顶替/剥离标后不并回/回合末打标），
-  test_context_turn_integration.py 增 3 项改 1 项（回合内请求 1.2 已并回思维链、
-  回合末双消息打标、第二回合不再并回且 payload 无任何思维链残留）全部通过；
-  session_store/keyinput 回归无恙。
-
-## 2026-09-29 — thinking 留档：思考与正文并存时不再丢弃，出站并回 content
-
-- 背景：此前 `_normalize` 对 reasoning_content 是"二选一"——正文非空时思考直接
-  丢弃，仅思考时顶替 content。逐轮对话中"思考+正文"并存轮的思考就丢了。
-- 改动（`core/llm.py` / `main.py` / `core/memory.py`）：
-  - `_normalize` 拆分返回 `content` + `reasoning`；**仅思考无正文仍顶替
-    content**（保住计划/压缩/复杂度判定等下游取文本的既有路径不回归）；
-  - assistant 入库点（工具轮消息 + 收尾消息）并存时以 `thinking` 字段随消息
-    留档——会话记录/UI 载荷保持 content 干净，思考单独成字段；
-  - `_api_session_item` 出站时把 thinking 并回该条 assistant 消息的 content
-    （`思考\n\n正文`），跨轮/跨回合模型都能看到自己之前的思考；
-    thinking 仅存记录不出站的裁剪开关留给后续按需加。
-- 回合结束判定与工具结果回填机制不变：无 tool_calls 即回合结束；有
-  tool_calls 则结果照旧回填上下文。
-- 验证：test_context_mgmt.py 增 5 项（normalize 拆分/顶替、出站并回/仅思考/
-  无字段不受影响）+ test_context_turn_integration.py 增 3 项（工具轮与收尾
-  消息 thinking 留档、第二回合 payload 中已并回）全部通过；
-  session_store/keyinput 回归无恙。
 
 ## 2026-09-28 — 上下文管理系统：工具白名单 + 回合末剥离 + 结果外置磁盘
 

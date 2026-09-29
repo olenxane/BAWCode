@@ -4,10 +4,11 @@
 公开契约：read_key_event / read_events / read_key / flush_input /
 direction_of / supported_kinds + KeyEvent NamedTuple。
 
-数据源为 Win32 INPUT_RECORD 事件流（prompt_toolkit Win32Input），
-翻译层 KeyPress → KeyEvent；读取循环后台线程阻塞读键 + 队列，
-read_events(0) 非阻塞供拍帧泵。旧实现（msvcrt/自研 FSM/滴灌）在
-_recycle/keyinput.py。
+数据源为 Win32 INPUT_RECORD 事件流：BawWin32Input 强制使用 ConsoleInputReader
+（pt 默认经 _is_win_vt100_input_enabled 试探切到 Vt100ConsoleInputReader，该
+路径丢弃 MOUSE_EVENT 记录——鼠标滚轮/拖拽全断，2026-09-28 修复）；翻译层
+KeyPress → KeyEvent；读取循环后台线程 + 队列，read_events(0) 非阻塞供拍帧泵。
+旧实现（msvcrt/自研 FSM/滴灌）在 _recycle/keyinput.py。
 
 物理键位（2026-09-28 定案）：
   Enter        → submit（直接发送）
@@ -25,6 +26,8 @@ import os
 import queue
 import sys
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, NamedTuple, Optional
 
@@ -41,7 +44,8 @@ log = logging.getLogger("keyinput")
 
 _WINDOWS = sys.platform == "win32"
 # 取证日志开关（延续旧栈的 BAW_LOG_KEYINPUT 工具链）
-_LOG_ON = os.environ.get("BAW_LOG_KEYINPUT") == "1"
+# 【取证期临时默认开启】诊断鼠标事件，结束后改回 == "1"
+_LOG_ON = os.environ.get("BAW_LOG_KEYINPUT", "1") != "0"
 _LOG_PATH = Path(__file__).resolve().parent.parent / "develop" / "pt_input.log"
 
 
@@ -70,18 +74,23 @@ def _hotkey(name: str, ctrl: bool, alt: bool, shift: bool) -> KeyEvent:
 
 
 def _mouse_event(data: str) -> Optional[KeyEvent]:
-    """WindowsMouseEvent data = "button;event_type;X;Y"（0-based 单元格）"""
+    """WindowsMouseEvent data = "button;event_type;X;Y"（0-based 单元格）。
+
+    pt 枚举值实测为大写（'NONE;SCROLL_UP;76;19'，2026-09-28 取证），统一
+    lower 后匹配；MOUSE_UP 的 button 为 NONE，不参与按下态判定。"""
     try:
         button, et, xs, ys = (data or "").split(";")
     except ValueError:
         return None
+    button = button.strip().lower()
+    et = et.strip().lower()
     if et == "scroll_up":
         return KeyEvent("mouse_wheel", "up")
     if et == "scroll_down":
         return KeyEvent("mouse_wheel", "down")
     pos = f"{xs},{ys}"
     if et == "mouse_down":
-        # legacy 忽略右/中键按下
+        # 旧栈忽略右/中键按下
         return KeyEvent("mouse_down", pos) if button == "left" else None
     if et == "mouse_up":
         return KeyEvent("mouse_up", pos)
@@ -154,6 +163,7 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
 def _press_to_event(key, data: str) -> Optional[KeyEvent]:
     # 鼠标
     if key == _K.WindowsMouseEvent:
+        _flog("mouse data=%r" % (data,))
         return _mouse_event(data)
 
     # 枚举键优先（Keys 是 str 混入枚举，必须先于 isinstance(key, str) 判断）
@@ -237,6 +247,32 @@ except ImportError:  # pragma: no cover - 无 prompt_toolkit 时翻译层不可�
     _KEY_MAP, _COMBO_MAP, _CTRL_LETTERS = {}, {}, {}
 
 
+# ----- 强制事件记录路径（鼠标修复） -----
+
+def _baw_win32_input_cls():
+    """构造强制事件记录路径的 Win32Input 子类。
+
+    pt 默认经 _is_win_vt100_input_enabled() 试探（临时设置 ENABLE_VIRTUAL_
+    TERMINAL_INPUT）选择 Vt100ConsoleInputReader——该路径的 _get_keys 只解码
+    KEY_EVENT，MOUSE_EVENT 记录被丢弃（滚轮/滑块拖拽全断）；VT 路径的鼠标
+    需应用主动发 \\x1b[?1000h 上报序列，裸 reader 没有。此处强制回到
+    ConsoleInputReader 事件记录路径（旧栈同源）：MOUSE_EVENT →
+    WindowsMouseEvent → 翻译层；raw_mode 也不再设置输入 VT。
+    """
+    try:
+        from prompt_toolkit.input.win32 import ConsoleInputReader, Win32Input
+    except ImportError:  # pragma: no cover
+        return None
+
+    class BawWin32Input(Win32Input):
+        def __init__(self, stdin=None):
+            super().__init__(stdin)
+            self._use_virtual_terminal_input = False
+            self.console_input_reader = ConsoleInputReader()
+
+    return BawWin32Input
+
+
 # ----- 读取循环（后台线程 + 队列，阻塞读键不阻塞 20fps 帧泵） -----
 
 class _PtReader:
@@ -246,6 +282,9 @@ class _PtReader:
         self._raw = None
         self._started = False
         self._lock = threading.Lock()
+        # 暂停协议：内建 input() 临时接管控制台时停泵 + 恢复 cooked 模式
+        self._pause_req = threading.Event()
+        self._parked = threading.Event()
 
     def start(self) -> None:
         with self._lock:
@@ -257,7 +296,11 @@ class _PtReader:
         try:
             from prompt_toolkit.input import create_input
 
-            self._input = create_input()
+            cls = _baw_win32_input_cls()
+            try:
+                self._input = (cls or create_input)()
+            except Exception:
+                self._input = create_input()
             self._raw = self._input.raw_mode()
             self._raw.__enter__()  # 与 legacy get_reader().__enter__() 同生命周期
             threading.Thread(target=self._pump, daemon=True, name="bawcode-pt-input").start()
@@ -270,10 +313,18 @@ class _PtReader:
     def _pump(self) -> None:
         try:
             while True:
+                if self._pause_req.is_set():
+                    self._parked.set()
+                    time.sleep(0.02)
+                    continue
                 presses = self._input.read_keys()
                 if presses:
                     self._q.put(presses)
-        except (EOFError, OSError, Exception) as exc:  # noqa: B014 - 后台线程兜底
+                else:
+                    # pt 的 read() 非阻塞（wait_for_handles timeout=0），
+                    # 空转时休眠防占满 CPU 核
+                    time.sleep(0.01)
+        except Exception as exc:  # noqa: B014 - 后台线程兜底
             log.error("pt 读键线程退出: %r", exc)
             _flog("pump exit: %r" % (exc,))
 
@@ -339,6 +390,41 @@ def read_key(timeout: float = 0.0) -> Optional[Event]:
 
 def flush_input() -> None:
     get_reader().flush_input()
+
+
+@contextmanager
+def paused():
+    """暂停输入泵并恢复行缓冲模式：内建 input() 临时接管控制台。
+
+    raw_mode 关闭了 ENABLE_LINE_INPUT/ECHO 且泵线程会抽干输入缓冲，
+    任何绕过本模块的内建 input() 都必须在 paused() 内使用。
+    退出时恢复 raw 模式并清空 input() 期间的残留输入。"""
+    r = get_reader()
+    r.start()
+    if r._input is None or r._raw is None:
+        yield
+        return
+    r._pause_req.set()
+    r._parked.wait(1.0)
+    try:
+        try:
+            r._raw.__exit__()
+        except Exception:
+            pass
+        try:
+            yield
+        finally:
+            try:
+                r._raw.__enter__()
+            except Exception:
+                pass
+    finally:
+        r._parked.clear()
+        r._pause_req.clear()
+        try:
+            flush_input()
+        except Exception:
+            pass
 
 
 def direction_of(kind: str, value: str) -> Optional[str]:

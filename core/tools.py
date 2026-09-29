@@ -87,8 +87,8 @@ def execute_command(command: str, cwd: Optional[str] = None, timeout: int = DEFA
 
 @register.register(
     name="read",
-    description="Read the content of specified file",
-    usage="read <file_path>",
+    description="Read the content of specified file (supports line-based paging via offset/limit)",
+    usage="read <file_path> [offset] [limit]",
     schema={
         "type": "object",
         "properties": {
@@ -96,27 +96,44 @@ def execute_command(command: str, cwd: Optional[str] = None, timeout: int = DEFA
                 "type": "string",
                 "description": "Path of the file to read",
             },
+            "offset": {
+                "type": "integer",
+                "description": "1-based start line; omit to read from the beginning",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max number of lines to return; omit to read to the end",
+            },
         },
         "required": ["file_path"],
     },
 )
-def read(file_path: str) -> str:
-    """读取指定文件内容"""
+def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
+    """读取指定文件内容；offset/limit 可选，按行分页（大文件与外置调用记录回读用）"""
     path = Path(file_path)
-    log.debug("读取文件: %s", path)
+    log.debug("读取文件: %s offset=%s limit=%s", path, offset or "-", limit or "-")
     try:
         text = path.read_text(encoding="utf-8")
-        log.debug("读取完成: %d字符", len(text))
-        return text
     except FileNotFoundError:
         log.warn("读取失败，文件不存在: %s", path)
         return "找不到文件"
     except UnicodeDecodeError:
         log.debug("非 UTF-8 编码，替换无效字节后读取: %s", path)
-        return path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         log.error("读取失败 %s: %s", path, e)
         return f"读取失败，发生错误: {e}"
+    log.debug("读取完成: %d字符", len(text))
+    lines = text.splitlines()
+    total = len(lines)
+    start = max(int(offset or 0), 1) - 1
+    if start >= total:
+        return f"offset 超出范围：文件共 {total} 行"
+    end = start + int(limit) if int(limit or 0) > 0 else total
+    page = "\n".join(lines[start:end])
+    if start > 0 or end < total:
+        return f"[第 {start + 1}-{min(end, total)} 行 / 共 {total} 行]\n{page}"
+    return text
 
 
 @register.register(

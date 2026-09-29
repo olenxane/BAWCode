@@ -66,8 +66,29 @@ def call(name: str, **kwargs: Any) -> Any:
         log.debug("工具调用 %s 用时 %.3fs", name, time.monotonic() - started)
 
 
+# 调用说明参数：每次工具调用随 arguments 传入，回合末作为该调用的简明记录
+# （见 memory.finalize_turn）；执行前会被剥除，不进入工具函数
+DESCRIPTION_PARAM = {
+    "type": "string",
+    "description": "本次工具调用的简短说明（一句话，说明本次调用想做什么，供调用记录留档）",
+}
+
+
+def _with_description_param(schema: Optional[dict]) -> dict:
+    """向工具参数 schema 注入公共 description 属性（幂等，不覆盖已有定义）"""
+    base = dict(schema or {"type": "object", "properties": {}, "required": []})
+    properties = dict(base.get("properties") or {})
+    properties.setdefault("description", dict(DESCRIPTION_PARAM))
+    base["properties"] = properties
+    required = list(base.get("required") or [])
+    if "description" not in required:
+        required.append("description")
+    base["required"] = required
+    return base
+
+
 def get_tool_defs() -> List[dict]:
-    """导出 OpenAI function calling 格式的工具定义"""
+    """导出 OpenAI function calling 格式的工具定义（自动注入公共 description 参数）"""
     defs = []
     for tool in _registry.values():
         defs.append(
@@ -76,7 +97,7 @@ def get_tool_defs() -> List[dict]:
                 "function": {
                     "name": tool["name"],
                     "description": tool["description"],
-                    "parameters": tool["schema"],
+                    "parameters": _with_description_param(tool["schema"]),
                 },
             }
         )

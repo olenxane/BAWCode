@@ -1,4 +1,4 @@
-#该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.不必要的工具调用历史剥离3.长期记忆写入配置4.在agent对话时提供记忆补充内容5.针对特定项目的RAG模块
+#该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.工具调用记录管理（白名单保留/回合末剥离/结果外置磁盘）3.长期记忆写入配置4.在agent对话时提供记忆补充内容5.针对特定项目的RAG模块
 import json
 from datetime import datetime
 from pathlib import Path
@@ -7,12 +7,16 @@ from typing import Callable, List, Optional
 from core import hooks
 from core import rag as rag_mod
 from core import session_store
+from core import toolstore
 from core.log import get_logger
 from wcwidth import wcwidth as _char_width
 
 log = get_logger("memory")
 
 _ROOT = Path(__file__).resolve().parent.parent
+
+# 工具结果视为"已是简明记录"的长度阈值：拒绝原因/短错误不再剥离改写
+_CONCISE_CONTENT_CHARS = 200
 
 # 会话级记忆单例，由 main 初始化
 _session: Optional["Memory"] = None
@@ -48,8 +52,14 @@ class Memory:
         )
         self.auto_compress = memory_cfg.get("auto_compress", True)
         self.compress_threshold = memory_cfg.get("compress_threshold", 0.8)
-        self.strip_tool_history = memory_cfg.get("strip_tool_history", True)
-        self.strip_tool_keep = memory_cfg.get("strip_tool_keep", 6)
+        # 上下文管理（core/toolstore.py）：白名单/预算/行内限额/回合末剥离保护
+        ctx_cfg = config.data.get("context", {})
+        self.tool_whitelist = set(ctx_cfg.get("tool_whitelist") or [])
+        self.whitelist_budget_tokens = int(ctx_cfg.get("whitelist_budget_tokens", 32768))
+        self.inline_limit_tokens = int(ctx_cfg.get("inline_limit_tokens", 4096))
+        self.large_tools = set(ctx_cfg.get("large_tools") or ["read", "write", "edit_file"])
+        self.inline_limit_tokens_large = int(ctx_cfg.get("inline_limit_tokens_large", 32768))
+        self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", 6))
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
         self.session_created_at = datetime.now().isoformat(timespec="seconds")
@@ -313,23 +323,152 @@ class Memory:
             chars = self.estimate_token_chars()
             return max(1, chars // 2)
 
-    def strip_old_tool_messages(self) -> int:
-        """剥离多余的历史工具输出，保留最近若干条，其余替换为占位"""
-        if not self.strip_tool_history:
-            return 0
+    # ----- 工具调用记录管理（白名单保留 / 回合末剥离 / 结果外置磁盘） -----
+
+    def _inline_cap(self, tool_name: str) -> int:
+        """单条工具结果的行内 token 上限：读写类工具放宽"""
+        if tool_name in self.large_tools:
+            return self.inline_limit_tokens_large
+        return self.inline_limit_tokens
+
+    @staticmethod
+    def _fallback_description(call: dict) -> str:
+        """模型未传 description 时的兜底简明记录：工具名+参数摘要"""
+        name = str(call.get("name") or "tool")
+        args = call.get("arguments") or {}
+        try:
+            summary = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            summary = str(args)
+        summary = " ".join(summary.split())
+        if len(summary) > 80:
+            summary = summary[:77] + "..."
+        return f"{name}({summary})" if summary and summary != "{}" else name
+
+    def add_tool_result(self, call: dict, content: str) -> dict:
+        """记录一次工具调用结果：description 随消息留档，行内超限部分立即外置磁盘并附回读指针"""
+        tool_name = str(call.get("name") or "")
+        call_id = str(call.get("id") or call.get("tool_call_id") or "")
+        description = str(call.get("description") or "").strip() or self._fallback_description(call)
+        args = call.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        total_lines = len(content.splitlines())
+        cap = self._inline_cap(tool_name)
+        persist_path = None
+        if toolstore.count_tokens_safe(content, getattr(self.config, "model_name", "")) > cap:
+            persist_path = toolstore.persist(
+                self.config, self.project_id, self.session_id,
+                call_id, tool_name, args, description, content,
+            )
+            if persist_path is not None:
+                preview = toolstore.slice_to_tokens(content, cap, getattr(self.config, "model_name", ""))
+                content = f"{preview}\n\n[{toolstore.pointer_line(persist_path, total_lines)}]"
+        message = self.add_message(
+            "tool",
+            content,
+            type="tool",
+            tool_name=tool_name,
+            tool_call_id=call_id,
+            description=description,
+        )
+        if persist_path is not None:
+            message["persisted"] = True
+            message["persist_path"] = str(persist_path)
+            message["total_lines"] = total_lines
+        return message
+
+    def finalize_turn(self) -> None:
+        """回合末上下文维护：非白名单工具记录剥离为简明记录（保护最近 strip_keep_recent 条），
+        白名单历史累计超预算时最老的先外置，思维链（thinking 字段）打标剥离——回合内已并回
+        content 拼接，下一轮对话起不再出站（会话记录保留）。幂等；在 _agent_turn 的 finally
+        调用，覆盖正常结束/出错/中断全部路径。tool 消息本体保留以维持 tool_call/tool_result 配对。"""
+        if not self.messages:
+            return
+        model = getattr(self.config, "model_name", "")
         tool_indexes = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
-        if len(tool_indexes) <= self.strip_tool_keep:
+        protected = set(tool_indexes[-self.strip_keep_recent:]) if self.strip_keep_recent > 0 else set()
+        stripped = 0
+        for index in tool_indexes:
+            if index in protected:
+                continue
+            message = self.messages[index]
+            if message.get("stripped") or message.get("tool_name") in self.tool_whitelist:
+                continue
+            if self._strip_tool_message(message, prefix="已剥离"):
+                stripped += 1
+        evicted = self._evict_whitelist_overflow(model)
+        think_stripped = 0
+        for message in self.messages:
+            if (
+                message.get("role") == "assistant"
+                and message.get("thinking")
+                and not message.get("thinking_stripped")
+            ):
+                message["thinking_stripped"] = True
+                think_stripped += 1
+        if stripped or evicted or think_stripped:
+            log.info(
+                "回合末维护: 剥离工具记录%d条 白名单外置%d条 思维链剥离%d条（保护最近%d条）",
+                stripped, evicted, think_stripped, self.strip_keep_recent,
+            )
+
+    def _strip_tool_message(self, message: dict, prefix: str) -> bool:
+        """把单条 tool 消息改写为简明记录（description+call_id+落盘路径）；返回是否改写"""
+        content = message.get("content") or ""
+        if len(content) < _CONCISE_CONTENT_CHARS:
+            return False
+        if not message.get("persisted"):
+            path = toolstore.persist(
+                self.config, self.project_id, self.session_id,
+                str(message.get("tool_call_id") or ""),
+                str(message.get("tool_name") or ""),
+                {}, str(message.get("description") or ""), content,
+            )
+            if path is not None:
+                message["persisted"] = True
+                message["persist_path"] = str(path)
+                message["total_lines"] = len(content.splitlines())
+        parts = [f"[{prefix}·{message.get('tool_name') or 'tool'}]"]
+        if message.get("description"):
+            parts.append(str(message["description"]))
+        if message.get("tool_call_id"):
+            parts.append(f"call_id={message['tool_call_id']}")
+        if message.get("persist_path"):
+            parts.append(f"完整输出: {message['persist_path']}")
+        message["content"] = " ".join(parts)
+        message["stripped"] = True
+        return True
+
+    def _evict_whitelist_overflow(self, model: str) -> int:
+        """白名单工具历史会话累计超预算时，最老的先外置为占位，直至回到预算内"""
+        budget = self.whitelist_budget_tokens
+        if budget <= 0:
             return 0
-        to_strip = tool_indexes[: -self.strip_tool_keep]
-        for index in to_strip:
-            self.messages[index]["content"] = "[已剥离的工具历史]"
-            self.messages[index]["stripped"] = True
-        log.debug("剥离历史工具输出: %d条（保留最近%d条）", len(to_strip), self.strip_tool_keep)
-        return len(to_strip)
+        entries = []
+        for index, message in enumerate(self.messages):
+            if (
+                message.get("role") == "tool"
+                and message.get("tool_name") in self.tool_whitelist
+                and not message.get("stripped")
+            ):
+                entries.append((index, toolstore.count_tokens_safe(message.get("content") or "", model)))
+        total = sum(tokens for _, tokens in entries)
+        if total <= budget:
+            return 0
+        evicted = 0
+        for index, tokens in entries:
+            if total <= budget:
+                break
+            message = self.messages[index]
+            if self._strip_tool_message(message, prefix="白名单外置"):
+                message["stripped"] = True
+                total -= tokens
+                evicted += 1
+        return evicted
 
     def compress(self, llm_fn: Optional[Callable[[str], str]] = None, external_handler=None) -> str:
         """上下文压缩"""
-        self.strip_old_tool_messages()
         if not self.messages:
             return ""
         history_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in self.messages)
@@ -427,6 +566,11 @@ class Memory:
             else:
                 # 缺 id 的 tool 不进 API（降级为 system 会破坏 tool_calls 配对）
                 return {}
+        # thinking 字段（思维链留档）回合内出站时并回 content；回合末 finalize_turn 打
+        # thinking_stripped 标后仅留档不再并回——下一轮对话起模型不可见
+        thinking = item.get("thinking")
+        if thinking and not item.get("thinking_stripped"):
+            out["content"] = f"{thinking}\n\n{out['content']}" if out["content"] else thinking
         if role == "assistant" and item.get("tool_calls"):
             import json as _json
             from uuid import uuid4
@@ -460,7 +604,6 @@ class Memory:
         顺序：system提示词 → 长期记忆等补充 → 会话历史（含 tool/tool_calls）。
         """
         self.maybe_compress(llm_fn=self._llm_fn)
-        self.strip_old_tool_messages()
         messages: List[dict] = []
         if extra_system:
             messages.append({"role": "system", "content": extra_system})
@@ -496,20 +639,16 @@ class Memory:
             used += cw
         return "".join(out)
 
-    def _derive_session_title(self) -> str:
-        """标题 = 第一条用户任务输入（折叠空白后截断）；无任务输入时用占位"""
-        for item in self.messages:
-            if item.get("type") == "task" and item.get("role") == "user":
-                text = " ".join(str(item.get("content") or "").split())
-                if text:
-                    return self._clip_title(text)
-        return "（无标题会话）"
+    def rename_session(self, title: str) -> str:
+        """手动命名当前会话（折叠空白、按显示宽度截断）；随下次 save_session 落盘"""
+        self.session_title = self._clip_title(" ".join(str(title or "").split()))
+        log.info("会话已重命名: %s (id=%s)", self.session_title, self.session_id)
+        return self.session_title
 
     def save_session(self) -> Optional[Path]:
-        """自动保存当前会话；空会话不写盘（避免堆积空文件）"""
+        """自动保存当前会话；空会话不写盘（避免堆积空文件）；标题仅取手动命名"""
         if not self.messages:
             return None
-        self.session_title = self._derive_session_title()
         data = {
             "version": session_store.SESSION_VERSION,
             "id": self.session_id,
@@ -545,7 +684,7 @@ class Memory:
         log.info("会话已切换: %s · id=%s · %d条消息", self.session_title, self.session_id, len(self.messages))
 
     def start_new_session(self) -> None:
-        """开启新会话：旋转 ID 并清空对话状态（旧会话已落盘，可 /sessions 切回）"""
+        """开启新会话：旋转 ID 并清空对话状态（旧会话已落盘，可 /resume 切回）"""
         self.session_id = session_store.new_session_id()
         self.session_created_at = datetime.now().isoformat(timespec="seconds")
         self.session_title = ""
@@ -553,3 +692,13 @@ class Memory:
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []
         log.info("已开启新会话: %s", self.session_id)
+
+    def clear(self) -> None:
+        """清空当前会话内容：原地恢复为空对话（保留 id），并删除落盘文件与外置工具记录防 /resume 复活旧内容"""
+        session_store.delete_session_data(self.sessions_dir, self.session_id)
+        toolstore.clear_session(self.config, self.project_id, self.session_id)
+        self.messages.clear()
+        self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
+        self.steps = []
+        self.session_title = ""
+        log.info("会话已清空: %s", self.session_id)

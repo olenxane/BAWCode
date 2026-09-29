@@ -1,3 +1,13 @@
+[BAWCode 工具调用记录]
+call_id: call_d4fecd6497564d58b8dac5e7
+tool: read
+time: 2026-09-29 07:29:24
+arguments: {}
+description: read({"file_path": "D:\\Windows11\\桌面\\code\\BAWCode\\main.py"})
+total_chars: 23819
+total_lines: 642
+
+--- content ---
 #该部分为程序的主逻辑，调用各个模块实现完整功能
 import sys
 import threading
@@ -416,10 +426,8 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
             session.add_message("assistant", response["error"])
             _syncq(status="出错")
             return
-        if (response.get("content") or response.get("reasoning")) and not response.get("tool_calls"):
-            # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
-            extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
-            session.add_message("assistant", response["content"], **extra)
+        if response.get("content") and not response.get("tool_calls"):
+            session.add_message("assistant", response["content"])
         tool_calls = response.get("tool_calls") or []
         if not tool_calls:
             log.info("任务完成（共%d轮推理）", round_no + 1)
@@ -459,9 +467,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
                 )
 
         if tool_calls:
-            # DeepSeek Tool Calls：保留 assistant 工具轮（含 content + tool_calls）；
-            # thinking 与正文并存时以 thinking 字段留档（出站时并回 content）
-            thinking_extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
+            # DeepSeek Tool Calls：保留 assistant 工具轮（含 content + tool_calls）
             session.add_message(
                 "assistant",
                 response.get("content") or "",
@@ -475,7 +481,6 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
                     }
                     for c in tool_calls
                 ],
-                **thinking_extra,
             )
 
         for call, item in allowed_results:
