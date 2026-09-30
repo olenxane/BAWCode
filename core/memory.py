@@ -770,7 +770,7 @@ class Memory:
 
             loader = skills_mod.get_loader(self.config)
             if loader is not None:
-                listing = loader.listing()
+                listing = skills_mod.filtered_listing(loader)  # 工作流 skill 节点可过滤/关闭
                 if listing:
                     supplements.append(
                         {

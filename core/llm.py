@@ -42,10 +42,10 @@ def _fallback_system_prompt() -> str:
     )
 
 
-def get_system_prompt(config=None, **kwargs) -> str:
-    """从 core/prompts 加载系统提示词（占位符替换）"""
+def get_system_prompt(config=None, files: Optional[List[str]] = None, **kwargs) -> str:
+    """从 core/prompts 加载系统提示词（占位符替换）；files 覆盖默认文件组"""
     try:
-        return prompt_loader.get_system_prompt(config=config, **kwargs)
+        return prompt_loader.get_system_prompt(config=config, files=files, **kwargs)
     except Exception as e:
         log.warn("加载系统提示词失败，使用兜底: %s", e)
         return _fallback_system_prompt()
@@ -744,9 +744,14 @@ class LLM:
         if isinstance(external, dict) and external.get("steps"):
             return [str(s) for s in external["steps"]]
         plan_model = self.config.get_task_model("plan") if hasattr(self.config, "get_task_model") else None
+        try:
+            system = prompt_loader.get_steps_prompt(prompt, plan_content, config=self.config)
+        except Exception as e:
+            log.warn("加载 steps.md 失败: %s", e)
+            system = "将任务拆成 3-8 个可执行步骤，每步一行，只输出步骤列表。"
         result = self.chat(
             [
-                {"role": "system", "content": "将任务拆成 3-8 个可执行步骤，每步一行，只输出步骤列表。"},
+                {"role": "system", "content": system},
                 {"role": "user", "content": f"任务:\n{prompt}\n\n计划:\n{plan_content}"},
             ],
             model=plan_model,

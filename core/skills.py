@@ -173,6 +173,37 @@ class SkillLoader:
         return skill
 
 
+# 注入过滤（工作流 skill 节点经 set_injection 设置；None=默认不过滤）
+# enabled=False → 清单整段不注入；allow 非空 → 仅注入白名单内技能
+_injection: Dict[str, object] = {"enabled": None, "allow": None}
+
+
+def set_injection(enabled: Optional[bool] = None, allow: Optional[List[str]] = None) -> None:
+    """设置回合级注入过滤；None 恢复默认（不过滤）。工作流每回合开始时重置"""
+    _injection["enabled"] = enabled
+    _injection["allow"] = list(allow) if allow else None
+
+
+def filtered_listing(loader: Optional[SkillLoader]) -> str:
+    """经注入过滤的清单（memory.build_context_supplements 使用）"""
+    if loader is None:
+        return ""
+    if _injection["enabled"] is False:
+        return ""
+    allow = _injection["allow"]
+    if not allow:
+        return loader.listing()
+    listing = loader.listing()
+    if not listing:
+        return ""
+    keep = []
+    for line in listing.splitlines():
+        name = line.lstrip("- ").split(":", 1)[0].strip()
+        if name in allow:
+            keep.append(line)
+    return "\n".join(keep)
+
+
 # 全局单例（会话间复用；配置签名变化时重建，换技能目录也可走 /skill reload）
 _loader: Optional[SkillLoader] = None
 

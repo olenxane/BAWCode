@@ -117,6 +117,9 @@ def default_config() -> dict:
                 "memory_add_fact",
                 "memory_add_project_note",
                 "rag_add",
+                "read",
+                "edit_file",
+                "write",
             ],
             "whitelist_budget_tokens": 32768,
             "inline_limit_tokens": 4096,
@@ -136,6 +139,17 @@ def default_config() -> dict:
             "metadata_budget_tokens": 1024,
         },
         "command_plugins": ["data/commands"],
+        # 外置工作流（core/workflow.py）：dir 下 <active>.json 声明一轮回合的
+        # 线性节点链（system_prompt/skill/analyze/plan/execute/llm），加载失败
+        # 回退内置默认工作流；编辑器 gui/workflow_editor.py（/workflow 命令）。
+        # max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
+        # max_rounds_extensions：轮次用尽后基于"最近工具调用仍有进展"的续期次数上限
+        "workflow": {
+            "dir": "data/workflows",
+            "active": "default",
+            "max_rounds": 0,
+            "max_rounds_extensions": 5,
+        },
         # 核心功能外部 API（UI/改配置不挂接口）
         "external_apis": {
             "prompt_refine": None,
@@ -288,6 +302,12 @@ class Config:
         task_models = self.data.setdefault("task_models", {})
         for role in TASK_ROLES:
             task_models.setdefault(role, self.active_model_name() if hasattr(self, "model_name") else "")
+        # 工具白名单迁移：read/edit_file/write 后补（旧配置文件的列表会整组覆盖默认值）
+        ctx_cfg = self.data.setdefault("context", {})
+        whitelist = ctx_cfg.setdefault("tool_whitelist", [])
+        for name in ("read", "edit_file", "write"):
+            if name not in whitelist:
+                whitelist.append(name)
 
     def providers(self) -> List[dict]:
         return list(self.data.get("providers") or [])
@@ -363,6 +383,12 @@ class Config:
 
     def get_task_model(self, role: str) -> str:
         return self.task_models().get(role) or self.active_model_name()
+
+    def workflow_path(self, name: Optional[str] = None) -> Path:
+        """工作流 JSON 路径（name 缺省取 active）"""
+        from core import workflow as workflow_mod
+
+        return workflow_mod.workflow_path(self, name or workflow_mod.active_name(self))
 
     def set_task_model(self, role: str, model_name: str) -> bool:
         if role not in TASK_ROLES:

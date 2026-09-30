@@ -176,7 +176,11 @@ def write(file_path: str, content: str) -> str:
 
 @register.register(
     name="edit_file",
-    description="Edit a file by replacing old_str with new_str",
+    description=(
+        "Edit a file by replacing old_str with new_str. old_str must be copied "
+        "verbatim from the file (exact indentation and whitespace) and be unique "
+        "unless replace_all is true; include surrounding lines for context when needed."
+    ),
     usage="edit_file <file_path> <old_str> <new_str> [replace_all]",
     schema={
         "type": "object",
@@ -187,11 +191,15 @@ def write(file_path: str, content: str) -> str:
             },
             "old_str": {
                 "type": "string",
-                "description": "Exact string to replace",
+                "description": (
+                    "Exact text from the file to replace; copy verbatim including "
+                    "indentation. Must be unique in the file unless replace_all is "
+                    "true — extend it with surrounding lines for a unique anchor."
+                ),
             },
             "new_str": {
                 "type": "string",
-                "description": "Replacement string",
+                "description": "Replacement text (the edited version of old_str); must differ from old_str",
             },
             "replace_all": {
                 "type": "boolean",
@@ -210,8 +218,6 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
         return "找不到文件"
     if not old_str:
         return "old_str 不能为空"
-    if old_str == new_str:
-        return "old_str 与 new_str 相同，未做修改"
     try:
         content, is_crlf, enc, err = _load_editable(path)
     except OSError as e:
@@ -219,6 +225,12 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
     if err:
         log.warn("编辑中止: %s（%s）", path, err)
         return err
+    if old_str == new_str:
+        hint = "old_str 与 new_str 相同，未做修改。new_str 应为修改后的目标内容。"
+        probe = next((ln.strip() for ln in old_str.splitlines() if ln.strip()), "")
+        if probe and probe not in content:
+            hint += f"另外 old_str 首行「{probe[:80]}」当前不在文件中，old_str 必须与文件现有内容精确一致。"
+        return hint
     count = content.count(old_str)
     if count == 0:
         log.warn("编辑失败，未找到待替换内容: %s", path)
@@ -232,10 +244,16 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
                 break
             spots.append(content.count("\n", 0, i) + 1)
             start = i + len(old_str)
+        lines = content.splitlines()
+        ctx = []
+        for n in spots[:5]:
+            window = lines[max(0, n - 2) : min(len(lines), n + 1)]
+            ctx.append(f"  L{n}: {' | '.join(x.strip() for x in window)[:200]}")
         log.warn("编辑中止，匹配到 %d 处: %s", count, path)
         return (
             f"匹配到 {count} 处（行号: {'、'.join(str(n) for n in spots)}），"
-            "请为 old_str 扩展上下文精确锚定，或设置 replace_all=true"
+            "请为 old_str 扩展上下文精确锚定，或设置 replace_all=true\n"
+            "各匹配处上下文：\n" + "\n".join(ctx)
         )
     new_content = content.replace(old_str, new_str) if replace_all else content.replace(old_str, new_str, 1)
     note = _changed_note(content, new_content)
@@ -362,6 +380,37 @@ _SUGGEST_MAX_LINES = 20000
 _SNIPPET_CONTEXT = 3
 _SNIPPET_MAX_LINES = 30
 
+# 工具结果失败模式（启发式）：供 UI ✅/❌ 展示与工作流轮次续期判定共用
+_TOOL_FAILURE_PATTERNS = (
+    "命令退出码 ",
+    "工具执行错误",
+    "工具参数错误",
+    "未找到待替换内容",
+    "匹配到 ",  # edit_file 多处匹配中止
+    "找不到文件",
+    "读取失败",
+    "写入失败",
+    "拒绝编辑",
+    "old_str 不能为空",
+    "old_str 与 new_str 相同",
+    "命令被安全策略拒绝",
+    "已拒绝",
+)
+
+
+def tool_failure_hint(content: str) -> bool:
+    """启发式判定工具结果是否失败；子串匹配可能误判，仅用于展示与续期决策"""
+    text = str(content or "")
+    for pat in _TOOL_FAILURE_PATTERNS:
+        if pat not in text:
+            continue
+        if pat == "命令退出码 ":
+            m = re.search(r"命令退出码\s+(\d+)", text)
+            if m and m.group(1) == "0":
+                continue  # 退出码 0 视为成功
+        return True
+    return False
+
 
 def _decode_best_effort(raw: bytes) -> tuple:
     """文件解码探测：utf-8 → gbk → 有损兜底；返回 (文本, 编码名, 是否纯文本)"""
@@ -374,7 +423,7 @@ def _decode_best_effort(raw: bytes) -> tuple:
 
 
 def _edit_miss_feedback(old_str: str, content: str) -> str:
-    """0 匹配时的定位反馈：对 old_str 较长行做全文相似度匹配，报近似行号"""
+    """0 匹配时的定位反馈：对 old_str 较长行做全文相似度匹配，给出最接近的现有行原文"""
     parts = ["未找到待替换内容（检查空白、缩进与全半角字符差异）"]
     lines = content.splitlines()
     if len(lines) <= _SUGGEST_MAX_LINES:
@@ -391,11 +440,11 @@ def _edit_miss_feedback(old_str: str, content: str) -> str:
                     continue
                 ratio = max(difflib.SequenceMatcher(None, p, stripped).ratio() for p in probes)
                 if ratio >= 0.7:
-                    hits.append((ratio, idx + 1, stripped))
+                    hits.append((ratio, idx + 1, line.rstrip()))
         hits.sort(key=lambda t: (-t[0], t[1]))
         if hits:
-            parts.append("old_str 内容的近似位置：")
-            parts.extend(f"  L{n}: {t[:80]}" for _, n, t in hits[:3])
+            parts.append("文件中最接近的现有行原文（替换时需保留其精确缩进）：")
+            parts.extend(f"  L{n}: {t[:200]}" for _, n, t in hits[:3])
     parts.append("可先 read 该文件核对实际内容再试")
     return "\n".join(parts)
 

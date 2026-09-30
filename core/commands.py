@@ -108,6 +108,15 @@ def _complete_skill(config, arg: str) -> List[dict]:
     return _filter_arg_items(items, arg)
 
 
+def _complete_workflow(config, arg: str) -> List[dict]:
+    from core import workflow as workflow_mod
+
+    items = [{"name": "/workflow edit", "hint": "打开工作流编辑器", "source": "arg", "callable": True}]
+    for name in workflow_mod.list_workflows(config):
+        items.append({"name": f"/workflow {name}", "hint": "切换为该工作流", "source": "arg", "callable": True})
+    return _filter_arg_items(items, arg)
+
+
 # 内置参数补全
 register_arg_completer("/mode", _complete_mode)
 register_arg_completer("/theme", _complete_theme)
@@ -115,6 +124,7 @@ register_arg_completer("/model", _complete_model)
 register_arg_completer("/use", _complete_model)
 register_arg_completer("/plugin_echo", _complete_plugin_echo)
 register_arg_completer("/skill", _complete_skill)
+register_arg_completer("/workflow", _complete_workflow)
 
 
 def set_handler(name: str, handler: Callable) -> None:

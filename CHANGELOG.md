@@ -1,5 +1,72 @@
 # Changelog
 
+## 2026-09-30 — 回合体验修复：计划入时间线 / 工具节点 ✅❌ 单行 / 确认面板可滚动 / 轮次续期 / edit_file 反馈增强
+
+- **计划节点入时间线**（ui.py `_build_tree`）："计划 [draft/confirmed]" 节点不再固定
+  插在树顶，改为挂到最后一次 write_plan/update_plan 工具调用所在的轮次下
+  （无则回落任务根）——树按对话顺序展开，顶部不再被长计划占据。
+- **工具节点状态化**（ui.py + tools.tool_failure_hint）：工具结果节点标题带
+  ✅/❌（启发式：命令退出码非零/工具错误/编辑失败等模式清单，ui 与工作流续期
+  判定共用）；折叠时仅显示标题单行，完整输出树焦点 Enter/空格展开查看
+  （原折叠展示 3 行 + "(+N 行)" 提示）。
+- **确认面板不再冻结视图**（ui.py）：show_confirm_form 等待期间滚轮/PageUp/
+  PageDown 可滚动会话树查看历史（面板固定在输入框位置不动，滚轮不再切换
+  选项）；refresh_from_session 在 confirm_mode 下不再强制拉底——弹出确认不
+  打断用户当前查看位置。
+- **轮次智能续期**（workflow.py `_tool_loop`）：达到 max_rounds 不再硬中断，
+  判定最近 4 条工具结果"非空、去空白互不相同、非全部失败"即视为复杂长任务
+  自动续期（上限 config.workflow.max_rounds_extensions=5，设置页"轮次续期上
+  限"可调，0=禁用）；终止消息注明轮数+续期次数。config.workflow.max_rounds
+  >0 时全局覆盖工作流文件值（设置页"最大工具轮数"）。
+- **设置页新增三项**（ui.py 系统页 + _settings_apply）：工具白名单（逗号分隔，
+  context.tool_whitelist）、最大工具轮数、轮次续期上限。
+- **edit_file 反馈增强**（tools.py）：0 匹配的近似命中行给**完整行原文**
+  （含缩进，上限 200 字符，原 80 字符截断会让模型拿不到可复制的锚文本）；
+  old_str==new_str 给差异化指引并提示 old_str 首行不在文件中；多处匹配附各
+  处 ±1 行上下文；schema description 补充锚定指引（逐字复制缩进、唯一性、
+  上下文扩展）。
+- **白名单迁移**（config.py `_migrate_legacy`）：read/edit_file/write 幂等追加
+  进现有配置的 tool_whitelist（旧配置整组覆盖默认值，需迁移才能生效）——
+  解决模型回合末丢失已编辑/已读取内容导致的重复失败。
+
+## 2026-09-30 — 工作流编辑器实机测试修复：画布残影 + 连线可取消
+
+- **节点虚线残影堆积**：选中/连线高亮画在 rect.adjusted(-3,-3,3,3)，超出默认
+  boundingRect 的部分不参与重绘裁剪，拖动/切换选中留下一串橙色虚线尸块；
+  boundingRect 外扩 6px 覆盖高亮区（gui/workflow_editor.py NodeItem）。
+- **连线单独取消**：重复点击已连的两个节点 = 取消该连线（双向均可触发），
+  原实现仅同向去重、无法删边；状态栏提示同步更新。反向连线的三次贝塞尔
+  控制点跟随方向，消除反向边的大回环交叉。
+- 实机回归：编辑器冒烟 20/20（新增取消连线双向/同向用例），真机拖拽节点
+  画布无残影、连线实时重排。
+
+## 2026-09-30 — 外置工作流引擎 + PySide6 工作流编辑器（最小原型）
+
+- **工作流外置**（core/workflow.py）：一轮回合的处理管线不再硬编码于 main.py，
+  改由 data/workflows/<active>.json 的线性节点链驱动（config.workflow.active 指定，
+  /workflow <名称> 切换）。节点类型：system_prompt（选择注入哪些系统提示词文件）、
+  skill（是否注入/白名单过滤技能清单）、analyze（复杂度判定：keywords 本地关键词
+  匹配为主，keywords_high/low + min_len_high 用户可配；method=llm 保留原判定+钩子）、
+  plan（gate 门槛 + confirm 确认菜单 + steps 步骤）、execute（工具循环，max_rounds/
+  model_role 可配）、llm（通用阶段：prompt_files 渲染注入 + capture 捕获输出为
+  ^{变量}^，max_rounds>0 带工具循环——分析调研/测试类节点）。
+- **节点取舍即管线定制**：不要规划/测试就在编辑器里删掉对应节点；节点级
+  gate 属性（always / complexity == high|low）承载条件门槛，本期线性链+节点门槛，
+  无分支边。加载失败/结构不合法 → 告警回退内置 DEFAULT_WORKFLOW，回合可跑。
+- **main.py 减重**：_agent_turn_impl 的阶段流水（系统提示词注入→复杂度→计划确认
+  →步骤→12 轮工具循环）整体迁入 workflow 引擎；UI 交互经 TurnIO 回调桥移交
+  （core 不依赖 UI），取消/中断抛 TurnInterrupt、正常终止（用户取消/计划未确认/
+  出错/轮次上限）抛 TurnStop，收尾语义与迁移前一致。
+- **PySide6 编辑器**（gui/workflow_editor.py，/workflow edit 子进程拉起）：
+  左侧面板双击/拖拽添加节点 → 依次点击两节点连线（必须构成单链，保存前校验）
+  → 双击改属性（按类型 schema 生成表单）→ 保存为 data/workflows/<名称>.json
+  （节点按链顺序写出）。PySide6 入 requirements.txt，缺失时仅编辑器不可用。
+- **配套**：core/prompts 新增 steps.md（generate_steps 硬编码提示词外置）、
+  analyze.md/test.md（分析/测试节点示例提示词）；skills.set_injection 注入过滤
+  （memory.build_context_supplements 走 filtered_listing）；/workflow 命令与参数
+  补全器。示例工作流三份：default（与旧行为一致）/ analyze-plan-code（注入分析
+  提示词→分析→计划→编码）/ plan-execute-test（含测试节点，删节点即跳过）。
+
 ## 2026-09-29 — 技能加载系统：SKILL.md 双层目录 + load_skill 工具 + /skill 命令
 
 - **渐进式披露三层**（core/skills.py）：启动仅扫 SKILL.md frontmatter 元数据（每条

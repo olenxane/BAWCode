@@ -65,6 +65,14 @@ def compress_prompt_files(config=None) -> List[str]:
     return ["compress.md"]
 
 
+def steps_prompt_files(config=None) -> List[str]:
+    if config is not None:
+        files = ((config.data or {}).get("prompt") or {}).get("steps_files")
+        if files:
+            return list(files)
+    return ["steps.md"]
+
+
 def memory_paths(config=None) -> Dict[str, Path]:
     root = _ROOT
     if config is not None:
@@ -246,10 +254,18 @@ def join_segments(segments: List[PromptSegment]) -> str:
     return "\n\n".join(parts)
 
 
-def get_system_prompt(config=None, extra_variables: Optional[Dict[str, Any]] = None, **ctx_kwargs) -> str:
-    """供 llm/main 使用：渲染系统提示词（多文件拼接）"""
+def get_system_prompt(
+    config=None,
+    files: Optional[List[str]] = None,
+    extra_variables: Optional[Dict[str, Any]] = None,
+    **ctx_kwargs,
+) -> str:
+    """供 llm/main/workflow 使用：渲染系统提示词（多文件拼接）
+
+    files 显式传入时覆盖 config.prompt.system_files（工作流 system_prompt 节点用）。
+    """
     variables = build_variable_context(config=config, extra=extra_variables, **ctx_kwargs)
-    segs = load_prompt_bundle(system_prompt_files(config), variables, config=config)
+    segs = load_prompt_bundle(files or system_prompt_files(config), variables, config=config)
     if not segs:
         log.warn("系统提示词文件均为空/缺失，使用内置兜底")
         return (
@@ -280,6 +296,22 @@ def get_plan_prompt(
             "输出 markdown 计划：目标、步骤、风险、验收。不要执行任务。"
         )
     return join_segments(segs)
+
+
+def get_steps_prompt(
+    task_text: str,
+    plan_content: str = "",
+    config=None,
+    extra_variables: Optional[Dict[str, Any]] = None,
+    **ctx_kwargs,
+) -> str:
+    """供 llm.generate_steps 使用：渲染步骤拆分提示词（steps.md，含内置兜底）"""
+    variables = build_variable_context(config=config, extra=extra_variables, **ctx_kwargs)
+    segs = load_prompt_bundle(steps_prompt_files(config), variables, config=config)
+    if segs:
+        return join_segments(segs)
+    log.warn("加载 steps.md 失败，使用内置兜底")
+    return "将任务拆成 3-8 个可执行步骤，每步一行，只输出步骤列表。"
 
 
 def get_compress_prompt(

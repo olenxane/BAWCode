@@ -1,7 +1,6 @@
 #该部分为程序的主逻辑，调用各个模块实现完整功能
 import sys
 import threading
-import uuid
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -13,13 +12,13 @@ from core import hooks
 from core import memory as memory_mod
 from core import policy
 from core import project_identity
-from core import prompt_loader
 from core import register
 from core import session_store
 from core import tools as tools_mod  # noqa: F401
 from core import ui
+from core import workflow as workflow_mod
 from core.config import Config
-from core.llm import CANCELLED, get_system_prompt, LLM
+from core.llm import CANCELLED, LLM
 from core.log import get_logger
 
 log = get_logger("main")
@@ -194,6 +193,36 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         ctx["app"].status = f"计划 {ctx['session'].plan.get('status')}"
         return True
 
+    @commands.register(
+        "/workflow", hint="工作流 · 列表/切换/编辑", usage="/workflow [名称|edit [名称]]", source="builtin"
+    )
+    def _workflow(ctx, args):
+        arg = (args or "").strip()
+        parts = arg.split(maxsplit=1)
+        head = parts[0].lower() if parts else ""
+        if head in ("edit", "gui", "编辑"):
+            name = parts[1].strip() if len(parts) > 1 else workflow_mod.active_name(ctx["config"])
+            _launch_workflow_editor(ctx, name)
+            return True
+        if arg in ("", "list", "列表"):
+            active = workflow_mod.active_name(ctx["config"])
+            names = workflow_mod.list_workflows(ctx["config"])
+            lines = [f"工作流（active={active}）:"]
+            for name in names:
+                lines.append(("  * " if name == active else "    ") + name)
+            lines.append("提示: /workflow <名称> 切换 · /workflow edit [名称] 打开编辑器")
+            _echo(ctx, "\n".join(lines))
+            return True
+        if arg not in workflow_mod.list_workflows(ctx["config"]):
+            available = ", ".join(workflow_mod.list_workflows(ctx["config"])) or "（无）"
+            _echo(ctx, f"未找到工作流: {arg}\n可用: {available}")
+            return True
+        workflow_mod.set_active(ctx["config"], arg)
+        ctx["config"].save()
+        ctx["app"].status = f"工作流: {arg}"
+        _echo(ctx, f"已切换工作流: {arg}（下一回合生效）")
+        return True
+
     @commands.register("/steps", hint="查看步骤", source="builtin")
     def _steps(ctx, args):
         ctx["app"].status = f"步骤 {len(ctx['session'].steps)}"
@@ -279,6 +308,25 @@ def _bridge_line(app: "ui.TuiApp", prompt: str, config, cancelled=None):
     return app.wait_ui(req, cancelled)
 
 
+def _launch_workflow_editor(ctx, name: str = "") -> None:
+    """子进程拉起 PySide6 工作流编辑器（独立事件循环，不阻塞 TUI）"""
+    try:
+        import PySide6  # noqa: F401
+    except ImportError:
+        _echo(ctx, "工作流编辑器需要 PySide6：pip install PySide6")
+        return
+    import subprocess
+
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    cmd = [sys.executable, "-m", "gui.workflow_editor"]
+    if name:
+        cmd.append(name)
+    subprocess.Popen(cmd, cwd=str(_ROOT), **kwargs)
+    _echo(ctx, f"工作流编辑器已启动: {name or '（新工作流）'}")
+
+
 def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
     """回合入口：无论正常结束/出错/中断，回合末执行上下文维护（剥离+预算外置），
     并清掉流式树尾消息（partial 丢弃，与在途回合丢弃语义一致）"""
@@ -328,219 +376,29 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         _aborted()
         return
 
-    # 系统提示词：从 core/prompts 渲染；chat 窗口可见注入消息
-    system_prompt_text = get_system_prompt(
-        config=llm.config,
-        session=session,
-        project_identity=getattr(session, "project_identity", None),
+    # 外置工作流：按 data/workflows/<active>.json 的节点链驱动一轮回合
+    # （系统提示词注入/分析/规划/编码等均为节点，增删改走编辑器或直接改 JSON）
+    io = workflow_mod.TurnIO(
+        status=lambda text: _syncq(status=text),
+        choose=lambda options, prompt: _bridge_choose(app, options, prompt, _cancelled),
+        line=lambda prompt: _bridge_line(app, prompt, llm.config, _cancelled),
+        cancelled=_cancelled,
+        on_delta=_on_delta,
+        clear_stream=lambda: setattr(app, "streaming_msg", None),
+        tool_confirm=lambda call: _handle_tool_confirm(llm, app, session, call, _cancelled),
+        phase=lambda text: setattr(app, "phase_hint", text),
     )
-    seg_names = list(prompt_loader.system_prompt_files(llm.config))
-    if not any(m.get("type") == "system_prompt" for m in session.messages):
-        session.add_message(
-            "system",
-            "注入系统提示词",
-            type="system_prompt",
-            files=seg_names or ["system_prompt.md"],
-        )
-        log.info("注入系统提示词: %s", ", ".join(seg_names or ["system_prompt.md"]))
-        _syncq(status="注入系统提示词")
-
-    complexity = llm.judge_complexity(user_text)
-    if _cancelled():
+    wf = workflow_mod.load_workflow(llm.config)
+    log.info("工作流: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
+    turn = workflow_mod.TurnContext(
+        session=session, llm=llm, app=app, config=llm.config, user_text=user_text, io=io
+    )
+    try:
+        workflow_mod.run_workflow(wf, turn)
+    except workflow_mod.TurnInterrupt:
         _aborted()
-        return
-    if complexity == "high":
-        log.info("复杂任务，进入计划流程")
-        _syncq(status="生成计划")
-        plan = llm.generate_plan(user_text)
-        if _cancelled():
-            _aborted()
-            return
-        session.set_plan(plan.get("title", "任务计划"), plan.get("content", ""), complexity=plan.get("complexity", "high"))
-        confirmed = False
-        for _edit_round in range(3):
-            choice = str(
-                _bridge_choose(
-                    app,
-                    [("1", "确认计划"), ("2", "直接改计划"), ("3", "反馈修改"), ("0", "取消")],
-                    "计划已生成",
-                    _cancelled,
-                )
-                or ""
-            ).strip()
-            if choice == CANCELLED or _cancelled():
-                _aborted()
-                return
-            if choice == "0":
-                session.add_message("assistant", "用户取消任务。")
-                _syncq(status="已取消")
-                return
-            if choice == "2":
-                lines = []
-                while True:
-                    line = str(_bridge_line(app, "计划> ", llm.config, _cancelled) or "")
-                    if line == CANCELLED or _cancelled():
-                        _aborted()
-                        return
-                    if line.strip() == "END":
-                        break
-                    lines.append(line)
-                session.plan.update(llm.confirm_plan(session.plan, "manual_edit", feedback="\n".join(lines)))
-            elif choice == "3":
-                fb = str(_bridge_line(app, "反馈> ", llm.config, _cancelled) or "")
-                if fb == CANCELLED or _cancelled():
-                    _aborted()
-                    return
-                session.plan.update(llm.confirm_plan(session.plan, "llm_modify", feedback=fb))
-            elif choice == "1":
-                session.plan.update(llm.confirm_plan(session.plan, "confirm"))
-                session.update_plan_status("confirmed")
-                session.save_longterm()
-                confirmed = True
-                break
-            else:
-                session.add_message("system", "请输入 0/1/2/3", type="help")
-                _syncq(status="请重新选择计划操作")
-                continue
-            # 2/3 修改后必须二次确认，禁止直接执行
-            again = str(
-                _bridge_choose(
-                    app,
-                    [("1", "确认并执行"), ("2", "继续修改"), ("0", "取消")],
-                    "计划已修改",
-                    _cancelled,
-                )
-                or ""
-            ).strip()
-            if again == CANCELLED or _cancelled():
-                _aborted()
-                return
-            if again == "0":
-                session.add_message("assistant", "用户取消任务。")
-                _syncq(status="已取消")
-                return
-            if again == "1":
-                session.plan.update(llm.confirm_plan(session.plan, "confirm"))
-                session.update_plan_status("confirmed")
-                session.save_longterm()
-                confirmed = True
-                break
-            # again == "2" 或非法 → 回到 1/2/3 菜单继续改
-        if not confirmed:
-            session.add_message("assistant", "计划未确认，任务中止。")
-            _syncq(status="计划未确认")
-            return
-        steps = llm.generate_steps(user_text, session.plan.get("content", ""))
-        if _cancelled():
-            _aborted()
-            return
-        session.set_steps(steps)
-        session.add_message("assistant", "计划确认，开始执行。", type="plan")
-        _syncq(status="执行步骤")
-
-    for round_no in range(12):
-        if _cancelled():
-            _aborted()
-            return
-        _syncq(status=f"推理 · 第{round_no + 1}轮")
-        app.phase_hint = "思考中"
-        payload = session.build_messages(extra_system=system_prompt_text)
-        llm.meter.measure_context(payload)
-        # 代码编写默认模型（设置页可指定）
-        code_model = llm.config.get_task_model("code") if hasattr(llm.config, "get_task_model") else None
-        response = llm.chat(payload, tools=register.get_tool_defs(), model=code_model, on_delta=_on_delta)
-        app.streaming_msg = None  # 树尾直播收口：正式消息按现有路径入库
-        app.token_meter = llm.meter
-        if response.get("error") == CANCELLED or _cancelled():
-            _aborted()
-            return
-        if response.get("error"):
-            log.error("第%d轮推理返回错误: %s", round_no + 1, response["error"])
-            session.add_message("assistant", response["error"])
-            _syncq(status="出错")
-            return
-        if (response.get("content") or response.get("reasoning")) and not response.get("tool_calls"):
-            # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
-            extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
-            session.add_message("assistant", response["content"], **extra)
-        tool_calls = response.get("tool_calls") or []
-        if not tool_calls:
-            app.phase_hint = ""  # 回合完成：状态行空行占位
-            log.info("任务完成（共%d轮推理）", round_no + 1)
-            if not _cancelled():
-                session.maybe_compress(llm_fn=lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
-            _syncq(status="就绪")
-            return
-
-        # description 是调用意图的简明说明（回合末剥离后的留档记录）：
-        # 提取后从 arguments 剔除，策略判定/指纹白名单/确认面板/工具执行均不可见
-        for call in tool_calls:
-            args = call.get("arguments")
-            if isinstance(args, dict) and "description" in args:
-                call["description"] = str(args.pop("description") or "")
-
-        app.phase_hint = "工具调用中"
-        pending = []
-        allowed_results = []
-        log.debug("第%d轮返回 %d 个工具调用", round_no + 1, len(tool_calls))
-        for call in tool_calls:
-            action, reason = llm.evaluate_tool(call.get("name"), call.get("arguments") or {})
-            if action == policy.ALLOW:
-                allowed_results.append((call, llm.execute_approved_tool(call)))
-            elif action == policy.CONFIRM:
-                pending.append(call)
-            else:
-                allowed_results.append(
-                    (
-                        call,
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id"),
-                            "tool_name": call.get("name"),
-                            "content": policy.default_reject_message(reason),
-                            "type": "tool",
-                        },
-                    )
-                )
-
-        if tool_calls:
-            # DeepSeek Tool Calls：保留 assistant 工具轮（含 content + tool_calls）；
-            # thinking 与正文并存时以 thinking 字段留档（出站时并回 content）
-            thinking_extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
-            session.add_message(
-                "assistant",
-                response.get("content") or "",
-                type="tool_call",
-                tool_calls=[
-                    {
-                        "id": c.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                        "name": c.get("name"),
-                        "arguments": c.get("arguments") or {},
-                        "type": c.get("type") or "function",
-                    }
-                    for c in tool_calls
-                ],
-                **thinking_extra,
-            )
-
-        for call, item in allowed_results:
-            session.add_tool_result(call, item["content"])
-        _syncq(status=f"工具 {len(allowed_results)} 完成 · 待确认 {len(pending)}")
-
-        for call in pending:
-            result = _handle_tool_confirm(llm, app, session, call, _cancelled)
-            session.add_tool_result(call, result["content"])
-            if _cancelled():
-                _aborted()
-                return
-            _syncq(status=f"确认完成 · {call.get('name')}")
-
-        app.token_meter = llm.meter
-        _syncq(status="继续")
-
-    session.add_message("assistant", "达到最大工具轮次。")
-    log.warn("达到最大工具轮次（12轮），任务中止")
-    _syncq(status="轮次上限")
+    except workflow_mod.TurnStop:
+        pass
 
 
 class _AgentRunner:

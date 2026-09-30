@@ -5,3 +5,5 @@ tiktoken>=0.7.0
 wcwidth>=0.8.0
 prompt_toolkit>=3.0.53
 pyyaml>=6.0
+# 工作流编辑器 GUI（/workflow edit；缺失时主程序可用，仅编辑器不可用）
+PySide6>=6.6

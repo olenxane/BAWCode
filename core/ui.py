@@ -22,6 +22,7 @@ from core import commands as cmdsys
 from core import keymap as keymap_mod
 from core import policy
 from core import tokens as tokenmod
+from core.tools import tool_failure_hint
 from core.keymap import Action, Context, Keymap
 from core.textbuf import TextBuffer
 from wcwidth import wcwidth
@@ -759,8 +760,9 @@ class TuiApp:
         self.steps = list(getattr(session, "steps", []) or [])
         self._tree_sig = None  # 内容已同步，强制重建树缓存
         msg_n = len(self.messages)
-        if msg_n > self._tree_last_msg_n:
-            # 会话变长：恢复贴底，避免停在顶部看不到新回复
+        if msg_n > self._tree_last_msg_n and not self.confirm_mode:
+            # 会话变长：恢复贴底，避免停在顶部看不到新回复；
+            # 确认面板等待期间不拉底——用户可能正在翻看历史
             self._tree_follow_tail = True
         self._tree_last_msg_n = msg_n
         if task is not None:
@@ -890,22 +892,6 @@ class TuiApp:
             root_label = f"任务 · {_oneline(self.task or '（新会话）', 40)}"
         task_node = TreeNode("task", root_label, "task", default_expanded=True)
         roots.append(task_node)
-        plan = self.plan or {}
-        if plan.get("status") not in ("empty", "", None) or plan.get("content") or plan.get("title"):
-            expanded = plan.get("status") in ("draft", "confirmed", "executing", "running")
-            plan_node = TreeNode(
-                "plan",
-                f"计划 [{plan.get('status') or 'empty'}] {plan.get('title') or ''}",
-                "plan",
-                default_expanded=expanded,
-                summary=_oneline(plan.get("content") or "", 40),
-                detail=plan.get("content") or "",
-            )
-            if plan_node.detail:
-                # 计划不限行数：全部子行展示，不截断
-                for i, line in enumerate(_wrap(plan_node.detail, 50)):
-                    plan_node.children.append(TreeNode(f"plan:{i}", line, "plan_line"))
-            task_node.children.append(plan_node)
         if self.steps:
             done = sum(1 for s in self.steps if s.get("status") == "done")
             step_root = TreeNode("steps", f"步骤 {done}/{len(self.steps)}", "steps")
@@ -929,6 +915,7 @@ class TuiApp:
 
         # 消息按对话轮次挂在树上：每条用户消息都是独立节点（不替换根标题）
         current_turn: Optional[TreeNode] = None
+        last_plan_turn: Optional[TreeNode] = None
 
         def _parent() -> TreeNode:
             return current_turn if current_turn is not None else task_node
@@ -951,9 +938,11 @@ class TuiApp:
                 current_turn = node
                 continue
             if role == "tool" or msg_type == "tool":
+                failed = tool_failure_hint(content)
+                icon = "❌" if failed else "✅"
                 node = TreeNode(
                     f"msg:{index}",
-                    f"⚙ {tool_name or 'tool'} · {content}",
+                    f"⚙ {tool_name or 'tool'} {icon} · {content}",
                     "tool",
                     default_expanded=False,
                     detail="",
@@ -978,6 +967,8 @@ class TuiApp:
                 head = ",".join(names) if names else "工具调用"
                 if content:
                     head = f"{head} · {content}"
+                if any(n in ("write_plan", "update_plan") for n in names):
+                    last_plan_turn = current_turn  # 计划节点挂到最后修改计划的轮次
                 node = TreeNode(
                     f"msg:{index}",
                     f"⚙ {head}",
@@ -988,6 +979,8 @@ class TuiApp:
             elif role == "assistant":
                 # 完整回复写入 label，由 _tree_rows 折行；LLM 输出不限行数、无折叠指示
                 # 不建子节点、不开独立详情区
+                if msg_type == "plan":
+                    last_plan_turn = current_turn  # 工作流 plan 节点："计划确认，开始执行。"锚点
                 node = TreeNode(
                     f"msg:{index}",
                     f"Agent · {content}",
@@ -1015,6 +1008,25 @@ class TuiApp:
                     detail="",
                 )
             _parent().children.append(node)
+
+        # 计划节点：挂在最后修改计划的轮次下（时间线顺序），无 write_plan/update_plan
+        # 的旧会话回落到任务根；不进 messages，由 session.plan 状态驱动
+        plan = self.plan or {}
+        if plan.get("status") not in ("empty", "", None) or plan.get("content") or plan.get("title"):
+            expanded = plan.get("status") in ("draft", "confirmed", "executing", "running")
+            plan_node = TreeNode(
+                "plan",
+                f"计划 [{plan.get('status') or 'empty'}] {plan.get('title') or ''}",
+                "plan",
+                default_expanded=expanded,
+                summary=_oneline(plan.get("content") or "", 40),
+                detail=plan.get("content") or "",
+            )
+            if plan_node.detail:
+                # 计划不限行数：全部子行展示，不截断
+                for i, line in enumerate(_wrap(plan_node.detail, 50)):
+                    plan_node.children.append(TreeNode(f"plan:{i}", line, "plan_line"))
+            (last_plan_turn if last_plan_turn is not None else task_node).children.append(plan_node)
 
         # 流式树尾直播（纯 UI 状态，不在 session.messages 里）：思考过程折叠为尾部窗口，正文全文折行
         streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
@@ -1154,22 +1166,18 @@ class TuiApp:
                 # 折叠只作用于正文溢出行（子节点照常展示），marker 仅反映正文是否超限
                 has = False
             if node.kind == "tool":
-                # 工具调用（含工具轮）：标题青色（14babc）+ 内容纯白，同一物理行双色
+                # 工具调用（含工具轮）：标题青色（14babc）+ 内容纯白，同一物理行双色。
+                # 折叠仅显示标题行（✅/❌ 状态在标题内），完整输出展开后查看
                 title, sep, content_text = label.partition(" · ")
-                has_content = bool(sep) and content_text != ""
-                # 先按占位 marker（恒 1 字符，不影响估宽）折行，再据总行数定折叠与真实 marker
                 probe_title = f"{indent}· {title}"
                 budget = max(8, width - _display_width(probe_title) - _display_width(" · "))
-                wrapped = _wrap(content_text, budget) if has_content else []
-                total_rows = len(wrapped)
-                truncated = foldable and not expanded and total_rows > _TREE_INLINE_CAP
-                if foldable and total_rows > _TREE_INLINE_CAP:
-                    has = True
+                has_output = bool(sep) and content_text != ""
+                wrapped = _wrap(content_text, budget) if (has_output and expanded) else []
+                if foldable and not expanded and has_output:
+                    has = True  # 折叠时 marker 提示有可展开内容
                 first_prefix = f"{indent}{_marker(has, expanded)} "
                 title_part = f"{first_prefix}{title}"
-                if has_content:
-                    if truncated:
-                        wrapped = wrapped[:_TREE_INLINE_CAP]
+                if has_output and expanded:
                     first = wrapped[0] if wrapped else ""
                     rest = wrapped[1:]
                     row = (self.c("tool_title") + _clip(title_part, width) + self.RESET
@@ -1180,9 +1188,6 @@ class TuiApp:
                         rows.append(row)
                     for wline in rest:
                         rows.append(self.c("tool_content") + _clip(cont_prefix + wline, width) + self.RESET)
-                    if truncated:
-                        hint = f"… (+{total_rows - _TREE_INLINE_CAP} 行)"
-                        rows.append(self.c("dim") + _clip(cont_prefix + hint, width) + self.RESET)
                 else:
                     rows.append(self.c("tool_title") + _clip(title_part, width) + self.RESET)
                 spans.append((span_start, len(rows) - span_start))
@@ -1995,8 +2000,16 @@ class TuiApp:
                     self.render()
                     continue
                 if kind == "mouse_wheel":
-                    step = 1 if value == "down" else -1
-                    self.confirm_index = (self.confirm_index + step) % len(options)
+                    # 滚轮滚动会话树（面板固定在输入框位置），不再用于切换选项
+                    self._scroll_tree_by(3 if value == "down" else -3)
+                    self.render()
+                    continue
+                if kind == "pageup" or (kind == "hotkey" and str(value) == "pageup"):
+                    self._scroll_tree_by(-self._row_meta.get("tree_h", 10))
+                    self.render()
+                    continue
+                if kind == "pagedown" or (kind == "hotkey" and str(value) == "pagedown"):
+                    self._scroll_tree_by(self._row_meta.get("tree_h", 10))
                     self.render()
                     continue
                 if kind == "submit":
@@ -2413,6 +2426,8 @@ class TuiApp:
             ui_cfg = (config.data or {}).get("ui") or {}
             mem_cfg = (config.data or {}).get("memory") or {}
             llm_cfg = (config.data or {}).get("llm") or {}
+            ctx_cfg = (config.data or {}).get("context") or {}
+            wf_cfg = (config.data or {}).get("workflow") or {}
             log_level = str((config.data or {}).get("log", {}).get("level") or "info").strip().lower()
             if log_level not in ("debug", "info", "warn", "error", "off"):
                 log_level = "info"
@@ -2433,6 +2448,9 @@ class TuiApp:
                 {"key": "compress_threshold", "label": "压缩阈值", "type": "text", "current": mem_cfg.get("compress_threshold", 0.8)},
                 {"key": "compress_keep_recent_tokens", "label": "压缩保留尾段token", "type": "text", "current": mem_cfg.get("compress_keep_recent_tokens", 16384)},
                 {"key": "compress_summary_max_tokens", "label": "摘要上限token", "type": "text", "current": mem_cfg.get("compress_summary_max_tokens", 1024)},
+                {"key": "tool_whitelist", "label": "工具白名单", "type": "text", "current": ", ".join(str(x) for x in (ctx_cfg.get("tool_whitelist") or [])), "hint": "逗号分隔 · 白名单工具结果跨回合保留"},
+                {"key": "max_tool_rounds", "label": "最大工具轮数", "type": "text", "current": wf_cfg.get("max_rounds", 0), "hint": "0=用工作流文件值 · 超限后仍有进展会自动续期"},
+                {"key": "max_rounds_extensions", "label": "轮次续期上限", "type": "text", "current": wf_cfg.get("max_rounds_extensions", 5), "hint": "有进展续期次数上限，0=禁用续期"},
                 {"key": "log_level", "label": "日志等级", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "current": "关闭" if log_level == "off" else log_level, "hint": "←→ 关闭=不记录任何日志（含写盘）"},
                 {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 切换当前模型"},
             ]
@@ -3058,6 +3076,21 @@ class TuiApp:
         if "compress_summary_max_tokens" in s:
             try:
                 mem_cfg["compress_summary_max_tokens"] = max(100, int(float(s["compress_summary_max_tokens"])))
+            except (TypeError, ValueError):
+                pass
+        if "tool_whitelist" in s:
+            ctx_cfg = config.data.setdefault("context", {})
+            names = [p.strip() for p in str(s["tool_whitelist"] or "").split(",") if p.strip()]
+            ctx_cfg["tool_whitelist"] = names
+        wf_cfg = config.data.setdefault("workflow", {})
+        if "max_tool_rounds" in s:
+            try:
+                wf_cfg["max_rounds"] = max(0, int(float(s["max_tool_rounds"])))
+            except (TypeError, ValueError):
+                pass
+        if "max_rounds_extensions" in s:
+            try:
+                wf_cfg["max_rounds_extensions"] = max(0, int(float(s["max_rounds_extensions"])))
             except (TypeError, ValueError):
                 pass
         if "log_level" in s and s["log_level"]:

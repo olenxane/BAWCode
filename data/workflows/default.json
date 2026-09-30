@@ -1,0 +1,39 @@
+{
+  "name": "default",
+  "description": "系统提示词注入 → 技能清单 → 关键词分析 → 计划（仅高复杂度，需确认）→ 编码执行",
+  "nodes": [
+    {
+      "id": "system_prompt",
+      "type": "system_prompt",
+      "files": ["system_prompt.md"]
+    },
+    {
+      "id": "skills",
+      "type": "skill",
+      "enabled": true,
+      "list": []
+    },
+    {
+      "id": "analyze",
+      "type": "analyze",
+      "method": "keywords",
+      "keywords_high": ["重构", "架构", "系统", "完整", "多文件", "设计", "实现", "agent", "框架", "迁移"],
+      "keywords_low": [],
+      "min_len_high": 400,
+      "default_level": "low"
+    },
+    {
+      "id": "plan",
+      "type": "plan",
+      "gate": "complexity == high",
+      "confirm": true,
+      "steps": true
+    },
+    {
+      "id": "execute",
+      "type": "execute",
+      "max_rounds": 12,
+      "model_role": "code"
+    }
+  ]
+}
