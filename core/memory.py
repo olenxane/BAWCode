@@ -80,6 +80,35 @@ def get_session() -> Optional["Memory"]:
     return _session
 
 
+def conv_block_bounds(messages: List[dict], idx: int) -> tuple:
+    """消息 idx 所在"原子块"的闭区间 [start, end]：树回退的切割边界。
+
+    - user/普通 assistant（无 tool_calls）：块就是自己
+    - assistant(tool_calls)：向后吞掉连续 role=tool 结果（tool_call/tool_result 配对
+      不可拆——截在中间 API 会因孤儿 tool 消息报错）
+    - role=tool：向前归属其 assistant(tool_calls) 父块（同上再向后吞）
+    假设 tool 结果紧跟其 assistant 消息（本项目的记录顺序）。
+    """
+    n = len(messages)
+    if idx < 0 or idx >= n:
+        return (idx, idx)
+    start = end = idx
+    if str(messages[idx].get("role")) == "tool":
+        # 向前越过连续 tool 结果，归属紧邻的 assistant(tool_calls) 父块
+        start = idx
+        while start > 0 and str(messages[start - 1].get("role")) == "tool":
+            start -= 1
+        if start > 0:
+            prev = messages[start - 1]
+            if str(prev.get("role")) == "assistant" and prev.get("tool_calls"):
+                start -= 1
+    if str(messages[start].get("role")) == "assistant" and messages[start].get("tool_calls"):
+        end = start
+        while end + 1 < n and str(messages[end + 1].get("role")) == "tool":
+            end += 1
+    return (start, end)
+
+
 class Memory:
     """Agent 记忆：消息、计划、步骤、长期记忆（md）、RAG 接口"""
 
@@ -110,6 +139,7 @@ class Memory:
         self.large_tools = set(ctx_cfg.get("large_tools") or ["read", "write", "edit_file"])
         self.inline_limit_tokens_large = int(ctx_cfg.get("inline_limit_tokens_large", 32768))
         self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", 6))
+        toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
         self.session_created_at = datetime.now().isoformat(timespec="seconds")
@@ -418,14 +448,17 @@ class Memory:
             if persist_path is not None:
                 preview = toolstore.slice_to_tokens(content, cap, getattr(self.config, "model_name", ""))
                 content = f"{preview}\n\n[{toolstore.pointer_line(persist_path, total_lines)}]"
-        message = self.add_message(
-            "tool",
-            content,
-            type="tool",
-            tool_name=tool_name,
-            tool_call_id=call_id,
-            description=description,
-        )
+        extra = {
+            "type": "tool",
+            "tool_name": tool_name,
+            "tool_call_id": call_id,
+            "description": description,
+        }
+        if tool_name == "read":
+            file_path = str((args or {}).get("file_path") or "")
+            if file_path:
+                extra["file_path"] = file_path  # 随消息留档，供回合末剥离记录附新鲜度状态
+        message = self.add_message("tool", content, **extra)
         if persist_path is not None:
             message["persisted"] = True
             message["persist_path"] = str(persist_path)
@@ -490,6 +523,12 @@ class Memory:
             parts.append(f"call_id={message['tool_call_id']}")
         if message.get("persist_path"):
             parts.append(f"完整输出: {message['persist_path']}")
+        if message.get("tool_name") == "read" and message.get("file_path"):
+            # 剥离后的 read 记录升级为状态路标：模型据此判断可否直接 edit_file，免一次试探
+            try:
+                parts.append(f"[{toolstore.ledger_fresh_hint(Path(message['file_path']))}]")
+            except (OSError, ValueError):
+                pass
         message["content"] = " ".join(parts)
         message["stripped"] = True
         return True
@@ -920,6 +959,7 @@ class Memory:
         self.plan = dict(plan) if isinstance(plan, dict) else plan_default
         steps = data.get("steps")
         self.steps = list(steps) if isinstance(steps, list) else []
+        toolstore.ledger_reset()  # 台账不跨会话：resume 后首次 edit 需重新 read（安全优先）
         log.info("会话已切换: %s · id=%s · %d条消息", self.session_title, self.session_id, len(self.messages))
 
     def start_new_session(self) -> None:
@@ -930,6 +970,7 @@ class Memory:
         self.messages.clear()
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []
+        toolstore.ledger_reset()
         log.info("已开启新会话: %s", self.session_id)
 
     def clear(self) -> None:
@@ -937,6 +978,7 @@ class Memory:
         session_store.delete_session_data(self.sessions_dir, self.session_id)
         toolstore.clear_session(self.config, self.project_id, self.session_id)
         self._delete_precompact_archives()
+        toolstore.ledger_reset()
         self.messages.clear()
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []

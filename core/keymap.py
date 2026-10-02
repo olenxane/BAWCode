@@ -18,6 +18,7 @@ class Action(str, Enum):
     MODE_CYCLE = "mode_cycle"
     EXPAND = "expand"
     COLLAPSE = "collapse"
+    ROLLBACK = "rollback"
     SCROLL_UP = "scroll_up"
     SCROLL_DOWN = "scroll_down"
     CARET_UP = "caret_up"
@@ -82,6 +83,7 @@ _DEFAULT_BINDINGS: Dict[str, List[str]] = {
     "scroll_down": ["pagedown", "ctrl+down"],
     "expand": ["right", "l"],
     "collapse": ["left", "h"],
+    "rollback": ["ctrl+z"],
 }
 
 _ACTION_OF_SETTING = {
@@ -94,6 +96,7 @@ _ACTION_OF_SETTING = {
     "scroll_down": Action.SCROLL_DOWN,
     "expand": Action.EXPAND,
     "collapse": Action.COLLAPSE,
+    "rollback": Action.ROLLBACK,
 }
 
 _EDIT_DEFAULTS: Dict[str, Action] = {

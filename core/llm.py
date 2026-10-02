@@ -702,16 +702,6 @@ class LLM:
         )
         return result.get("content") or prompt
 
-    def judge_complexity(self, prompt: str) -> str:
-        external = hooks.call_hook("complexity_judge", {"prompt": prompt}, default=None)
-        if isinstance(external, dict) and external.get("complexity"):
-            return str(external["complexity"]).lower()
-        keywords = ["重构", "架构", "系统", "完整", "多文件", "设计", "实现", "agent", "框架", "迁移"]
-        text = prompt.lower()
-        result = "high" if any(k in text for k in keywords) or len(prompt) > 400 else "low"
-        log.info("复杂度判定: %s（%d字）", result, len(prompt))
-        return result
-
     def generate_plan(self, prompt: str) -> dict:
         external = hooks.call_hook("plan_generate", {"prompt": prompt}, default=None)
         if isinstance(external, dict) and external.get("content"):

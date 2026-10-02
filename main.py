@@ -9,11 +9,14 @@ if str(_ROOT) not in sys.path:
 
 from core import commands
 from core import hooks
+from core import mcp as mcp_mod
 from core import memory as memory_mod
 from core import policy
 from core import project_identity
 from core import register
 from core import session_store
+from core import snapshot as snapshot_mod
+from core import subagent as subagent_mod
 from core import tools as tools_mod  # noqa: F401
 from core import ui
 from core import workflow as workflow_mod
@@ -162,6 +165,29 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         _echo(ctx, "工具:\n" + "\n".join(lines))
         return True
 
+    @commands.register("/agents", hint="子代理 · 角色列表/本会话记录/重载", usage="/agents [reload]", source="builtin")
+    def _agents(ctx, args):
+        arg = (args or "").strip().lower()
+        if arg == "reload":
+            count = subagent_mod.load_specs(ctx["config"])
+            _echo(ctx, f"子代理角色已重扫: {count} 个")
+            return True
+        sess = ctx["session"]
+        records = subagent_mod.list_records(ctx["config"], sess)
+        lines = [f"本会话子代理 {len(records)} 个:"]
+        for rec in records[-20:]:
+            label = subagent_mod.status_label(str(rec.get("status")))
+            task_brief = " ".join(str(rec.get("task") or "").split())[:40]
+            lines.append(
+                f"  #{rec.get('id')} · {rec.get('role')} · {label}"
+                f" · {rec.get('rounds', 0)}轮 · {task_brief}"
+            )
+        lines.append("角色:")
+        lines.append(subagent_mod.roles_listing())
+        lines.append("提示: /agents reload 重扫 data/agents；子代理经 task 工具派发、query_subagent 查询")
+        _echo(ctx, "\n".join(lines))
+        return True
+
     @commands.register("/skill", hint="技能系统 · 列表/查看/重载", usage="/skill [名称|reload]", source="builtin")
     def _skill(ctx, args):
         from core import skills as skills_mod
@@ -186,6 +212,70 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
             ctx,
             f"可用技能 {len(loader)} 个:\n{listing}" if listing else "暂无技能（放置 data/skills/<name>/SKILL.md）",
         )
+        return True
+
+    @commands.register("/mcp", hint="MCP 服务器 · 列表/工具/重连", usage="/mcp [tools 名称|reconnect 名称]", source="builtin")
+    def _mcp(ctx, args):
+        arg = (args or "").strip()
+        parts = arg.split(maxsplit=1)
+        head = parts[0].lower() if parts else ""
+        if head == "reconnect":
+            ok, msg = mcp_mod.reconnect(parts[1].strip() if len(parts) > 1 else "")
+            _echo(ctx, msg)
+            return True
+        if head == "tools":
+            _echo(ctx, mcp_mod.tools_listing(parts[1].strip() if len(parts) > 1 else ""))
+            return True
+        _echo(ctx, mcp_mod.status_listing())
+        return True
+
+    @commands.register("/undo", hint="回滚回合文件改动 /undo [list|序号]", usage="/undo [list|序号]", source="builtin")
+    def _undo(ctx, args):
+        arg = (args or "").strip().lower()
+        sess = ctx["session"]
+        if arg == "list":
+            turns = snapshot_mod.list_turns(ctx["config"], sess.project_id, sess.session_id)
+            if not turns:
+                _echo(ctx, "本会话暂无回合快照（文件改动回合结束时自动生成）")
+                return True
+            lines = ["回合快照:"]
+            for t in turns:
+                lines.append(
+                    f"  #{t['seq']} · {t['time']} · {t['files']} 文件（可还原 {t['restorable']}）"
+                    f" · {t['task'] or '（无任务摘要）'}"
+                )
+            lines.append("提示: /undo 回滚最近回合 · /undo <序号> 回滚指定回合 · 事后改过的文件会跳过")
+            _echo(ctx, "\n".join(lines))
+            return True
+        result = snapshot_mod.undo(
+            ctx["config"], sess.project_id, sess.session_id, int(arg) if arg.isdigit() else "last"
+        )
+        if result is None:
+            _echo(ctx, "没有可回滚的回合快照（/undo list 查看）")
+            return True
+        lines = [f"已回滚回合 #{result['seq']}（{result['task'] or '（无任务摘要）'}）:"]
+        for p in result["restored"]:
+            lines.append(f"  还原 {p}")
+        for p in result["deleted"]:
+            lines.append(f"  删除 {p}")
+        for p, why in result["skipped"]:
+            lines.append(f"  跳过 {p}（{why}）")
+        for p in result["external_changes"]:
+            lines.append(f"  无法还原（非工具改动）{p}")
+        if not (result["restored"] or result["deleted"] or result["skipped"]):
+            lines.append("  （该回合无文件改动）")
+        ctx["app"].status = f"已回滚回合 #{result['seq']}"
+        _echo(ctx, "\n".join(lines), mtype="help")
+        return True
+
+    @commands.register("/clear-trash", hint="清空项目回收站（真正不可逆删除）", source="builtin")
+    def _clear_trash(ctx, args):
+        count, size = snapshot_mod.clear_trash(ctx["config"], ctx["session"].project_id)
+        if count:
+            _echo(ctx, f"回收站已清空: {count} 项，释放 {size} 字节")
+        else:
+            _echo(ctx, "回收站已是空的")
+        ctx["app"].status = "回收站已清空" if count else "回收站为空"
         return True
 
     @commands.register("/plan", hint="查看计划", source="builtin")
@@ -329,15 +419,21 @@ def _launch_workflow_editor(ctx, name: str = "") -> None:
 
 def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
     """回合入口：无论正常结束/出错/中断，回合末执行上下文维护（剥离+预算外置），
-    并清掉流式树尾消息（partial 丢弃，与在途回合丢弃语义一致）"""
+    并清掉流式树尾消息（partial 丢弃，与在途回合丢弃语义一致）与子代理运行时/直播槽"""
     try:
         _agent_turn_impl(llm, session, user_text, app, runner=runner)
     finally:
         try:
+            snapshot_mod.end_turn()  # 回合快照落盘（中断/异常路径同样收尾；空回合无副作用）
+        except Exception as exc:
+            log.error("回合快照收尾失败: %r", exc)
+        try:
             session.finalize_turn()
         except Exception as exc:
             log.error("回合末上下文维护失败: %r", exc)
+        subagent_mod.unbind_runtime()
         app.streaming_msg = None
+        app.subagent_stream = None
         app.phase_hint = ""
 
 
@@ -370,6 +466,12 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
 
     log.info("任务开始: %s", user_text)
     session.add_message("user", user_text, type="task")
+    # 回合快照：绑定上下文 + 轻量清单对账基线（写入工具经 capture_before 留底）；
+    # msg_index=本回合用户消息绝对序号，树模式 Ctrl+Z 按它联动文件回滚
+    snapshot_mod.begin_turn(
+        llm.config, session.project_id, session.session_id, user_text,
+        msg_index=len(session.messages) - 1,
+    )
     mode = app.mode
     _syncq(task=user_text, status=f"{policy.MODE_LABELS.get(mode, mode)} · 分析")
     if _cancelled():
@@ -393,6 +495,8 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     turn = workflow_mod.TurnContext(
         session=session, llm=llm, app=app, config=llm.config, user_text=user_text, io=io
     )
+    # 子代理运行时随回合绑定/解绑：task 工具经此取得 llm/io/app/session
+    subagent_mod.bind_runtime(llm=llm, config=llm.config, io=io, app=app, session=session)
     try:
         workflow_mod.run_workflow(wf, turn)
     except workflow_mod.TurnInterrupt:
@@ -423,12 +527,32 @@ class _AgentRunner:
         m = str(ui_cfg.get("busy_send_mode") or "queue").strip().lower()
         return m if m in ("queue", "interrupt") else "queue"
 
+    def _set_busy(self, value: bool) -> None:
+        """busy 双写：runner 自身判定 + app.busy 镜像（UI 键位如树回退据此拒绝，跨线程只读）"""
+        self.busy = value
+        try:
+            self.app.busy = value
+        except Exception:
+            pass
+
     def start(self, text: str) -> bool:
-        if self.busy:
-            return False
+        with self._lock:
+            if self.busy:
+                return False
+            self._set_busy(True)
         t = threading.Thread(target=self._run, args=(text,), daemon=True, name="bawcode-agent")
         t.start()
         return True
+
+    def notify(self, text: str) -> None:
+        """后台事件通知入口（tools.set_background_notifier 注册）：
+        idle 直接开新回合，busy 入队接力——不打断在途回合（区别于 submit 的 interrupt 语义）"""
+        with self._lock:
+            self._queue.append(text)
+            if self.busy:
+                return
+            self._set_busy(True)
+        threading.Thread(target=self._run, args=(None,), daemon=True, name="bawcode-agent").start()
 
     def submit(self, text: str) -> str:
         """busy 期间的发送语义；返回给用户看的状态说明"""
@@ -445,10 +569,17 @@ class _AgentRunner:
         with self._lock:
             return self._queue.pop(0) if self._queue else None
 
-    def _run(self, first: str) -> None:
+    def _run(self, first=None) -> None:
+        # busy 生命周期全部在锁内决策：循环顶"取队续跑或退忙退出"，
+        # 与 notify/start 的置忙互斥，杜绝双 agent 线程并发
         text = first
-        while text:
-            self.busy = True
+        while True:
+            if text is None:
+                with self._lock:
+                    text = self._queue.pop(0) if self._queue else None
+                    if text is None:
+                        self._set_busy(False)
+                        return
             try:
                 self.llm.reset_cancel()
                 _agent_turn(self.llm, self.session, text, self.app, runner=self)
@@ -459,12 +590,11 @@ class _AgentRunner:
                 except Exception:
                     pass
             finally:
-                self.busy = False
                 try:
                     self.session.save_session()
                 except Exception:
                     pass
-            text = self.pop_queue()
+            text = None
 
     def cancel_and_join(self, timeout: float = 3.0) -> None:
         """退出前中止在途请求并等待线程收尾"""
@@ -488,6 +618,8 @@ def main() -> None:
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
+    subagent_mod.register_tools(config)
+    mcp_mod.register_tools(config)  # MCP 服务器后台连接发现，工具随注册进度逐个可见
     app = ui.get_app()
     app.bind_config(config)
     app.token_meter = llm.meter
@@ -496,6 +628,7 @@ def main() -> None:
     app.enter()
     try:
         runner = _AgentRunner(llm, session, app, config)
+        tools_mod.set_background_notifier(runner.notify)  # 后台命令完成 → runner.notify 自动开新回合
         llm.query_balance()
         app.token_meter = llm.meter
         _sync(app, session, status="就绪")
@@ -507,7 +640,7 @@ def main() -> None:
                 continue
             if text.startswith("/"):
                 head = text.split()[0]
-                if runner.busy and head in ("/clear", "/new", "/resume"):
+                if runner.busy and head in ("/clear", "/new", "/resume", "/undo", "/clear-trash"):
                     session.add_message(
                         "system",
                         "本轮对话进行中：等待完成，或直接发送新消息（按设置中断/排队）后再操作会话",
@@ -541,6 +674,16 @@ def main() -> None:
         session.save_longterm()
         session.save_session()
     finally:
+        try:
+            mcp_mod.shutdown()  # 先断 MCP（daemon 线程收尾），再恢复终端
+        except Exception:
+            pass
+        try:
+            n = snapshot_mod.trash_count(config, session.project_id)
+            if n:
+                print(f"\n提示: 项目回收站有 {n} 个文件待处理（/clear-trash 真正删除）")
+        except Exception:
+            pass
         app.leave()
         print("BAWCode 已退出。")
         log.info("BAWCode 已退出")

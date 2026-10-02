@@ -36,6 +36,12 @@ SAFE_TOOLS = {
     "memory_add_fact",
     "rag_add",
     "load_skill",
+    # 计划管理四件套：仅改会话内计划/步骤状态，无文件系统与系统副作用；
+    # 参数随轮次变化导致通用指纹"始终允许"失效，逐次确认纯属打扰
+    "write_plan",
+    "update_plan",
+    "generate_steps",
+    "update_step_status",
 }
 
 # 命令白名单片段（manual/auto 判为相对安全）
@@ -66,6 +72,18 @@ _DANGEROUS_CMD_RE = re.compile(
 )
 
 _VERSION_RE = re.compile(r"(?i)(-v|--version|version)\s*$")
+
+# 删除类命令硬拒绝（完全访问模式也不例外）：shell 直删不可恢复，文件删除一律走
+# delete_file 工具（移入项目回收站，可 /undo 回滚、/clear-trash 真正清空）。
+# 只匹配命令首词或分隔符（|;&）之后的删除词，避免 "python app.py del" 这类参数误伤
+_DELETE_CMD_RE = re.compile(
+    r"(?ix)(?:^|[|;&])\s*(?:[a-z]:\S+\s+)?(?:rm|rmdir|rd|del|erase|deltree|rimraf)(?:\s|$)|"
+    r"(?:^|[|;&])\s*remove-item(?:\s|$)"
+)
+_DELETE_DENY_REASON = (
+    "删除类命令被拦截（不可恢复）：请改用 delete_file 工具"
+    "（文件移入回收站，可 /undo 回滚、/clear-trash 真正清空）"
+)
 
 
 def project_root() -> Path:
@@ -105,6 +123,11 @@ def save_allowlist(data: dict, root: Optional[Path] = None) -> Path:
 def fingerprint(tool_name: str, args: Optional[dict]) -> str:
     """指令指纹：工具名 + 归一化关键参数"""
     args = args or {}
+    if tool_name.startswith("mcp__"):
+        # MCP 工具指纹不含参数：语义为「放行该工具」；mcp|<server>|* 前缀通配
+        # 借 similar_fingerprint 的 |* 机制即可按服务器粒度放行
+        server, _, tool = tool_name[len("mcp__"):].partition("__")
+        return f"mcp|{server}|{tool}"
     if tool_name == "execute_command":
         cmd = str(args.get("command") or "")
         parts = cmd.strip().split()
@@ -114,7 +137,7 @@ def fingerprint(tool_name: str, args: Optional[dict]) -> str:
     if tool_name == "run_program":
         prog = str(args.get("program") or "").lower()
         return f"run_program|{prog}"
-    if tool_name in ("write", "edit_file"):
+    if tool_name in ("write", "edit_file", "delete_file"):
         path = str(args.get("file_path") or "").replace("\\", "/").lower()
         return f"{tool_name}|{path}"
     # 其他：工具名 + 参数键排序摘要
@@ -126,6 +149,9 @@ def fingerprint(tool_name: str, args: Optional[dict]) -> str:
 def similar_fingerprint(tool_name: str, args: Optional[dict]) -> str:
     """较宽指纹：同名工具 + 命令首词/路径目录"""
     args = args or {}
+    if tool_name.startswith("mcp__"):
+        server, _, _tool = tool_name[len("mcp__"):].partition("__")
+        return f"mcp|{server}|*"
     if tool_name == "execute_command":
         cmd = str(args.get("command") or "")
         parts = cmd.strip().split()
@@ -174,6 +200,9 @@ def evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pat
 
 
 def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Path] = None) -> Tuple[str, str]:
+    # 删除类命令硬安全栏：先于一切模式判定（full 也不例外）
+    if tool_name == "execute_command" and _DELETE_CMD_RE.search(str((args or {}).get("command") or "")):
+        return DENY, _DELETE_DENY_REASON
     if mode == MODE_FULL or not mode:
         return ALLOW, "full"
     if not tool_name:

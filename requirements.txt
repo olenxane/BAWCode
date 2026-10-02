@@ -7,3 +7,5 @@ prompt_toolkit>=3.0.53
 pyyaml>=6.0
 # 工作流编辑器 GUI（/workflow edit；缺失时主程序可用，仅编辑器不可用）
 PySide6>=6.6
+# MCP 客户端桥接（core/mcp.py；缺失时主程序可用，仅 MCP 功能不可用）
+mcp>=1.2.0

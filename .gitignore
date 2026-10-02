@@ -10,3 +10,7 @@ data/log
 data/sessions
 data/toolcalls
 新建文件夹
+
+# 回合快照/回收站运行时产物
+data/snapshots/
+data/trash/

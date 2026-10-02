@@ -2,13 +2,13 @@
 """外置工作流引擎：data/workflows/<name>.json 声明式线性节点链。
 
 一轮 agent 回合的处理管线不再硬编码于 main.py，而是按配置文件的节点列表
-顺序执行；"不想要计划/测试"等取舍由用户在编辑器里增删节点表达，节点级
-gate 属性承载条件门槛（本期仅 complexity 比较，线性链无条件分支边）。
+顺序执行；"不想要计划/测试"等取舍由用户在编辑器里增删节点表达。
+按复杂度路由节点的机制（analyze 节点 + gate 门槛）已于 2026-09-30 移除，
+引擎为无条件线性链——备份见 _recycle/gate-routing-20260930/。
 
 节点类型（内置执行器）：
   system_prompt — 指定初始化注入哪些系统提示词文件（缺省走 config.prompt.system_files）
   skill         — 是否注入技能清单 / 白名单过滤（经 core/skills.set_injection）
-  analyze       — 复杂度判定：keywords（本地关键词匹配，默认）或 llm（judge_complexity+钩子）
   plan          — 生成计划（plan.md）；confirm 需用户确认；steps 确认后生成步骤
   execute       — 主工具调用循环（编码执行）
   llm           — 通用 LLM 阶段：prompt_files 渲染为补充系统提示词，max_rounds>0 时
@@ -33,34 +33,21 @@ from core import prompt_loader
 from core import register
 from core.llm import CANCELLED, get_system_prompt
 from core.log import get_logger
-from core.tools import tool_failure_hint
+from core.tools import has_recent_progress
 
 log = get_logger("workflow")
 
 _ROOT = Path(__file__).resolve().parent.parent
 
-# gate 表达式：仅支持 "always" / "complexity == high|low"
-GATE_RE = re.compile(r"^\s*complexity\s*==\s*(high|low)\s*$", re.IGNORECASE)
-
-NODE_TYPES = ("system_prompt", "skill", "analyze", "plan", "execute", "llm")
+NODE_TYPES = ("system_prompt", "skill", "plan", "execute", "llm")
 
 # 未知/损坏配置的最后兜底：与 data/workflows/default.json 保持一致
 DEFAULT_WORKFLOW: dict = {
     "name": "default",
-    "description": "系统提示词注入 → 技能清单 → 关键词分析 → 计划（仅高复杂度，需确认）→ 编码执行",
+    "description": "系统提示词注入 → 技能清单 → 编码执行（计划类需求在编辑器添加 plan 节点）",
     "nodes": [
         {"id": "system_prompt", "type": "system_prompt", "files": ["system_prompt.md"]},
         {"id": "skills", "type": "skill", "enabled": True, "list": []},
-        {
-            "id": "analyze",
-            "type": "analyze",
-            "method": "keywords",
-            "keywords_high": ["重构", "架构", "系统", "完整", "多文件", "设计", "实现", "agent", "框架", "迁移"],
-            "keywords_low": [],
-            "min_len_high": 400,
-            "default_level": "low",
-        },
-        {"id": "plan", "type": "plan", "gate": "complexity == high", "confirm": True, "steps": True},
         {"id": "execute", "type": "execute", "max_rounds": 12, "model_role": "code"},
     ],
 }
@@ -109,7 +96,6 @@ class TurnContext:
         self.user_text = user_text
         self.io = io
         self.system_prompt_text = ""
-        self.complexity = "low"
         self.captured: Dict[str, str] = {}
 
 
@@ -166,9 +152,6 @@ def validate_workflow(data: Any) -> List[str]:
         elif nid in ids:
             errors.append(f"{label} id 重复: {nid}")
         ids.add(nid)
-        gate = node.get("gate")
-        if gate and not GATE_RE.match(str(gate)) and str(gate).strip().lower() not in ("always", "true"):
-            errors.append(f"{label}({nid}) 门槛表达式不支持: {gate!r}（仅 always / complexity == high|low）")
     return errors
 
 
@@ -213,17 +196,6 @@ def load_workflow(config, name: Optional[str] = None) -> dict:
 # 运行器
 
 
-def gate_passes(gate: Any, turn: TurnContext) -> bool:
-    text = str(gate or "always").strip().lower()
-    if text in ("", "always", "true"):
-        return True
-    m = GATE_RE.match(text)
-    if m:
-        return turn.complexity == m.group(1).lower()
-    log.warn("未知门槛表达式 %r，忽略门槛照常执行", gate)
-    return True
-
-
 def _check_cancel(turn: TurnContext) -> None:
     if turn.io.cancelled():
         raise TurnInterrupt()
@@ -240,8 +212,8 @@ def _role_model(config, role: Any) -> Optional[str]:
 
 
 def _stage_variables(turn: TurnContext) -> Dict[str, Any]:
-    """节点提示词渲染变量：基础变量表 + 复杂度/计划 + 回合捕获变量"""
-    extra: Dict[str, Any] = {"complexity": turn.complexity}
+    """节点提示词渲染变量：基础变量表 + 计划 + 回合捕获变量"""
+    extra: Dict[str, Any] = {}
     extra.update(turn.captured)
     plan = getattr(turn.session, "plan", None) or {}
     extra.setdefault("plan_title", plan.get("title", ""))
@@ -300,34 +272,6 @@ def _exec_skill(node: dict, turn: TurnContext) -> None:
         enabled=bool(node.get("enabled", True)),
         allow=[str(n) for n in (node.get("list") or [])] or None,
     )
-
-
-def _exec_analyze(node: dict, turn: TurnContext) -> None:
-    method = str(node.get("method") or "keywords").strip().lower()
-    text = turn.user_text or ""
-    if method == "llm":
-        # judge_complexity 内部先查 external_apis 钩子，再走内置关键词兜底
-        turn.complexity = turn.llm.judge_complexity(text)
-    else:
-        low_text = text.lower()
-        kws_high = [str(k) for k in (node.get("keywords_high") or []) if str(k)]
-        kws_low = [str(k) for k in (node.get("keywords_low") or []) if str(k)]
-        try:
-            min_len = int(node.get("min_len_high") or 0)
-        except (TypeError, ValueError):
-            min_len = 0
-        default_level = str(node.get("default_level") or "low").strip().lower()
-        if default_level not in ("high", "low"):
-            default_level = "low"
-        if any(k.lower() in low_text for k in kws_high) or (min_len > 0 and len(text) >= min_len):
-            turn.complexity = "high"
-        elif any(k.lower() in low_text for k in kws_low):
-            turn.complexity = "low"
-        else:
-            turn.complexity = default_level
-    turn.captured["complexity"] = turn.complexity
-    log.info("复杂度判定(%s): %s（%d字）", method, turn.complexity, len(text))
-    turn.io.status(f"分析完成 · {turn.complexity}")
 
 
 def _plan_confirm_loop(turn: TurnContext) -> None:
@@ -413,23 +357,21 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
         steps = llm.generate_steps(turn.user_text, session.plan.get("content", ""))
         _check_cancel(turn)
         session.set_steps(steps)
-    session.add_message("assistant", "计划确认，开始执行。", type="plan")
+    # 收尾消息附带最终版 plan/steps 快照（extras 不进 API）：会话树在消息时间线位置
+    # 渲染冻结的计划/步骤节点（core/ui.py._snapshot_nodes），不再用置底状态单节点
+    session.add_message(
+        "assistant",
+        "计划确认，开始执行。",
+        type="plan",
+        plan_snapshot=json.dumps(session.plan, ensure_ascii=False),
+        steps_snapshot=json.dumps(session.steps, ensure_ascii=False),
+    )
     io.status("执行步骤")
 
 
 def _has_recent_progress(session, window: int = 4) -> bool:
-    """最近工具结果仍有进展：非空、去空白后互不相同（非死循环）、且非全部失败"""
-    messages = getattr(session, "messages", None) or []
-    outputs = [str(m.get("content") or "") for m in messages if m.get("role") == "tool"]
-    recent = outputs[-window:]
-    if not recent or any(not t.strip() for t in recent):
-        return False
-    normalized = {re.sub(r"\s+", "", t) for t in recent}
-    if len(normalized) < len(recent):
-        return False
-    if all(tool_failure_hint(t) for t in recent):
-        return False
-    return True
+    """最近工具结果仍有进展（判据见 core.tools.has_recent_progress）"""
+    return has_recent_progress(getattr(session, "messages", None) or [], window=window)
 
 
 def _tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, model: Optional[str]) -> dict:
@@ -626,7 +568,6 @@ def _exec_llm(node: dict, turn: TurnContext) -> None:
 _EXECUTORS: Dict[str, Callable[[dict, TurnContext], None]] = {
     "system_prompt": _exec_system_prompt,
     "skill": _exec_skill,
-    "analyze": _exec_analyze,
     "plan": _exec_plan,
     "execute": _exec_execute,
     "llm": _exec_llm,
@@ -646,9 +587,6 @@ def run_workflow(workflow: dict, turn: TurnContext) -> str:
         _check_cancel(turn)
         if not node.get("enabled", True):
             log.debug("节点已停用，跳过: %s", node.get("id"))
-            continue
-        if not gate_passes(node.get("gate"), turn):
-            log.info("节点门槛不满足，跳过: %s（gate=%s, complexity=%s）", node.get("id"), node.get("gate"), turn.complexity)
             continue
         runner = _EXECUTORS.get(str(node.get("type") or ""))
         if runner is None:

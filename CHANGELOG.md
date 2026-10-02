@@ -1,5 +1,203 @@
 # Changelog
 
+## 2026-10-03 — 防空转误判修复：write 返回带路径/体量 + 进展去重键含工具名
+
+- **事故**（会话存档实锤复放）：Agent 连续写三个不同文件，`write` 全量覆盖返回常量
+  "写入成功"（无路径无体量），`has_recent_progress` 窗口 4 去重后仅 3 种 → 误判
+  "最近工具调用无进展"，第 15 轮续期被拒强行终止（当时实际在正常推进）。
+- **修复**：① `write` 全量覆盖返回 `写入成功: <路径>（N 字符）`——不同文件结果天然
+  可区分，同时给模型更完整的执行反馈；② 去重键加入 tool_name（`工具名|去空白内容`）：
+  不同工具的相同文案不互判重复，同工具同文案仍捕获真打转。全失败/空结果判定不变；
+  `execute_command` 无输出的"执行完成。"保持保守判无进展（真实模糊场景，不引入参数指纹复杂度）。
+- **测试**：develop/test_progress_heuristic.py 8 项全绿（事故序列复放对照、真打转捕获
+  保留、跨工具同文案、全失败/空结果语义、write 工具级返回断言）。
+
+## 2026-10-02 — 计划/步骤树渲染改造：状态单节点 → 时间线增量节点
+
+- **问题**：计划节点始终沉底且内容原地突变（被误读为"Agent 没推进"）；步骤节点始终
+  置顶且原地突变。
+- **改造**（ui._build_tree）：删除置顶步骤块与置底计划块及 last_plan_turn 锚定机制；
+  改为从消息时间线渲染冻结快照——
+  - write_plan/update_plan 工具消息 → 时间线**计划节点**（kind plan，快照正文）；
+  - generate_steps 工具消息 → 时间线**步骤清单节点**（kind steps，done 折叠沿用
+    collapse_done）；
+  - update_step_status 工具消息 → **步骤更新节点**（新 kind step_update，单行
+    `{图标} 步骤 N → 状态 · 备注`，colors 映射复用 tool 紫，不新增 DEFAULT_COLORS 键）；
+  - 工作流 `_exec_plan` 收尾消息（"计划确认，开始执行。"）附带 plan_snapshot/
+    steps_snapshot extras（最终版 JSON，不进 API、随会话存档持久化）→ 该消息位置渲染
+    计划+步骤节点对（id msg:{i}:plan / msg:{i}:steps）；
+  - 旧会话回落：时间线无计划/步骤节点且状态非空 → 任务根尾部补当前态节点（id
+    fallback:plan / fallback:steps）。
+  节点 id 保持 msg:{index} 系（树回退锚点兼容）；子行 id 加序号命名空间防多快照折叠态
+  撞名；JSON 解析失败（白名单预算外置后的指针文本）回落普通 ⚙ 工具节点。
+- **测试**：develop/test_plan_steps_tree.py 20 项全绿（节点位置/冻结快照/更新节点/
+  快照消息三连/回落/解析失败回落/锚点解析/渲染冒烟）；回归 workflow34、
+  tree_rollback、snapshot_undo、context_turn_integration、session_store、skills、
+  keymap 全绿；test_p1p2_tools 维持基线（12 项失败为台账在途工作，与本改动无关）。
+
+## 2026-10-02 — 树模式 Ctrl+Z 会话回退：选中节点锚定、可再按取消、可选联动文件快照
+
+- **语义（与用户确认）**：仅树操作模式（focus=tree）生效。选中消息节点 → **节点保留**为
+  最后一条消息，其后移除；工具调用块原子处理（assistant(tool_calls)+连续 tool 结果经
+  memory.conv_block_bounds 求闭区间，不切在配对中间，选工具结果=保留整块）。再按
+  Ctrl+Z 恢复被移除尾段（取消回退）；截断后已有新消息/切换会话则暂存失效丢弃。
+- **文件快照联动**：被移除回合存在文件快照时弹 choose 确认框（对话+文件 / 仅对话 /
+  取消；无快照不弹框直接回退）。定位规则：快照 index.json 新增 msg_index（回合用户
+  消息绝对序号，main.begin_turn 传入）；阈值 cut-1——锚点为用户消息（节点保留）时该
+  回合的文件改动同样随移除。联动还原复用 snapshot.restore_turn（从 undo 提取
+  _restore_entries），seq 降序逐回合还原，md5 门禁照旧，完成后统一 ledger_reset。
+  取消（Ctrl+Z 再按）仅恢复对话，文件回滚不可再按恢复。
+- **实现**：keymap 增 Action.ROLLBACK（默认 ctrl+z，可改键，设置页快捷键页可配）；
+  ui._dispatch_key 增分支 + TuiApp._tree_rollback（busy 拒绝——_AgentRunner 经
+  _set_busy 镜像 app.busy；refresh_from_session+按 node.id 重钉光标消除 app.messages
+  副本漂移；msg:/call: 前缀解析含 messages[-200:] 窗口偏移；合成节点/末节点/锚点失效
+  各有状态提示；截断后追加 _rollback_note 系统标记消息，help 类型不进 API，作取消
+  校验锚）。snapshot.py 增 turns_from_msg_index/restore_turn、begin_turn 增 msg_index。
+- **验证**：develop/test_tree_rollback.py 24 项全绿（键位解析、keyinput ControlZ 事件
+  翻译、块边界五例、busy/合成节点/末节点拒绝、回退-取消切换、失效丢弃、切会话、
+  快照联动 choose 三路 + md5 门禁）。回归 keymap/keyinput_pt/snapshot_undo/
+  workflow34/session_store/context_turn_integration/skills 全绿。
+- **已知**：develop/conpty_input_test.py 的 ConPTY 注入 harness 与现行 PT 输入栈不兼容
+  （基线会话即挂起/无输出，早于本功能；属旧栈遗留工具），真机键位到达请日常使用中
+  抽验；test_tree_toggle 为陈旧失败（3 元组解包 vs 现行 flat 四元组约定），与本次无关。
+
+## 2026-10-02 — 回合快照/回滚（/undo）+ delete_file 回收站：文件改动的安全网
+
+- **管线（与用户逐点确认）**：回合开始建轻量清单（路径+mtime+size，不含内容，超
+  inventory_max_files 放弃对账）；write 全量/位置、edit_file、multi_edit、delete_file
+  落盘前 capture_before 留底**原始字节**（字节级还原保编码/CRLF 保真，同回合同文件
+  首次为准）；tool 名随记录入索引——"成功修改工具调用历史"落在快照 index.json（上下文
+  回合末剥离会丢参数，必须在捕获时落盘）。回退由程序确定性执行，不走模型（逆操作重放
+  脆弱、write 覆盖参数无旧内容）。
+- **core/snapshot.py 新模块**：begin_turn/capture_before/end_turn 回合配对（main 挂在
+  user 消息后与 finally，中断/异常同覆盖；空回合零落盘）；快照落盘
+  data/snapshots/{project}/{session}/{序号}/（blob+index.json，tmp+os.replace 原子写，
+  max_turns 裁剪）；undo 前**md5 门禁**——当前磁盘 md5 ≠ 回合末 md5（用户事后改过）
+  的文件跳过不还原；还原后 ledger_reset() 强制模型重读（台账"安全优先"）。
+- **对账**：回合末重扫工作区 diff 清单，execute_command 等绕过写入工具的改动在 /undo
+  中明确列出"无法还原（非工具改动）"而非静默；快照目录/回收站自身产物不计入。
+- **delete_file 工具（新）**：删除不直接销毁——移入项目回收站
+  data/trash/{project_id}/（trash_dir 可配，时间戳前缀防撞名），可 /undo 回滚本次
+  删除、/clear-trash 真正不可逆清空（返回释放统计）；仅文件不支持目录。
+- **policy 硬安全栏**：execute_command 的 rm/rmdir/rd/del/erase/deltree/rimraf/
+  Remove-Item（命令首词或 |;& 分隔符后）**直接 DENY**（完全访问模式也不例外），
+  指引改用 delete_file；正则锚定避免 "python app.py del" 类参数误伤。
+  delete_file 默认 CONFIRM，指纹 delete_file|<路径>（参数无关可读）。
+- **命令**：/undo [list|序号]（list 列序号/时间/任务摘要/可还原数）；/clear-trash；
+  两者加入 busy 守卫名单；退出时回收站非空则提示待处理数量。
+- **配置**（default_config 深合并零迁移）：snapshot = {enabled, dir, trash_dir,
+  max_turns=10, max_file_bytes=20MB, inventory_max_files=50000}。
+- **不做（明示边界）**：execute_command 副作用仅对账提示不还原；MCP 工具写文件不留底
+  （Phase 2 可在 MCP wrapper 加钩子）；rename/move/copy 无专用工具（用户裁决不加，
+  仍走 execute_command 不记录）；不做 redo；/clear、/new 不清旧快照（残留小）。
+- **测试**：develop/test_snapshot_undo.py 22 项全绿（新建删除还原、CRLF+GBK 字节级
+  保真、事后修改跳过、外部改动对账、retention 裁剪、按序号回滚、回收站全链、删除命令
+  硬拒绝与指纹）；回归 test_workflow 34 项、test_skills、test_context_turn_integration、
+  test_session_store 全绿。
+
+## 2026-10-02 — MCP 客户端桥接（Phase 1）：外部 MCP 服务器工具接入本机工具循环
+
+- **决策**：新增 MCP（Model Context Protocol）客户端能力，BAWCode 作为 host 把外部
+  服务器的 tools 桥接进 register→policy→工具循环全链路，免自研接入 MCP 生态
+  （fetch/playwright/数据库等）。方案报告 docs/mcp-integration.md（qwen-code TS 客户端
+  逐模块剖析 + hello_agents 工具体系结论 + 集成点实测）；路线选官方 `mcp` Python SDK
+  （1.x/2.x 兼容垫片）+ 专用 daemon 事件循环线程同步桥接，v1 聚焦工具核心
+  （stdio + Streamable HTTP/SSE）。
+- **core/mcp.py 新模块**：事件循环线程 + run_coroutine_threadsafe 桥接（调用超时协程内
+  asyncio.wait_for 实现真实取消）；每服务器 AsyncExitStack 承载传输/ClientSession 长生命
+  周期；三态状态表 connected/connecting/disconnected + last_error（无 FAILED 态）；发现
+  best-effort 单服务器失败不拖累整体；服务器 stderr 收编 data/log/mcp-<name>.stderr.log。
+- **工具桥接**：注册名 mcp__<服务器>__<工具>（qwen 式规范化：63 字符/字符集/哈希后缀，
+  注册名与原始名分离）；inputSchema 直接入册（get_tool_defs 公共 description 参数自动
+  注入/剥除零改动搭车）；字符串实参按 schema 矫正 number/integer/boolean；结果块统一
+  转文本（text/image 占位/resource_link/structuredContent；isError 加"MCP 工具返回错误:"
+  前缀，失败文本命中 ✅/❌ 启发）。mcp 2.x 字段蛇形改名（is_error/input_schema 等）
+  经 _attr 双探测兼容。
+- **配置**（config.data["mcp"]，默认 enabled=false 零迁移）：servers 每项 stdio 用
+  command/args/env/cwd（env 与 SDK 安全默认环境合并），远程用 url+headers
+  （transport=http|sse 留空按 /sse 后缀推断）；discovery_timeout_stdio/http（30/5s）与
+  call_timeout（600s）分离；auto_reconnect 调用失败自动后台重连一次。
+- **权限**：MCP 工具默认 CONFIRM（未知工具兜底零改动）；「始终允许」指纹不含参数
+  （mcp|<server>|<tool>，宽指纹 mcp|<server>|* 按服务器通配），SAFE_TOOLS 不动。
+- **生命周期**：main 启动序 subagent 注册后 mcp.register_tools（后台连接发现不阻塞 TUI，
+  工具随注册进度逐个对模型可见）；退出 finally mcp.shutdown（逐服务器带超时断开 +
+  取消在途任务后停 loop）。断开同步落 DISCONNECTED 状态防假状态误导重连等待。
+- **UI/命令**：MCP 工具调用/确认复用现有 ⚙ 节点与确认面板零改动；树尾新增 ⧉ MCP
+  状态行（DEFAULT_COLORS 增 mcp 键，_tree_signature 计入失效）；/mcp [tools|reconnect]
+  命令（照 /skill 模式）。
+- **配套**：register.py 增 unregister + get_tool_defs 快照迭代（后台注册并发安全）；
+  tools.py 失败启发增 MCP 错误前缀两模式；requirements/pyproject 增 mcp>=1.2.0。
+- **测试**：develop/test_mcp_e2e.py + mock_mcp_server.py（MCPServer/FastMCP 双版本），
+  31 项全绿：真实 stdio 子进程走连接发现注册/get_tool_defs 出站/直调（矫正+错误前缀）/
+  policy 指纹与放行/finalize_turn 剥离/断开重连恢复//mcp 列表/shutdown 收尾；
+  allowlist 断言用临时 root 落盘并清理，不污染真实项目规则。
+
+## 2026-09-30 — 移除工作流 gate/复杂度路由：引擎回归纯线性节点链
+
+- **决策**：按复杂度把回合路由到不同节点链的机制（analyze 节点 + gate 门槛）没有
+  存在必要——keyword 启发式判定噪声大（22 字任务即被判 low），门槛与技能测试互相
+  干扰（gui-test 的 skills 节点排 analyze 之前被恒跳过），且此前已降级为默认停用
+  仍占编辑器复杂度。经用户裁决整体移除，备份于 _recycle/gate-routing-20260930/
+  （workflow.py / workflow_editor.py / 全部 workflows JSON / llm.py / config.py 快照）。
+- **引擎线性化**（core/workflow.py）：删 GATE_RE、gate_passes、_exec_analyze、
+  TurnContext.complexity、门槛校验与运行时跳过；NODE_TYPES 去 analyze；
+  DEFAULT_WORKFLOW 与 default.json 回归 system_prompt → skills → execute（plan 节点
+  按需在编辑器添加，被包含即无条件执行，confirm/steps 语义不变）。
+- **配套清理**：llm.py 删 judge_complexity（含 external_apis.complexity_judge 钩子
+  路径）；config external_apis 删该键；workflow 编辑器删"复杂度分析"节点类型与
+  "执行门槛"字段（新建节点不再写 gate，节点副标题不再显示 gate）。
+- **兼容**：validate_workflow 对历史文件中的 gate 键宽松忽略；data/workflows 五个
+  JSON 已清洗（去 gate 键与 analyze 节点）。gui-test 清洗后 skills 节点不再被门槛
+  跳过；analyze-plan-code / plan-execute-test / hook-test 的 judge 节点移除后其余
+  节点照常。
+- **测试**：develop/test_workflow.py 重写为线性链语义 34 项全绿（default 直达执行、
+  plan 无条件确认流、取消/中断、^{变量}^捕获、历史 gate 宽松忽略、技能注入过滤）；
+  test_skills.py 17 项、test_session_store、test_context_turn_integration 回归全绿；
+  test_e2e_mock_llm A1/B2 断言适配（复杂度日志不再存在），其余 3 项失败为台账改版
+  在途工作所致（read 剥离记录格式变化），与本机制移除无关。
+
+## 2026-09-30 — 子代理系统：task 派发 / query_subagent 查询 / 中断恢复 / 会话树节点
+
+- **task 工具**（新 core/subagent.py）：主代理派发独立上下文的子代理执行
+  调研/审查/独立执行类子任务，中间检索输出不进主会话，只回传"状态行 + 最
+  终结论（result_char_cap 截断）+ 产物列表（修改文件/执行命令/加载技能，
+  从工具调用史提取）"。参数 role/task/permission/context + resume_id/
+  context_id；task 必须自足完整（子代理看不到主对话历史，context 为主代理
+  显式手写背景）。一次派发写盘一条记录：data/subagents/{project}/{session}/
+  {id}.json（顺序编号 "1"/"2"/…，每轮落盘，崩溃残留按可恢复处理）。
+- **权限继承与钳制**：子代理默认权限跟随主代理（手动模式主代理→auto，自动
+  放行普通请求）；permission 传值按 full>auto>manual 宽窄序钳制，只允许收
+  紧不允许放宽（LLM 不可自行提权）。子代理内每次工具调用照走 policy.evaluate
+  + 确认桥（手动确认面板复用主 UI 请求桥），allowlist 指纹全局共享，不构成
+  权限旁路。
+- **query_subagent 工具**：按编号查询子代理最后 n 轮工作上下文（输出+工具
+  调用+结果，逐条限长），附完整记录文件指针；/agents 命令列出本会话全部子
+  代理与角色清单（reload 重扫）。
+- **中断恢复**：任意退出路径（中断/轮次上限/出错/完成）统一落盘；task(
+  resume_id) 沿用原编号与完整上下文续跑，task(context_id) 以旧上下文派生新
+  编号子代理（系统提示词与模型沿用源）。
+- **角色系统**：角色=系统提示词 persona + 可选独立模型（data/agents/<role>.json：
+  description/prompt_file|prompt/model），内置 universal 极简通用提示词兜底；
+  角色不携带工具白名单（权限统一由 permission 决定）。子代理工具集强制剔除
+  task/query_subagent（无递归）与会话状态工具 write_plan/update_plan/
+  generate_steps/update_step_status/memory_*/rag_add（防污染主会话计划记忆）。
+- **防空转**：与主循环同判据（has_recent_progress 抽至 core/tools.py 共用，
+  workflow._tool_loop 改为调用）：最近 4 条工具结果非空/互不相同/非全失败方
+  可续期，上限沿用 workflow.max_rounds_extensions。
+- **UI**：运行中树尾新增子代理直播节点（独立 subagent_stream 槽，复刻
+  streaming_msg 三件套：状态+最近输出尾部窗口+最近工具行，逐 delta 实时刷
+  新）；结束后会话树出现"子代理 #N"节点，展开即完整工作上下文（trace 字段
+  随会话自动落盘/恢复，子节点 id 用编号派生规避 /resume 索引漂移）；新增
+  subagent 暖橙配色（DEFAULT_COLORS，主题自动继承）。task 列入工具白名单
+  （结论跨回合保留）。
+- **修复**（实机前踩线）：ui._flatten_tree 已升级为 guide 引导线四元组，但
+  toggle_fold/_tree_rows 仍按旧三元组解包（渲染必崩）——消费端补齐四元组
+  解包；子代理树消息 extras 的 role 键与 Memory.add_message 位置参数撞名，
+  改名 subagent_role。
+- 冒烟：离线桩全链路（钳制/落盘/树消息/query/恢复/派生/互斥校验）+ 真实
+  LLM 端到端（派发→list_directory 工具循环→摘要回传→过程查询→恢复续跑）
+  通过；脚本 develop/subagent_smoke.py（本地不入库）。
+
 ## 2026-09-30 — 回合体验修复：计划入时间线 / 工具节点 ✅❌ 单行 / 确认面板可滚动 / 轮次续期 / edit_file 反馈增强
 
 - **计划节点入时间线**（ui.py `_build_tree`）："计划 [draft/confirmed]" 节点不再固定

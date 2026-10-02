@@ -1,6 +1,6 @@
 ---
-name: example
-description: 技能格式示例：演示 SKILL.md 结构，可作为新技能的起点模板
+name: play-music
+description: （占位）play-music 技能尚未编写，当前内容为示例模板，请替换为实际的音乐播放操作指南
 ---
 
 # Example Skill

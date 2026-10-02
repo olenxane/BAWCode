@@ -120,6 +120,7 @@ def default_config() -> dict:
                 "read",
                 "edit_file",
                 "write",
+                "task",
             ],
             "whitelist_budget_tokens": 32768,
             "inline_limit_tokens": 4096,
@@ -150,10 +151,58 @@ def default_config() -> dict:
             "max_rounds": 0,
             "max_rounds_extensions": 5,
         },
+        # 子代理系统（core/subagent.py）：task 工具派发独立上下文子代理，
+        # query_subagent 查询其工作过程。enabled=false 不注册工具（模型侧不可见）。
+        # 全程轨迹落盘 dir/{project_id}/{session_id}/{id}.json；角色=系统提示词
+        # persona（agents_dir 下 <role>.json，内置 universal），模型经角色 model
+        # 字段指定；权限继承主代理（手动模式主代理→auto）且只可收紧不可放宽。
+        # max_rounds 单次派发轮次上限（配合 workflow.max_rounds_extensions 的
+        # 进展续期）；result_char_cap 结果摘要字符上限；query_default_rounds 查询默认轮数
+        "subagent": {
+            "enabled": True,
+            "dir": "data/subagents",
+            "agents_dir": "data/agents",
+            "max_rounds": 20,
+            "result_char_cap": 3000,
+            "query_default_rounds": 3,
+        },
+        # 工具执行层（core/tools.py）：max_timeout 为模型传入 timeout 参数的
+        # 钳制上限（execute_command/run_program），防止模型传超大值绕过卡死兜底
+        "tools": {
+            "max_timeout": 600,
+        },
+        # MCP 客户端（core/mcp.py）：把外部 MCP 服务器的工具桥接进本机工具循环。
+        # enabled=false 不连接不注册（模型侧完全不可见）。servers 每项：stdio 用
+        # command/args/env/cwd；远程用 url + headers（transport=http|sse，留空自动
+        # 推断：/sse 结尾走 sse，其余 streamable HTTP）。timeout 单条调用超时秒数
+        # （0 用全局 call_timeout）；include/exclude_tools 按原始工具名过滤。
+        # 注册名 mcp__<服务器>__<工具>（超长/非法字符自动规范化加哈希后缀）；
+        # 权限默认逐次确认，「始终允许」指纹不含参数（mcp|<server>|<tool>）。
+        "mcp": {
+            "enabled": False,
+            "servers": {},
+            "discovery_timeout_stdio": 30,
+            "discovery_timeout_http": 5,
+            "call_timeout": 600,
+            "auto_reconnect": True,
+        },
+        # 回合快照与回收站（core/snapshot.py）：write/edit_file/multi_edit/delete_file
+        # 改动前留底原始字节，回合末落盘 data/snapshots/{project}/{session}/{序号}/，
+        # /undo 校验 md5 后字节级还原（用户事后改过的文件跳过）；回合开始轻量清单
+        # （不含内容）回合末对账，execute_command 等绕过写入工具的改动仅列出无法还原。
+        # trash_dir 项目回收站：delete_file 移入、/clear-trash 真正清空。
+        # inventory_max_files 清单文件数上限（0=禁用对账；超限本回合放弃对账）
+        "snapshot": {
+            "enabled": True,
+            "dir": "data/snapshots",
+            "trash_dir": "data/trash",
+            "max_turns": 10,
+            "max_file_bytes": 20971520,
+            "inventory_max_files": 50000,
+        },
         # 核心功能外部 API（UI/改配置不挂接口）
         "external_apis": {
             "prompt_refine": None,
-            "complexity_judge": None,
             "plan_generate": None,
             "plan_confirm": None,
             "step_generate": None,

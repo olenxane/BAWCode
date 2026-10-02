@@ -10,7 +10,14 @@
     "dim": "#667788",
     "ink": "#DDDDDD",
     "line": "#1C3A4A",
-    "highlight_bg": "#004F6A"
+    "highlight_bg": "#004F6A",
+    "user_msg": "#3FC1C9",
+    "agent": "#7FCCA0",
+    "thinking": "#5F9EA0",
+    "tool_title": "#48D1CC",
+    "tool_content": "#FFFFFF",
+    "subagent": "#F0A868",
+    "tree_guide": "#2E5A6E"
   },
   "tips_rotate_seconds": 6
 }

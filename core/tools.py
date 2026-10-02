@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -13,12 +14,35 @@ from typing import List, Optional
 from core import hooks
 from core import memory as memory_mod
 from core import register
+from core import snapshot
+from core import toolstore
 from core.log import get_logger
 
 log = get_logger("tools")
 
-# 子进程默认超时（秒）
+# 子进程默认超时（秒）；模型传入值的钳制范围，上限防模型传超大值关掉兜底
 DEFAULT_TIMEOUT = 60
+MAX_TIMEOUT = 600
+
+
+def _max_tool_timeout() -> int:
+    """超时上限（tools.max_timeout，设置页可调）；会话不可用或非法值回退内置默认"""
+    try:
+        session = memory_mod.get_session()
+        data = getattr(getattr(session, "config", None), "data", None) or {}
+        value = int((data.get("tools") or {}).get("max_timeout") or 0)
+        return value if value >= 1 else MAX_TIMEOUT
+    except Exception:
+        return MAX_TIMEOUT
+
+
+def _clamp_timeout(value) -> int:
+    """超时参数钳制到 [1, 上限]，非法值回退默认"""
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT
+    return max(1, min(seconds, _max_tool_timeout()))
 
 
 def _console_output_encoding() -> str:
@@ -41,7 +65,7 @@ def _session():
 
 @register.register(
     name="execute_command",
-    description="Execute a command in the terminal",
+    description="Execute a command in the terminal (foreground or background)",
     usage="execute_command <command>",
     schema={
         "type": "object",
@@ -56,14 +80,27 @@ def _session():
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in seconds, optional",
+                "description": "Timeout in seconds (foreground only), clamped to 1-600",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["foreground", "background"],
+                "description": "foreground=等待完成并直接返回输出；background=立即返回，输出落盘文件，完成后系统自动通知（timeout 不生效）",
             },
         },
         "required": ["command"],
     },
 )
-def execute_command(command: str, cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT) -> str:
-    """终端命令调用，返回 stdout/stderr"""
+def execute_command(
+    command: str,
+    cwd: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    mode: str = "foreground",
+) -> str:
+    """终端命令调用：前台阻塞收输出，后台落盘+完成通知"""
+    timeout = _clamp_timeout(timeout)
+    if str(mode or "").strip().lower() == "background":
+        return _execute_command_background(command, cwd)
     log.info("执行命令: %s（cwd=%s timeout=%ds）", command, cwd or "-", timeout)
     try:
         result = subprocess.run(
@@ -88,6 +125,90 @@ def execute_command(command: str, cwd: Optional[str] = None, timeout: int = DEFA
     except OSError as e:
         log.error("命令执行失败: %s（%s）", e, command)
         return f"执行失败: {e}"
+
+
+# ----- 后台执行（execute_command mode=background）：Popen 不等待，输出落盘，
+# 监视线程 wait 后经 notifier（main 注册的 runner.notify）发起新回合通知 -----
+
+_bg_notifier = None  # Callable[[str], None]：main.py 启动 _AgentRunner 后注册 runner.notify
+
+
+def set_background_notifier(fn) -> None:
+    """注册后台任务完成通知通道（runner.notify：idle 开新回合，busy 排队）"""
+    global _bg_notifier
+    _bg_notifier = fn
+
+
+def _bg_output_file() -> Path:
+    """后台输出文件：沿用外置存储目录 data/toolcalls/{project}/{session}/，无会话退 data/bgtasks"""
+    session = memory_mod.get_session()
+    if session is not None:
+        d = toolstore.store_dir(session.config, session.project_id, session.session_id)
+    else:
+        d = Path("data") / "bgtasks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"bg_{time.strftime('%H%M%S')}_{os.getpid()}_{threading.get_ident() % 10000}.log"
+
+
+def _execute_command_background(command: str, cwd: Optional[str]) -> str:
+    out_file = _bg_output_file()
+    try:
+        fh = open(out_file, "w", encoding=_console_output_encoding(), errors="replace")
+    except OSError as e:
+        return f"后台启动失败（输出文件不可写）: {e}"
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=cwd,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as e:
+        fh.close()
+        log.error("后台启动失败: %s（%s）", e, command)
+        return f"后台启动失败: {e}"
+    task_id = out_file.stem
+    threading.Thread(
+        target=_bg_watch,
+        args=(proc, fh, command, str(out_file), task_id, started),
+        daemon=True,
+        name=f"bawcode-bg-{task_id}",
+    ).start()
+    log.info("后台任务启动 id=%s pid=%s 输出=%s", task_id, proc.pid, out_file)
+    return (
+        f"已在后台启动（id={task_id} pid={proc.pid}，cwd={cwd or '当前目录'}）\n"
+        f"输出文件: {out_file}\n"
+        f"完成后系统会自动通知（届时用 read 工具读取输出文件）；期间也可随时用 read 查看该文件获取当前输出。"
+    )
+
+
+def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: str, started: float) -> None:
+    """后台监视线程：进程退出后关文件句柄并通知（无通道时仅落日志）"""
+    try:
+        code = proc.wait()
+    except Exception as exc:
+        log.error("后台任务等待异常 id=%s: %r", task_id, exc)
+        code = -1
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+    elapsed = time.monotonic() - started
+    note = (
+        f"[后台任务完成] id={task_id}\n命令: {command}\n退出码: {code}（耗时 {elapsed:.1f}s）\n"
+        f"输出文件: {out_file}\n请用 read 工具读取输出文件查看执行结果。"
+    )
+    fn = _bg_notifier
+    if fn is None:
+        log.info("后台任务完成（无通知通道，未投递）: id=%s 退出码=%s", task_id, code)
+        return
+    try:
+        fn(note)
+    except Exception as exc:
+        log.error("后台任务通知投递失败 id=%s: %r", task_id, exc)
 
 
 @register.register(
@@ -132,6 +253,7 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
         log.warn("读取拒绝，二进制文件: %s", path)
         return "二进制文件，read 工具不适用"
     text, _enc, _ok = _decode_best_effort(raw)
+    toolstore.ledger_register(path, text, source="read")
     lines = text.splitlines()
     total = len(lines)
     if total == 0:
@@ -148,8 +270,13 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
 
 @register.register(
     name="write",
-    description="Write content to a file",
-    usage="write <file_path> <content>",
+    description=(
+        "Write content to a file. With optional start_line: positional write that "
+        "overwrites line-by-line starting at that line and keeps all other lines "
+        "(appends when start_line is past EOF); positional writes require a prior "
+        "read of the file, full overwrite does not."
+    ),
+    usage="write <file_path> <content> [start_line]",
     schema={
         "type": "object",
         "properties": {
@@ -161,17 +288,63 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
                 "type": "string",
                 "description": "Content to write to the file",
             },
+            "start_line": {
+                "type": "integer",
+                "description": (
+                    "1-based line number; omit or 0 = overwrite the whole file. "
+                    "When set, content overwrites lines from here (same line count as "
+                    "content), all other lines are kept, and writing past EOF appends"
+                ),
+            },
         },
         "required": ["file_path", "content"],
     },
 )
-def write(file_path: str, content: str) -> str:
-    """写入文件（覆盖）"""
+def write(file_path: str, content: str, start_line: int = 0) -> str:
+    """写入文件；缺省整文件覆盖；start_line≥1 时为位置写入（同 edit 门槛，其余行保留，越界追加）"""
     path = Path(file_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    log.info("写入文件: %s（%d字符，覆盖）", path, len(content))
-    return "写入成功"
+    start_line = int(start_line or 0)
+    if start_line < 0:
+        return "start_line 须 ≥0（0/缺省=整文件覆盖，≥1=自该行起位置写入）"
+    if start_line == 0:
+        snapshot.capture_before(path, tool="write")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        toolstore.ledger_register(path, content, source="write")
+        log.info("写入文件: %s（%d字符，覆盖）", path, len(content))
+        # 返回带路径与体量：不同文件的写入结果可区分（防空转重复判定 + 模型反馈）
+        return f"写入成功: {path}（{len(content)} 字符）"
+    # ---- 位置写入（行号口径与 read 的 splitlines 编号一致）----
+    if not content:
+        return "位置写入的 content 不能为空（清空文件请省略 start_line 整文件覆盖）"
+    if not path.exists():
+        return "找不到文件（位置写入要求文件已存在；新建文件请省略 start_line）"
+    refusal = toolstore.ledger_check(path)
+    if refusal:
+        log.warn("位置写入门禁拦截: %s", path)
+        return refusal
+    try:
+        old_content, is_crlf, enc, err = _load_editable(path)
+    except OSError as e:
+        return f"读取失败，发生错误: {e}"
+    if err:
+        log.warn("写入中止: %s（%s）", path, err)
+        return err
+    lines = old_content.splitlines()
+    new_lines = content.splitlines()
+    idx = start_line - 1
+    if idx > len(lines):
+        return f"start_line 超出范围：文件共 {len(lines)} 行；从末尾追加请用 start_line={len(lines) + 1}"
+    merged = lines[:idx] + new_lines + lines[idx + len(new_lines):]
+    new_content = "\n".join(merged)
+    if old_content.endswith("\n") or content.endswith("\n"):
+        new_content += "\n"
+    snapshot.capture_before(path, tool="write")
+    _save_editable(path, new_content, is_crlf, enc)
+    toolstore.ledger_register(path, new_content, source="write")
+    total = len(new_content.splitlines())
+    log.info("位置写入: %s 自第%d行起写入%d行（现%d行）", path, start_line, len(new_lines), total)
+    return f"位置写入成功：自第 {start_line} 行起写入 {len(new_lines)} 行（文件现 {total} 行）"
 
 
 @register.register(
@@ -216,6 +389,10 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
     if not path.exists():
         log.warn("编辑失败，文件不存在: %s", path)
         return "找不到文件"
+    refusal = toolstore.ledger_check(path)
+    if refusal:
+        log.warn("编辑门禁拦截: %s", path)
+        return refusal
     if not old_str:
         return "old_str 不能为空"
     try:
@@ -257,7 +434,9 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
         )
     new_content = content.replace(old_str, new_str) if replace_all else content.replace(old_str, new_str, 1)
     note = _changed_note(content, new_content)
+    snapshot.capture_before(path, tool="edit_file")
     written = _save_editable(path, new_content, is_crlf, enc)
+    toolstore.ledger_register(path, new_content, source="edit")
     log.debug("编辑完成: 替换 %d 处，写入 %d 字节", count, written)
     suffix = f"（原编码 {enc} 已保留）" if enc != "utf-8" else ""
     return f"编辑成功：替换 {count} 处{suffix}\n{note}"
@@ -326,6 +505,10 @@ def multi_edit(file_path: str, edits: List[dict]) -> str:
     if not path.exists():
         log.warn("编辑失败，文件不存在: %s", path)
         return "找不到文件"
+    refusal = toolstore.ledger_check(path)
+    if refusal:
+        log.warn("批量编辑门禁拦截: %s", path)
+        return refusal
     if not edits or not isinstance(edits, list):
         return "edits 不能为空"
     items = []
@@ -369,10 +552,45 @@ def multi_edit(file_path: str, edits: List[dict]) -> str:
         total += count
         content = content.replace(old, new) if replace_all else content.replace(old, new, 1)
     note = _changed_note(original, content)
+    snapshot.capture_before(path, tool="multi_edit")
     written = _save_editable(path, content, is_crlf, enc)
+    toolstore.ledger_register(path, content, source="multi_edit")
     log.debug("批量编辑完成: %d 项替换 %d 处，写入 %d 字节", len(items), total, written)
     suffix = f"（原编码 {enc} 已保留）" if enc != "utf-8" else ""
     return f"multi_edit 成功：{len(items)} 项编辑，共替换 {total} 处{suffix}\n{note}"
+
+
+@register.register(
+    name="delete_file",
+    description=(
+        "删除单个文件（安全删除）：文件不会直接销毁，而是移入项目回收站，"
+        "用户可 /undo 回滚本次删除、/clear-trash 真正清空。仅支持文件，不支持目录。"
+        "execute_command 的 rm/del 等删除命令会被安全策略直接拒绝，删除文件一律用本工具。"
+    ),
+    usage="delete_file <file_path>",
+    schema={
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string", "description": "要删除的文件路径（绝对路径或相对当前目录）"},
+        },
+        "required": ["file_path"],
+    },
+)
+def delete_file(file_path: str) -> str:
+    """删除文件：移入项目回收站（可 /undo 回滚、/clear-trash 真正清空）"""
+    path = Path(file_path)
+    if not path.exists():
+        return f"找不到文件: {file_path}"
+    if path.is_dir():
+        return "不支持删除目录（递归删除风险高，请逐个文件处理）"
+    snapshot.capture_before(path, tool="delete_file")
+    try:
+        dest = snapshot.move_to_trash(path)
+    except (OSError, shutil.Error) as e:
+        log.error("移入回收站失败 %s: %s", path, e)
+        return f"删除失败（移入回收站出错）: {e}"
+    log.info("文件已移入回收站: %s -> %s", path, dest)
+    return f"已移入回收站: {dest}\n（/undo 可回滚本次删除 · /clear-trash 真正清空回收站）"
 
 
 # edit_file 失败反馈/成功回显参数
@@ -395,6 +613,9 @@ _TOOL_FAILURE_PATTERNS = (
     "old_str 与 new_str 相同",
     "命令被安全策略拒绝",
     "已拒绝",
+    # MCP 工具（core/mcp.py）：isError 结果与调用失败统一前缀
+    "MCP 工具返回错误",
+    "MCP 调用失败",
 )
 
 
@@ -410,6 +631,27 @@ def tool_failure_hint(content: str) -> bool:
                 continue  # 退出码 0 视为成功
         return True
     return False
+
+
+def has_recent_progress(messages: List[dict], window: int = 4) -> bool:
+    """最近工具结果仍有进展：非空、去空白后互不相同（非死循环）、且非全部失败。
+    主循环（workflow._tool_loop 续期判定）与子代理循环共用的防空转判据。
+    去重键含 tool_name：不同工具的相同文案（如 read 与 write）不互判重复；
+    同工具同文案仍算重复（真打转照抓）。"""
+    outputs = [
+        (str(m.get("tool_name") or ""), str(m.get("content") or ""))
+        for m in messages or []
+        if m.get("role") == "tool"
+    ]
+    recent = outputs[-window:]
+    if not recent or any(not t.strip() for _, t in recent):
+        return False
+    normalized = {f"{n}|{re.sub(r'\s+', '', t)}" for n, t in recent}
+    if len(normalized) < len(recent):
+        return False
+    if all(tool_failure_hint(t) for _, t in recent):
+        return False
+    return True
 
 
 def _decode_best_effort(raw: bytes) -> tuple:
@@ -872,7 +1114,7 @@ def _load_lines(full: str) -> Optional[List[str]]:
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in seconds",
+                "description": "Timeout in seconds, clamped to 1-600",
             },
         },
         "required": ["program"],
@@ -885,6 +1127,7 @@ def run_program(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
     """程序调用：独立进程启动并收集输出"""
+    timeout = _clamp_timeout(timeout)
     cmd = [program] + list(args or [])
     log.info("运行程序: %s（cwd=%s timeout=%ds）", " ".join(cmd), cwd or "-", timeout)
     try:

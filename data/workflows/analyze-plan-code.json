@@ -5,7 +5,9 @@
     {
       "id": "system_prompt",
       "type": "system_prompt",
-      "files": ["system_prompt.md"]
+      "files": [
+        "system_prompt.md"
+      ]
     },
     {
       "id": "skills",
@@ -16,23 +18,15 @@
     {
       "id": "analyze_ctx",
       "type": "llm",
-      "prompt_files": ["analyze.md"],
+      "prompt_files": [
+        "analyze.md"
+      ],
       "capture": "analysis",
       "model_role": "plan"
     },
     {
-      "id": "judge",
-      "type": "analyze",
-      "method": "keywords",
-      "keywords_high": ["重构", "架构", "系统", "完整", "多文件", "设计", "实现", "agent", "框架", "迁移"],
-      "keywords_low": [],
-      "min_len_high": 400,
-      "default_level": "low"
-    },
-    {
       "id": "plan",
       "type": "plan",
-      "gate": "complexity == high",
       "confirm": true,
       "steps": true
     },

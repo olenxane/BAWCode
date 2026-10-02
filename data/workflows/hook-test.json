@@ -5,21 +5,13 @@
     {
       "id": "system_prompt",
       "type": "system_prompt",
-      "files": ["system_prompt.md"]
-    },
-    {
-      "id": "judge",
-      "type": "analyze",
-      "method": "keywords",
-      "keywords_high": ["重构", "架构", "系统", "完整", "多文件", "设计", "实现", "agent", "框架", "迁移"],
-      "keywords_low": [],
-      "min_len_high": 400,
-      "default_level": "low"
+      "files": [
+        "system_prompt.md"
+      ]
     },
     {
       "id": "plan",
       "type": "plan",
-      "gate": "complexity == high",
       "confirm": false,
       "steps": false
     },

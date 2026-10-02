@@ -37,7 +37,6 @@ MIME_NODE = "application/x-bawcode-node"
 TYPE_LABELS = {
     "system_prompt": ("系统提示词", "#3A6EA5"),
     "skill": ("技能清单", "#5E8C31"),
-    "analyze": ("复杂度分析", "#B96A1B"),
     "plan": ("任务规划", "#7D4AA0"),
     "execute": ("编码执行", "#2E7D52"),
     "llm": ("通用LLM", "#4682B4"),
@@ -45,17 +44,9 @@ TYPE_LABELS = {
 
 # 属性表单 schema：type -> [(key, 标签, 控件类型, 附加参数)]
 BOOL, INT, STR, LIST, CHOICE = "bool", "int", "str", "list", "choice"
-GATE_CHOICES = ["always", "complexity == high", "complexity == low"]
 FIELD_SCHEMAS = {
     "system_prompt": [("files", "系统提示词文件（逗号分隔）", LIST, None)],
     "skill": [("list", "技能白名单（逗号分隔，空=全部）", LIST, None)],
-    "analyze": [
-        ("method", "判定方式", CHOICE, ["keywords", "llm"]),
-        ("keywords_high", "高复杂度关键词（逗号分隔）", LIST, None),
-        ("keywords_low", "低复杂度关键词（逗号分隔）", LIST, None),
-        ("min_len_high", "输入长度≥N 视为高复杂度（0=不限）", INT, (0, 100000)),
-        ("default_level", "未命中关键词时的默认复杂度", CHOICE, ["low", "high"]),
-    ],
     "plan": [("confirm", "计划生成后需用户确认", BOOL, None), ("steps", "计划确认后生成步骤", BOOL, None)],
     "execute": [
         ("max_rounds", "工具循环轮数", INT, (1, 200)),
@@ -70,13 +61,12 @@ FIELD_SCHEMAS = {
         ("max_rounds", "工具循环轮数（0=单次无工具）", INT, (0, 200)),
     ],
 }
-COMMON_FIELDS = [("enabled", "启用节点", BOOL, None), ("gate", "执行门槛", CHOICE, GATE_CHOICES)]
+COMMON_FIELDS = [("enabled", "启用节点", BOOL, None)]
 
 # 新建节点时的字段默认值（对齐 data/workflows 示例）
 NODE_DEFAULTS = {
     "system_prompt": {"files": ["system_prompt.md"]},
     "skill": {"list": []},
-    "analyze": {"method": "keywords", "keywords_high": [], "keywords_low": [], "min_len_high": 400, "default_level": "low"},
     "plan": {"confirm": True, "steps": True},
     "execute": {"max_rounds": 12, "model_role": "code", "prompt_files": [], "capture": ""},
     "llm": {"prompt_files": [], "capture": "", "model_role": "plan", "max_rounds": 0},
@@ -121,9 +111,6 @@ class NodeItem(QtWidgets.QGraphicsObject):
         painter.setFont(QtGui.QFont("Microsoft YaHei", 8))
         painter.setPen(QtGui.QPen(QtGui.QColor("#B0B8C0")))
         sub = f"{self.node.get('id', '')}"
-        gate = str(self.node.get("gate") or "always")
-        if gate not in ("always", ""):
-            sub += f" · gate:{gate.split('==')[-1].strip()}"
         if self.node.get("enabled") is False:
             sub += " · 已停用"
         painter.drawText(rect.adjusted(8, 30, -8, -6), QtCore.Qt.AlignmentFlag.AlignLeft, sub)
@@ -406,7 +393,7 @@ class EditorWindow(QtWidgets.QMainWindow):
     def add_node(self, ntype: str, pos: QtCore.QPointF | None = None) -> NodeItem:
         if ntype not in TYPE_LABELS:
             return None
-        node = {"id": self._unique_id(ntype), "type": ntype, "enabled": True, "gate": "always"}
+        node = {"id": self._unique_id(ntype), "type": ntype, "enabled": True}
         node.update(json.loads(json.dumps(NODE_DEFAULTS.get(ntype, {}))))  # 深拷贝默认字段
         item = NodeItem(node, self)
         if pos is None:

@@ -7,4 +7,5 @@ dependencies = [
     "openai>=1.40.0",
     "rich>=13.0.0",
     "tiktoken>=0.7.0",
+    "mcp>=1.2.0",
 ]

@@ -54,6 +54,11 @@ def has_tool(name: str) -> bool:
     return name in _registry
 
 
+def unregister(name: str) -> bool:
+    """注销工具（MCP 重连时撤销已下线的工具）；返回是否确有注销"""
+    return _registry.pop(name, None) is not None
+
+
 def call(name: str, **kwargs: Any) -> Any:
     """调用已注册工具"""
     if name not in _registry:
@@ -88,9 +93,10 @@ def _with_description_param(schema: Optional[dict]) -> dict:
 
 
 def get_tool_defs() -> List[dict]:
-    """导出 OpenAI function calling 格式的工具定义（自动注入公共 description 参数）"""
+    """导出 OpenAI function calling 格式的工具定义（自动注入公共 description 参数）。
+    迭代用快照：MCP 工具经后台线程注册，避免注册期间字典变更导致 RuntimeError"""
     defs = []
-    for tool in _registry.values():
+    for tool in list(_registry.values()):
         defs.append(
             {
                 "type": "function",

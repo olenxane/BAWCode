@@ -138,3 +138,137 @@ def clear_session(config, project_id: str, session_id: str) -> int:
     if removed:
         log.info("已清理会话外置记录: %s (%d个文件)", directory, removed)
     return removed
+
+
+# ----- 文件状态台账（edit/位置写入门禁）-----
+# read/write/edit 成功后登记磁盘基线（md5+mtime+size+行数）与内存快照（LRU 上限）；
+# edit/位置 write 前校验三态：无记录拒绝（要求先 read）、新鲜放行（哪怕 read 内容
+# 已被剥离/压缩——锚点是台账不是对话历史）、内容漂移拒绝并附变更区间行号与窄读建议。
+# 台账是会话级 RAM 状态，随会话生命周期重置（memory.__init__/switch_to/start_new_session/clear）；
+# 快照仅存内存（工具函数无 session 上下文，落盘版待台账持久化时一并考虑），LRU 淘汰后
+# 漂移检测退化为"已变化但无法给出区间"。
+import difflib
+import hashlib
+import re as _re
+
+_LEDGER_MAX_ENTRIES = 32
+_LEDGER_SNAPSHOT_MAX_CHARS = 2_000_000
+_LEDGER_DIFF_MAX_LINES = 20000
+_ledger: dict = {}
+
+
+def _ledger_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _file_md5(path: Path) -> str:
+    return hashlib.md5(path.read_bytes()).hexdigest()
+
+
+def ledger_reset() -> None:
+    """清空台账（会话初始化/切换/清空时调用，防跨会话串状态）"""
+    _ledger.clear()
+
+
+def ledger_register(path: Path, text: str = "", source: str = "") -> None:
+    """登记/更新文件基线：对磁盘现状取 md5 指纹，保存行数与文本快照（供漂移时算 diff）"""
+    key = _ledger_key(path)
+    try:
+        st = path.stat()
+    except OSError as e:
+        log.warn("台账登记失败（文件不可 stat）: %s (%s)", path, e)
+        return
+    _ledger.pop(key, None)  # 重插维持 LRU 新鲜度
+    _ledger[key] = {
+        "md5": _file_md5(path),
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
+        "total_lines": len((text or "").splitlines()),
+        "source": source or "-",
+        "snapshot": (text or "")[:_LEDGER_SNAPSHOT_MAX_CHARS] if text else "",
+    }
+    while len(_ledger) > _LEDGER_MAX_ENTRIES:
+        _ledger.pop(next(iter(_ledger)))
+    log.debug("台账登记: %s（来源=%s，%d行）", path, source or "-", _ledger[key]["total_lines"])
+
+
+def ledger_fresh_hint(path: Path) -> str:
+    """剥离 read 记录时的新鲜度提示（仅比 mtime/size，不做全文哈希）"""
+    entry = _ledger.get(_ledger_key(path))
+    if entry is None:
+        return "文件不在台账中，edit_file 前请先 read"
+    try:
+        st = path.stat()
+    except OSError:
+        return "文件已不存在，请先确认路径"
+    if st.st_mtime_ns == entry["mtime_ns"] and st.st_size == entry["size"]:
+        return "文件自上次读取未变化（仍新鲜），可直接 edit_file"
+    return "文件 mtime/size 与上次读取不符（可能已变化），edit_file 前请重新 read"
+
+
+def ledger_check(path: Path) -> Optional[str]:
+    """edit/位置写入门禁：返回 None=放行；否则为拒绝消息（含原因、变更区间与窄读建议）"""
+    entry = _ledger.get(_ledger_key(path))
+    if entry is None:
+        return (
+            f"编辑被拒绝：{path} 本次会话尚未 read 过。"
+            "请先用 read 工具读取该文件（可用 offset/limit 分段），再执行编辑。"
+        )
+    try:
+        st = path.stat()
+    except OSError as e:
+        return f"编辑被拒绝：无法获取文件状态（{e}），请重新 read 确认。"
+    if st.st_mtime_ns == entry["mtime_ns"] and st.st_size == entry["size"]:
+        return None
+    current_md5 = _file_md5(path)
+    if current_md5 == entry["md5"]:
+        # 触碰未变内容（保存但无改动）：刷新缓存口径，避免下次重复全文哈希
+        entry["mtime_ns"], entry["size"] = st.st_mtime_ns, st.st_size
+        return None
+    regions, changed = ledger_diff_regions(path)
+    if regions:
+        first = _re.match(r"L(\d+)", regions[0])
+        start_line = int(first.group(1)) if first else 1
+        suggest = f"建议 read offset={max(1, start_line - 3)} limit=40 核对后重试"
+        return (
+            f"编辑被拒绝：文件自上次读取后已变化"
+            f"（{'、'.join(regions)}，共变更约{changed}行）。{suggest}"
+        )
+    return (
+        f"编辑被拒绝：文件自上次读取后已变化"
+        f"（md5 {entry['md5'][:8]}→{current_md5[:8]}，内容快照不可用，无法给出变更区间）。"
+        "请重新 read 后重试。"
+    )
+
+
+def ledger_diff_regions(path: Path, max_regions: int = 5) -> tuple:
+    """当前磁盘内容 vs 上次快照的变更区间（新文件行号口径）与变更行数；快照不可用返回空"""
+    entry = _ledger.get(_ledger_key(path))
+    old_text = (entry or {}).get("snapshot") or ""
+    if not old_text:
+        return [], 0
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return [], 0
+    from core.tools import _decode_best_effort  # 惰性导入避免模块循环
+
+    new_text, _enc, _ok = _decode_best_effort(raw)
+    old_lines, new_lines = old_text.splitlines(), new_text.splitlines()
+    if max(len(old_lines), len(new_lines)) > _LEDGER_DIFF_MAX_LINES:
+        return [], 0
+    matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    regions, changed = [], 0
+    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        changed += max(a2 - a1, b2 - b1)
+        if len(regions) < max_regions:
+            # 以新文件行号报告（模型重读的是新文件）；纯删除区间为空时报告插入位置
+            regions.append(f"L{b1 + 1}-L{b2}" if b2 > b1 else f"L{b1 + 1}前")
+    if len(regions) == max_regions and changed and _re.search(r"L\d+", "、".join(regions)):
+        pass  # 区间已截断到 max_regions，错误消息里以"共变更约N行"兜底
+    return regions, changed

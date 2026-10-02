@@ -23,6 +23,38 @@
     {
       "tool": "execute_command",
       "fingerprint": "execute_command|pwd|&& ls"
+    },
+    {
+      "tool": "write",
+      "fingerprint": "write|d:/windows11/桌面/code/bawcode/about_sensenova.html"
+    },
+    {
+      "tool": "write",
+      "fingerprint": "write|*"
+    },
+    {
+      "tool": "update_step_status",
+      "fingerprint": "4bb764d5f08f1b6c|*"
+    },
+    {
+      "tool": "update_step_status",
+      "fingerprint": "4bb764d5f08f1b6c"
+    },
+    {
+      "tool": "update_step_status",
+      "fingerprint": "a23a0649a04da7d3"
+    },
+    {
+      "tool": "update_step_status",
+      "fingerprint": "a23a0649a04da7d3|*"
+    },
+    {
+      "tool": "update_step_status",
+      "fingerprint": "8103581f6e79c650|*"
+    },
+    {
+      "tool": "update_step_status",
+      "fingerprint": "8103581f6e79c650"
     }
   ]
 }

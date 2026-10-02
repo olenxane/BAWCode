@@ -6,7 +6,6 @@
       "id": "system_prompt",
       "type": "system_prompt",
       "enabled": true,
-      "gate": "always",
       "files": [
         "system_prompt.md"
       ]
@@ -15,36 +14,12 @@
       "id": "skills",
       "type": "skill",
       "enabled": true,
-      "gate": "complexity == high",
       "list": []
-    },
-    {
-      "id": "analyze",
-      "type": "analyze",
-      "enabled": true,
-      "gate": "always",
-      "method": "keywords",
-      "keywords_high": [
-        "重构",
-        "架构",
-        "系统",
-        "完整",
-        "多文件",
-        "设计",
-        "实现",
-        "agent",
-        "框架",
-        "迁移"
-      ],
-      "keywords_low": [],
-      "min_len_high": 400,
-      "default_level": "low"
     },
     {
       "id": "plan",
       "type": "plan",
       "enabled": true,
-      "gate": "complexity == high",
       "confirm": false,
       "steps": true
     },
@@ -52,7 +27,6 @@
       "id": "execute",
       "type": "execute",
       "enabled": true,
-      "gate": "always",
       "max_rounds": 12,
       "model_role": "code",
       "prompt_files": [],
