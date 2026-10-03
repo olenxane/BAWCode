@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-10-03 — 插件系统：目录式外部插件装载 + hook 链改造 + 插件开发文档
+
+- **hook 系统**（core/hooks.py 重写）：单事件单处理函数 → 多处理函数**链**，新增两种
+  调用语义——`call_hook` 变换链（dict 结果与 payload 浅合并向后传递，最终返回各 dict
+  贡献的浅合并，None=不参与，全 None 回落 default）与 `collect_hook` 观察链（收集全部
+  非 None 结果）。每个处理函数带 `priority`（升序执行）与 `owner` 归属（插件卸载按
+  owner 注销），单个异常隔离不中断链条。`register_hook/call_hook/call_user_participating/
+  set_external_apis/clear_hooks` 签名向后兼容；`set_external_apis` 挂 owner=
+  external_apis（重复设置替换不叠加）。事件目录固化为 `hooks.EVENTS`。
+- **插件系统**（core/plugins.py 新增）：目录式外部插件 = `plugin.json` 清单 +
+  `main.py` 入口（`setup(ctx)`），双层目录发现（`data/plugins` 全局 + 项目
+  `.bawcode/plugins` 同名覆盖，`_`/`.` 开头目录跳过，无清单按目录名兜底）。PluginContext
+  提供 hooks/commands/arg 补全器/模型可见工具/上下文补充/external_apis 进程内实现/
+  storage_dir（`.bawcode/plugin-data/<id>`）注册面；装载错误隔离（失败回滚该插件全部
+  注册，不影响其他插件）；启停持久化到 `config.plugins.disable`。config 新增
+  `plugins{enabled,dir,disable}` 与 `plugins_config`（插件私有配置经 ctx.settings）。
+- **生命周期事件**：`session_start`（init_session）、`before_turn`（可改写 user_text，
+  覆盖主回合与 /refine、/run 入口）、`after_turn`（含中断/异常路径，同覆盖三入口）、
+  `before_tool`（可改写 args 或 decision=deny 拒绝，llm.execute_approved_tool）、
+  `after_tool`、`context_supplement`（[插件补充] 注入，memory.build_context_supplements）、
+  `tool_confirm`（确认面板前代答，main._handle_tool_confirm）。main 启动在 init_session
+  前装载插件；`/plugin` 命令（列表/reload/enable/disable + 参数补全），reload 复用启动
+  workspace。
+- **配套**：register.py 工具注册加 `owner` + `unregister_owner`；commands.py 加
+  `remove_source` 与补全器来源归属（插件卸载不误删内建补全器）；skills.py 技能扫描
+  支持插件目录（全局 → 插件 → 项目覆盖）；**修复 register.call 既有撞名隐患**
+  （首参 name → tool_name，工具形参含 name 时报"multiple values for argument"）。
+- **示例**：data/plugins/hello-plugin（命令 /hello、工具 plugin_hello、观察钩子、
+  可开关的上下文补充、自带技能），即文档示例本体。
+- **类用户操作 API**：plugins.bind_runtime(app, runner) 由 main 在回合调度器创建后
+  注入；PluginContext 新增 `submit_turn(text)`（idle 开新回合 / busy 按 busy_send_mode
+  排队或中断，等价用户在主输入框发送）、`notify(text)`（会话系统消息 + UI 缓存刷新，
+  呈现同命令反馈）、`ctx.ui.confirm/choose/line`（request_ui/wait_ui 交互面板桥的
+  插件包装：仅 agent 线程可调，取消/运行时未注入返回 None 不抛异常）。文档新增 §4.4
+  （含 submit_turn 自激防护、before_turn 无中止通道的说明）+ 生命周期图 + FAQ 同步。
+- **文档**：docs/plugin-development.md（快速开始/目录与清单/PluginContext API 含
+  类用户操作接口/hook 事件总表含 payload 与返回语义/命令与工具规范/配置参考/调试/
+  线程模型/兼容性/FAQ）。
+- **测试**：develop/test_plugins_e2e.py 56 项全绿（mock LLM 真实管线：双层发现与覆盖、
+  错误隔离、插件命令/工具/技能/补充注入、before_tool 改写经真实工具执行路径回传、
+  session_start 落痕、/plugin 启停持久化、卸载清理含内建命令上的插件补全器与运行时
+  绑定、hook 链语义与 external_apis 兼容、类用户操作 API——stub runner 路由/面板桥
+  序号与文本映射/取消语义/notify 落会话/真实 _AgentRunner 经 submit_turn 完整跑通
+  一回合）；
+  回归 skills/workflow34/context_turn/skills_plan/mcp/snapshot_undo/tree_rollback/
+  plan_steps_tree/context_compress/file_ledger/session_store/keymap/log 全绿
+  （test_e2e_mock_llm 3 项与 test_context_injection 1 项失败经 stash 对照确认为
+  HEAD 既有，与本改动无关）。
+
 ## 2026-10-03 — 防空转误判修复：write 返回带路径/体量 + 进展去重键含工具名
 
 - **事故**（会话存档实锤复放）：Agent 连续写三个不同文件，`write` 全量覆盖返回常量

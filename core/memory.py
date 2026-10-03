@@ -72,6 +72,15 @@ def init_session(config, project_identity_data: Optional[dict] = None) -> "Memor
     """初始化全局记忆会话"""
     global _session
     _session = Memory(config, project_identity=project_identity_data)
+    # session_start 观察链：处理函数异常已在 hooks 内隔离
+    hooks.collect_hook(
+        "session_start",
+        {
+            "project_id": getattr(_session, "project_id", ""),
+            "session_id": getattr(_session, "session_id", ""),
+            "workspace": str(getattr(_session, "workspace", "") or ""),
+        },
+    )
     return _session
 
 
@@ -825,6 +834,23 @@ class Memory:
                     )
         except Exception as e:
             log.debug("技能清单注入失败: %s", e)
+        # 插件上下文补充（core/plugins.py）：context_supplement 观察链收集文本，
+        # 与技能清单同为每回合重建，不进会话历史（处理函数异常已在 hooks 内隔离）
+        plugin_texts = [
+            t for t in hooks.collect_hook(
+                "context_supplement",
+                {"project_id": self.project_id, "session_id": self.session_id},
+            )
+            if isinstance(t, str) and t.strip()
+        ]
+        if plugin_texts:
+            supplements.append(
+                {
+                    "role": "system",
+                    "content": "[插件补充]\n" + "\n".join(plugin_texts),
+                    "type": "memory",
+                }
+            )
         return supplements
 
     @staticmethod

@@ -11,6 +11,7 @@ from core import commands
 from core import hooks
 from core import mcp as mcp_mod
 from core import memory as memory_mod
+from core import plugins as plugins_mod
 from core import policy
 from core import project_identity
 from core import register
@@ -327,7 +328,11 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         final = edited.strip() or refined
         choice = ctx["app"].choose([("Y", "使用"), ("n", "放弃")], prompt="使用完善结果？").lower()
         if choice in ("", "y", "yes"):
-            _agent_turn(ctx["llm"], ctx["session"], final, ctx["app"])
+            final = _before_turn(final)
+            try:
+                _agent_turn(ctx["llm"], ctx["session"], final, ctx["app"])
+            finally:
+                _after_turn(ctx["session"], final)
         return True
 
     @commands.register("/run", hint="执行任务", usage="/run <任务>", source="builtin")
@@ -336,7 +341,11 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         if not task:
             task = ctx["app"].read_line("任务> ", config=ctx["config"]).strip()
         if task:
-            _agent_turn(ctx["llm"], ctx["session"], task, ctx["app"])
+            task = _before_turn(task)
+            try:
+                _agent_turn(ctx["llm"], ctx["session"], task, ctx["app"])
+            finally:
+                _after_turn(ctx["session"], task)
         return True
 
     @commands.register("/balance", hint="查询余额", source="builtin")
@@ -351,11 +360,81 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         _echo(ctx, commands.help_text())
         return True
 
+    @commands.register("/plugin", hint="插件系统 · 查看/重载/启停", usage="/plugin [reload|enable <id>|disable <id>]", source="builtin")
+    def _plugin(ctx, args):
+        cfg = ctx["config"]
+        parts = (args or "").split(maxsplit=1)
+        sub = parts[0].lower() if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if sub == "reload":
+            counts = plugins_mod.reload(cfg)  # 复用启动时的 workspace
+            _echo(
+                ctx,
+                f"插件已重载：装载 {counts['loaded']} · 禁用 {counts['disabled']} · 失败 {counts['failed']}\n"
+                + plugins_mod.status_listing(),
+            )
+            return True
+        if sub in ("enable", "disable"):
+            pid = arg.split()[0] if arg else ""
+            if not pid:
+                _echo(ctx, f"用法: /plugin {sub} <插件id>（/plugin 查看 id 列表）")
+                return True
+            if plugins_mod.set_enabled(pid, sub == "enable", cfg):
+                counts = plugins_mod.reload(cfg)
+                _echo(
+                    ctx,
+                    f"已{('启用' if sub == 'enable' else '禁用')}插件 {pid}（写入 config.plugins.disable）· "
+                    f"装载 {counts['loaded']} / 失败 {counts['failed']}",
+                )
+            else:
+                _echo(ctx, f"未找到插件: {pid}")
+            return True
+        if sub and sub != "list":
+            _echo(ctx, f"未知子命令: {sub}（可用: reload / enable / disable）")
+        _echo(ctx, plugins_mod.status_listing())
+        return True
+
+    def _complete_plugin(config, arg: str):
+        items = [{"name": "/plugin reload", "hint": "重新发现并装载全部插件", "source": "arg", "callable": True}]
+        for row in plugins_mod.statuses():
+            if row["status"] == "loaded":
+                items.append(
+                    {"name": f"/plugin disable {row['id']}", "hint": "禁用并持久化", "source": "arg", "callable": True}
+                )
+            else:
+                items.append(
+                    {"name": f"/plugin enable {row['id']}", "hint": row["error"][:36] or "启用并持久化", "source": "arg", "callable": True}
+                )
+        return commands._filter_arg_items(items, arg)
+
+    commands.register_arg_completer("/plugin", _complete_plugin)
+
     commands.load_plugins(str(_ROOT / "data" / "commands"))
 
 
 def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancelled=None) -> dict:
-    """工具确认：经 UI 请求桥在主线程弹面板（↑↓ 选择）；取消时按默认拒绝回注"""
+    """工具确认：先经 tool_confirm 扩展点（插件/外部接口可代答），无处理时
+    经 UI 请求桥在主线程弹面板（↑↓ 选择）；取消时按默认拒绝回注"""
+    hooked = hooks.call_hook(
+        "tool_confirm",
+        {"name": call.get("name"), "arguments": call.get("arguments") or {}},
+        default=None,
+    )
+    if isinstance(hooked, dict):
+        action = str(hooked.get("action") or "").lower()
+        if action in ("allow_once", "allow_always"):
+            if action == "allow_always":
+                policy.add_always_allow(call.get("name"), call.get("arguments") or {})
+            return llm.execute_approved_tool(call)
+        if action in ("deny", "denied", "reject"):
+            reason = str(hooked.get("reason") or hooked.get("message") or "")
+            return {
+                "role": "tool",
+                "tool_call_id": call.get("id"),
+                "tool_name": call.get("name"),
+                "content": policy.default_reject_message(reason or f"tool_confirm 扩展点拒绝（{hooked.get('source', 'plugin')}）"),
+                "type": "tool",
+            }
     app.pending_tool = {"name": call.get("name"), "arguments": call.get("arguments") or {}}
     try:
         req = app.request_ui(
@@ -415,6 +494,26 @@ def _launch_workflow_editor(ctx, name: str = "") -> None:
         cmd.append(name)
     subprocess.Popen(cmd, cwd=str(_ROOT), **kwargs)
     _echo(ctx, f"工作流编辑器已启动: {name or '（新工作流）'}")
+
+
+def _before_turn(text: str) -> str:
+    """before_turn 变换链：插件可改写本轮输入（返回 {user_text: ...} 生效），不改写则原样返回"""
+    before = hooks.call_hook("before_turn", {"user_text": text}, default=None)
+    rewritten = before.get("user_text") if isinstance(before, dict) else None
+    return rewritten if isinstance(rewritten, str) and rewritten.strip() else text
+
+
+def _after_turn(session, user_text: str) -> None:
+    """after_turn 观察链：回合结束通知（正常/中断/异常路径都触发），响应取最后一条 assistant 消息"""
+    last = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
+    hooks.collect_hook(
+        "after_turn",
+        {
+            "user_text": user_text,
+            "response": (last or {}).get("content", ""),
+            "session_id": getattr(session, "session_id", ""),
+        },
+    )
 
 
 def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
@@ -581,6 +680,7 @@ class _AgentRunner:
                         self._set_busy(False)
                         return
             try:
+                text = _before_turn(text)
                 self.llm.reset_cancel()
                 _agent_turn(self.llm, self.session, text, self.app, runner=self)
             except Exception as exc:
@@ -590,6 +690,7 @@ class _AgentRunner:
                 except Exception:
                     pass
             finally:
+                _after_turn(self.session, text)
                 try:
                     self.session.save_session()
                 except Exception:
@@ -614,6 +715,7 @@ def main() -> None:
         config.model_name,
         identity.get("project_id"),
     )
+    plugins_mod.load(config, workspace=Path.cwd())  # 外部插件装载（先于会话初始化，插件可收到 session_start）
     session = memory_mod.init_session(config, project_identity_data=identity)
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
@@ -629,6 +731,7 @@ def main() -> None:
     try:
         runner = _AgentRunner(llm, session, app, config)
         tools_mod.set_background_notifier(runner.notify)  # 后台命令完成 → runner.notify 自动开新回合
+        plugins_mod.bind_runtime(app=app, runner=runner)  # 插件类用户操作 API（submit_turn/notify/ctx.ui）载体
         llm.query_balance()
         app.token_meter = llm.meter
         _sync(app, session, status="就绪")

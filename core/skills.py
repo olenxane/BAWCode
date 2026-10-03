@@ -97,6 +97,16 @@ def _resolve_config(config=None, workspace: Optional[Path] = None):
     return enabled, global_dir, project_dir, budget
 
 
+# 插件技能目录（core/plugins.py 装载时注入）：扫描顺序 全局 → 插件 → 项目
+_extra_dirs: List[Path] = []
+
+
+def set_extra_dirs(dirs: Optional[List[Path]]) -> None:
+    """设置插件技能目录（整体替换）；None/空清空。项目级目录始终最后覆盖"""
+    global _extra_dirs
+    _extra_dirs = [Path(d) for d in (dirs or [])]
+
+
 class SkillLoader:
     """技能加载器：启动仅扫元数据，正文按需读取并缓存，支持热重载"""
 
@@ -104,19 +114,24 @@ class SkillLoader:
         self.enabled, self.global_dir, self.project_dir, self.metadata_budget_tokens = _resolve_config(
             config, workspace
         )
+        self.extra_dirs = list(_extra_dirs)
         # name -> {"description", "path"}（仅元数据）；正文缓存 name -> Skill
         self._metadata: Dict[str, dict] = {}
         self._loaded: Dict[str, Skill] = {}
         if self.enabled:
             self.scan()
 
+    def _scan_bases(self) -> List[Path]:
+        """扫描顺序：全局 → 插件目录 → 项目（后者同名覆盖前者）"""
+        return [self.global_dir, *self.extra_dirs, self.project_dir]
+
     def scan(self) -> int:
-        """扫描双层目录，仅解析 frontmatter；项目级同名覆盖全局。返回技能数"""
+        """扫描多层目录，仅解析 frontmatter；后扫的同名覆盖先扫的。返回技能数"""
         self._metadata.clear()
         self._loaded.clear()
         if not self.enabled:
             return 0
-        for base in (self.global_dir, self.project_dir):
+        for base in self._scan_bases():
             if not base.is_dir():
                 continue
             for skill_md in sorted(base.glob("*/SKILL.md")):
@@ -126,12 +141,18 @@ class SkillLoader:
                     continue
                 name = str(metadata.get("name") or skill_md.parent.name)
                 if name in self._metadata:
-                    log.debug("技能 %s 被项目级覆盖: %s", name, skill_md)
+                    log.debug("技能 %s 被覆盖: %s", name, skill_md)
                 self._metadata[name] = {
                     "description": str(metadata["description"]).strip(),
                     "path": skill_md,
                 }
-        log.info("技能扫描完成: %d 个（全局 %s 项目 %s）", len(self._metadata), self.global_dir, self.project_dir)
+        log.info(
+            "技能扫描完成: %d 个（全局 %s · 插件 %d · 项目 %s）",
+            len(self._metadata),
+            self.global_dir,
+            len(self.extra_dirs),
+            self.project_dir,
+        )
         return len(self._metadata)
 
     def reload(self) -> int:
@@ -211,7 +232,7 @@ _loader: Optional[SkillLoader] = None
 def get_loader(config=None, workspace: Optional[Path] = None) -> Optional[SkillLoader]:
     global _loader
     enabled, global_dir, project_dir, budget = _resolve_config(config, workspace)
-    signature = (enabled, str(global_dir), str(project_dir), budget)
+    signature = (enabled, str(global_dir), str(project_dir), budget, tuple(str(d) for d in _extra_dirs))
     if _loader is None or getattr(_loader, "signature", None) != signature:
         _loader = SkillLoader(config=config, workspace=workspace)
         _loader.signature = signature

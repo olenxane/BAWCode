@@ -1,0 +1,8 @@
+{
+  "id": "hello-plugin",
+  "name": "Hello Plugin",
+  "version": "0.1.0",
+  "description": "官方示例插件：演示 hooks/commands/tools/skills/上下文补充 的完整接入方式",
+  "author": "BAWCode",
+  "entry": "main.py"
+}

@@ -654,18 +654,34 @@ class LLM:
         return action, reason
 
     def execute_approved_tool(self, call: dict) -> dict:
-        """确认通过后执行单个工具"""
+        """确认通过后执行单个工具；before_tool 钩子可改写 args 或拒绝执行"""
         name = call.get("name")
         args = call.get("arguments") or {}
         if not isinstance(args, dict):
             args = {}
         args = {k: v for k, v in args.items() if k != "description"}
+        # before_tool（变换链）：返回 {"args": {...}} 改写参数；
+        # 返回 {"decision": "deny", "message": "..."} 拒绝执行（不进工具本体）
+        hooked = hooks.call_hook("before_tool", {"name": name, "args": args}, default=None)
+        if isinstance(hooked, dict):
+            if str(hooked.get("decision") or "").lower() in ("deny", "denied", "block", "blocked"):
+                message = str(hooked.get("message") or f"工具 {name} 被 before_tool 钩子拒绝")
+                log.info("工具 %s 被 before_tool 钩子拒绝: %s", name, message)
+                return {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "tool_name": name,
+                    "content": message,
+                    "type": "tool",
+                }
+            if isinstance(hooked.get("args"), dict):
+                args = hooked["args"]
         log.info("执行工具 %s（已确认）", name)
+        started = time.monotonic()
         if not register.has_tool(name or ""):
             output = f"工具不存在: {name}"
             log.warn("调用未注册工具: %s", name)
         else:
-            started = time.monotonic()
             try:
                 output = register.call(name, **args)
                 log.debug("工具 %s 完成，用时 %.2fs", name, time.monotonic() - started)
@@ -676,6 +692,11 @@ class LLM:
                 output = f"工具执行错误: {e}"
                 log.error("工具 %s 执行错误: %s", name, e)
         text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+        # after_tool（观察链）：通知执行结果（处理函数异常已在 hooks 内隔离）
+        hooks.collect_hook(
+            "after_tool",
+            {"name": name, "args": args, "output": text, "elapsed": round(time.monotonic() - started, 3)},
+        )
         return {
             "role": "tool",
             "tool_call_id": call.get("id"),

@@ -15,6 +15,7 @@ def register(
     description: str = "",
     usage: str = "",
     schema: Optional[dict] = None,
+    owner: str = "",
 ) -> Callable[[Callable], Callable]:
     """工具注册装饰器
 
@@ -22,6 +23,7 @@ def register(
     :param description: 工具描述，供模型选择
     :param usage: 用法说明
     :param schema: JSON Schema 参数结构
+    :param owner: 归属标识（插件 id），便于整体注销
     """
 
     def decorator(func: Callable) -> Callable:
@@ -32,6 +34,7 @@ def register(
             "description": description,
             "usage": usage,
             "schema": schema or {"type": "object", "properties": {}, "required": []},
+            "owner": owner or "",
         }
         log.debug("注册工具: %s", tool_name)
         return func
@@ -59,16 +62,28 @@ def unregister(name: str) -> bool:
     return _registry.pop(name, None) is not None
 
 
-def call(name: str, **kwargs: Any) -> Any:
-    """调用已注册工具"""
-    if name not in _registry:
-        log.warn("调用未注册工具: %s", name)
-        return f"工具不存在: {name}"
+def unregister_owner(owner: str) -> List[str]:
+    """注销某归属（插件）注册的全部工具，返回被注销的工具名列表"""
+    if not owner:
+        return []
+    removed = [n for n, t in _registry.items() if t.get("owner") == owner]
+    for n in removed:
+        _registry.pop(n, None)
+    if removed:
+        log.debug("注销 owner=%s 的工具: %s", owner, ",".join(removed))
+    return removed
+
+
+def call(tool_name: str, **kwargs: Any) -> Any:
+    """调用已注册工具（首参命名避开 kwargs 撞名：工具形参可含 name）"""
+    if tool_name not in _registry:
+        log.warn("调用未注册工具: %s", tool_name)
+        return f"工具不存在: {tool_name}"
     started = time.monotonic()
     try:
-        return _registry[name]["func"](**kwargs)
+        return _registry[tool_name]["func"](**kwargs)
     finally:
-        log.debug("工具调用 %s 用时 %.3fs", name, time.monotonic() - started)
+        log.debug("工具调用 %s 用时 %.3fs", tool_name, time.monotonic() - started)
 
 
 # 调用说明参数：每次工具调用随 arguments 传入，回合末作为该调用的简明记录

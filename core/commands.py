@@ -15,6 +15,8 @@ _metas: Dict[str, dict] = {}
 _aliases: Dict[str, str] = {}
 # 命令参数补全器：name -> fn(config, arg) -> list[dict]
 _ARG_COMPLETERS: Dict[str, Callable] = {}
+# 补全器来源归属：name -> source（插件卸载时仅注销自己注册的补全器）
+_ARG_COMPLETER_SOURCES: Dict[str, str] = {}
 
 
 def _normalize(name: str) -> str:
@@ -26,11 +28,12 @@ def _normalize(name: str) -> str:
     return name.lower()
 
 
-def register_arg_completer(name: str, fn: Callable) -> None:
+def register_arg_completer(name: str, fn: Callable, source: str = "") -> None:
     """注册命令参数补全器（插件可扩展）；fn(config, arg) -> [{name,hint}, ...]"""
     key = _normalize(name)
     if key and fn is not None:
         _ARG_COMPLETERS[key] = fn
+        _ARG_COMPLETER_SOURCES[key] = source
 
 
 def _filter_arg_items(items: List[dict], arg: str) -> List[dict]:
@@ -222,6 +225,28 @@ def list_commands(include_handlerless: bool = True) -> List[dict]:
         meta["callable"] = key in _handlers
         items.append(meta)
     return items
+
+
+def remove_source(source: str) -> List[str]:
+    """按来源注销命令（插件卸载时调用）：清除该 source 注册的 handler/meta/别名
+    与参数补全器（含挂在内建等其他来源命令上的），返回被注销的命令名列表"""
+    if not source:
+        return []
+    removed = [key for key, meta in _metas.items() if meta.get("source") == source]
+    for key in removed:
+        meta = _metas.pop(key, {})
+        for alias in meta.get("aliases") or []:
+            if _aliases.get(alias) == key:
+                _aliases.pop(alias, None)
+        _handlers.pop(key, None)
+    # 补全器按来源整体清理：插件可给内建命令挂补全器，注销不随插件自身命令走
+    for key, src in list(_ARG_COMPLETER_SOURCES.items()):
+        if src == source:
+            _ARG_COMPLETERS.pop(key, None)
+            _ARG_COMPLETER_SOURCES.pop(key, None)
+    if removed:
+        log.debug("注销来源 %s 的命令: %s", source, ",".join(removed))
+    return removed
 
 
 def complete(prefix: str, limit: int = 12, config: Any = None) -> List[dict]:

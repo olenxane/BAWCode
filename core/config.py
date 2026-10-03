@@ -140,6 +140,17 @@ def default_config() -> dict:
             "metadata_budget_tokens": 1024,
         },
         "command_plugins": ["data/commands"],
+        # 插件系统（core/plugins.py）：dir 下 <id>/plugin.json + main.py，双层目录
+        # （项目级 {workspace}/.bawcode/plugins 同名覆盖全局）。插件可注册 hooks/
+        # commands/tools/skills/上下文补充；enabled=false 全局关闭；disable 按 id
+        # 禁用单个插件（/plugin disable 写入）。plugins_config.<id> 为插件私有配置
+        # （插件经 ctx.settings 读取，宿主不解释其内容）。
+        "plugins": {
+            "enabled": True,
+            "dir": "data/plugins",
+            "disable": [],
+        },
+        "plugins_config": {},
         # 外置工作流（core/workflow.py）：dir 下 <active>.json 声明一轮回合的
         # 线性节点链（system_prompt/skill/analyze/plan/execute/llm），加载失败
         # 回退内置默认工作流；编辑器 gui/workflow_editor.py（/workflow 命令）。
