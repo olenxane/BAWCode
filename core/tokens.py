@@ -52,8 +52,18 @@ def count_message_tokens(messages: Iterable[dict], model: str = "") -> int:
     total = 0
     for msg in messages:
         content = msg.get("content") or ""
-        if not isinstance(content, str):
+        image_count = 0
+        if isinstance(content, list):
+            # 数组形态（多模态）：text 片段分词计价，图片块按常数计（无法按分辨率精确估算）
+            image_count = sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+            content = "\n".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        elif not isinstance(content, str):
             content = str(content)
+        total += 768 * image_count  # 单图粗略计价，与 memory._IMAGE_TOKEN_ESTIMATE 同值
         total += 4  # 每条消息开销
         total += count_tokens(str(msg.get("role") or ""), model)
         total += count_tokens(content, model)

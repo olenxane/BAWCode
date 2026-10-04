@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core import policy
+from core import memory as memory_mod
 from core import prompt_loader
 from core import register
 from core.llm import CANCELLED
@@ -334,6 +335,19 @@ def _normalize_tool_msg(call: dict, content: str) -> dict:
     }
 
 
+def _with_images(item: dict) -> dict:
+    """执行层携带的 images（本地路径）转为数组形态 content，供子代理消息循环透传图片"""
+    imgs = item.pop("images", None)
+    if not imgs:
+        return item
+    parts, notes = memory_mod.build_image_parts(imgs)
+    text = memory_mod.content_text(item.get("content"))
+    if notes:
+        text = (text.rstrip() + "\n" if text.strip() else "") + "[图片说明] " + "；".join(notes)
+    item["content"] = [{"type": "text", "text": text}] + parts
+    return item
+
+
 def _execute_one(rt: dict, call: dict, permission: str) -> dict:
     """子代理内单个工具调用：description 先提取（确认面板/执行不可见），照走主策略与确认桥"""
     io, llm = rt["io"], rt["llm"]
@@ -353,13 +367,13 @@ def _execute_one(rt: dict, call: dict, permission: str) -> dict:
     action, reason = policy.evaluate(name, args, permission)
     if action == policy.ALLOW:
         item = llm.execute_approved_tool(call)
-        return item if isinstance(item, dict) and "content" in item else _normalize_tool_msg(call, item)
+        return _with_images(item) if isinstance(item, dict) and "content" in item else _normalize_tool_msg(call, item)
     if action == policy.CONFIRM:
         if io.tool_confirm is None:
             return _normalize_tool_msg(call, policy.default_reject_message("无确认通道"))
         item = io.tool_confirm(call)
         if isinstance(item, dict) and "content" in item:
-            return item
+            return _with_images(item)
         return _normalize_tool_msg(call, policy.default_reject_message(""))
     return _normalize_tool_msg(call, policy.default_reject_message(reason))
 

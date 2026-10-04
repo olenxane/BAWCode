@@ -29,7 +29,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 
 class KeyEvent(NamedTuple):
@@ -103,6 +103,46 @@ def _is_char_press(key, data: str) -> bool:
     return isinstance(key, str) and len(key) == 1 and ord(key) >= 32
 
 
+def _fold_paste_run(presses: List, i: int, n: int) -> Optional[Tuple[str, int]]:
+    """conhost 粘贴折叠启发式：presses[i:] 起的连续段满足粘贴特征时折叠为单 paste。
+
+    终端拦截 Ctrl+V 后，剪贴板文本以按键记录流到达，与逐键打字同形。批次内
+    连续段满足以下任一特征判为粘贴：
+      - 段内出现"中部"回车/Tab（非批尾）→ 多行粘贴（否则会逐行提交）
+      - 纯可打印字符连续 ≥ _PASTE_BURST_MIN（单行长文本；打字/自动重复在帧泵
+        批次里到不了这个量级）
+    段折叠为单个 paste 事件（回车→\\n、Tab→\\t）；段尾紧随的批尾回车视为剪贴板
+    尾部换行并入。≤320 字符折叠后与逐键插入等价，无行为回归面。
+    返回 (paste文本, 消费后的下一索引)；不满足特征返回 None。"""
+    j = i
+    chars = 0
+    interior_break = False
+    while j < n:
+        k2, d2 = presses[j].key, presses[j].data or ""
+        if _is_char_press(k2, d2):
+            chars += 1
+        elif k2 in _PASTE_BREAK_KEYS and j + 1 < n:
+            interior_break = True  # 中部回车/Tab 入段；批尾的保持原语义
+        else:
+            break
+        j += 1
+    if not (interior_break or chars >= _PASTE_BURST_MIN) or j == i:
+        return None
+    text_parts = []
+    for p in presses[i:j]:
+        k2 = p.key
+        if k2 in (_K.Enter, _K.ControlM):
+            text_parts.append("\n")
+        elif k2 in (_K.Tab, _K.ControlI):
+            text_parts.append("\t")
+        else:
+            text_parts.append(k2)
+    if j < n and presses[j].key in (_K.Enter, _K.ControlM):
+        text_parts.append("\n")
+        j += 1
+    return "".join(text_parts), j
+
+
 def translate_key_presses(presses: List) -> List[KeyEvent]:
     """一批 KeyPress → KeyEvent 列表。
 
@@ -148,6 +188,15 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
                 j += 1
             out.append(KeyEvent("paste", "".join(text)))
             _flog("paste assembled len=%d" % len("".join(text)))
+            i = j
+            continue
+
+        # conhost 粘贴折叠启发式：与逐键打字同形的剪贴板按键段折叠为单 paste 事件
+        folded = _fold_paste_run(presses, i, n)
+        if folded is not None:
+            text, j = folded
+            out.append(KeyEvent("paste", text))
+            _flog("paste folded len=%d" % len(text))
             i = j
             continue
 
@@ -231,6 +280,9 @@ try:
         _K.ControlT: "t", _K.ControlV: "v", _K.ControlW: "w", _K.ControlX: "x",
         _K.ControlY: "y", _K.ControlZ: "z",
     }
+    # 粘贴折叠启发式（translate_key_presses）：分段键与爆发阈值
+    _PASTE_BREAK_KEYS = {_K.Enter, _K.ControlM, _K.Tab, _K.ControlI}
+    _PASTE_BURST_MIN = 20
     # F1-F24
     for _idx in range(1, 25):
         _fkey = getattr(_K, "F%d" % _idx, None)

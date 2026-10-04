@@ -1,6 +1,9 @@
 #该部分为程序的主逻辑，调用各个模块实现完整功能
+import json
+import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -582,7 +585,20 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
 
     log.info("任务开始: %s", user_text)
-    session.add_message("user", user_text, type="task")
+    # 粘贴附图（输入框占位符=图片路径，提交时入队）：与正文一并落为多模态数组
+    pending = None
+    pending_q = getattr(app, "pending_images", None)
+    if pending_q:
+        pending = pending_q.pop(0)
+    if pending:
+        parts, notes = memory_mod.build_image_parts(pending)
+        content: list = [{"type": "text", "text": user_text}]
+        if notes:
+            content[0]["text"] += "\n[图片说明] " + "；".join(notes)
+        content.extend(parts)
+        session.add_message("user", content, type="task")
+    else:
+        session.add_message("user", user_text, type="task")
     # 回合快照：绑定上下文 + 轻量清单对账基线（写入工具经 capture_before 留底）；
     # msg_index=本回合用户消息绝对序号，树模式 Ctrl+Z 按它联动文件回滚
     snapshot_mod.begin_turn(
@@ -734,6 +750,154 @@ class _AgentRunner:
             self._queue.clear()
 
 
+class _HeadlessApp:
+    """无头 UI 桩：与 TuiApp 同接口面（_agent_turn/_AgentRunner 所需），但无渲染无真人交互。
+
+    无人值守语义：工具确认默认拒绝（--full 时 full 模式下 confirm 本就不触发）；
+    choose 自动选首项（计划确认流等"确认"场景可无人推进）；ask_user 视作用户跳过
+    （工具侧收到"基于现有信息继续"提示）；line 输入返回取消哨兵。"""
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.status = ""
+        self.phase_hint = ""
+        self.token_meter = None
+        self.busy = False
+        self.pending_tool = None
+        self.streaming_msg = None
+        self.subagent_stream = None
+        self._tree_follow_tail = True
+        self.tool_count = 0
+        self.ui_requests = []  # (kind, payload) 留档，供诊断/测试断言
+        self.config = None
+
+    def bind_config(self, config) -> None:
+        self.config = config
+
+    def refresh_from_session(self, session, task=None, render=True) -> None:
+        pass
+
+    def show_sessions_form(self, *args, **kwargs):
+        return None  # 无头模式无会话选择面板
+
+    def request_ui(self, kind: str, payload: dict) -> dict:
+        self.ui_requests.append((kind, payload or {}))
+        return {
+            "kind": kind,
+            "payload": payload or {},
+            "result": self._auto_answer(kind, payload or {}),
+            "event": threading.Event(),
+            "served": True,
+        }
+
+    @staticmethod
+    def _auto_answer(kind: str, payload: dict):
+        if kind == "confirm":
+            return {"action": "deny", "reason": "无头模式无确认通道（需放行请用 --full）"}
+        if kind == "choose":
+            options = payload.get("options") or []
+            first = options[0] if options else ""
+            return first[0] if isinstance(first, (tuple, list)) and first else first
+        if kind == "ask":
+            return {"status": "declined"}
+        return CANCELLED
+
+    def wait_ui(self, req: dict, cancelled=None, poll: float = 0.05):
+        return req.get("result")
+
+
+def _parse_args(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="bawcode",
+        description="BAWCode 编码代理；不带 -p 进入交互式 TUI",
+    )
+    parser.add_argument("-p", "--prompt", metavar="任务",
+                        help="一次性非交互任务（值为 - 时从 stdin 读取）；缺省进入交互模式")
+    parser.add_argument("--cd", metavar="目录", help="工作区目录（缺省当前目录）")
+    parser.add_argument("--config", metavar="路径", help="指定配置文件路径")
+    parser.add_argument("--full", action="store_true",
+                        help="一次性模式使用完全访问（工具确认自动放行；缺省确认类工具自动拒绝）")
+    parser.add_argument("--json", action="store_true", help="一次性模式输出 JSON 结果（stdout，供脚本消费）")
+    return parser.parse_args(argv)
+
+
+def main_headless(args) -> int:
+    """一次性模式：-p 任务 → 同线程跑完一整回合（复用 _AgentRunner 的完整路径：
+    before_turn/agent_turn/回合快照/上下文维护/会话保存）→ 最终回复打 stdout → 退出"""
+    if args.cd:
+        os.chdir(args.cd)
+    config = Config(config_path=args.config) if args.config else Config()
+    identity = project_identity.ensure_project_identity(Path.cwd())
+    log.info(
+        "BAWCode 无头运行 · 配置=%s · 模型=%s · project_id=%s",
+        config.config_path,
+        config.model_name,
+        identity.get("project_id"),
+    )
+    plugins_mod.load(config, workspace=Path.cwd())
+    session = memory_mod.init_session(config, project_identity_data=identity)
+    tools_mod.webfetch_gc()
+    llm = LLM(config)
+    session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
+    hooks.set_external_apis((config.data or {}).get("external_apis") or {})
+    subagent_mod.register_tools(config)
+    mcp_mod.register_tools(config)  # MCP 后台连接发现；退出时统一 shutdown
+    if args.full:
+        config.mode = policy.MODE_FULL  # --full：完全访问（策略判定读 config.mode）
+    app = _HeadlessApp(mode=config.mode or policy.MODE_AUTO)
+    app.bind_config(config)
+    app.token_meter = llm.meter
+    _register_commands(llm, session, config, app)
+
+    user_text = args.prompt
+    if user_text == "-":
+        user_text = sys.stdin.read()
+    text = (user_text or "").strip()
+    if not text:
+        print("任务为空：-p \"任务\"，或 -p - 从 stdin 读取", file=sys.stderr)
+        return 2
+
+    started = time.monotonic()
+    try:
+        runner = _AgentRunner(llm, session, app, config)
+        tools_mod.set_background_notifier(runner.notify)
+        plugins_mod.bind_runtime(app=app, runner=runner)
+        runner._run(text)  # 同线程同步执行：内部含 before_turn/回合/保存收尾
+    finally:
+        try:
+            mcp_mod.shutdown()
+        except Exception:
+            pass
+        try:
+            session.save_longterm()
+        except Exception:
+            pass
+
+    elapsed = time.monotonic() - started
+    last = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
+    response = str((last or {}).get("content") or "").strip()
+    log.info("无头运行结束 · %.2fs · 回复 %d 字", elapsed, len(response))
+    if args.json:
+        print(json.dumps(
+            {
+                "ok": bool(response),
+                "response": response,
+                "session_id": session.session_id,
+                "project_id": session.project_id,
+                "elapsed_s": round(elapsed, 2),
+            },
+            ensure_ascii=False, indent=2,
+        ))
+    else:
+        if response:
+            print(response)
+        else:
+            print("（本轮未产生文本回复；详情见 data/log）", file=sys.stderr)
+    return 0 if response else 1
+
+
 def main() -> None:
     # 尽早开启 Windows 输入/输出 VT，便于 Shift+Tab → ESC [ Z
     ui._enable_windows_ansi()
@@ -824,4 +988,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _cli_args = _parse_args()
+    if _cli_args.prompt is not None:
+        sys.exit(main_headless(_cli_args))
     main()

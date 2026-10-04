@@ -117,6 +117,7 @@ def default_config() -> dict:
                 "read_memory",
                 "rag_search",
                 "read",
+                "read_image",
                 "edit_file",
                 "write",
                 "task",

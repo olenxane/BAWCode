@@ -326,7 +326,12 @@ def setup(ctx):
         session = _session()
         if session is not None:
             for m in list(session.messages)[-max_history:]:
-                entry = {"role": m.get("role"), "content": str(m.get("content") or "")[:2000]}
+                # 数组形态 content 取文本部分（防 base64 图片块灌进网页）；附图片计数
+                text = memory_mod.content_text(m.get("content")) if memory_mod else str(m.get("content") or "")
+                n_imgs = memory_mod.count_image_parts(m.get("content")) if memory_mod else 0
+                entry = {"role": m.get("role"), "content": text[:2000]}
+                if n_imgs:
+                    entry["images"] = n_imgs
                 if m.get("tool_name"):
                     entry["tool_name"] = str(m.get("tool_name"))
                 if m.get("type"):

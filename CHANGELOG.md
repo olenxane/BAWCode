@@ -1,5 +1,96 @@
 # Changelog
 
+## 2026-10-04 — Ctrl+V 粘贴适配：占位符机制 + 取图/取文件通路
+
+- **占位机制（仅输入框）**：粘贴文本 ≤320 字直贴；超出只放 `[粘贴:N字符]`
+  （同长碰撞加 ·2/·3 保唯一），完整内容存注册表，提交时 `_expand_submission`
+  展开为全文——会话树/模型看到完整文本，占位符只活在输入框；/命令行不展开；
+  清空输入框（Esc/ctrl+u）连带清注册表防孤儿 token。
+- **取图通路**：剪贴板纯图片（ctypes 探测 CF_DIB/CF_BITMAP）→ PowerShell
+  System.Windows.Forms 落盘 PNG 到 data/temp/clipboard-<ts>.png，占位符=路径
+  （图片任何时刻不显示，只显示路径）；粘贴图片路径则直取原图不复制。
+  发送时图片经 memory.build_image_parts 编码进 user 消息多模态数组
+  （复用视觉输入基建，pending_images 队列逐回合消费）。
+- **取文件通路**：粘贴单行路径（含资源管理器 HDROP 文件列表）→ 文本可解码且
+  ≤1MB 读全文走占位机制（>320 占位，发送展开）；二进制（\x00 判据）/超限/
+  失败退回仅插路径（agent 自用 read 工具取）。
+- **Ctrl+V 捕获**：`hotkey ctrl+v`（终端透传场景，本机实测透传——输入框出现
+  ^V 即证据）→ 应用侧读剪贴板（HDROP>文本>图片，ctypes 无新依赖）；终端
+  字符流粘贴（WT/conhost 拦截形态）→ 升级已有 Action.PASTE 分支走同一规则。
+- **conhost 折叠启发式补齐**（keyinput，docstring 承诺未实现的行为）：批次内
+  连续段满足"中部回车/Tab"或"纯字符 ≥20"判为粘贴折叠为单 paste 事件
+  （回车→\n）；段尾批内回车视为剪贴板尾换行并入——**粘贴不自动发送**；
+  顺带修复多行粘贴被逐行提交的现状缺陷。2004h 括号粘贴保持关闭（既有决策不动）。
+- **验证**：test_paste_e2e 25 项全绿（A 占位/路径/桥三分支/submit 全链 +
+  B 折叠启发式 + C mock LLM 真实管线 user 消息多模态数组出站）；回归
+  vision/headless/main e2e、keyinput_pt、plan_steps_tree、rag、context 全绿。
+- **结构**：粘贴逻辑独立为 core/pasteboard.py（239 行：剪贴板 IO/纯判定/
+  PasteBuffer 状态对象——注册表+附图登记+占位/展开决策，与 UI 缓冲解耦可
+  独立测试），ui.py 净减 193 行只留薄适配（_handle_paste_text 3 行 /
+  _handle_clipboard_paste 8 行），keyinput 折叠启发式抽为 _fold_paste_run
+  辅助函数；行为逐字不变，重构前后 25 项测试同绿。
+- **真机待取证**：实机 Ctrl+V 粘贴文本/图片、PowerShell 取图延迟、IME 无回归。
+
+## 2026-10-04 — 无头一次性模式：`python main.py -p "任务"`
+
+- **CLI 入口**：argparse 接入 `__main__`——`-p/--prompt` 一次性任务（值 `-` 从
+  stdin 读取）、`--cd` 工作区目录、`--config` 指定配置、`--full` 完全访问、
+  `--json` 结构化输出；不带 `-p` 行为与原交互式 TUI 完全一致（`main()` 未动，
+  新增 `main_headless()` 分支）。
+- **执行路径复用**：无头走 `_AgentRunner._run(text)` 同线程同步执行——
+  before_turn 变换链、agent 回合（工作流/直连、回合快照、上下文维护）、
+  会话保存与 `_after_turn` 全部与交互式同路；后台命令完成通知照常挂接。
+- **_HeadlessApp**：与 TuiApp 同接口面的无人值守桩——工具确认自动拒绝
+  （拒绝理由回注模型，`--full` 时策略层直接放行不进确认）、choose 自动选
+  首项（计划确认流可无人推进）、ask_user 视作用户跳过（工具收到"基于现有
+  信息继续"提示）、line 输入返回取消哨兵；ui_requests 留档供诊断。
+- **模式传导修正**：策略判定读 `config.mode`（Config 初始化时取自
+  `ui.mode`），非 `app.mode`——`--full` 显式写入 `config.mode`，否则沿用
+  配置值（测试暴露的传导断点）。
+- **输出**：最终 assistant 回复打 stdout（空回复退码 1、说明走 stderr，
+  日志 console 输出走 stderr，stdout 可安全管道消费）；`--json` 输出
+  `{ok, response, session_id, project_id, elapsed_s}`。
+- **验证**：test_headless_e2e 10 项全绿（子进程真实 CLI 四场景：--json
+  直达执行+会话落盘、auto 模式确认自动拒绝且命令未执行、--full 同命令
+  真实执行输出回注、stdin 读任务）。
+
+## 2026-10-04 — 多模态视觉输入：read_image 工具 + 消息数组形态 content
+
+- **工具结果可携带图片**：约定工具返回 dict 可带 `"images"`（本地图片路径列表）——
+  `execute_approved_tool` 摘出随消息携带，`add_tool_result` 落为 OpenAI 数组形态
+  content（`[{"type":"text",...},{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]`）；
+  图片校验扩展名（png/jpg/jpeg/gif/webp/bmp）/单图 4MB 上限/单结果 4 张，
+  异常项降级为 `[图片说明]` 文字并入正文。
+- **新工具 read_image**（SAFE_TOOLS + context.tool_whitelist）：读本地图片回注
+  多模态消息——webfetch 落盘图、computer_use 截图、任意本地图通用；
+  webfetch 图片标注追加「read_image 可查看」；computer_use 外部处理器返回
+  dict 可带 images（截图直接回注模型）。子代理路径（_with_images）同样生效。
+- **全链路适配**：`_map_api_messages`/`_api_session_item` 数组形态透传；
+  回合末剥离/白名单外置按文本部分处理（带图记录不受 200 字守卫保护——
+  图片滞留上下文的代价远高于一条短记录，剥离后可重调 read_image 再看）；
+  白名单预算与 token 估算对图片按常数 768 计价；会话存档/加载无损往返；
+  UI 树渲染取文本部分并附 🖼×N 标记（树签名计入图片数防漏失效）；
+  防空转判据（has_recent_progress）/remote-control 会话推送同步取文本部分。
+- **验证**：test_vision_e2e 12 项全绿（出站数组形态、base64 与磁盘字节逐位一致、
+  非白名单回合末剥离、白名单跨回合保留、缺文件/坏格式纯文本错误、
+  子代理转换桩、存档往返）；test_e2e_mock_llm 27+9 项、test_workflow 48 项、
+  skills_plan/plugins/mcp/rag/context 全量回归绿。
+
+## 2026-10-04 — 测试适配存量语义 + 存量失败定位
+
+- **test_e2e_mock_llm**：read/edit_file/write 经 config 白名单迁移（1a8ed03 起）
+  恒在白名单，read 记录不再回合末剥离——剥离机制改由非白名单的 search 工具
+  验证（A11b/C6b），read 记录改断言白名单保留（A11/C6）。
+- **test_e2e_skills_plan**：适配工作流显式启用（配置补 `workflow.enabled: true`）
+  与步骤归口主 LLM 新语义——脚本首轮回合改为 generate_steps 工具落库 3 条步骤，
+  内部调用从 2 次减为 1 次（计划），A4/A5 请求序号后移，计划状态经 executing
+  （确认后步骤落库自动转入），B5 改断言 generate_steps 工具真实执行。
+- **test_workflow**：StubSession.add_tool_result 补 images 参数；
+  **test_context_injection**：系统提示词身份文案对齐（"BAW Code"）。
+- **存量失败定位**（HEAD 复现，与本轮无关）：test_edit_search 17 项、
+  test_p1p2_tools 12 项——集中在 read/edit 台账门槛（"尚未 read 过"拒绝），
+  疑与 2026-10-03/04 工具循环迁移相关，待排查。
+
 ## 2026-10-04 — 工作流改为显式启用：默认直接对话
 
 - **总开关 `workflow.enabled`（默认 false）**：未启用时回合不经工作流节点链——

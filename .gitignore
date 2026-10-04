@@ -21,3 +21,5 @@ data/memory.json
 data/memory/Agent.md.bak
 data/memory/global/
 data/memory/Projects/
+data/temp/
+data/subagents/

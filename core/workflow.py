@@ -559,7 +559,7 @@ def _tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, 
         )
 
         for call, item in allowed_results:
-            session.add_tool_result(call, item["content"])
+            session.add_tool_result(call, item["content"], item.get("images"))
         io.status(f"工具 {len(allowed_results)} 完成 · 待确认 {len(pending)}")
 
         for call in pending:
@@ -567,7 +567,7 @@ def _tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, 
                 result = {"content": policy.default_reject_message("无确认通道")}
             else:
                 result = io.tool_confirm(call)
-            session.add_tool_result(call, result["content"])
+            session.add_tool_result(call, result["content"], result.get("images"))
             _check_cancel(turn)
             io.status(f"确认完成 · {call.get('name')}")
 

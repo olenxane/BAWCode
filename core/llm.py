@@ -449,7 +449,8 @@ class LLM:
             content = m.get("content")
             if content is None:
                 content = ""
-            item: dict = {"role": role, "content": content if isinstance(content, str) else str(content)}
+            # content 原样出站：str 或数组形态（多模态图片块）均透传
+            item: dict = {"role": role, "content": content if isinstance(content, (str, list)) else str(content)}
             if m.get("name"):
                 item["name"] = m["name"]
             if role == "tool":
@@ -691,19 +692,30 @@ class LLM:
             except Exception as e:
                 output = f"工具执行错误: {e}"
                 log.error("工具 %s 执行错误: %s", name, e)
-        text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
+        # 多模态约定：工具返回 dict 可带 "images"（本地图片路径列表），摘出随消息携带，
+        # 由 add_tool_result 落为 API 数组形态 content；正文取 content 键，无则序列化其余键
+        images = None
+        if isinstance(output, dict) and isinstance(output.get("images"), list) and output["images"]:
+            images = [str(p) for p in output["images"] if p]
+            output = {k: v for k, v in output.items() if k != "images"}
+            text = output["content"] if isinstance(output.get("content"), str) else json.dumps(output, ensure_ascii=False)
+        else:
+            text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
         # after_tool（观察链）：通知执行结果（处理函数异常已在 hooks 内隔离）
         hooks.collect_hook(
             "after_tool",
             {"name": name, "args": args, "output": text, "elapsed": round(time.monotonic() - started, 3)},
         )
-        return {
+        result = {
             "role": "tool",
             "tool_call_id": call.get("id"),
             "tool_name": name,
             "content": text,
             "type": "tool",
         }
+        if images:
+            result["images"] = images
+        return result
 
     def refine_prompt(self, prompt: str) -> str:
         external = hooks.call_hook("prompt_refine", {"prompt": prompt}, default=None)

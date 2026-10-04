@@ -365,6 +365,40 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
 
 
 @register.register(
+    name="read_image",
+    description=(
+        "Read a local image file so you can see it (multimodal). Use for screenshots, "
+        "UI captures, webfetch-saved page images, diagrams and photos."
+    ),
+    usage="read_image <file_path>",
+    schema={
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "图片文件路径（png/jpg/jpeg/gif/webp/bmp，单图上限 4MB）",
+            },
+        },
+        "required": ["file_path"],
+    },
+)
+def read_image(file_path: str) -> dict:
+    """读取本地图片回注多模态消息：返回 {"content", "images"} 约定，
+    执行层摘出 images 随消息携带，经 add_tool_result 落为 API 数组形态 content"""
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+    if suffix not in memory_mod.IMAGE_SUFFIXES:
+        return f"不支持的图片格式: {suffix or '(无后缀)'}（支持 png/jpg/jpeg/gif/webp/bmp）"
+    if not path.is_file():
+        return f"图片不存在: {path}"
+    size = path.stat().st_size
+    if size > memory_mod._IMAGE_MAX_BYTES:
+        return f"图片超过 {memory_mod._IMAGE_MAX_BYTES // (1024 * 1024)}MB 上限（当前 {size // 1024}KB）：请压缩后重试"
+    kb = max(size // 1024, 1)
+    return {"content": f"已加载图片: {path}（{kb}KB），图片内容已随本结果提供", "images": [str(path)]}
+
+
+@register.register(
     name="write",
     description=(
         "Write content to a file. With optional start_line: positional write that "
@@ -735,7 +769,7 @@ def has_recent_progress(messages: List[dict], window: int = 4) -> bool:
     去重键含 tool_name：不同工具的相同文案（如 read 与 write）不互判重复；
     同工具同文案仍算重复（真打转照抓）。"""
     outputs = [
-        (str(m.get("tool_name") or ""), str(m.get("content") or ""))
+        (str(m.get("tool_name") or ""), memory_mod.content_text(m.get("content")))
         for m in messages or []
         if m.get("role") == "tool"
     ]
@@ -1495,7 +1529,7 @@ def _webfetch_download_images(targets: list) -> dict:
 
     with ThreadPoolExecutor(max_workers=_WEBFETCH_IMG_WORKERS) as pool:
         results = dict(pool.map(fetch_one, targets))
-    return {key: f"[图: {alt} | {results[key]}]" if alt else f"[图 | {results[key]}]"
+    return {key: f"[图: {alt} | {results[key]} | read_image 可查看]" if alt else f"[图 | {results[key]} | read_image 可查看]"
             for _, key, alt, _raw in targets}
 
 
@@ -1872,7 +1906,9 @@ def update_step_status(step_id: int, status: str, detail: str = "", external_han
     },
 )
 def computer_use(action: str, params: Optional[dict] = None, external_handler=None) -> str:
-    """computer-use 相关能力，必须通过外部 API 接入"""
+    """computer-use 相关能力，必须通过外部 API 接入。
+    外部处理器返回 dict 时可携带 "images"（截图等本地图片路径列表）：
+    执行层会摘出随工具结果回注，模型即可看到截图（多模态约定同 read_image）"""
     log.info("computer_use: %s params=%s", action, sorted((params or {}).keys()))
     result = hooks.call_user_participating(
         "computer_use",

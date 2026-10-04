@@ -21,6 +21,7 @@ except ImportError:
 from core import commands as cmdsys
 from core import keymap as keymap_mod
 from core import memory as memory_mod
+from core import pasteboard
 from core import policy
 from core import snapshot as snapshot_mod
 from core import subagent as subagent_mod
@@ -598,6 +599,10 @@ class TuiApp:
         self.status = "就绪"
         self.tool_count = 0
         self.focus = "input"
+        # 粘贴占位机制（core/pasteboard.py）：判定与登记在 PasteBuffer；
+        # pending_images 由 _dispatch_key 提交时入队、_agent_turn 逐回合出队编码
+        self.paste = pasteboard.PasteBuffer()
+        self.pending_images: List[str] = []
         self.scroll = 0
         self.input_scroll = 0
         self.cand_scroll = 0
@@ -922,7 +927,7 @@ class TuiApp:
         for m in self.messages:
             role = m.get("role")
             mtype = m.get("type") or ""
-            content = (m.get("content") or "").strip()
+            content = memory_mod.content_text(m.get("content")).strip()
             if not content:
                 continue
             if role in ("user", "assistant", "tool"):
@@ -982,8 +987,9 @@ class TuiApp:
         # 根节点标题：取「首次」用户消息，避免被新一轮输入替换掉
         first_user = ""
         for m in self.messages:
-            if m.get("role") == "user" and str(m.get("content") or "").strip():
-                first_user = str(m.get("content"))
+            first_content = memory_mod.content_text(m.get("content"))
+            if m.get("role") == "user" and first_content.strip():
+                first_user = first_content
                 break
         if first_user:
             root_label = f"任务 · {_oneline(first_user, 40)}"
@@ -1004,7 +1010,9 @@ class TuiApp:
 
         for index, item in enumerate(self.messages[-200:]):
             role = item.get("role")
-            content = item.get("content") or ""
+            content = memory_mod.content_text(item.get("content"))
+            n_imgs = memory_mod.count_image_parts(item.get("content"))
+            image_note = f" 🖼×{n_imgs}" if n_imgs else ""
             msg_type = item.get("type") or ""
             tool_name = item.get("tool_name") or ""
             pending_extra: List[TreeNode] = []  # type=plan 快照等附加节点（排在 node 之后）
@@ -1033,7 +1041,7 @@ class TuiApp:
                     icon = "❌" if failed else "✅"
                     # 结果正文 trim 后再拼（纯空白结果不挂悬空「 · 」）；内部换行保留供展开查看
                     result_text = content.strip()
-                    label = f"⚙ {tool_name or 'tool'} {icon}"
+                    label = f"⚙ {tool_name or 'tool'} {icon}{image_note}"
                     if result_text:
                         label = f"{label} · {result_text}"
                     node = TreeNode(
@@ -1100,7 +1108,7 @@ class TuiApp:
                     if not isinstance(tm, dict):
                         continue
                     t_role = tm.get("role")
-                    t_content = str(tm.get("content") or "")
+                    t_content = memory_mod.content_text(tm.get("content"))
                     # trace 正文同样可能是模型给用户的说明：strip 后拆分渲染，
                     # 与主对话 tool_call 分支同规则（避免折叠藏正文 / 悬空分隔符）
                     t_text = t_content.strip()
@@ -1321,7 +1329,8 @@ class TuiApp:
         msgs = self.messages[-200:]
         total = 0
         for m in msgs:
-            total += len(m.get("content") or "")
+            total += len(memory_mod.content_text(m.get("content")))
+            total += memory_mod.count_image_parts(m.get("content"))  # 图片块计入签名防漏失效
         plan = self.plan or {}
         streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
         live = self.subagent_stream if isinstance(self.subagent_stream, dict) else None
@@ -1903,6 +1912,24 @@ class TuiApp:
             return Context.TREE
         return Context.INPUT
 
+    # ----- 粘贴占位机制（判定/登记在 core/pasteboard.py，此处只做缓冲插入与状态行） -----
+
+    def _handle_paste_text(self, text: str) -> None:
+        """paste 事件载荷（终端字符流/括号粘贴）：按文本/路径规则登记后插入缓冲"""
+        inserted = self.paste.accept_text(text)
+        if inserted:
+            self._buf_insert(inserted)
+
+    def _handle_clipboard_paste(self) -> None:
+        """应用侧读剪贴板（Ctrl+V 热键）：文件列表/文本/纯图片三分支"""
+        texts, status = self.paste.accept_clipboard()
+        for t in texts:
+            if t:
+                self._buf_insert(t)
+        if status:
+            self.status = status
+        self.render()
+
     def _dispatch_key(self, kind: str, value: Any, config=None) -> Optional[str]:
         """返回 None 表示继续循环；返回 str 为提交行。"""
         # 鼠标事件不走键表（也不必重编译键位表：拖拽中 move 事件高频）
@@ -1916,6 +1943,11 @@ class TuiApp:
             mode = self.cycle_mode()
             self.status = f"{policy.MODE_LABELS.get(mode, mode)}"
             self.render()
+            return None
+
+        # Ctrl+V 热键（终端透传场景）：应用侧读剪贴板（文本/文件列表/纯图片）
+        if kind == "hotkey" and str(value) == "ctrl+v" and self.focus == "input":
+            self._handle_clipboard_paste()
             return None
 
         act = self.keymap.resolve(ctx, kind, value)
@@ -1944,6 +1976,13 @@ class TuiApp:
             if self.focus == "tree" and act == Action.SEND:
                 pass
             line = self._buf_text()
+            if line.startswith("/"):
+                # 命令行不展开粘贴占位（占位机制只服务对话消息）
+                self.paste.reset()
+            else:
+                line, images = self.paste.expand(line)
+                if images:
+                    self.pending_images.append(images)
             if line.strip():
                 self.input_history.append(line)
             self.hist_index = len(self.input_history)
@@ -1973,6 +2012,7 @@ class TuiApp:
 
         if act == Action.CLEAR:
             self._buf_clear()
+            self.paste.reset()
             self.render()
             return None
 
@@ -1982,12 +2022,12 @@ class TuiApp:
                 self.render()
             else:
                 self._buf_clear()
+                self.paste.reset()
             return None
 
         if act == Action.PASTE:
-            text = (value or "").replace("\r\n", "\n").replace("\r", "\n")
-            if text and self.focus == "input":
-                self._buf_insert(text)
+            if self.focus == "input" and value:
+                self._handle_paste_text(str(value))
             return None
 
         if act == Action.EXPAND:

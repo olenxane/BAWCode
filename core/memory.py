@@ -21,6 +21,71 @@ _ROOT = Path(__file__).resolve().parent.parent
 # 工具结果视为"已是简明记录"的长度阈值：拒绝原因/短错误不再剥离改写
 _CONCISE_CONTENT_CHARS = 200
 
+# ----- 多模态消息（tool 结果可携带本地图片，content 用 OpenAI 数组形态） -----
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+_IMAGE_MAX_BYTES = 4 * 1024 * 1024  # 单图原始字节上限（base64 后约 5.4MB，兼容主流网关请求体限制）
+_IMAGE_MAX_COUNT = 4                # 单条工具结果最多携带图片数
+# 预算估算时单张图片的粗略 token 计价（token 计数器只认文本，图片按常数计，与 tokens.py 同值）
+_IMAGE_TOKEN_ESTIMATE = 768
+
+
+def content_text(content) -> str:
+    """消息 content 的纯文本部分：str 原样返回，数组形态拼接 text 片段"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return str(content or "")
+
+
+def count_image_parts(content) -> int:
+    """content 中图片块数量（str 恒为 0）"""
+    if isinstance(content, list):
+        return sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+    return 0
+
+
+def build_image_parts(paths) -> tuple:
+    """本地图片路径列表 → API 图片块（data URL base64）；越界/缺失/超限项降级为文字说明。
+    返回 (parts, notes)：parts 追加在 text 块之后，notes 由调用方并入正文说明"""
+    import base64
+
+    parts, notes = [], []
+    path_list = [str(p) for p in (paths or []) if p]
+    if len(path_list) > _IMAGE_MAX_COUNT:
+        notes.append(f"仅加载前 {_IMAGE_MAX_COUNT} 张（共 {len(path_list)} 张）")
+        path_list = path_list[:_IMAGE_MAX_COUNT]
+    for raw in path_list:
+        path = Path(raw)
+        suffix = path.suffix.lower()
+        if suffix not in _IMAGE_MIME:
+            notes.append(f"{path.name}: 不支持的图片格式（{suffix or '无后缀'}）")
+            continue
+        try:
+            size = path.stat().st_size
+            if size > _IMAGE_MAX_BYTES:
+                notes.append(f"{path.name}: 超过单图 {_IMAGE_MAX_BYTES // (1024 * 1024)}MB 上限")
+                continue
+            data = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError as exc:
+            notes.append(f"{path.name}: 读取失败（{exc.__class__.__name__}）")
+            continue
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{_IMAGE_MIME[suffix]};base64,{data}"}})
+    return parts, notes
+
 # 压缩摘要的 state_snapshot 结构节（与 core/prompts/compress.md 模板一一对应；程序按节解析校验）
 _SNAPSHOT_SECTIONS = (
     "primary_request_and_intent",
@@ -585,7 +650,7 @@ class Memory:
         """粗估当前消息占用字符数（仅作 fallback，不直接与 token 阈值比较）"""
         total = 0
         for message in self.messages:
-            total += len(str(message.get("content") or ""))
+            total += len(content_text(message.get("content")))
         return total
 
     def estimate_context_tokens(self) -> int:
@@ -621,14 +686,20 @@ class Memory:
             summary = summary[:77] + "..."
         return f"{name}({summary})" if summary and summary != "{}" else name
 
-    def add_tool_result(self, call: dict, content: str) -> dict:
-        """记录一次工具调用结果：description 随消息留档，行内超限部分立即外置磁盘并附回读指针"""
+    def add_tool_result(self, call: dict, content, images=None) -> dict:
+        """记录一次工具调用结果：description 随消息留档，行内超限部分立即外置磁盘并附回读指针；
+        images 为本地图片路径列表（多模态），与正文一并落为 API 数组形态 content（外置只落文本）"""
         tool_name = str(call.get("name") or "")
         call_id = str(call.get("id") or call.get("tool_call_id") or "")
         description = str(call.get("description") or "").strip() or self._fallback_description(call)
         args = call.get("arguments")
         if not isinstance(args, dict):
             args = {}
+        if not isinstance(content, str):
+            content = content_text(content)
+        image_parts, image_notes = build_image_parts(images)
+        if image_notes:
+            content = (content.rstrip() + "\n" if content.strip() else "") + "[图片说明] " + "；".join(image_notes)
         total_lines = len(content.splitlines())
         cap = self._inline_cap(tool_name)
         persist_path = None
@@ -640,6 +711,10 @@ class Memory:
             if persist_path is not None:
                 preview = toolstore.slice_to_tokens(content, cap, getattr(self.config, "model_name", ""))
                 content = f"{preview}\n\n[{toolstore.pointer_line(persist_path, total_lines)}]"
+        # 数组形态：text 块在前，图片块随后
+        message_content: Union[str, list] = (
+            [{"type": "text", "text": content}] + image_parts if image_parts else content
+        )
         extra = {
             "type": "tool",
             "tool_name": tool_name,
@@ -650,7 +725,7 @@ class Memory:
             file_path = str((args or {}).get("file_path") or "")
             if file_path:
                 extra["file_path"] = file_path  # 随消息留档，供回合末剥离记录附新鲜度状态
-        message = self.add_message("tool", content, **extra)
+        message = self.add_message("tool", message_content, **extra)
         if persist_path is not None:
             message["persisted"] = True
             message["persist_path"] = str(persist_path)
@@ -695,19 +770,21 @@ class Memory:
     def _strip_tool_message(self, message: dict, prefix: str) -> bool:
         """把单条 tool 消息改写为简明记录（description+call_id+落盘路径）；返回是否改写"""
         content = message.get("content") or ""
-        if len(content) < _CONCISE_CONTENT_CHARS:
+        text = content_text(content)
+        # 带图片的记录不受短文本守卫保护：图片滞留上下文的代价远高于一条短记录
+        if len(text) < _CONCISE_CONTENT_CHARS and not count_image_parts(content):
             return False
         if not message.get("persisted"):
             path = toolstore.persist(
                 self.config, self.project_id, self.session_id,
                 str(message.get("tool_call_id") or ""),
                 str(message.get("tool_name") or ""),
-                {}, str(message.get("description") or ""), content,
+                {}, str(message.get("description") or ""), text,
             )
             if path is not None:
                 message["persisted"] = True
                 message["persist_path"] = str(path)
-                message["total_lines"] = len(content.splitlines())
+                message["total_lines"] = len(text.splitlines())
         parts = [f"[{prefix}·{message.get('tool_name') or 'tool'}]"]
         if message.get("description"):
             parts.append(str(message["description"]))
@@ -737,7 +814,10 @@ class Memory:
                 and message.get("tool_name") in self.tool_whitelist
                 and not message.get("stripped")
             ):
-                entries.append((index, toolstore.count_tokens_safe(message.get("content") or "", model)))
+                # 图片块 token 计数器看不见，按常数计入预算防图片记录挤占上下文
+                tokens = toolstore.count_tokens_safe(content_text(message.get("content") or ""), model)
+                tokens += _IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
+                entries.append((index, tokens))
         total = sum(tokens for _, tokens in entries)
         if total <= budget:
             return 0
@@ -767,7 +847,7 @@ class Memory:
         try:
             return tokenmod.count_message_tokens(messages, model)
         except Exception:
-            chars = sum(len(str(m.get("content") or "")) for m in messages)
+            chars = sum(len(content_text(m.get("content"))) for m in messages)
             return max(1, chars // 2)
 
     def _round_boundaries(self) -> List[int]:
@@ -1022,11 +1102,11 @@ class Memory:
         # 插件上下文补充（core/plugins.py）：context_supplement 观察链收集文本，
         # 与技能清单同为每回合重建，不进会话历史（处理函数异常已在 hooks 内隔离）。
         # payload 带当前用户消息（最后一条可见 user 消息），供 RAG 类插件做
-        # 按消息内容的主动召回
+        # 按消息内容的主动召回（数组形态 content 取文本部分，防图片块 repr 污染检索）
         user_message = ""
         for m in reversed(self.messages):
             if m.get("role") == "user" and self._api_visible(m):
-                user_message = str(m.get("content") or "")
+                user_message = content_text(m.get("content"))
                 break
         plugin_texts = [
             t for t in hooks.collect_hook(
@@ -1055,7 +1135,8 @@ class Memory:
         # UI 专用注入提示不进 API
         if mtype in ("system_prompt", "help"):
             return {}
-        out: dict = {"role": role, "content": content if isinstance(content, str) else str(content)}
+        # content 原样出站：str 或数组形态（多模态图片块）均透传
+        out: dict = {"role": role, "content": content if isinstance(content, (str, list)) else str(content)}
         if role == "tool":
             out["role"] = "tool"
             if item.get("tool_call_id"):
@@ -1066,7 +1147,7 @@ class Memory:
         # thinking 字段（思维链留档）回合内出站时并回 content；回合末 finalize_turn 打
         # thinking_stripped 标后仅留档不再并回——下一轮对话起模型不可见
         thinking = item.get("thinking")
-        if thinking and not item.get("thinking_stripped"):
+        if thinking and not item.get("thinking_stripped") and isinstance(out["content"], str):
             out["content"] = f"{thinking}\n\n{out['content']}" if out["content"] else thinking
         if role == "assistant" and item.get("tool_calls"):
             import json as _json
