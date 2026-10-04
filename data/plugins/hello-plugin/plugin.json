@@ -1,8 +1,21 @@
 {
   "id": "hello-plugin",
   "name": "Hello Plugin",
-  "version": "0.1.0",
-  "description": "官方示例插件：演示 hooks/commands/tools/skills/上下文补充 的完整接入方式",
+  "version": "0.2.0",
+  "description": "官方示例插件：演示 hooks/commands/tools/skills/上下文补充/配置声明 的完整接入方式",
   "author": "BAWCode",
-  "entry": "main.py"
+  "entry": "main.py",
+  "config": [
+    { "key": "supplement", "type": "bool", "default": false, "label": "每回合注入示例补充", "hint": "开启后每回合追加一行 [插件补充]" },
+    { "key": "greet", "type": "str", "default": "world", "label": "缺省问候对象", "hint": "/hello 未带参数时使用" },
+    {
+      "key": "style",
+      "type": "list",
+      "options": ["简洁", "详细"],
+      "default": "简洁",
+      "label": "问候风格",
+      "hint": "←→ 切换"
+    },
+    { "key": "shout", "type": "int", "default": 1, "min": 1, "max": 3, "label": "感叹号数量" }
+  ]
 }

@@ -81,6 +81,7 @@ DEFAULT_COLORS = {
     "subagent": (240, 156, 88),      # f09c58 子代理节点/直播（暖橙，与主对话区分）
     "mcp": (106, 204, 132),          # 6acc84 MCP 状态行（外接服务器，冷绿示连通）
     "tree_guide": (58, 85, 120),     # 3a5578 会话树引导线（│）
+    "selection_bg": (42, 82, 134),   # 2a5286 自绘选区背景（比光标高亮略深一档）
 }
 
 TIPS = [
@@ -182,6 +183,56 @@ def _mix(c1: Tuple[int, int, int], c2: Tuple[int, int, int], t: float) -> Tuple[
     """c1 向 c2 混合 t（0~1）：由角色饱和色生成浅色正文变体"""
     return tuple(round(a + (b - a) * t) for a, b in zip(c1, c2))
 
+
+def _copy_to_clipboard(text: str) -> bool:
+    """CF_UNICODETEXT 写入系统剪贴板（win32；失败静默返回 False 不打断渲染）"""
+    if sys.platform != "win32" or not text:
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # 显式原型：64 位下 windll 默认把句柄返回值截成 32 位 c_int，
+        # GlobalAlloc 的 HGLOBAL 高位被砍会导致 GlobalLock 拿野句柄返回 NULL
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x0002
+        buf = text.encode("utf-16-le") + b"\x00\x00"
+        opened = False
+        for _ in range(6):  # 剪贴板是共享资源，被短暂锁住时按惯例重试
+            if user32.OpenClipboard(0):
+                opened = True
+                break
+            time.sleep(0.03)
+        if not opened:
+            return False
+        try:
+            if not user32.EmptyClipboard():
+                return False
+            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(buf))
+            if not handle:
+                return False
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
+                kernel32.GlobalFree(handle)
+                return False
+            ctypes.memmove(ptr, buf, len(buf))
+            kernel32.GlobalUnlock(handle)
+            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+                kernel32.GlobalFree(handle)  # 失败时回收；成功后句柄归系统
+                return False
+            return True
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        return False
 
 def _clip(text: str, width: int) -> str:
     if width <= 0:
@@ -583,7 +634,8 @@ class TuiApp:
         self._conv_stash: Optional[dict] = None
         self.logo_enabled = True
         self.settings_tab = 0
-        self.settings_tabs = ["提供商", "模型", "系统", "快捷键"]
+        self.settings_tabs = ["提供商", "模型", "系统", "快捷键", "插件"]
+        self._plugin_expanded: set = set()  # 设置页插件行展开的插件 id 集合
         self.settings_provider_id = ""
         self.settings_model_name = ""
         self._settings_scroll = 0
@@ -604,6 +656,14 @@ class TuiApp:
         self.confirm_index = 0
         self.confirm_reason_mode = False
         self._confirm_buf = TextBuffer()
+        # 询问用户面板（ask_user 工具）：同位置渲染，选项+末位自由输入+可选倒计时
+        self.ask_mode = False
+        self.ask_spec: dict = {}
+        self.ask_index = 0
+        self.ask_input_mode = False
+        self._ask_buf = TextBuffer()
+        self.ask_deadline: Optional[float] = None
+        self._ask_last_sec = -1
         # UI 请求桥：agent 线程的交互弹窗移交主线程执行（单读者保证）
         self._ui_req: Optional[dict] = None
         self._input_prompt = "> "
@@ -648,6 +708,12 @@ class TuiApp:
         self._hold_start = 0.0
         self._hold_last = 0.0
         self._scroll_drag_grab: Optional[int] = None
+        # 自绘选区（文档坐标：_tree_rows 缓存行号 + 单元格）；锚点/焦点 None=无选区
+        self._sel_anchor: Optional[Tuple[int, int]] = None
+        self._sel_focus: Optional[Tuple[int, int]] = None
+        self._sel_dragging = False
+        self._sel_sig: Optional[tuple] = None
+        self._sel_edge = 0  # 拖拽选区越界方向：-1 顶缘 / +1 底缘 / 0 在树体内
 
     @property
     def cursor(self) -> int:
@@ -1100,7 +1166,8 @@ class TuiApp:
                     detail=content,
                 )
                 for i, line in enumerate(content.splitlines()):
-                    node.children.append(TreeNode(f"msg:{index}:{i}", _clip(line, 60), "help_line"))
+                    # 不预截断：长行（如含密钥链接）由 _tree_rows 按实时宽度折行展示
+                    node.children.append(TreeNode(f"msg:{index}:{i}", line, "help_line"))
             else:
                 node = TreeNode(
                     f"msg:{index}",
@@ -1507,7 +1574,13 @@ class TuiApp:
         cand_show = min(3, len(self.candidates)) if self.candidates else 0
         input_zone_h = min(6, text_h + cand_show)
         # 确认面板：取代输入框位置，行数更多时向上拓展（压缩会话区）
-        confirm_panel = self._compose_confirm(w) if self.confirm_mode else None
+        # 确认/询问面板：取代输入框位置，行数更多时向上拓展（压缩会话区）
+        if self.ask_mode:
+            confirm_panel = self._compose_ask(w)
+        elif self.confirm_mode:
+            confirm_panel = self._compose_confirm(w)
+        else:
+            confirm_panel = None
         if confirm_panel is not None:
             input_zone_h = len(confirm_panel)
 
@@ -1535,6 +1608,20 @@ class TuiApp:
             visible = rows[self.scroll : self.scroll + tree_h]
             body = list(visible) + [""] * (tree_h - len(visible))
             body = body[:tree_h]
+            sel = self._selection_range()
+            if sel is not None:
+                r0, c0, r1, c1 = sel
+                body = [
+                    self._apply_row_selection(
+                        ln,
+                        c0 if self.scroll + i == r0 else 0,
+                        c1 if self.scroll + i == r1 else w - 2,
+                        w - 1,
+                    )
+                    if r0 <= self.scroll + i <= r1
+                    else ln
+                    for i, ln in enumerate(body)
+                ]
             if total > tree_h:
                 thumb_h, thumb_top = _scrollbar_geometry(total, tree_h, self.scroll)
                 # 几何快照：鼠标拖拽事件按此换算（每帧刷新）
@@ -1798,8 +1885,9 @@ class TuiApp:
                 if result is not None:
                     return result
 
-            # 帧尾：UI 请求桥 + 无条件渲染 + 补足帧周期
+            # 帧尾：UI 请求桥 + 选区边缘自动滚动 + 无条件渲染 + 补足帧周期
             self._serve_ui_request()
+            self._selection_tick()
             self.render()
             frame_deadline += self._frame_time
             sleep_left = frame_deadline - time.time()
@@ -1990,48 +2078,204 @@ class TuiApp:
         self._set_scroll(self.scroll + delta)
 
     def _on_mouse(self, kind: str, value: Any) -> None:
-        """滚动条鼠标交互：down 抓取滑块/轨道翻页，move 连动，up 结束。
+        """鼠标交互：滚动条拖拽/翻页 + 会话区自绘选区（左键拖拽选、右键复制）。
 
         坐标为控制台 0-based 单元格，几何换算基于 _row_meta 每帧快照；
-        控制台 y 与 compose 行号按 1:1 映射（_MOUSE_Y_OFFSET 可校准）。"""
+        mouse_down 的 value 自 keyinput 起携带按键前缀（"left:x,y"/"right:x,y"）。
+        选区锚定文档行（_tree_rows 缓存行号），滚动时选区随内容移动；
+        内容变化（签名改变）后选区自动失效。"""
+        meta = self._row_meta
+        text = str(value or "")
+        btn, coord = "", text
+        if kind == "mouse_down" and ":" in text:
+            btn, coord = text.split(":", 1)
         try:
-            x_s, y_s = str(value or "").split(",", 1)
+            x_s, y_s = coord.split(",", 1)
             x, y = int(x_s), int(y_s) + _MOUSE_Y_OFFSET
         except (ValueError, IndexError):
             return
-        meta = self._row_meta
-        if self.settings_mode or not meta.get("scrollbar_on"):
+        if self.settings_mode or self.sessions_mode:
             return
         tree_h = int(meta.get("tree_h") or 4)
         body_top = int(meta.get("body_top") or 1)
+        scrollbar_on = bool(meta.get("scrollbar_on"))
         scrollbar_x = int(meta.get("scrollbar_x") or -1)
         if kind == "mouse_down":
-            if x != scrollbar_x:
+            if btn == "right":
+                self._copy_selection()
                 return
+            if scrollbar_on and x == scrollbar_x:
+                y_rel = y - body_top
+                if not (0 <= y_rel < tree_h):
+                    return
+                thumb_top = int(meta.get("thumb_top") or 0)
+                thumb_h = int(meta.get("thumb_h") or 1)
+                if thumb_top <= y_rel < thumb_top + thumb_h:
+                    self._scroll_drag_grab = y_rel - thumb_top
+                elif y_rel < thumb_top:
+                    self._set_scroll(self.scroll - tree_h)  # 轨道上段：上翻页
+                else:
+                    self._set_scroll(self.scroll + tree_h)  # 轨道下段：下翻页
+                return
+            # 会话区左键按下：开启/重开选区（文档坐标锚定）
             y_rel = y - body_top
             if not (0 <= y_rel < tree_h):
                 return
-            thumb_top = int(meta.get("thumb_top") or 0)
-            thumb_h = int(meta.get("thumb_h") or 1)
-            if thumb_top <= y_rel < thumb_top + thumb_h:
-                self._scroll_drag_grab = y_rel - thumb_top
-            elif y_rel < thumb_top:
-                self._set_scroll(self.scroll - tree_h)  # 轨道上段：上翻页
-            else:
-                self._set_scroll(self.scroll + tree_h)  # 轨道下段：下翻页
+            total = len(self._tree_rows_cache or [])
+            row = max(0, min(self.scroll + y_rel, max(0, total - 1)))
+            self._sel_anchor = (row, max(0, x))
+            self._sel_focus = (row, max(0, x))
+            self._sel_dragging = True
+            self._sel_edge = 0
+            self._sel_sig = self._tree_signature()
         elif kind == "mouse_move":
-            if self._scroll_drag_grab is None:
-                return
-            thumb_h = int(meta.get("thumb_h") or 1)
-            total = int(meta.get("scroll_total") or 0)
-            if total <= 0:
-                return
-            y_rel = y - body_top
-            usable = max(1, tree_h - thumb_h)
-            new_thumb = max(0, min(y_rel - self._scroll_drag_grab, usable))
-            self._set_scroll(round(new_thumb * max(1, total - tree_h) / usable))
+            if self._scroll_drag_grab is not None:
+                thumb_h = int(meta.get("thumb_h") or 1)
+                total = int(meta.get("scroll_total") or 0)
+                if total <= 0:
+                    return
+                y_rel = y - body_top
+                usable = max(1, tree_h - thumb_h)
+                new_thumb = max(0, min(y_rel - self._scroll_drag_grab, usable))
+                self._set_scroll(round(new_thumb * max(1, total - tree_h) / usable))
+            elif self._sel_dragging and self._sel_anchor is not None:
+                y_rel = y - body_top
+                last = max(0, len(self._tree_rows_cache or []) - 1)
+                # 越界方向：上缘（表头行以上，鼠标出不了窗口故最深 -1）/
+                # 下缘（提示·输入区视作"向下继续选"）；滚动交给帧循环 tick
+                if y_rel < 0:
+                    self._sel_edge = -1
+                    row = self.scroll
+                elif y_rel >= tree_h:
+                    self._sel_edge = 1
+                    row = min(self.scroll + tree_h - 1, last)
+                else:
+                    self._sel_edge = 0
+                    row = max(0, min(self.scroll + y_rel, last))
+                self._sel_focus = (row, max(0, x))
         elif kind == "mouse_up":
+            if self._sel_dragging:
+                # 原地单击（未拖出）：清除选区
+                if self._sel_focus == self._sel_anchor:
+                    self._sel_anchor = None
+                    self._sel_focus = None
+                self._sel_dragging = False
+            self._sel_edge = 0
             self._scroll_drag_grab = None
+
+    # ----- 自绘选区 -----
+
+    def _selection_range(self) -> Optional[Tuple[int, int, int, int]]:
+        """归一化选区 (r0, c0, r1, c1)：文档行号 + 单元格，两端含端点；失效返回 None
+
+        失效比对用帧内已算好的 _tree_sig（_tree_rows 每帧先于叠加更新，且缓存
+        命中时与当前签名等值），避免每帧重算 _tree_signature（内含 mcp.status_line）。"""
+        if self._sel_anchor is None or self._sel_focus is None:
+            return None
+        if self._tree_sig is not None and self._sel_sig != self._tree_sig:
+            self._sel_anchor = self._sel_focus = None
+            self._sel_edge = 0
+            return None
+        (r0, c0), (r1, c1) = self._sel_anchor, self._sel_focus
+        if (r1, c1) < (r0, c0):
+            r0, c0, r1, c1 = r1, c1, r0, c0
+        return r0, c0, r1, c1
+
+    def _selection_tick(self) -> None:
+        """拖拽选区顶/底缘的帧级自动滚动：motion 事件只在鼠标移动时到达，
+        鼠标停在边缘时由帧循环持续滚（每帧 2 行 @20fps ≈ 40 行/秒）。"""
+        if not self._sel_dragging or not self._sel_edge or self._sel_anchor is None:
+            return
+        self._set_scroll(self.scroll + 2 * self._sel_edge)
+        last = max(0, len(self._tree_rows_cache or []) - 1)
+        tree_h = int(self._row_meta.get("tree_h") or 4)
+        if self._sel_edge < 0:
+            row = self.scroll
+        else:
+            row = min(self.scroll + tree_h - 1, last)
+        cell = self._sel_focus[1] if self._sel_focus else 0
+        self._sel_focus = (row, cell)
+
+    @staticmethod
+    def _cell_to_col(plain: str, cell: int, end: bool = False) -> int:
+        """显示单元格 → 字符下标（宽字符跨界按包含处理）。
+
+        end=False 取覆盖 cell 的首个字符；end=True 取其后（右边界含端）。"""
+        used = 0
+        for i, ch in enumerate(plain):
+            w = _char_width(ch)
+            if used + w > cell:
+                return i + 1 if end else i
+            used += w
+        return len(plain)
+
+    def _apply_row_selection(self, row: str, c0: int, c1: int, width: int) -> str:
+        """带 ANSI 行上叠加选区背景：[c0, c1] 单元格（含端点）。行先补齐到 width。
+
+        分段发射：仅在「进入/离开选区、SGR 变化」的边界发射一次 SGR（选中段
+        = cur+底色，未选中段 = cur），而非逐字符重放——拖拽时每帧多出上万字节
+        转义序列会拉爆 rich 的整帧重写，表现为闪烁。"""
+        sel_bg = _bg(self.colors["selection_bg"])
+        padded = _pad(row, width)
+        out = []
+        cur = ""  # 自上个 RESET 起累积生效的 SGR
+        emitting_sel = None  # 上个可见字符是否处于选区（None=尚未发射可见字符）
+        used = 0
+        i = 0
+        while i < len(padded):
+            ch = padded[i]
+            m = _ANSI_RE.match(padded, i)
+            if m:
+                seq = m.group(0)
+                out.append(seq)
+                if seq == "\033[0m":
+                    cur = ""
+                    emitting_sel = None  # RESET 后下个可见字符前需重新声明状态
+                elif seq.endswith("m"):
+                    cur += seq
+                    if emitting_sel is True:
+                        out.append(sel_bg)  # 新 SGR 落在选中段中段：底色重声明
+                i = m.end()
+                continue
+            w = _char_width(ch)
+            selected = used + w > c0 and used <= c1
+            if selected != emitting_sel and (emitting_sel is not None or selected):
+                # 状态切换：RESET 后重放完整 SGR（cur）。只重放 cur 不够——
+                # 它通常只含 fg 分量，选区底色会残留到行尾（未选中尾段被误高亮）
+                out.append("\033[0m" + cur + (sel_bg if selected else ""))
+                emitting_sel = selected
+            out.append(ch)
+            used += w
+            i += 1
+        if cur or emitting_sel:
+            out.append(self.RESET)  # 有未闭合状态才补；行已自带 RESET 则不重复
+        return "".join(out)
+
+    def _selection_text(self) -> Optional[str]:
+        """选区纯文本：按单元格切首尾行，中间行取整行，去行尾填充空白"""
+        rng = self._selection_range()
+        if rng is None:
+            return None
+        r0, c0, r1, c1 = rng
+        cache = self._tree_rows_cache or []
+        lines = []
+        for r in range(max(0, r0), min(r1, len(cache) - 1) + 1):
+            plain = _ANSI_RE.sub("", cache[r])
+            if r == r0 and r == r1:
+                plain = plain[self._cell_to_col(plain, c0): self._cell_to_col(plain, c1, end=True)]
+            elif r == r0:
+                plain = plain[self._cell_to_col(plain, c0):]
+            elif r == r1:
+                plain = plain[: self._cell_to_col(plain, c1, end=True)]
+            lines.append(plain.rstrip())
+        return ("\n".join(lines)).strip("\n") or None
+
+    def _copy_selection(self) -> None:
+        text = self._selection_text()
+        if not text:
+            return
+        if _copy_to_clipboard(text):
+            self.status = f"已复制选区 {text.count(chr(10)) + 1} 行 · {len(text)} 字符"
 
     def _with_scrollbar(self, body: List[str], total: int, tree_h: int, width: int) -> List[str]:
         """会话区右侧 1 列滚动条：█ 滑块(accent) + │ 轨道(dim) + ▲▼ 端点(dim)。
@@ -2282,6 +2526,8 @@ class TuiApp:
                 result = self.show_confirm_form(
                     str(payload.get("name") or ""), payload.get("arguments") or {}
                 )
+            elif kind == "ask":
+                result = self.show_ask_form(payload or {})
             elif kind == "choose":
                 result = self.choose(
                     list(payload.get("options") or []), str(payload.get("prompt") or "")
@@ -2340,6 +2586,182 @@ class TuiApp:
                 rows.append(self.c("ink") + _clip(line, w - 1) + self.RESET)
         rows.append(self.c("dim") + _clip(" ↑↓ 选择 · Enter 确认 · Esc 拒绝", w - 1) + self.RESET)
         return rows
+
+    def _compose_ask(self, w: int) -> List[str]:
+        """询问用户面板内容：问题+选项（概述+描述）+末位自由输入+倒计时"""
+        spec = self.ask_spec or {}
+        options = list(spec.get("options") or [])
+        rows: List[str] = []
+        rows.append(
+            self.c("accent") + " ❓ " + self.RESET
+            + self.c("warn") + _clip(f"询问用户: {spec.get('question') or ''}", w - 6) + self.RESET
+        )
+        if self.ask_input_mode:
+            # 自由输入态：块光标跟随文本（同 confirm 拒绝原因输入）
+            text = self._ask_buf.to_text()
+            cur = max(0, min(self._ask_buf.cursor, len(text)))
+            left, right = text[:cur], text[cur:]
+            prompt = " 你的意见> "
+            inner = max(4, w - _display_width(prompt) - 3)
+            left_c = _clip(left, inner)
+            used = _display_width(left_c)
+            right_c = _clip(right, max(0, inner - used))
+            rows.append(
+                f"{self.c('accent')}{prompt}{self.RESET}"
+                f"{self.c('ink')}{left_c}{self.C_HL} {self.RESET}{right_c}{self.RESET}"
+            )
+            rows.append(self.c("dim") + _clip(" Enter 提交 · Esc 返回选项", w - 1) + self.RESET)
+            return rows
+        for i, opt in enumerate(options):
+            title = str(opt.get("title") or "")
+            desc = str(opt.get("description") or "")
+            line = f" {'❯' if i == self.ask_index else ' '} {i + 1}. {title}"
+            if i == self.ask_index:
+                rows.append(self.C_HL + _pad(_clip(line, w - 1), w - 1) + self.RESET)
+            else:
+                rows.append(self.c("ink") + _clip(line, w - 1) + self.RESET)
+            if desc:
+                dline = f"      {desc}"
+                color = self.c("dim") if i != self.ask_index else self.c("ink")
+                rows.append(color + _clip(dline, w - 1) + self.RESET)
+        free_i = len(options)
+        line = f" {'❯' if self.ask_index == free_i else ' '} ✎ 其他（自行输入意见）"
+        if self.ask_index == free_i:
+            rows.append(self.C_HL + _pad(_clip(line, w - 1), w - 1) + self.RESET)
+        else:
+            rows.append(self.c("ink") + _clip(line, w - 1) + self.RESET)
+        hint = " ↑↓ 选择 · 数字快选 · Enter 确认 · Esc 跳过"
+        if self.ask_deadline is not None:
+            rem = max(0, int(self.ask_deadline - time.monotonic()))
+            hint += f" · ⏱ {rem // 60}:{rem % 60:02d} 后自动跳过"
+        rows.append(self.c("dim") + _clip(hint, w - 1) + self.RESET)
+        return rows
+
+    def show_ask_form(self, payload: dict) -> dict:
+        """询问用户面板（阻塞）：↑↓/数字选择 · Enter 确认 · 末项进自由输入 · Esc 跳过。
+
+        payload: {"question": str, "options": [{"title", "description"}], "timeout": 秒，0=禁用}
+        返回 {"status": "answer"|"declined"|"timeout"|"cancelled", "answer"/"index"/"timeout"}。
+        自动超时经键盘轮询 tick 检查 deadline，超时返回 timeout 让 agent 循环继续。"""
+        question = str((payload or {}).get("question") or "")
+        raw_opts = payload.get("options") or []
+        options = [
+            {"title": str(o.get("title") or ""), "description": str(o.get("description") or "")}
+            for o in raw_opts
+            if isinstance(o, dict) and str(o.get("title") or "").strip()
+        ]
+        try:
+            timeout = max(0, int(payload.get("timeout") or 0))
+        except (TypeError, ValueError):
+            timeout = 0
+        self.ask_mode = True
+        self.ask_spec = {"question": question, "options": options}
+        self.ask_index = 0
+        self.ask_input_mode = False
+        self._ask_buf = TextBuffer()
+        self.ask_deadline = (time.monotonic() + timeout) if timeout > 0 else None
+        self._ask_last_sec = -1
+        try:
+            try:
+                _flush_input()
+            except Exception:
+                pass
+            self.render()
+            while True:
+                ev = _read_key()
+                kind, value = ev if ev is not None else ("tick", "")
+                if kind == "tick":
+                    # 倒计时：整秒变化才重渲染；到点自动跳过
+                    if self.ask_deadline is not None:
+                        now = time.monotonic()
+                        if now >= self.ask_deadline:
+                            return {"status": "timeout", "timeout": timeout}
+                        sec = int(self.ask_deadline - now)
+                        if sec != self._ask_last_sec:
+                            self._ask_last_sec = sec
+                            self.render()
+                    continue
+                if kind in ("mode_switch",):
+                    continue
+                if self.ask_input_mode:
+                    # 自由输入态
+                    if kind == "interrupt":
+                        return {"status": "cancelled"}
+                    if kind == "escape":
+                        self.ask_input_mode = False
+                        self._ask_buf.clear()
+                        self.render()
+                        continue
+                    if kind in ("submit", "newline"):
+                        return {"status": "answer", "answer": self._ask_buf.to_text().strip()}
+                    if kind == "char":
+                        if isinstance(value, str) and value and all(ord(c) >= 32 for c in value):
+                            self._ask_buf.insert(value)
+                            self.render()
+                        continue
+                    if kind == "backspace":
+                        self._ask_buf.backspace()
+                        self.render()
+                        continue
+                    if kind == "paste":
+                        flat = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+                        self._ask_buf.insert(flat)
+                        self.render()
+                        continue
+                    continue
+                # 选项模式
+                n = len(options) + 1  # 末项=自由输入
+                if kind == "interrupt":
+                    return {"status": "cancelled"}
+                if kind in ("escape",):
+                    return {"status": "declined"}
+                if kind == "up" or (kind == "hotkey" and str(value).endswith("up")):
+                    self.ask_index = (self.ask_index - 1) % n
+                    self.render()
+                    continue
+                if kind == "down" or (kind == "hotkey" and str(value).endswith("down")):
+                    self.ask_index = (self.ask_index + 1) % n
+                    self.render()
+                    continue
+                if kind == "mouse_wheel":
+                    self._scroll_tree_by(3 if value == "down" else -3)
+                    self.render()
+                    continue
+                if kind == "pageup" or (kind == "hotkey" and str(value) == "pageup"):
+                    self._scroll_tree_by(-self._row_meta.get("tree_h", 10))
+                    self.render()
+                    continue
+                if kind == "pagedown" or (kind == "hotkey" and str(value) == "pagedown"):
+                    self._scroll_tree_by(self._row_meta.get("tree_h", 10))
+                    self.render()
+                    continue
+                if kind == "submit":
+                    if self.ask_index < len(options):
+                        return {
+                            "status": "answer",
+                            "index": self.ask_index,
+                            "answer": options[self.ask_index]["title"],
+                        }
+                    self.ask_input_mode = True
+                    self._ask_buf = TextBuffer()
+                    self.render()
+                    continue
+                # 数字快捷键：直接选中对应项（选项立即生效，末项进输入态）
+                if kind == "char" and str(value).isdigit():
+                    idx = int(value) - 1
+                    if 0 <= idx < len(options):
+                        return {"status": "answer", "index": idx, "answer": options[idx]["title"]}
+                    if idx == len(options):
+                        self.ask_index = len(options)
+                        self.ask_input_mode = True
+                        self._ask_buf = TextBuffer()
+                        self.render()
+                    continue
+        finally:
+            self.ask_mode = False
+            self.ask_input_mode = False
+            self.ask_deadline = None
+            self.render()
 
     def show_confirm_form(self, tool_name: str, tool_args: Optional[dict] = None) -> dict:
         """工具确认面板（阻塞）：↑↓ 选择 · Enter 确认 · Esc 拒绝。
@@ -2492,7 +2914,23 @@ class TuiApp:
                 label = field.get("label", "")
                 ftype = field.get("type", "text")
                 value = self.settings_scratch.get(field["key"], field.get("current"))
-                if ftype == "choice":
+                if ftype == "plugin":
+                    # 树状插件行：展开箭头 + 开关状态；可展开项附 Enter 提示
+                    state = "开" if field.get("current") is True else "关"
+                    arrow = "▾" if field.get("expanded") else ("▸" if field.get("expandable") else "·")
+                    extra = " · Enter配置" if field.get("expandable") else ""
+                    display = _clip(f"{arrow} {label:20} < {state} > ←→{extra}", w - 4)
+                elif ftype == "pbool":
+                    # 勾选框模式（缩进于插件行下）
+                    mark = "[x]" if field.get("current") in (True, "true", "1", 1) else "[ ]"
+                    display = _clip(f"    {mark} {label}", w - 4)
+                elif ftype == "pchoice":
+                    show = "" if field.get("current") is None else str(field.get("current"))
+                    display = _clip(f"    {label:18} < {show} > ←→", w - 4)
+                elif ftype == "ptext":
+                    show = "" if field.get("current") is None else str(field.get("current"))
+                    display = _clip(f"    {label:18} {show}", w - 4)
+                elif ftype == "choice":
                     show = "" if value is None else str(value)
                     hint_lr = " ←→"
                     display = _clip(f"{label:20}  < {show} >{hint_lr}", w - 4)
@@ -2531,7 +2969,7 @@ class TuiApp:
         return lines[:h]
 
     # ----- 设置：三标签页 -----
-    settings_tabs = ["提供商", "模型", "系统", "快捷键"]
+    settings_tabs = ["提供商", "模型", "系统", "快捷键", "插件"]
 
     # 快捷键可选值（设置页 ←→）
     SHORTCUT_OPTIONS = {
@@ -2584,6 +3022,23 @@ class TuiApp:
     def _settings_model_names(self, config) -> List[str]:
         names = config.list_model_names() or [config.model_name]
         return names
+
+    @staticmethod
+    def _settings_workflow_names(config) -> List[str]:
+        """已识别的工作流列表（data/workflows/*.json），至少含当前激活项"""
+        from core import workflow as workflow_mod
+
+        names = workflow_mod.list_workflows(config)
+        active = workflow_mod.active_name(config)
+        if active not in names:
+            names.append(active)
+        return names or ["default"]
+
+    @staticmethod
+    def _settings_workflow_current(config) -> str:
+        from core import workflow as workflow_mod
+
+        return workflow_mod.active_name(config)
 
     # 焦点离开时才重建模型列表的文本字段
     _MODEL_LIST_TEXT_KEYS = frozenset({"provider_id", "model_id"})
@@ -2826,6 +3281,59 @@ class TuiApp:
                         "shortcut": key,
                     }
                 )
+        elif tab == "插件":
+            # 插件列表 + 声明式配置（树状缩进）：插件行 ←→ 启停（写盘+重载）、
+            # Enter 展开/收起；配置行按声明类型渲染（bool 勾选框 / list 左右切换 /
+            # str·int·float 行编辑），所有改动即时写透 config.plugins_config
+            from core import plugins as plugins_mod
+
+            rows = plugins_mod.statuses()
+            fields = []
+            if not rows:
+                fields.append(
+                    {
+                        "key": "_plugin_none",
+                        "label": "（未发现插件 · 放置 data/plugins/<id>/ 后 /plugin reload）",
+                        "type": "sep",
+                    }
+                )
+            else:
+                expanded_ids = getattr(self, "_plugin_expanded", set())
+                ftype_map = {"bool": "pbool", "list": "pchoice", "str": "ptext", "int": "ptext", "float": "ptext"}
+                for row in rows:
+                    pid = row["id"]
+                    decls = plugins_mod.declared_configs(pid)
+                    expanded = pid in expanded_ids
+                    fields.append(
+                        {
+                            "key": f"plugin_{pid}",
+                            "label": f"{row['name']} ({pid})",
+                            "type": "plugin",
+                            "pid": pid,
+                            "status": row["status"],
+                            "current": row["status"] == "loaded",
+                            "expandable": bool(decls),
+                            "expanded": expanded,
+                            "hint": row.get("error") or row.get("description") or "←→ 开/关 · Enter 展开/收起配置",
+                        }
+                    )
+                    if not expanded:
+                        continue
+                    for d in decls:
+                        fields.append(
+                            {
+                                "key": f"pcfg_{pid}__{d['key']}",
+                                "label": d.get("label") or d["key"],
+                                "type": ftype_map[d["type"]],
+                                "pid": pid,
+                                "ckey": d["key"],
+                                "decl": d,
+                                "options": d.get("options"),
+                                "current": plugins_mod.get_setting(pid, d["key"], d.get("default"), config),
+                                "hint": d.get("hint")
+                                or {"list": "←→ 切换选项", "bool": "Enter/←→ 勾选"}.get(d["type"], "Enter 编辑"),
+                            }
+                        )
         else:
             ui_cfg = (config.data or {}).get("ui") or {}
             mem_cfg = (config.data or {}).get("memory") or {}
@@ -2857,12 +3365,18 @@ class TuiApp:
                 {"key": "max_tool_rounds", "label": "最大工具轮数", "type": "text", "current": wf_cfg.get("max_rounds", 0), "hint": "0=用工作流文件值 · 超限后仍有进展会自动续期"},
                 {"key": "max_rounds_extensions", "label": "轮次续期上限", "type": "text", "current": wf_cfg.get("max_rounds_extensions", 5), "hint": "有进展续期次数上限，0=禁用续期"},
                 {"key": "max_tool_timeout", "label": "命令超时上限秒", "type": "text", "current": tools_cfg.get("max_timeout", 600), "hint": "execute_command/run_program 传入超时的钳制上限（1-∞）"},
+                {"key": "ask_user_timeout", "label": "询问自动超时", "type": "bool", "current": bool(tools_cfg.get("ask_user_timeout", True)), "hint": "←→ 开/关 · 开启后询问框 5 分钟未选择自动跳过"},
+                {"key": "workflow_enabled", "label": "启用工作流", "type": "bool", "current": bool(wf_cfg.get("enabled", False)), "hint": "←→ 关=直接对话 · 开=按工作流节点链运行（下一回合生效）"},
+                {"key": "workflow_active", "label": "工作流", "type": "choice", "options": self._settings_workflow_names(config), "current": self._settings_workflow_current(config), "hint": "←→ 选择处理管线（仅在启用工作流时生效）"},
                 {"key": "log_level", "label": "日志等级", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "current": "关闭" if log_level == "off" else log_level, "hint": "←→ 关闭=不记录任何日志（含写盘）"},
                 {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 切换当前模型"},
             ]
         self.settings_fields = fields
-        # 初始化 scratch：保留同 key 已编辑值
+        # 初始化 scratch：保留同 key 已编辑值（插件页字段写透持久化，不经 scratch）
         for field in fields:
+            if field.get("type") in ("plugin", "pbool", "pchoice", "ptext"):
+                scratch_keep.pop(field["key"], None)
+                continue
             if field["key"] not in scratch_keep:
                 scratch_keep[field["key"]] = field.get("current")
             # choice 新 options 时校正
@@ -2881,6 +3395,7 @@ class TuiApp:
         self.settings_index = 0
         self._settings_scroll = 0
         self.settings_scratch = {}
+        self._plugin_expanded = set()
         self.settings_provider_id = config.data.get("active_provider_id", "")
         self.settings_model_name = config.model_name
         self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
@@ -2944,6 +3459,24 @@ class TuiApp:
                 self._clamp_settings_index()
                 field = self.settings_fields[self.settings_index] if self.settings_fields else {}
                 ftype = field.get("type")
+                # 插件页：Enter 展开/收起插件行；勾选 bool；行编辑 str/int/float
+                if ftype == "plugin":
+                    self._settings_plugin_expand(field)
+                    self._immediate_settings_refresh(config)
+                    self._clamp_settings_index()
+                    self.render()
+                    continue
+                if ftype == "pbool":
+                    self._settings_plugin_toggle_bool(config, field)
+                    self._immediate_settings_refresh(config)
+                    self.render()
+                    continue
+                if ftype == "ptext":
+                    self._settings_plugin_edit_text(config, field)
+                    self._immediate_settings_refresh(config)
+                    self._clamp_settings_index()
+                    self.render()
+                    continue
                 # 执行动作 / 文本编辑 / 开关
                 if ftype == "action":
                     if field.get("key") == "save_provider":
@@ -2998,10 +3531,18 @@ class TuiApp:
                 self._settings_move_selection(1)
                 self.render()
             elif dirn == "left":
-                self._settings_cycle_choice(-1, config)
+                if self._settings_plugin_adjust(config, -1):
+                    self._immediate_settings_refresh(config)
+                    self._clamp_settings_index()
+                else:
+                    self._settings_cycle_choice(-1, config)
                 self.render()
             elif dirn == "right":
-                self._settings_cycle_choice(1, config)
+                if self._settings_plugin_adjust(config, 1):
+                    self._immediate_settings_refresh(config)
+                    self._clamp_settings_index()
+                else:
+                    self._settings_cycle_choice(1, config)
                 self.render()
             else:
                 # 其它键（含 backspace/char——文本编辑统一走 Enter 后的行输入）仅重绘
@@ -3320,6 +3861,114 @@ class TuiApp:
         self._settings_baseline = self._settings_snapshot(config)
         return msg
 
+    # ----- 设置：插件标签页（改动即时写透 config.plugins_config，不经 scratch）-----
+
+    def _plugin_current_field(self) -> dict:
+        fields = self.settings_fields or []
+        if not fields:
+            return {}
+        self._clamp_settings_index()
+        return fields[self.settings_index]
+
+    def _settings_plugin_adjust(self, config, direction: int) -> bool:
+        """←→：插件行=启停（写盘+重载）、pbool=勾选、pchoice=切换选项。
+        处理了插件类字段返回 True（调用方跳过通用 choice 循环并重建字段）。"""
+        field = self._plugin_current_field()
+        ftype = field.get("type")
+        if ftype == "plugin":
+            self._settings_plugin_toggle_enable(config, field)
+            return True
+        if ftype == "pbool":
+            self._settings_plugin_toggle_bool(config, field)
+            return True
+        if ftype == "pchoice":
+            self._settings_plugin_cycle_choice(config, field, direction)
+            return True
+        return False
+
+    def _settings_plugin_toggle_enable(self, config, field) -> None:
+        from core import plugins as plugins_mod
+
+        pid = field.get("pid")
+        target = field.get("current") is not True
+        if not plugins_mod.set_enabled(pid, target, config):
+            self.settings_notice = f"插件 {pid} 状态写入失败"
+            return
+        counts = plugins_mod.reload(config)
+        row = next((r for r in plugins_mod.statuses() if r["id"] == pid), {})
+        status = row.get("status")
+        if target and status != "loaded":
+            self.settings_notice = f"插件 {pid} 启用后仍为[{status}]：{row.get('error') or '未知原因'}"
+        else:
+            self.settings_notice = (
+                f"插件 {pid} 已{'启用' if target else '禁用'} · 重载："
+                f"装载{counts['loaded']} 禁用{counts['disabled']} 失败{counts['failed']}"
+            )
+
+    def _settings_plugin_toggle_bool(self, config, field) -> None:
+        from core import plugins as plugins_mod
+
+        pid, key = field.get("pid"), field.get("ckey")
+        cur = bool(plugins_mod.get_setting(pid, key, None, config) in (True, "true", "1", 1))
+        val = plugins_mod.set_setting(pid, key, not cur, config)
+        self.settings_notice = f"{field.get('label', key)} = {'开' if val else '关'}"
+
+    def _settings_plugin_cycle_choice(self, config, field, direction: int) -> None:
+        from core import plugins as plugins_mod
+
+        options = [str(o) for o in (field.get("options") or [])]
+        if not options:
+            return
+        pid, key = field.get("pid"), field.get("ckey")
+        cur = plugins_mod.get_setting(pid, key, None, config)
+        cur_s = "" if cur is None else str(cur)
+        idx = options.index(cur_s) if cur_s in options else 0
+        nxt = options[(idx + direction) % len(options)]
+        plugins_mod.set_setting(pid, key, nxt, config)
+        self.settings_notice = f"{field.get('label', key)} = {nxt}"
+
+    def _settings_plugin_expand(self, field) -> None:
+        pid = field.get("pid")
+        expanded = getattr(self, "_plugin_expanded", set())
+        if pid in expanded:
+            expanded.discard(pid)
+            self.settings_notice = f"已收起 {field.get('label', pid)} 的配置"
+        else:
+            expanded.add(pid)
+            self.settings_notice = f"已展开 {field.get('label', pid)} 的配置"
+        self._plugin_expanded = expanded
+
+    def _settings_plugin_edit_text(self, config, field) -> None:
+        """str/int/float 配置：Enter 占用输入行编辑；int/float 解析失败保留原值"""
+        from core import plugins as plugins_mod
+
+        pid, key = field.get("pid"), field.get("ckey")
+        decl = field.get("decl") or {}
+        label = field.get("label", key)
+        cur = plugins_mod.get_setting(pid, key, None, config)
+        self.settings_mode = False
+        self.render()
+        try:
+            raw = _paused_input(f"{label} [{'' if cur is None else cur}]: ")
+        except (EOFError, KeyboardInterrupt):
+            raw = ""
+        self.settings_mode = True
+        if raw == "":
+            self.settings_notice = f"{label} 未修改"
+            return
+        ctype = decl.get("type", "str")
+        try:
+            coerced = int(float(raw)) if ctype == "int" else (float(raw) if ctype == "float" else raw)
+        except (TypeError, ValueError):
+            self.settings_notice = f"{label} 需要{'整数' if ctype == 'int' else '小数'}，已保留原值 {cur}"
+            return
+        try:
+            val = plugins_mod.set_setting(pid, key, coerced, config)
+        except ValueError as e:
+            self.settings_notice = str(e)
+            return
+        self.settings_notice = f"{label} 已保存 = {val}"
+
     def _settings_run_action(self, config, action: str) -> None:
         """添加提供商/模型：占用输入行读入 id"""
         if action == "add_provider":
@@ -3489,6 +4138,13 @@ class TuiApp:
             names = [p.strip() for p in str(s["tool_whitelist"] or "").split(",") if p.strip()]
             ctx_cfg["tool_whitelist"] = names
         wf_cfg = config.data.setdefault("workflow", {})
+        if "workflow_enabled" in s:
+            raw = s["workflow_enabled"]
+            wf_cfg["enabled"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
+        if "workflow_active" in s and s["workflow_active"]:
+            from core import workflow as workflow_mod
+
+            workflow_mod.set_active(config, str(s["workflow_active"]))
         if "max_tool_rounds" in s:
             try:
                 wf_cfg["max_rounds"] = max(0, int(float(s["max_tool_rounds"])))
@@ -3505,6 +4161,10 @@ class TuiApp:
                 tools_cfg["max_timeout"] = max(1, int(float(s["max_tool_timeout"])))
             except (TypeError, ValueError):
                 pass
+        if "ask_user_timeout" in s:
+            tools_cfg = config.data.setdefault("tools", {})
+            raw = s["ask_user_timeout"]
+            tools_cfg["ask_user_timeout"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
         if "log_level" in s and s["log_level"]:
             level = str(s["log_level"]).strip()
             level = {"关闭": "off"}.get(level, level.lower())

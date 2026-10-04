@@ -90,8 +90,8 @@ def _mouse_event(data: str) -> Optional[KeyEvent]:
         return KeyEvent("mouse_wheel", "down")
     pos = f"{xs},{ys}"
     if et == "mouse_down":
-        # 旧栈忽略右/中键按下
-        return KeyEvent("mouse_down", pos) if button == "left" else None
+        # value 携带按键前缀（left/right/middle）：会话树自绘选区需要右键复制
+        return KeyEvent("mouse_down", f"{button}:{pos}")
     if et == "mouse_up":
         return KeyEvent("mouse_up", pos)
     if et == "mouse_move":

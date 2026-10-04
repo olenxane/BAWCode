@@ -54,6 +54,8 @@ EVENTS: Dict[str, dict] = {
     "session_start": {"kind": "collect", "desc": "会话初始化完成（collect）"},
     "before_turn": {"kind": "call", "desc": "回合开始，可改写 user_text（返回 {user_text: ...} 生效）"},
     "after_turn": {"kind": "collect", "desc": "回合结束通知（collect）"},
+    "stream_delta": {"kind": "collect", "desc": "流式输出增量通知 {kind, piece}（collect，高频率）"},
+    "turn_status": {"kind": "collect", "desc": "回合状态/阶段变化通知 {status} 或 {phase}（collect）"},
     "before_tool": {"kind": "call", "desc": "工具执行前，可改写 args 或拒绝执行"},
     "after_tool": {"kind": "collect", "desc": "工具执行后通知（collect）"},
     "context_supplement": {"kind": "collect", "desc": "回合上下文补充文本（collect，返回 str 生效）"},

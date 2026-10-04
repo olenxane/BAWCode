@@ -1,5 +1,7 @@
 #该部分是工具的具体实现，需要补齐常用工具，包含：基础的文件编辑、computer-use相关、终端命令调用、程序调用、计划编写、步骤生成、步骤更新、计划更新
+import base64
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -140,12 +142,12 @@ def set_background_notifier(fn) -> None:
 
 
 def _bg_output_file() -> Path:
-    """后台输出文件：沿用外置存储目录 data/toolcalls/{project}/{session}/，无会话退 data/bgtasks"""
+    """后台输出文件：沿用外置存储目录 data/toolcalls/{project}/{session}/，无会话退项目根 data/bgtasks"""
     session = memory_mod.get_session()
     if session is not None:
         d = toolstore.store_dir(session.config, session.project_id, session.session_id)
     else:
-        d = Path("data") / "bgtasks"
+        d = Path(__file__).resolve().parent.parent / "data" / "bgtasks"
     d.mkdir(parents=True, exist_ok=True)
     return d / f"bg_{time.strftime('%H%M%S')}_{os.getpid()}_{threading.get_ident() % 10000}.log"
 
@@ -209,6 +211,100 @@ def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: 
         fn(note)
     except Exception as exc:
         log.error("后台任务通知投递失败 id=%s: %r", task_id, exc)
+
+
+# ----- ask_user：询问用户意见（选项+自由输入，可自动超时） -----
+# 交互经 UI 请求桥（main._agent_turn_impl 回合内绑定，回合末解绑）：
+# agent 线程发请求阻塞等结果，主线程弹面板收键盘（复用 confirm 面板管线）
+
+_ask_bridge = None  # Callable[[dict], dict]
+
+# 自动超时时长（秒）：开关型配置，开启即固定 5 分钟
+ASK_USER_TIMEOUT = 300
+
+
+def set_ask_user_bridge(fn) -> None:
+    """注册 ask_user 的 UI 交互桥（payload -> result dict）"""
+    global _ask_bridge
+    _ask_bridge = fn
+
+
+def _ask_user_timeout() -> int:
+    """自动超时秒数：开关开启固定 5 分钟（兼容旧数字配置，>0 视为开），关=0 禁用"""
+    try:
+        session = memory_mod.get_session()
+        data = getattr(getattr(session, "config", None), "data", None) or {}
+        raw = (data.get("tools") or {}).get("ask_user_timeout", True)
+        if isinstance(raw, str):
+            raw = raw.strip().lower() in ("true", "1", "on")
+        return ASK_USER_TIMEOUT if raw else 0
+    except Exception:
+        return ASK_USER_TIMEOUT
+
+
+@register.register(
+    name="ask_user",
+    description="Ask the user for a decision via an interactive dialog",
+    usage="ask_user <question> <options...>",
+    schema={
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "要询问用户的问题（一句话）",
+            },
+            "options": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "选项概述（短语）"},
+                        "description": {"type": "string", "description": "选项具体描述（做法/后果/理由）"},
+                    },
+                    "required": ["title"],
+                },
+                "description": "候选项列表（2-4 个为宜）；界面自动附加一项自由输入供用户自填意见",
+            },
+        },
+        "required": ["question", "options"],
+    },
+)
+def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
+    """询问用户意见：弹交互框（概述+描述选项、末位自由输入），超时自动跳过"""
+    if not isinstance(question, str) or not question.strip():
+        return "参数错误: question 不能为空"
+    opts = []
+    for o in options or []:
+        if isinstance(o, dict) and str(o.get("title") or "").strip():
+            opts.append({"title": str(o["title"]).strip(), "description": str(o.get("description") or "").strip()})
+    if not opts:
+        return "参数错误: options 至少需要一项（含 title）"
+    bridge = _ask_bridge
+    if bridge is None:
+        return "当前环境无交互通道，无法询问用户；请基于现有信息自行决策。"
+    payload = {"question": question.strip(), "options": opts, "timeout": _ask_user_timeout()}
+    try:
+        result = bridge(payload)
+    except Exception as exc:
+        log.error("ask_user 交互桥异常: %r", exc)
+        return f"询问用户失败: {exc}"
+    if not isinstance(result, dict):
+        return "用户未作出选择（交互中断），请基于现有信息继续。"
+    status = str(result.get("status") or "")
+    if status == "timeout":
+        secs = int(result.get("timeout") or payload["timeout"] or 0)
+        return f"超时：{secs}秒内用户未作出选择，已自动跳过。请基于现有信息继续推进，不要等待。"
+    if status == "declined":
+        return "用户按 Esc 跳过了本次询问（未作出选择），请基于现有信息继续推进。"
+    if status == "cancelled":
+        return "询问被取消（回合中断）。"
+    answer = str(result.get("answer") or "").strip()
+    if not answer:
+        return "用户未提供有效选择，请基于现有信息继续。"
+    idx = result.get("index")
+    if isinstance(idx, int):
+        return f"用户选择了: {answer}"
+    return f"用户自行输入: {answer}"
 
 
 @register.register(
@@ -1152,6 +1248,446 @@ def run_program(
         return f"启动失败: {e}"
 
 
+# ----- webfetch：以真实浏览器头抓取页面，剥离脚本/导航/广告等噪音，
+# 块级结构转 markdown-ish 文本返回（bs4+lxml 缺失时优雅降级为依赖提示）-----
+
+_WEBFETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
+_WEBFETCH_MAX_BYTES = 5 * 1024 * 1024  # 响应体上限，防超大页面
+_WEBFETCH_MAX_CHARS = 50000            # 返回文本硬顶（无外置机制兜底时防撑爆上下文）
+_WEBFETCH_DROP_TAGS = frozenset({
+    "script", "style", "noscript", "template", "svg", "iframe", "object", "embed",
+    "link", "meta", "head", "nav", "header", "footer", "aside", "form", "button",
+    "select", "option", "input", "textarea", "label", "dialog",
+})
+_WEBFETCH_ROLES = frozenset({"navigation", "banner", "contentinfo", "complementary", "search"})
+# 启发式噪音 class/id 关键词（保守集合：只打明显广告/追踪/装饰，避免误伤正文）
+_WEBFETCH_NOISE_HINTS = (
+    "advert", "sponsor", "promo", "cookie", "consent", "gdpr", "newsletter",
+    "subscribe", "breadcrumb", "social-share", "share-bar", "popup", "banner",
+)
+_WEBFETCH_HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_WEBFETCH_INLINE_TAGS = frozenset({
+    "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em", "i",
+    "kbd", "mark", "q", "s", "samp", "small", "span", "strong", "sub", "sup",
+    "time", "u", "var", "wbr", "font", "big", "strike", "del", "ins",
+})
+# 正文图片保留：下载落盘并原位标注路径，供多模态模型读取理解
+_WEBFETCH_MAX_IMAGES = 20              # 单页保留上限，防图片瀑布页
+_WEBFETCH_IMG_MAX_BYTES = 10 * 1024 * 1024
+_WEBFETCH_IMG_TIMEOUT = 10             # 单图下载超时
+_WEBFETCH_IMG_WORKERS = 8
+# 图片生命周期跟随所属会话活跃度（启动时探测会话文件 mtime）：
+# 会话 1 天无更新（或会话已不存在）→ 其 webfetch_imgs 整目录回收；
+# 会话活跃的图片寿命另按文件 mtime 封顶 30 天
+_WEBFETCH_SESSION_IDLE = 86400
+_WEBFETCH_IMG_MAX_AGE = 30 * 86400
+_WEBFETCH_IMG_SKIP_HINTS = (           # 装饰图 URL 启发式（icon/logo/头像/占位）
+    "icon", "favicon", "logo", "sprite", "avatar", "emoji", "spacer",
+    "pixel", "blank", "badge", "rating",
+)
+_WEBFETCH_IMG_LAZY_ATTRS = ("src", "data-src", "data-original", "data-lazy-src", "data-srcset")
+
+
+def _webfetch_deps():
+    """webfetch 依赖（requests/bs4/lxml）；缺失返回 None 由调用方给依赖提示"""
+    try:
+        import requests
+        from bs4 import BeautifulSoup, NavigableString, Tag
+        return requests, BeautifulSoup, NavigableString, Tag
+    except ImportError as e:
+        log.warn("webfetch 依赖缺失: %s", e)
+        return None
+
+
+def _webfetch_is_noise(node) -> bool:
+    """噪音节点：hidden/aria/role 装饰件、内联隐藏或明显广告追踪 class/id"""
+    if node.get("aria-hidden") == "true" or node.get("hidden") is not None:
+        return True
+    if str(node.get("role") or "").lower() in _WEBFETCH_ROLES:
+        return True
+    style = str(node.get("style") or "").replace(" ", "").lower()
+    if "display:none" in style or "visibility:hidden" in style:
+        return True
+    sig = " ".join([" ".join(node.get("class") or []), str(node.get("id") or "")]).lower()
+    return any(h in sig for h in _WEBFETCH_NOISE_HINTS)
+
+
+def _webfetch_clean(root) -> None:
+    """整棵摘除噪音标签与启发式噪音节点（先收集后摘除，避免遍历中改树）"""
+    from bs4 import Comment
+    doomed = [
+        node
+        for node in root.find_all(True)
+        if node.name.lower() in _WEBFETCH_DROP_TAGS or _webfetch_is_noise(node)
+    ]
+    for node in doomed:
+        node.decompose()
+    for comment in root.find_all(string=lambda s: isinstance(s, Comment)):
+        comment.extract()
+
+
+def _webfetch_img_dir() -> Path:
+    """图片临时保存目录：外置存储下 webfetch_imgs/，无会话退项目根 data/webfetch_imgs（锚定绝对路径防 cwd 漂移）"""
+    session = memory_mod.get_session()
+    if session is not None:
+        d = toolstore.store_dir(session.config, session.project_id, session.session_id) / "webfetch_imgs"
+    else:
+        d = Path(__file__).resolve().parent.parent / "data" / "webfetch_imgs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def webfetch_gc() -> None:
+    """启动时图片回收：按 {persist_dir}/{project}/{session}/webfetch_imgs 遍历，
+    会话文件（data/sessions/{project}/{session}.json）1 天无更新或不存在 → 整目录释放；
+    会话活跃的目录内单图 mtime 超 30 天封顶删除。异常不阻塞启动。"""
+    try:
+        session = memory_mod.get_session()
+        config = getattr(session, "config", None) if session is not None else None
+        data = (getattr(config, "data", None) or {}) if config is not None else {}
+        ctx_cfg = data.get("context") or {}
+        base_raw = ctx_cfg.get("persist_dir") or "data/toolcalls"
+        root = Path(base_raw)
+        if not root.is_absolute():
+            root = Path(__file__).resolve().parent.parent / base_raw
+        sessions_root = Path(__file__).resolve().parent.parent / "data" / "sessions"
+        if not root.is_dir():
+            return
+        now = time.time()
+        freed = 0
+        for project_dir in root.iterdir():
+            if not project_dir.is_dir():
+                continue
+            for sid_dir in project_dir.iterdir():
+                imgs_dir = sid_dir / "webfetch_imgs"
+                if not imgs_dir.is_dir():
+                    continue
+                session_file = sessions_root / project_dir.name / f"{sid_dir.name}.json"
+                if not session_file.exists() or now - session_file.stat().st_mtime > _WEBFETCH_SESSION_IDLE:
+                    shutil.rmtree(imgs_dir, ignore_errors=True)
+                    freed += 1
+                    log.info("webfetch 回收：会话 %s/%s 已闲置，释放图片目录", project_dir.name, sid_dir.name)
+                    continue
+                for img in list(imgs_dir.iterdir()):
+                    try:
+                        if img.is_file() and now - img.stat().st_mtime > _WEBFETCH_IMG_MAX_AGE:
+                            img.unlink()
+                    except OSError as exc:
+                        log.warn("webfetch 图片清理失败 %s: %s", img, exc)
+        if freed:
+            log.info("webfetch 启动回收完成：%d 个闲置会话图片目录已释放", freed)
+    except Exception as exc:
+        log.warn("webfetch 图片回收异常（忽略）: %r", exc)
+
+
+def _webfetch_img_src(img) -> str:
+    """取图片地址：src 优先，依次回退常见懒加载属性；srcset 取首个 URL"""
+    for attr in _WEBFETCH_IMG_LAZY_ATTRS:
+        raw = str(img.get(attr) or "").strip()
+        if raw:
+            return raw.split(",")[0].strip().split(" ")[0] if attr == "data-srcset" else raw
+    return ""
+
+
+def _webfetch_img_rejected(src: str, img) -> bool:
+    """装饰图判定：URL 提示词（icon/logo/头像等）或声明确尺寸过小（<64px）"""
+    low = src.lower()
+    if any(h in low for h in _WEBFETCH_IMG_SKIP_HINTS):
+        return True
+    for dim in ("width", "height"):
+        m = re.search(r"\d+", str(img.get(dim) or ""))
+        if m and int(m.group()) < 64:
+            return True
+    return False
+
+
+def _webfetch_collect_images(root, Tag) -> list:
+    """收集正文根内有效图片：[(img_tag, key, alt, raw_src)]；key=绝对 URL 或 data URI 的 sha1"""
+    from urllib.parse import urljoin
+    targets, seen = [], set()
+    for img in root.find_all("img"):
+        raw = _webfetch_img_src(img)
+        if not raw or _webfetch_img_rejected(raw, img):
+            continue
+        if raw.startswith("data:image/"):
+            key = "data:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+        else:
+            key = urljoin(_webfetch_page_url[0], raw) if _webfetch_page_url[0] else raw
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append((img, key, str(img.get("alt") or "").strip(), raw))
+    return targets[:_WEBFETCH_MAX_IMAGES]
+
+
+_webfetch_page_url = [""]  # 当前抓取页面 URL（相对图片地址拼接用）
+
+
+def _webfetch_save_image(key: str, content: bytes, mime: str) -> Path:
+    """图片落盘：文件名=sha1 前 12 位 + 扩展名（mime → URL 后缀 → .img 兜底）"""
+    ext = {
+        "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+        "image/webp": ".webp", "image/svg+xml": ".svg", "image/bmp": ".bmp",
+        "image/x-icon": ".ico", "image/avif": ".avif",
+    }.get(mime.split(";")[0].strip().lower())
+    if not ext:
+        m = re.search(r"\.(\w{2,5})(?:[?#]|$)", key)
+        ext = f".{m.group(1).lower()}" if m else ".img"
+    path = _webfetch_img_dir() / f"img_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:12]}{ext}"
+    if not path.exists():
+        path.write_bytes(content)
+    return path
+
+
+def _webfetch_download_images(targets: list) -> dict:
+    """并发下载图片 → {key: 原位标注文本}；失败单图标注不阻塞正文"""
+    deps = _webfetch_deps()
+    if deps is None:
+        return {}
+    requests = deps[0]
+    from urllib.parse import urljoin
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_one(item: tuple):
+        _, key, _, raw = item
+        try:
+            if raw.startswith("data:image/"):
+                head, _, b64 = raw.partition(",")
+                mime = head[5:].split(";")[0] or "image/png"
+                content = base64.b64decode(b64, validate=False)
+            else:
+                headers = dict(_WEBFETCH_HEADERS)
+                headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+                headers["Referer"] = _webfetch_page_url[0]
+                headers["Sec-Fetch-Dest"] = "image"
+                headers["Sec-Fetch-Mode"] = "no-cors"
+                headers["Sec-Fetch-Site"] = "cross-site"
+                headers["Cache-Control"] = ""
+                with requests.get(key, headers=headers, timeout=_WEBFETCH_IMG_TIMEOUT, stream=True) as r:
+                    r.raise_for_status()
+                    mime = (r.headers.get("Content-Type") or "").lower()
+                    buf = []
+                    total = 0
+                    for chunk in r.iter_content(65536):
+                        buf.append(chunk)
+                        total += len(chunk)
+                        if total > _WEBFETCH_IMG_MAX_BYTES:
+                            return key, "超限未保存"
+                    content = b"".join(buf)
+            path = _webfetch_save_image(key, content, mime)
+            return key, f"已保存: {path}"
+        except Exception as exc:
+            log.debug("webfetch 图片下载失败 %s: %s", key[:120], exc)
+            return key, "下载失败"
+
+    with ThreadPoolExecutor(max_workers=_WEBFETCH_IMG_WORKERS) as pool:
+        results = dict(pool.map(fetch_one, targets))
+    return {key: f"[图: {alt} | {results[key]}]" if alt else f"[图 | {results[key]}]"
+            for _, key, alt, _raw in targets}
+
+
+def _webfetch_inline(node, Tag, img_map: dict) -> str:
+    """行内聚合并保留结构：链接 [text](href)、图片原位标注保存路径；块级/列表文本交给 block 层"""
+    parts = []
+    for child in node.children:
+        if isinstance(child, Tag):
+            name = child.name.lower()
+            if name == "br":
+                parts.append("\n")
+            elif name in ("ul", "ol"):
+                continue  # 嵌套列表由 block 层负责，避免重复渲染
+            elif name == "a":
+                text = _webfetch_inline(child, Tag, img_map).strip()
+                href = str(child.get("href") or "").strip()
+                if text and href and not href.startswith(("javascript:", "#")):
+                    parts.append(f"[{text}]({href})" if href != text else text)
+                else:
+                    parts.append(text)
+            elif name == "img":
+                src = _webfetch_img_src(child)
+                key = None
+                if src:
+                    if src.startswith("data:image/"):
+                        key = "data:" + hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
+                    else:
+                        from urllib.parse import urljoin
+                        key = urljoin(_webfetch_page_url[0], src) if _webfetch_page_url[0] else src
+                parts.append(img_map.get(key, "") if key else "")
+            elif name in _WEBFETCH_INLINE_TAGS:
+                parts.append(_webfetch_inline(child, Tag, img_map))
+            else:
+                parts.append(_webfetch_inline(child, Tag, img_map))
+        else:
+            parts.append(str(child))
+    return "".join(parts)
+
+
+def _webfetch_blocks(node, Tag, NavigableString, lines: list, img_map: dict, indent: int = 0) -> None:
+    """块级渲染：标题/段落/列表/表格/代码块各自成行，容器递归、行内子聚合成分段"""
+    name = (node.name or "").lower()
+
+    def push(text: str) -> None:
+        text = re.sub(r"[ \t\r\xa0]+", " ", text).strip()
+        if text:
+            lines.append(("    " * indent + text) if indent else text)
+            lines.append("")
+
+    if name in _WEBFETCH_HEADINGS:
+        push("#" * int(name[1]) + " " + _webfetch_inline(node, Tag, img_map))
+    elif name == "pre":
+        text = node.get_text().strip("\n")
+        if text.strip():
+            lines.append("```")
+            lines.extend(text.splitlines())
+            lines.append("```")
+            lines.append("")
+    elif name in ("ul", "ol"):
+        for i, li in enumerate(node.find_all("li", recursive=False), 1):
+            marker = f"{i}. " if name == "ol" else "- "
+            lines.append("    " * indent + marker + re.sub(r"\s+", " ", _webfetch_inline(li, Tag, img_map)).strip())
+            for sub in li.find_all(["ul", "ol"], recursive=False):
+                _webfetch_blocks(sub, Tag, NavigableString, lines, img_map, indent + 1)
+        lines.append("")
+    elif name == "table":
+        for tr in node.find_all("tr"):
+            cells = [re.sub(r"\s+", " ", _webfetch_inline(c, Tag, img_map)).strip() for c in tr.find_all(["td", "th"], recursive=False)]
+            if any(cells):
+                lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+    elif name in ("p", "blockquote", "figcaption", "dt", "dd", "summary", "dl"):
+        push(_webfetch_inline(node, Tag, img_map))
+    else:
+        buf = []
+        for child in node.children:
+            if isinstance(child, Tag):
+                cname = child.name.lower()
+                if cname == "br":
+                    buf.append("\n")
+                elif cname in _WEBFETCH_INLINE_TAGS or cname == "a" or cname == "img":
+                    buf.append(_webfetch_inline(child, Tag, img_map))
+                else:
+                    push(" ".join(buf))
+                    buf = []
+                    _webfetch_blocks(child, Tag, NavigableString, lines, img_map, indent)
+            else:
+                buf.append(str(child))
+        push(" ".join(buf))
+
+
+def _webfetch_render(soup, page_url: str) -> tuple:
+    from bs4 import NavigableString, Tag
+    title = str(soup.title.string).strip() if soup.title and soup.title.string else ""  # head 剥离前取
+    _webfetch_page_url[0] = page_url
+    _webfetch_clean(soup)
+    candidates = list(soup.find_all(["main", "article"]))
+    candidates += list(soup.find_all(attrs={"role": "main"}))
+    candidates += list(soup.find_all(attrs={"itemprop": "articleBody"}))
+    root = max(candidates, key=lambda c: len(c.get_text()), default=None) or soup.body or soup
+    targets = _webfetch_collect_images(root, Tag)
+    img_map = _webfetch_download_images(targets) if targets else {}
+    lines: list = []
+    _webfetch_blocks(root, Tag, NavigableString, lines, img_map)
+    return title, "\n".join(lines)
+
+
+@register.register(
+    name="webfetch",
+    description="Fetch a web page with real-browser headers and return the cleaned main text (noise stripped)",
+    usage="webfetch <url> [timeout]",
+    schema={
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "完整 URL（http/https）",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "请求超时秒数，可选，默认 30，钳制 1-120",
+            },
+        },
+        "required": ["url"],
+    },
+)
+def webfetch(url: str, timeout: int = 30) -> str:
+    """网页抓取：真实浏览器行为 + 噪音剥离 + 正文提取；正文图片下载落盘并原位标注路径（供多模态模型读取）"""
+    deps = _webfetch_deps()
+    if deps is None:
+        return "webfetch 依赖缺失（requests/beautifulsoup4/lxml），请 pip install -r requirements.txt"
+    requests, BeautifulSoup, _, Tag = deps
+
+    url = str(url or "").strip()
+    if not re.match(r"^https?://", url, re.I):
+        return f"URL 需以 http(s):// 开头: {url}"
+    try:
+        seconds = int(timeout)
+    except (TypeError, ValueError):
+        seconds = 30
+    seconds = max(1, min(seconds, 120))
+
+    log.info("webfetch: %s（timeout=%ds）", url, seconds)
+    try:
+        with requests.get(
+            url,
+            headers=_WEBFETCH_HEADERS,
+            timeout=seconds,
+            allow_redirects=True,
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            chunks = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > _WEBFETCH_MAX_BYTES:
+                    log.warn("webfetch 响应超限截断: %s（>%d bytes）", url, _WEBFETCH_MAX_BYTES)
+                    break
+            content = b"".join(chunks)
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            final_url = str(resp.url)
+    except requests.exceptions.Timeout:
+        return f"抓取超时（>{seconds}s）: {url}"
+    except requests.exceptions.SSLError as e:
+        return f"SSL 错误: {e}"
+    except requests.exceptions.RequestException as e:
+        log.warn("webfetch 失败: %s（%s）", url, e)
+        return f"抓取失败: {e}"
+
+    if "application/json" in ctype:
+        text = content.decode("utf-8", errors="replace")
+    elif "html" in ctype or "xml" in ctype or not ctype:
+        soup = BeautifulSoup(content, "lxml")
+        if soup.find("html") is None and b"<html" not in content[:2048].lower():
+            # 非 HTML 响应（纯文本等）：按文本直出
+            text = content.decode("utf-8", errors="replace")
+        else:
+            title, body = _webfetch_render(soup, final_url)
+            meta = "\n".join(filter(None, [title and f"# {title}", f"来源: {final_url}"]))
+            text = (meta + "\n\n" + body) if meta else body
+    else:
+        return f"不支持的内容类型: {ctype or '未知'}（仅支持 html/xml/json/text）"
+
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > _WEBFETCH_MAX_CHARS:
+        text = text[:_WEBFETCH_MAX_CHARS] + f"\n\n[内容已截断：原始 {len(text)} 字符，上限 {_WEBFETCH_MAX_CHARS}]"
+    log.debug("webfetch 完成: %s（%d 字符）", final_url, len(text))
+    return text or "（页面无有效正文）"
+
+
 @register.register(
     name="write_plan",
     description="Write or replace the current task plan",
@@ -1252,11 +1788,21 @@ def update_plan(
     },
 )
 def generate_steps(steps: List[str], external_handler=None) -> str:
-    """步骤生成；用户参与型，预留外部 API 接口"""
+    """步骤生成；用户参与型，预留外部 API 接口
+
+    步骤由主 LLM 结构化传入：清洗空行并钳制数量（旁路文本解析时代模型跑题
+    曾把整份 HTML 源码逐行收成 1379 步，2026-10-04），超限报错交模型自纠。"""
     session = _session()
     if session is None:
         return "记忆会话未初始化"
-    payload = {"steps": steps}
+    if isinstance(steps, str):
+        steps = steps.splitlines()  # 弱模型可能传单个字符串而非数组：按行容错
+    cleaned = [str(s).strip() for s in (steps or []) if str(s).strip()]
+    if not cleaned:
+        return "步骤列表为空：请提供 3-8 条可执行步骤（动词开头，每步具体可验证）"
+    if len(cleaned) > 15:
+        return f"步骤过多（{len(cleaned)} 条）：请合并为 3-8 条关键步骤后重新调用"
+    payload = {"steps": cleaned}
     external_result = hooks.call_user_participating(
         "step_generate",
         payload,
@@ -1265,6 +1811,8 @@ def generate_steps(steps: List[str], external_handler=None) -> str:
     )
     if isinstance(external_result, dict) and external_result.get("steps"):
         steps = external_result["steps"]
+    else:
+        steps = cleaned
     session.set_steps(steps)
     if session.plan.get("status") in ("draft", "confirmed"):
         session.update_plan_status("executing")
@@ -1348,71 +1896,153 @@ def computer_use(action: str, params: Optional[dict] = None, external_handler=No
 
 
 @register.register(
-    name="memory_add_fact",
-    description="Write a long-term memory fact to Agent.md or project memory",
-    usage="memory_add_fact <fact> [scope=agent|project]",
+    name="write_memory",
+    description="Write a new keyword memory file (global or project scope)",
+    usage="write_memory <keyword> <content> <type>",
     schema={
         "type": "object",
         "properties": {
-            "fact": {"type": "string", "description": "Fact to remember"},
-            "scope": {
+            "keyword": {"type": "string", "description": "记忆关键词（简短短语，作为文件名）"},
+            "content": {"type": "string", "description": "记忆正文（markdown）"},
+            "type": {
                 "type": "string",
-                "enum": ["agent", "project"],
-                "description": "agent=Agent.md global, project=current project memory",
+                "enum": ["global", "project"],
+                "description": "global=所有项目生效（正文随每轮上下文常驻注入）；project=仅当前项目（仅关键词入索引，正文需 read_memory 读取）",
             },
         },
-        "required": ["fact"],
+        "required": ["keyword", "content", "type"],
     },
 )
-def memory_add_fact(fact: str, scope: str = "agent") -> str:
-    """长期记忆写入工具接口 → Agent.md / 项目记忆 md"""
+def write_memory(keyword: str, content: str, type: str = "project") -> str:
+    """新建关键词记忆文件；同名关键词已存在时报错引导用 update_memory"""
     session = _session()
     if session is None:
         return "记忆会话未初始化"
-    session.add_fact(fact, scope=scope if scope in ("agent", "project") else "agent")
-    return f"已写入长期记忆({scope})"
+    if type not in ("global", "project"):
+        return "参数错误: type 必须为 global 或 project"
+    status, key = session.write_memory_file(type, keyword, content)
+    if status == "exists":
+        return f"写入失败: 关键词「{key}」的记忆已存在，请改用 update_memory 更新内容"
+    if status == "invalid":
+        return "写入失败: keyword 清洗后为空（含非法字符或过长），请换一个简短关键词"
+    if status == "error":
+        return "写入失败: 文件系统错误，详见日志"
+    scope_name = "全局" if type == "global" else "项目"
+    tip = "该记忆正文将随每轮上下文常驻注入。" if type == "global" else "关键词已入索引，正文需 read_memory 按需读取。"
+    return f"已写入{scope_name}记忆「{key}」。{tip}"
 
 
 @register.register(
-    name="memory_add_project_note",
-    description="Write a note into the current project long-term memory",
-    usage="memory_add_project_note <note>",
+    name="update_memory",
+    description="Update an existing keyword memory (content rewrite, optional rename)",
+    usage="update_memory <keyword> <content> <type> [new_keyword]",
     schema={
         "type": "object",
         "properties": {
-            "note": {"type": "string", "description": "Project note / convention"},
+            "keyword": {"type": "string", "description": "要更新的记忆关键词"},
+            "content": {"type": "string", "description": "新的记忆正文（整体替换）"},
+            "type": {
+                "type": "string",
+                "enum": ["global", "project"],
+                "description": "记忆作用域（global/project）",
+            },
+            "new_keyword": {"type": "string", "description": "可选：新关键词（改名=移动文件）"},
         },
-        "required": ["note"],
+        "required": ["keyword", "content", "type"],
     },
 )
-def memory_add_project_note(note: str) -> str:
+def update_memory(keyword: str, content: str, type: str = "project", new_keyword: str = "") -> str:
     session = _session()
     if session is None:
         return "记忆会话未初始化"
-    session.add_project_note(note)
-    return "已写入项目记忆"
+    if type not in ("global", "project"):
+        return "参数错误: type 必须为 global 或 project"
+    status, key = session.update_memory_file(type, keyword, content, new_keyword)
+    if status == "missing":
+        return f"更新失败: 关键词「{key}」的记忆不存在，可先用 write_memory 新建"
+    if status == "conflict":
+        return f"更新失败: 新关键词「{key}」已存在，请换一个或先删除"
+    if status == "invalid":
+        return "更新失败: 关键词清洗后为空，请检查 keyword/new_keyword"
+    if status == "error":
+        return "更新失败: 文件系统错误，详见日志"
+    return f"已更新记忆「{key}」内容" if key == keyword else f"已更新并改名: 「{keyword}」->「{key}」"
 
 
 @register.register(
-    name="rag_add",
-    description="Add a document into project RAG store",
-    usage="rag_add <text> [source]",
+    name="read_memory",
+    description="Read one or more project memory files by keyword (results are kept across turns, not stripped)",
+    usage="read_memory <keywords...>",
     schema={
         "type": "object",
         "properties": {
-            "text": {"type": "string", "description": "Document text"},
-            "source": {"type": "string", "description": "Document source path or name"},
+            "keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "要读取的项目记忆关键词列表（见 [项目记忆索引]；全局记忆正文已随上下文注入无需读取）",
+            },
         },
-        "required": ["text"],
+        "required": ["keywords"],
     },
 )
-def rag_add(text: str, source: str = "", external_handler=None) -> str:
-    """项目 RAG 写入；向量库预留外部接口"""
+def read_memory(keywords: Optional[List[str]] = None) -> str:
+    """按关键词读取项目记忆正文；结果入工具白名单，跨回合保留不被剥离"""
     session = _session()
     if session is None:
         return "记忆会话未初始化"
-    session.rag_add(text, source=source, external_handler=external_handler)
-    return "已写入项目 RAG"
+    keys = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    if not keys:
+        return "参数错误: keywords 至少提供一个关键词"
+    found, missing = [], []
+    for k in keys:
+        text = session.read_memory_file("project", k)
+        if text is None:
+            missing.append(k)
+        else:
+            key = session.sanitize_keyword(k)
+            found.append(f"## {key}\n{text.strip()}")
+    parts = []
+    if found:
+        parts.append("\n\n".join(found))
+    if missing:
+        parts.append("未找到的关键词: " + "、".join(missing) + "（当前项目记忆索引见 [项目记忆索引]）")
+    return "\n\n".join(parts)
+
+
+@register.register(
+    name="delete_memory",
+    description="Delete a keyword memory file (global or project scope)",
+    usage="delete_memory <keyword> <type>",
+    schema={
+        "type": "object",
+        "properties": {
+            "keyword": {"type": "string", "description": "要删除的记忆关键词"},
+            "type": {
+                "type": "string",
+                "enum": ["global", "project"],
+                "description": "记忆作用域（global/project）",
+            },
+        },
+        "required": ["keyword", "type"],
+    },
+)
+def delete_memory(keyword: str, type: str = "project") -> str:
+    session = _session()
+    if session is None:
+        return "记忆会话未初始化"
+    if type not in ("global", "project"):
+        return "参数错误: type 必须为 global 或 project"
+    status, key = session.delete_memory_file(type, keyword)
+    if status == "missing":
+        return f"删除失败: 关键词「{key}」的记忆不存在"
+    if status == "invalid":
+        return "删除失败: 关键词清洗后为空"
+    if status == "error":
+        return "删除失败: 文件系统错误，详见日志"
+    return f"已删除{('全局' if type == 'global' else '项目')}记忆「{key}」"
+
+
+# rag_add 工具已剥离为官方插件 data/plugins/rag（同名同 schema，经 ctx.register_tool 注册）
 
 
 @register.register(

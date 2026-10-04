@@ -1,14 +1,14 @@
-#该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.工具调用记录管理（白名单保留/回合末剥离/结果外置磁盘）3.长期记忆写入配置4.在agent对话时提供记忆补充内容5.针对特定项目的RAG模块
+#该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.工具调用记录管理（白名单保留/回合末剥离/结果外置磁盘）3.长期记忆写入配置4.在agent对话时提供记忆补充内容
+#（RAG 知识库已剥离为官方插件 data/plugins/rag，经 context_supplement 扩展点接入）
 import json
 import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 from core import hooks
 from core import prompt_loader
-from core import rag as rag_mod
 from core import session_store
 from core import toolstore
 from core.log import get_logger
@@ -119,7 +119,7 @@ def conv_block_bounds(messages: List[dict], idx: int) -> tuple:
 
 
 class Memory:
-    """Agent 记忆：消息、计划、步骤、长期记忆（md）、RAG 接口"""
+    """Agent 记忆：消息、计划、步骤、长期记忆（md）"""
 
     def __init__(self, config, project_identity: Optional[dict] = None):
         self.config = config
@@ -162,10 +162,11 @@ class Memory:
             "status": "empty",
         }
         self.steps: List[dict] = []
-        self.rag = rag_mod.get_store()
         self.longterm = self._load_longterm()
         self._ensure_md_files()
         self._migrate_legacy_json()
+        self.migrate_legacy_memory_files()
+        self.ensure_memory_notice()
         log.info(
             "记忆会话已初始化: Agent.md=%s 项目记忆=%s 自动压缩=%s 阈值=%.0f%%",
             self.agent_md_path,
@@ -345,6 +346,188 @@ class Memory:
         self.save_longterm()
         log.info("写入项目记忆: %s", note)
 
+    # ----- 关键词记忆（多 md 文件，替换旧 Agent.md 长文体系） -----
+    # global/{关键词}.md 全局记忆：build_context_supplements 全量常驻注入（不设预算）；
+    # Projects/{pid}/{关键词}.md 项目记忆：仅注入关键词索引，正文按需 read_memory；
+    # 旧 Agent.md / Projects/{pid}.md 启动时一次性拆分迁移（.bak 备份，幂等）
+
+    KEYWORD_MAX_LEN = 40
+
+    @staticmethod
+    def sanitize_keyword(keyword) -> str:
+        """关键词清洗为合法文件名：非法字符替换为 -、空白折叠、去首尾点、截断"""
+        cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]', "-", str(keyword or ""))
+        cleaned = re.sub(r"\s+", "-", cleaned).strip().strip(".")
+        return cleaned[: Memory.KEYWORD_MAX_LEN]
+
+    def memory_dir_for(self, mtype: str) -> Optional[Path]:
+        """关键词记忆目录：global=memory/global，project=Projects/{pid}"""
+        if mtype == "global":
+            return self.memory_dir / "global"
+        if mtype == "project":
+            return self.projects_dir / (self.project_id or "_default")
+        return None
+
+    def list_memory_keywords(self, mtype: str) -> List[str]:
+        d = self.memory_dir_for(mtype)
+        if d is None or not d.exists():
+            return []
+        return sorted(p.stem for p in d.glob("*.md"))
+
+    def read_memory_file(self, mtype: str, keyword: str) -> Optional[str]:
+        d = self.memory_dir_for(mtype)
+        key = self.sanitize_keyword(keyword)
+        if d is None or not key:
+            return None
+        path = d / f"{key}.md"
+        if not path.exists():
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as e:
+            log.warn("读取记忆失败 %s: %s", path, e)
+            return None
+
+    def write_memory_file(self, mtype: str, keyword: str, content) -> tuple:
+        """新建关键词记忆；返回 (status, key)，status: created/exists/invalid/error"""
+        d = self.memory_dir_for(mtype)
+        key = self.sanitize_keyword(keyword)
+        if d is None or not key:
+            return "invalid", ""
+        path = d / f"{key}.md"
+        if path.exists():
+            return "exists", key
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            path.write_text(str(content or ""), encoding="utf-8")
+        except OSError as e:
+            log.error("写入记忆失败 %s: %s", path, e)
+            return "error", key
+        log.info("写入关键词记忆(%s): %s -> %s", mtype, key, path)
+        return "created", key
+
+    def update_memory_file(self, mtype: str, keyword: str, content, new_keyword: str = "") -> tuple:
+        """更新内容/改名；返回 (status, key)，status: ok/missing/conflict/invalid/error"""
+        d = self.memory_dir_for(mtype)
+        key = self.sanitize_keyword(keyword)
+        if d is None or not key:
+            return "invalid", ""
+        path = d / f"{key}.md"
+        if not path.exists():
+            return "missing", key
+        new_key = self.sanitize_keyword(new_keyword) if new_keyword else ""
+        try:
+            if new_key and new_key != key:
+                target = d / f"{new_key}.md"
+                if target.exists():
+                    return "conflict", new_key
+                path.write_text(str(content or ""), encoding="utf-8")
+                path.rename(target)
+                log.info("记忆已更新并改名(%s): %s -> %s", mtype, key, new_key)
+                return "ok", new_key
+            path.write_text(str(content or ""), encoding="utf-8")
+        except OSError as e:
+            log.error("更新记忆失败 %s: %s", path, e)
+            return "error", key
+        log.info("记忆已更新(%s): %s", mtype, key)
+        return "ok", key
+
+    def delete_memory_file(self, mtype: str, keyword: str) -> tuple:
+        """删除关键词记忆；返回 (status, key)，status: deleted/missing/invalid/error"""
+        d = self.memory_dir_for(mtype)
+        key = self.sanitize_keyword(keyword)
+        if d is None or not key:
+            return "invalid", ""
+        path = d / f"{key}.md"
+        if not path.exists():
+            return "missing", key
+        try:
+            path.unlink()
+        except OSError as e:
+            log.error("删除记忆失败 %s: %s", path, e)
+            return "error", key
+        log.info("删除关键词记忆(%s): %s", mtype, key)
+        return "deleted", key
+
+    @staticmethod
+    def _parse_legacy_md_entries(text: str) -> List[str]:
+        """旧长文按 '- ' 列表项拆条目（# 标题/空行切断段落）；
+        无列表项但有实质正文段落时整文单条目兜底（纯标题空模板不迁移）"""
+        entries: List[str] = []
+        cur: List[str] = []
+        has_body = False
+        for line in (text or "").splitlines():
+            s = line.strip()
+            if s.startswith("- "):
+                if cur:
+                    entries.append("\n".join(cur).strip())
+                    cur = []
+                entries.append(s[2:].strip())
+                has_body = True
+            elif s.startswith("#") or not s:
+                if cur:
+                    entries.append("\n".join(cur).strip())
+                    cur = []
+            else:
+                cur.append(s)
+                has_body = True
+        if cur:
+            entries.append("\n".join(cur).strip())
+        if not entries and has_body and (text or "").strip():
+            entries = [text.strip()]
+        return [e for e in entries if e]
+
+    def migrate_legacy_memory_files(self) -> None:
+        """旧 Agent.md / 项目 md 拆分为关键词 md：条目逐条成文件，旧文件 .bak 备份。
+
+        幂等：新目录已有 md 时跳过（二次启动/迁移失败重跑安全）。"""
+        for path, mtype in ((self.agent_md_path, "global"), (self.project_md_path, "project")):
+            if not path.exists():
+                continue
+            d = self.memory_dir_for(mtype)
+            if d is None:
+                continue
+            if d.exists() and any(d.glob("*.md")):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as e:
+                log.warn("旧记忆读取失败 %s: %s", path, e)
+                continue
+            entries = self._parse_legacy_md_entries(text)
+            if not entries:
+                continue
+            d.mkdir(parents=True, exist_ok=True)
+            for item in entries:
+                base = self.sanitize_keyword(item.splitlines()[0]) if item else ""
+                key = base or "migrated"
+                n = 1
+                while (d / f"{key}.md").exists():
+                    n += 1
+                    key = f"{base or 'migrated'}-{n}"
+                try:
+                    (d / f"{key}.md").write_text(item, encoding="utf-8")
+                except OSError as e:
+                    log.warn("迁移条目写入失败 %s: %s", key, e)
+            backup = path.with_name(path.name + ".bak")
+            try:
+                path.rename(backup)
+                log.info("旧记忆已迁移: %s -> %s（%d 条，备份 %s）", path, d, len(entries), backup)
+            except OSError as e:
+                log.warn("旧记忆备份失败 %s: %s（条目已写入新目录）", path, e)
+
+    def ensure_memory_notice(self) -> None:
+        """会话树注入全局记忆清单提示（幂等）：替换旧提示保持清单最新；无全局记忆不显示"""
+        keywords = self.list_memory_keywords("global")
+        if not keywords:
+            return
+        content = f"[已注入全局记忆 {len(keywords)} 条：{'、'.join(keywords)}]"
+        for m in self.messages:
+            if m.get("role") == "system" and str(m.get("content") or "").startswith("[已注入全局记忆"):
+                m["content"] = content
+                return
+        self.add_message("system", content, type="help")
+
     def set_plan(self, title: str, content: str, complexity: str = "medium") -> dict:
         """更新任务计划"""
         self.plan = {
@@ -360,8 +543,8 @@ class Memory:
         self.plan["status"] = status
         log.debug("计划状态: %s", status)
 
-    def set_steps(self, steps: List[dict]) -> None:
-        """整体替换步骤列表"""
+    def set_steps(self, steps: List[Union[str, dict]]) -> None:
+        """整体替换步骤列表（str 项归一化为 pending 状态 dict）"""
         normalized = []
         for index, item in enumerate(steps, start=1):
             if isinstance(item, str):
@@ -780,19 +963,24 @@ class Memory:
             log.debug("未达压缩阈值: 约%d token/%d token", estimate, limit)
 
     def build_context_supplements(self) -> List[dict]:
-        """长期记忆（Agent.md + 项目 md）+ 计划/步骤（队首 system 区域）"""
+        """关键词记忆（全局全量+项目索引）+ 计划/步骤（队首 system 区域）"""
         supplements = []
         parts = []
-        agent_md = self.read_agent_md().strip()
-        project_md = self.read_project_md().strip()
-        if agent_md:
-            parts.append(f"[长期记忆 Agent.md]\n{agent_md}")
-        if project_md:
-            parts.append(f"[项目记忆 {self.project_md_path.name}]\n{project_md}")
-        # 兼容字段（若 md 未写入但 json 仍有）
-        facts = self.longterm.get("facts") or []
-        if facts and not agent_md:
-            parts.append("长期记忆事实:\n" + "\n".join(f"- {x}" for x in facts[-10:]))
+        # 全局记忆：每轮全量常驻注入（每回合重建，不参与回合末剥离/压缩，不设预算）
+        global_blocks = []
+        for kw in self.list_memory_keywords("global"):
+            text = (self.read_memory_file("global", kw) or "").strip()
+            if text:
+                global_blocks.append(f"## {kw}\n{text}")
+        if global_blocks:
+            parts.append("[全局记忆]\n" + "\n\n".join(global_blocks))
+        # 项目记忆：只注入关键词索引，正文按需 read_memory（结果入工具白名单不被剥离）
+        project_keywords = self.list_memory_keywords("project")
+        if project_keywords:
+            parts.append(
+                "[项目记忆索引] " + "、".join(project_keywords)
+                + "\n（正文不自动注入；需要时用 read_memory 工具按关键词读取）"
+            )
         if self.plan.get("status") not in ("empty", ""):
             parts.append(
                 f"当前计划[{self.plan.get('status')}]: {self.plan.get('title')}\n{self.plan.get('content')}"
@@ -800,9 +988,6 @@ class Memory:
         if self.steps:
             step_lines = [f"{s.get('id')}. [{s.get('status')}] {s.get('title')}" for s in self.steps]
             parts.append("当前步骤:\n" + "\n".join(step_lines))
-        rag_text = self.rag_query("当前任务相关资料")
-        if rag_text:
-            parts.append(f"项目RAG补充:\n{rag_text}")
         if parts:
             supplements.append(
                 {
@@ -835,11 +1020,19 @@ class Memory:
         except Exception as e:
             log.debug("技能清单注入失败: %s", e)
         # 插件上下文补充（core/plugins.py）：context_supplement 观察链收集文本，
-        # 与技能清单同为每回合重建，不进会话历史（处理函数异常已在 hooks 内隔离）
+        # 与技能清单同为每回合重建，不进会话历史（处理函数异常已在 hooks 内隔离）。
+        # payload 带当前用户消息（最后一条可见 user 消息），供 RAG 类插件做
+        # 按消息内容的主动召回
+        user_message = ""
+        for m in reversed(self.messages):
+            if m.get("role") == "user" and self._api_visible(m):
+                user_message = str(m.get("content") or "")
+                break
         plugin_texts = [
             t for t in hooks.collect_hook(
                 "context_supplement",
-                {"project_id": self.project_id, "session_id": self.session_id},
+                {"project_id": self.project_id, "session_id": self.session_id,
+                 "user_message": user_message},
             )
             if isinstance(t, str) and t.strip()
         ]
@@ -918,14 +1111,6 @@ class Memory:
                 messages.append(mapped)
         return messages
 
-    def rag_add(self, text: str, source: str = "", external_handler=None) -> None:
-        """项目级 RAG 写入；实现见 core/rag.py（占位：内存 + 外部接口）"""
-        self.rag.add(text, source=source, external_handler=external_handler)
-
-    def rag_query(self, query: str, external_handler=None) -> str:
-        """项目级 RAG 检索；实现见 core/rag.py"""
-        return self.rag.query(query, external_handler=external_handler)
-
     # ----- 历史会话保存/切换 -----
 
     @staticmethod
@@ -986,6 +1171,7 @@ class Memory:
         steps = data.get("steps")
         self.steps = list(steps) if isinstance(steps, list) else []
         toolstore.ledger_reset()  # 台账不跨会话：resume 后首次 edit 需重新 read（安全优先）
+        self.ensure_memory_notice()
         log.info("会话已切换: %s · id=%s · %d条消息", self.session_title, self.session_id, len(self.messages))
 
     def start_new_session(self) -> None:
@@ -997,6 +1183,7 @@ class Memory:
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []
         toolstore.ledger_reset()
+        self.ensure_memory_notice()
         log.info("已开启新会话: %s", self.session_id)
 
     def clear(self) -> None:
@@ -1009,4 +1196,5 @@ class Memory:
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []
         self.session_title = ""
+        self.ensure_memory_notice()
         log.info("会话已清空: %s", self.session_id)

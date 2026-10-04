@@ -1,0 +1,9 @@
+{
+  "id": "remote-control",
+  "name": "远程控制",
+  "version": "0.2.0",
+  "description": "浏览器远程查看与控制终端：七天密钥链接、实时流式视图、代发消息、远程工具确认代答、会话管理、模型/模式/工作流切换、回合回滚、远程斜杠命令",
+  "author": "BAWCode",
+  "entry": "main.py",
+  "enabled": true
+}

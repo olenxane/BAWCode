@@ -9,11 +9,18 @@
 节点类型（内置执行器）：
   system_prompt — 指定初始化注入哪些系统提示词文件（缺省走 config.prompt.system_files）
   skill         — 是否注入技能清单 / 白名单过滤（经 core/skills.set_injection）
+  understand    — 任务理解：带工具循环解析意图，缺失信息经 ask_user 询问用户
+  analyze       — 复杂度判定：独立一次 LLM 请求输出 high/low，写入 ^{complexity}^
   plan          — 生成计划（plan.md）；confirm 需用户确认；steps 确认后生成步骤
   execute       — 主工具调用循环（编码执行）
+  review        — 审查节点：审查本回合改动并反思修正（带工具循环）
   llm           — 通用 LLM 阶段：prompt_files 渲染为补充系统提示词，max_rounds>0 时
                   带工具循环（分析调研/测试类节点），0 则单次问答；capture 把输出
                   存为 ^{变量}^ 供后续节点提示词渲染
+
+通用字段（LLM 类节点）：model（完整 model_name，> model_role > 激活模型）、
+prompt（内联提示词，> prompt_files）、prompt_files、override_system（true=节点
+提示词替换内置系统提示词，默认追加）、capture。
 
 流程控制：引擎不依赖 UI——状态行/选择菜单/工具确认等经 TurnIO 回调移交；
 取消/中断抛 TurnInterrupt（调用方 _aborted），回合正常终止（用户取消任务/
@@ -39,15 +46,46 @@ log = get_logger("workflow")
 
 _ROOT = Path(__file__).resolve().parent.parent
 
-NODE_TYPES = ("system_prompt", "skill", "plan", "execute", "llm")
+NODE_TYPES = ("system_prompt", "skill", "understand", "analyze", "plan", "execute", "review", "llm")
 
-# 未知/损坏配置的最后兜底：与 data/workflows/default.json 保持一致
+# 节点内置提示词兜底（默认引用 core/prompts/ 下同名 md，可被节点 prompt/prompt_files 覆盖）
+JUDGE_PROMPT_BUILTIN = (
+    "你是任务复杂度评审员。基于对话中的用户任务判断复杂度：\n"
+    "- high：多文件/架构/系统级改动、需求模糊需要澄清、影响面大\n"
+    "- low：单点小改动、问题清晰可直接执行\n\n"
+    "只输出一行：high 或 low"
+)
+REVIEW_PROMPT_BUILTIN = (
+    "你是代码审查节点。对当前会话中的改动进行审查与修正：\n"
+    "1. 梳理本回合的改动范围（读代码/查 git）\n"
+    "2. 逐项审查：正确性、边界条件、风格一致性、遗漏的测试\n"
+    "3. 发现问题直接修复（可使用 edit_file/write/run_command）\n"
+    "4. 输出【审查结论】：发现的问题、已修正项、遗留风险\n\n"
+    "只输出审查结论。"
+)
+UNDERSTAND_PROMPT_BUILTIN = (
+    "你是任务理解节点。解析用户当前任务的真实意图：\n"
+    "1. 用一句话复述任务目标与验收标准\n"
+    "2. 逐项检查执行所需信息是否完备（目标路径、范围、约束、偏好等）\n"
+    "3. 发现缺失或歧义时，调用 ask_user 工具向用户提问（一次一个问题，问题具体、尽量给出候选项）\n"
+    "4. 信息补齐后，输出【任务理解】：目标、约束、待办要点清单\n\n"
+    "只输出任务理解本身，不要开始执行任务。"
+)
+# plan 节点 steps=true 时交付给 execute 的启动指令：步骤拆解由主 LLM 经 generate_steps
+# 工具完成（结构化参数），不再走节点旁路 LLM 请求（旁路输出无 schema 约束，按行解析
+# 会把模型的跑题长文整体误收为步骤，2026-10-04 1379 步事故）
+STEPS_KICKOFF_BUILTIN = (
+    "开始执行前，先调用 generate_steps 工具把当前计划拆解为可执行步骤"
+    "（3-8 条，动词开头、每步具体可验证），之后再按步骤推进；"
+    "每步开始/结束时用 update_step_status 同步状态。"
+)
+
+# 未知/损坏配置的最后兜底：与 data/workflows/default.json 保持一致（最简通用管线）
 DEFAULT_WORKFLOW: dict = {
     "name": "default",
-    "description": "系统提示词注入 → 技能清单 → 编码执行（计划类需求在编辑器添加 plan 节点）",
+    "description": "最简通用管线：系统提示词注入 → 编码执行（通用角色直接干活）",
     "nodes": [
         {"id": "system_prompt", "type": "system_prompt", "files": ["system_prompt.md"]},
-        {"id": "skills", "type": "skill", "enabled": True, "list": []},
         {"id": "execute", "type": "execute", "max_rounds": 12, "model_role": "code"},
     ],
 }
@@ -211,6 +249,37 @@ def _role_model(config, role: Any) -> Optional[str]:
     return None
 
 
+def _node_model(config, node: dict) -> Optional[str]:
+    """节点级模型：model（完整 model_name）> model_role > None（激活模型）。
+
+    model 不在可用列表时告警回落，避免拼错模型名静默打到错误端点。"""
+    name = str(node.get("model") or "").strip()
+    if name:
+        rows = config.list_models() if hasattr(config, "list_models") else []
+        if any(str(r.get("model_name")) == name for r in rows):
+            return name
+        log.warn("节点模型 %r 不在可用模型列表，回落 model_role/激活模型", name)
+    return _role_model(config, node.get("model_role"))
+
+
+def _node_stage(turn: TurnContext, node: dict, builtin: str = "") -> str:
+    """节点提示词：内联 prompt > prompt_files > builtin 兜底（均做 ^{var}^ 渲染）"""
+    inline = str(node.get("prompt") or "").strip()
+    if inline:
+        return prompt_loader.render_text(inline, _stage_variables(turn))
+    files = node.get("prompt_files") or []
+    if files:
+        return render_stage_prompt(turn, files)
+    return prompt_loader.render_text(builtin, _stage_variables(turn)) if builtin else ""
+
+
+def _stage_system(turn: TurnContext, node: dict, stage: str) -> Optional[str]:
+    """节点 extra_system 组装：override_system=true 时替换内置系统提示词，否则追加"""
+    if str(node.get("override_system") or "").strip().lower() in ("1", "true", "yes"):
+        return stage.strip() or None
+    return _combine_system(turn.system_prompt_text, stage)
+
+
 def _stage_variables(turn: TurnContext) -> Dict[str, Any]:
     """节点提示词渲染变量：基础变量表 + 计划 + 回合捕获变量"""
     extra: Dict[str, Any] = {}
@@ -339,7 +408,10 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
     io, session, llm = turn.io, turn.session, turn.llm
     log.info("进入计划流程")
     io.status("生成计划")
-    plan = llm.generate_plan(turn.user_text)
+    plan_model = _node_model(turn.config, node)
+    if plan_model is None:
+        plan_model = _role_model(turn.config, node.get("model_role") or "plan")
+    plan = llm.generate_plan(turn.user_text, model=plan_model)
     _check_cancel(turn)
     session.set_plan(
         plan.get("title", "任务计划"),
@@ -354,19 +426,17 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
         session.update_plan_status("confirmed")
         session.save_longterm()
     if node.get("steps", True):
-        steps = llm.generate_steps(turn.user_text, session.plan.get("content", ""))
-        _check_cancel(turn)
-        session.set_steps(steps)
-    # 收尾消息附带最终版 plan/steps 快照（extras 不进 API）：会话树在消息时间线位置
-    # 渲染冻结的计划/步骤节点（core/ui.py._snapshot_nodes），不再用置底状态单节点
+        # 步骤拆解归口主 LLM：execute 节点据该标记注入启动指令，经 generate_steps 工具落库
+        turn.captured["steps_kickoff"] = "1"
+    # 收尾消息附带 plan 快照（extras 不进 API）：会话树在该消息时间线位置渲染冻结的
+    # 计划节点（core/ui.py._snapshot_nodes）；步骤不在此快照——由后续 generate_steps
+    # 工具调用在时间线上以独立节点呈现
     session.add_message(
         "assistant",
         "计划确认，开始执行。",
         type="plan",
         plan_snapshot=json.dumps(session.plan, ensure_ascii=False),
-        steps_snapshot=json.dumps(session.steps, ensure_ascii=False),
     )
-    io.status("执行步骤")
 
 
 def _has_recent_progress(session, window: int = 4) -> bool:
@@ -507,7 +577,66 @@ def _tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, 
     # while 循环不可达出口：轮次终止统一在循环内 max_rounds 分支返回
 
 
+def _exec_analyze(node: dict, turn: TurnContext) -> None:
+    """复杂度判定：独立一次 LLM 请求，输出 high/low；失败/不可解析回落 default_level"""
+    io, session, llm = turn.io, turn.session, turn.llm
+    default_level = str(node.get("default_level") or "low").strip().lower()
+    if default_level not in ("high", "low"):
+        default_level = "low"
+    io.status("LLM 复杂度判定")
+    io.phase("思考中")
+    stage = _node_stage(turn, node, JUDGE_PROMPT_BUILTIN)
+    payload = session.build_messages(extra_system=_stage_system(turn, node, stage))
+    result = llm.chat(payload, model=_node_model(turn.config, node), on_delta=io.on_delta)
+    io.clear_stream()
+    _check_cancel(turn)
+    reply = ""
+    if result.get("error"):
+        log.warn("复杂度判定请求失败: %s，回落 %s", result["error"], default_level)
+    else:
+        reply = (result.get("content") or "").strip()
+    last = reply.splitlines()[-1].strip().lower().strip("*。.！!") if reply else ""
+    m = re.match(r"^(high|low)\b", last)
+    if m:
+        turn.captured["complexity"] = m.group(1)
+    else:
+        if reply:
+            log.warn("复杂度判定输出不可解析，回落 %s: %r", default_level, reply[:120])
+        turn.captured["complexity"] = default_level
+    log.info("复杂度判定(LLM): %s", turn.captured["complexity"])
+    io.status(f"分析完成 · {turn.captured['complexity']}")
+
+
+def _run_aux_loop(node: dict, turn: TurnContext, builtin: str, default_rounds: int, fallback_role: Optional[str]) -> None:
+    """审查/理解类节点：带工具循环，非致命（error/轮次上限不阻断后续节点）"""
+    stage = _node_stage(turn, node, builtin)
+    model = _node_model(turn.config, node)
+    if model is None:
+        model = _role_model(turn.config, node.get("model_role") or fallback_role)
+    try:
+        max_rounds = int(node.get("max_rounds") or default_rounds)
+    except (TypeError, ValueError):
+        max_rounds = default_rounds
+    result = _tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
+    capture = str(node.get("capture") or "").strip()
+    if capture and result.get("content"):
+        turn.captured[capture] = result["content"].strip()
+    if result["status"] == "error":
+        log.warn("节点(id=%s)推理出错，继续后续节点", node.get("id"))
+
+
+def _exec_review(node: dict, turn: TurnContext) -> None:
+    turn.io.status("审查与修正")
+    _run_aux_loop(node, turn, REVIEW_PROMPT_BUILTIN, 8, "review")
+
+
+def _exec_understand(node: dict, turn: TurnContext) -> None:
+    turn.io.status("任务理解")
+    _run_aux_loop(node, turn, UNDERSTAND_PROMPT_BUILTIN, 8, None)
+
+
 def _exec_execute(node: dict, turn: TurnContext) -> None:
+    turn.io.status("执行步骤")
     try:
         max_rounds = int(node.get("max_rounds") or 12)
     except (TypeError, ValueError):
@@ -520,9 +649,13 @@ def _exec_execute(node: dict, turn: TurnContext) -> None:
         override = 0
     if override > 0:
         max_rounds = override
-    model = _role_model(turn.config, node.get("model_role") or "code")
-    stage = render_stage_prompt(turn, node.get("prompt_files"))
-    result = _tool_loop(turn, _combine_system(turn.system_prompt_text, stage), max_rounds, model=model)
+    model = _node_model(turn.config, node)
+    if model is None:
+        model = _role_model(turn.config, node.get("model_role") or "code")
+    stage = _node_stage(turn, node)
+    if turn.captured.pop("steps_kickoff", None):
+        stage = _combine_system(stage, STEPS_KICKOFF_BUILTIN)
+    result = _tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
     if result["status"] != "complete":
         raise TurnStop()
     capture = str(node.get("capture") or "").strip()
@@ -532,8 +665,10 @@ def _exec_execute(node: dict, turn: TurnContext) -> None:
 
 def _exec_llm(node: dict, turn: TurnContext) -> None:
     io, session, llm = turn.io, turn.session, turn.llm
-    stage = render_stage_prompt(turn, node.get("prompt_files"))
-    model = _role_model(turn.config, node.get("model_role"))
+    stage = _node_stage(turn, node)
+    model = _node_model(turn.config, node)
+    if model is None:
+        model = _role_model(turn.config, node.get("model_role"))
     try:
         max_rounds = int(node.get("max_rounds") or 0)
     except (TypeError, ValueError):
@@ -541,14 +676,14 @@ def _exec_llm(node: dict, turn: TurnContext) -> None:
 
     if max_rounds > 0:
         # 带工具的分析/测试类节点：非致命（error/轮次上限不阻断后续节点）
-        result = _tool_loop(turn, _combine_system(turn.system_prompt_text, stage), max_rounds, model=model)
+        result = _tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
         content = result["content"]
         if result["status"] == "error":
             log.warn("工作流 llm 节点(id=%s)推理出错，继续后续节点", node.get("id"))
     else:
         # 单次问答：完整上下文（历史+记忆补充）+ 节点提示词，不带工具
         io.phase("思考中")
-        payload = session.build_messages(extra_system=_combine_system(turn.system_prompt_text, stage))
+        payload = session.build_messages(extra_system=_stage_system(turn, node, stage))
         result = llm.chat(payload, model=model, on_delta=io.on_delta)
         io.clear_stream()
         _check_cancel(turn)
@@ -568,8 +703,11 @@ def _exec_llm(node: dict, turn: TurnContext) -> None:
 _EXECUTORS: Dict[str, Callable[[dict, TurnContext], None]] = {
     "system_prompt": _exec_system_prompt,
     "skill": _exec_skill,
+    "understand": _exec_understand,
+    "analyze": _exec_analyze,
     "plan": _exec_plan,
     "execute": _exec_execute,
+    "review": _exec_review,
     "llm": _exec_llm,
 }
 
@@ -594,4 +732,32 @@ def run_workflow(workflow: dict, turn: TurnContext) -> str:
             continue
         log.info("工作流节点: %s（%s）", node.get("id"), node.get("type"))
         runner(node, turn)
+    return "complete"
+
+
+def workflow_enabled(config) -> bool:
+    """工作流总开关（config.workflow.enabled）：默认关闭=直接对话，设置页显式启用"""
+    return bool(((getattr(config, "data", None) or {}).get("workflow") or {}).get("enabled", False))
+
+
+_DIRECT_EXECUTE_NODE = {"id": "direct", "type": "execute", "max_rounds": 12, "model_role": "code"}
+
+
+def run_turn(workflow: Optional[dict], turn: TurnContext) -> str:
+    """回合入口：workflow=None（未启用工作流）直接对话，否则按节点链运行"""
+    if workflow is None:
+        return _run_direct(turn)
+    return run_workflow(workflow, turn)
+
+
+def _run_direct(turn: TurnContext) -> str:
+    """直接对话（工作流未启用）：注入系统提示词后进工具循环，不经节点链。
+
+    行为与最简 default 工作流等价，但作为一等状态存在——工作流是显式启用的
+    处理管线，而非"永远套着一层看不见的默认链"。"""
+    from core import skills as skills_mod
+
+    skills_mod.set_injection(enabled=None, allow=None)
+    _exec_system_prompt({}, turn)
+    _exec_execute(dict(_DIRECT_EXECUTE_NODE), turn)
     return "complete"

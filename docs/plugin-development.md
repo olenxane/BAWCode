@@ -151,7 +151,7 @@ my-plugin/
 | `ctx.source` | str | `"global"` 或 `"project"` |
 | `ctx.config` | Config | 宿主配置对象（**只读约定**：读模型名/主题等可以，改配置请走 `/settings`） |
 | `ctx.workspace` | Path | 当前工作区根目录 |
-| `ctx.settings` | dict | 插件私有配置 `config.plugins_config[<id>]`，无配置时为 `{}`。宿主不解释其内容，格式由插件自定义 |
+| `ctx.settings` | dict | 插件配置**实时视图**（声明缺省 + `config.plugins_config[<id>]` 持久化值）。每次访问重读宿主配置——设置面板改动即时生效；动态行为请在处理函数内读取，勿在 setup 时缓存 |
 | `ctx.log` | Logger | 命名空间化日志器（`plugins.<id>`），落盘到 `data/log/` |
 | `ctx.ui` | PluginUI | 交互面板桥（confirm/choose/line），**仅 agent 线程可用**，见 §4.4 |
 
@@ -168,6 +168,8 @@ my-plugin/
 | `ctx.call(event, payload, default=None)` | 主动触发变换链事件 | §5.5 |
 | `ctx.collect(event, payload)` | 主动触发观察链事件 | §5.5 |
 | `ctx.storage_dir()` | 插件专属持久化目录（自动创建） | §4.3 |
+| `ctx.register_teardown(fn)` | 注册卸载回调：卸载/重载时停线程、释放资源 | §12 |
+| `core.plugins.runtime()` | 模块级函数：只读运行时载体 `{app, runner}` | §12 |
 | `ctx.submit_turn(text)` | 以用户语义提交一条消息开启回合 | §4.4 |
 | `ctx.notify(text)` | 用户可见通知（写入会话系统消息） | §4.4 |
 
@@ -303,6 +305,8 @@ BAWCode 的每个 hook 事件属于两种语义之一（下表标明），写处
 | `session_start` | collect | 会话初始化完成（启动/`/new`/`/resume`） | `{project_id, session_id, workspace}` | 无消费方 |
 | `before_turn` | call | 回合开始、用户消息入档前 | `{user_text: str}` | `{user_text: str}` —— 改写本轮用户输入（返回空/空白视为不参与） |
 | `after_turn` | collect | 回合收尾（正常/中断/异常都触发） | `{user_text, response, session_id}` | 无消费方 |
+| `stream_delta` | collect | 流式输出增量（每 token 触发，高频率） | `{kind, piece}` | 无消费方 |
+| `turn_status` | collect | 回合状态/阶段变化 | `{status}` 或 `{phase}` | 无消费方 |
 | `before_tool` | call | 工具确认通过、执行前 | `{name, args}` | `{args: {...}}` 改写参数；`{decision: "deny", message: str}` 拒绝执行（拒绝文案回传给模型）；None 原样执行 |
 | `after_tool` | collect | 工具执行完成（含出错） | `{name, args, output, elapsed}` | 无消费方 |
 | `context_supplement` | collect | 每回合构建上下文补充时 | `{project_id, session_id}` | `str`（非空文本）—— 以 `[插件补充]` 消息注入本回合上下文（不进会话历史，每回合重建） |
@@ -460,6 +464,51 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 
 ## 9. 配置参考
 
+### 9.1 配置声明与设置面板"插件"标签页
+
+在 `plugin.json` 中声明 `config` 数组，插件即拥有**可视化配置界面**：设置面板
+（`/settings`）新增"插件"标签页，列出识别到的全部插件（含禁用/失败，附原因）：
+
+- **插件行**：`←→` 开/关插件（写盘 `config.plugins.disable` 并立即重载生效）；
+  `Enter` 展开/收起该插件的配置列表（树状缩进，仅声明了 config 的插件可展开）
+- **配置行**：按声明类型渲染不同控件——`bool` 勾选框（`[x]`/`[ ]`，Enter/←→ 切换）、
+  `list` 左右键循环切换选项（复用设置页既有交互）、`str`/`int`/`float` Enter 后行编辑
+  （int/float 带类型校验与 min/max 钳制，非法输入保留原值）
+- 所有改动**即时写透**到 `config.plugins_config[<id>]` 并落盘，插件经
+  `ctx.settings` 实时读取（无需重载）
+
+声明格式（支持 `str`/`list`/`int`/`float`/`bool` 五种类型）：
+
+```jsonc
+{
+  "id": "my-plugin",
+  // ...
+  "config": [
+    { "key": "endpoint",  "type": "str",   "default": "",              "label": "接口地址" },
+    { "key": "mode",      "type": "list",  "options": ["fast", "safe"], "default": "fast", "label": "运行模式" },
+    { "key": "retries",   "type": "int",   "default": 3, "min": 0, "max": 10, "label": "重试次数" },
+    { "key": "ratio",     "type": "float", "default": 0.5, "label": "采样比率" },
+    { "key": "verbose",   "type": "bool",  "default": false, "label": "详细日志", "hint": "调试用" }
+  ]
+}
+```
+
+| 字段 | 适用类型 | 说明 |
+|------|----------|------|
+| `key` | 全部 | 配置键名（字母开头，字母数字下划线），即 `ctx.settings` 与 `plugins_config` 里的键 |
+| `type` | 全部 | `str` / `list` / `int` / `float` / `bool`；非法声明的项被丢弃（warn 日志），不影响插件装载 |
+| `label` | 全部 | 设置面板显示名（缺省用 key） |
+| `hint` | 全部 | 设置面板底部的说明文字 |
+| `default` | 全部 | 缺省值（按类型规整；`list` 的 default 必须命中 options，否则取首项） |
+| `options` | list | **必填**，非空字符串数组，左右键在其间循环 |
+| `min` / `max` | int/float | 可选数值范围，写入时钳制 |
+
+程序侧 API（UI 之外同样可用）：`plugins.declared_configs(pid)` 取声明、
+`plugins.get_setting(pid, key, default)` 读、`plugins.set_setting(pid, key, value, config)`
+写（按声明规整钳制后写盘）。
+
+### 9.2 配置文件段
+
 `data/config.json` 中与插件相关的段（均有内置缺省，可只写覆盖项）：
 
 ```jsonc
@@ -471,7 +520,8 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
     "disable": ["some-id"]    // 禁用的插件 id 列表（/plugin enable/disable 维护）
   },
 
-  // 插件私有配置：键 = 插件 id，内容由插件自定义，经 ctx.settings 读取
+  // 插件私有配置：键 = 插件 id；声明过的键由设置面板"插件"页维护，
+  // 未声明的键插件可自行约定（经 ctx.settings 原样读取）
   "plugins_config": {
     "my-plugin": {
       "endpoint": "https://example.com/api",
@@ -487,6 +537,9 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
   }
 }
 ```
+
+读取优先级：**声明缺省 < 旧版自定义段（如有）< `plugins_config` 持久化值**。动态行为
+请在处理函数内读取 `ctx.settings`（每次访问实时重读），不要在 `setup()` 时缓存。
 
 设计约定：`plugins_config` 只放**行为开关与参数**，不放秘密（api_key 等）——插件进程内
 运行，读得到整个 config，请勿在文档中诱导用户把敏感信息交给不可信插件。
@@ -561,6 +614,14 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 - **重载语义**：整体卸载（按 owner 注销 hooks/commands/tools、清理 sys.modules 与
   sys.path、清空插件技能目录）→ 重新发现装载。模块级全局变量不保留——需要跨重载的
   状态请存 `ctx.storage_dir()`
+- **后台资源清理（必须）**：setup 里启动线程/HTTP 服务器等长期资源的插件，务必
+  `ctx.register_teardown(fn)` 注册卸载回调——卸载/重载/禁用回滚时按注册顺序执行
+  （异常隔离记日志）。没有它，`/plugin reload` 后旧线程会残留且插件自身无法停止
+  （模块对象已换新）。官方示例：remote-control 插件的 HTTP 服务即经 teardown 停止
+- **运行时载体只读访问**：`core.plugins.runtime()` 返回 `{app, runner}`（`bind_runtime`
+  注入的同一对象引用；未注入时值为 None）。可读取 `app.busy / app.streaming_msg /
+  app.status` 等实时状态、`runner.busy` 判定忙闲，或 `runner.llm.cancel()` 中断在途
+  请求（remote-control 的"停止"按钮即此实现）。约定只读，勿替换其中对象
 - **sys.path**：装载期间插件目录会被加入 `sys.path`（便于 `import 自带模块`），卸载时
   移除。若插件以后台线程长期持有 import 引用，重载后旧模块对象仍存活，注意避免
 - hook 处理函数**不要长时间阻塞**：`before_tool`/`before_turn` 在关键路径上，阻塞会
@@ -617,4 +678,8 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 ---
 
 *本指南对应实现：`core/plugins.py`（装载器）、`core/hooks.py`（hook 链）；
-示例插件：`data/plugins/hello-plugin/`；端到端测试：`develop/test_plugins_e2e.py`。*
+示例插件：`data/plugins/hello-plugin/`（入门）、`data/plugins/rag/`（项目 RAG 知识库，
+自核心剥离的真实案例：同名工具迁移 + context_supplement 上下文补充 + external_apis
+接管语义保留）、`data/plugins/remote-control/`（远程控制：后台 HTTP 服务 + register_teardown
++ 类用户操作 API + tool_confirm 代答的综合案例）；
+端到端测试：`develop/test_plugins_e2e.py`、`develop/test_rag_plugin.py`、`develop/test_remote_control_e2e.py`。*

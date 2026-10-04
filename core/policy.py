@@ -33,8 +33,12 @@ SAFE_TOOLS = {
     "search",
     "glob",
     "list_directory",
-    "memory_add_fact",
-    "rag_add",
+    "webfetch",
+    # RAG：检索/重建只读（索引仅存内存与插件数据目录）；set_rag 只写插件
+    # 项目状态文件（.bawcode/plugin-data/rag/state.json），无文件系统副作用
+    "rag_search",
+    "rag_index",
+    "set_rag",
     "load_skill",
     # 计划管理四件套：仅改会话内计划/步骤状态，无文件系统与系统副作用；
     # 参数随轮次变化导致通用指纹"始终允许"失效，逐次确认纯属打扰
@@ -42,6 +46,13 @@ SAFE_TOOLS = {
     "update_plan",
     "generate_steps",
     "update_step_status",
+    # 询问用户：纯交互无副作用，问之前还要先确认"能问"纯属打扰
+    "ask_user",
+    # 关键词记忆四件套：仅读写 data/memory 下 md 文件，无系统副作用
+    "write_memory",
+    "update_memory",
+    "read_memory",
+    "delete_memory",
 }
 
 # 命令白名单片段（manual/auto 判为相对安全）

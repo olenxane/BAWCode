@@ -1,0 +1,53 @@
+{
+  "name": "understand-plan-execute-review",
+  "description": "任务理解（ask_user 澄清）→ LLM 复杂度判定 → 计划 → 编码执行 → 审查修正，展示新节点与节点级模型",
+  "nodes": [
+    {
+      "id": "system_prompt",
+      "type": "system_prompt",
+      "files": ["system_prompt.md"]
+    },
+    {
+      "id": "skills",
+      "type": "skill",
+      "enabled": true,
+      "list": []
+    },
+    {
+      "id": "understand",
+      "type": "understand",
+      "prompt_files": ["understand.md"],
+      "capture": "understanding",
+      "max_rounds": 8,
+      "model_role": "plan"
+    },
+    {
+      "id": "analyze",
+      "type": "analyze",
+      "default_level": "low",
+      "model_role": "plan"
+    },
+    {
+      "id": "plan",
+      "type": "plan",
+      "confirm": false,
+      "steps": true,
+      "model_role": "plan"
+    },
+    {
+      "id": "execute",
+      "type": "execute",
+      "max_rounds": 12,
+      "model_role": "code",
+      "prompt": "当前任务理解如下，按其执行：\n^{understanding}^"
+    },
+    {
+      "id": "review",
+      "type": "review",
+      "prompt_files": ["review.md"],
+      "capture": "review_result",
+      "max_rounds": 8,
+      "model_role": "review"
+    }
+  ]
+}

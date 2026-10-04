@@ -285,7 +285,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         return True
 
     @commands.register(
-        "/workflow", hint="工作流 · 列表/切换/编辑", usage="/workflow [名称|edit [名称]]", source="builtin"
+        "/workflow", hint="工作流 · 列表/切换/停用/编辑", usage="/workflow [名称|off|edit [名称]]", source="builtin"
     )
     def _workflow(ctx, args):
         arg = (args or "").strip()
@@ -298,20 +298,29 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         if arg in ("", "list", "列表"):
             active = workflow_mod.active_name(ctx["config"])
             names = workflow_mod.list_workflows(ctx["config"])
-            lines = [f"工作流（active={active}）:"]
+            state = "启用" if workflow_mod.workflow_enabled(ctx["config"]) else "未启用（直接对话）"
+            lines = [f"工作流（{state} · active={active}）:"]
             for name in names:
                 lines.append(("  * " if name == active else "    ") + name)
-            lines.append("提示: /workflow <名称> 切换 · /workflow edit [名称] 打开编辑器")
+            lines.append("提示: /workflow <名称> 切换并启用 · /workflow off 直接对话 · /workflow edit [名称] 打开编辑器")
             _echo(ctx, "\n".join(lines))
+            return True
+        if arg in ("off", "off".upper(), "关闭", "直接对话"):
+            wf_cfg = ctx["config"].data.setdefault("workflow", {})
+            wf_cfg["enabled"] = False
+            ctx["config"].save()
+            ctx["app"].status = "直接对话"
+            _echo(ctx, "工作流已停用：直接与 LLM 对话（下一回合生效）")
             return True
         if arg not in workflow_mod.list_workflows(ctx["config"]):
             available = ", ".join(workflow_mod.list_workflows(ctx["config"])) or "（无）"
-            _echo(ctx, f"未找到工作流: {arg}\n可用: {available}")
+            _echo(ctx, f"未找到工作流: {arg}\n可用: {available}（/workflow off 可停用工作流）")
             return True
         workflow_mod.set_active(ctx["config"], arg)
+        ctx["config"].data.setdefault("workflow", {})["enabled"] = True  # 显式选择即启用
         ctx["config"].save()
         ctx["app"].status = f"工作流: {arg}"
-        _echo(ctx, f"已切换工作流: {arg}（下一回合生效）")
+        _echo(ctx, f"已启用工作流: {arg}（下一回合生效；/workflow off 可停用）")
         return True
 
     @commands.register("/steps", hint="查看步骤", source="builtin")
@@ -547,6 +556,14 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         # 后台线程只改状态不渲染：主循环帧渲染统一完成
         _sync(app, session, task=task, status=status, render=False)
 
+    def _set_status(text: str) -> None:
+        _syncq(status=text)
+        hooks.collect_hook("turn_status", {"status": text})
+
+    def _set_phase(text: str) -> None:
+        app.phase_hint = text
+        hooks.collect_hook("turn_status", {"phase": text})
+
     def _aborted():
         session.add_message("system", "[本轮已被新消息中断]", type="help")
         _syncq(status="已中断")
@@ -562,6 +579,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
             msg["thinking"] += piece
         else:
             msg["content"] += piece
+        hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
 
     log.info("任务开始: %s", user_text)
     session.add_message("user", user_text, type="task")
@@ -580,28 +598,40 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     # 外置工作流：按 data/workflows/<active>.json 的节点链驱动一轮回合
     # （系统提示词注入/分析/规划/编码等均为节点，增删改走编辑器或直接改 JSON）
     io = workflow_mod.TurnIO(
-        status=lambda text: _syncq(status=text),
+        status=_set_status,
         choose=lambda options, prompt: _bridge_choose(app, options, prompt, _cancelled),
         line=lambda prompt: _bridge_line(app, prompt, llm.config, _cancelled),
         cancelled=_cancelled,
         on_delta=_on_delta,
         clear_stream=lambda: setattr(app, "streaming_msg", None),
         tool_confirm=lambda call: _handle_tool_confirm(llm, app, session, call, _cancelled),
-        phase=lambda text: setattr(app, "phase_hint", text),
+        phase=_set_phase,
     )
-    wf = workflow_mod.load_workflow(llm.config)
-    log.info("工作流: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
+    wf = None
+    if workflow_mod.workflow_enabled(llm.config):
+        wf = workflow_mod.load_workflow(llm.config)
+        log.info("工作流: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
+    else:
+        log.info("工作流未启用：直接对话（设置页\"系统\"标签可启用）")
     turn = workflow_mod.TurnContext(
         session=session, llm=llm, app=app, config=llm.config, user_text=user_text, io=io
     )
     # 子代理运行时随回合绑定/解绑：task 工具经此取得 llm/io/app/session
     subagent_mod.bind_runtime(llm=llm, config=llm.config, io=io, app=app, session=session)
+
+    def _bridge_ask(payload: dict) -> dict:
+        req = app.request_ui("ask", payload)
+        return app.wait_ui(req, _cancelled)
+
+    tools_mod.set_ask_user_bridge(_bridge_ask)  # ask_user 工具经此弹面板（回合内有效）
     try:
-        workflow_mod.run_workflow(wf, turn)
+        workflow_mod.run_turn(wf, turn)
     except workflow_mod.TurnInterrupt:
         _aborted()
     except workflow_mod.TurnStop:
         pass
+    finally:
+        tools_mod.set_ask_user_bridge(None)
 
 
 class _AgentRunner:
@@ -717,6 +747,7 @@ def main() -> None:
     )
     plugins_mod.load(config, workspace=Path.cwd())  # 外部插件装载（先于会话初始化，插件可收到 session_start）
     session = memory_mod.init_session(config, project_identity_data=identity)
+    tools_mod.webfetch_gc()  # 启动探测：闲置会话（1 天无更新）的 webfetch 图片目录回收，活跃会话图片 30 天封顶
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})

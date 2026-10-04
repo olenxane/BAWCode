@@ -114,9 +114,8 @@ def default_config() -> dict:
                 "update_plan",
                 "generate_steps",
                 "update_step_status",
-                "memory_add_fact",
-                "memory_add_project_note",
-                "rag_add",
+                "read_memory",
+                "rag_search",
                 "read",
                 "edit_file",
                 "write",
@@ -124,7 +123,7 @@ def default_config() -> dict:
             ],
             "whitelist_budget_tokens": 32768,
             "inline_limit_tokens": 4096,
-            "large_tools": ["read", "search", "write", "edit_file", "load_skill"],
+            "large_tools": ["read", "search", "write", "edit_file", "load_skill", "webfetch"],
             "inline_limit_tokens_large": 32768,
             "persist_dir": "data/toolcalls",
             "strip_keep_recent": 6,
@@ -151,12 +150,15 @@ def default_config() -> dict:
             "disable": [],
         },
         "plugins_config": {},
-        # 外置工作流（core/workflow.py）：dir 下 <active>.json 声明一轮回合的
-        # 线性节点链（system_prompt/skill/analyze/plan/execute/llm），加载失败
-        # 回退内置默认工作流；编辑器 gui/workflow_editor.py（/workflow 命令）。
+        # 外置工作流（core/workflow.py）：enabled=false（默认）时用户直接与 LLM 对话
+        # （系统提示词+工具循环，不经节点链）；true 时按 dir 下 <active>.json 声明的
+        # 线性节点链运行（system_prompt/skill/analyze/plan/execute/llm），加载失败
+        # 回退内置默认工作流；设置页"系统"标签可切换 enabled/active，/workflow 命令
+        # 切换即自动启用；编辑器 gui/workflow_editor.py（/workflow edit）。
         # max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
         # max_rounds_extensions：轮次用尽后基于"最近工具调用仍有进展"的续期次数上限
         "workflow": {
+            "enabled": False,
             "dir": "data/workflows",
             "active": "default",
             "max_rounds": 0,
@@ -178,9 +180,12 @@ def default_config() -> dict:
             "query_default_rounds": 3,
         },
         # 工具执行层（core/tools.py）：max_timeout 为模型传入 timeout 参数的
-        # 钳制上限（execute_command/run_program），防止模型传超大值绕过卡死兜底
+        # 钳制上限（execute_command/run_program），防止模型传超大值绕过卡死兜底；
+        # ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟），
+        # 兼容旧数字配置（>0 视为开）
         "tools": {
             "max_timeout": 600,
+            "ask_user_timeout": True,
         },
         # MCP 客户端（core/mcp.py）：把外部 MCP 服务器的工具桥接进本机工具循环。
         # enabled=false 不连接不注册（模型侧完全不可见）。servers 每项：stdio 用
@@ -211,7 +216,8 @@ def default_config() -> dict:
             "max_file_bytes": 20971520,
             "inventory_max_files": 50000,
         },
-        # 核心功能外部 API（UI/改配置不挂接口）
+        # 核心功能外部 API（UI/改配置不挂接口；早期 rag_add/rag_query 钩子已随
+        # RAG 插件 v0.3 移除——检索改插件内建（关键词/嵌入模型），无外部接管点）
         "external_apis": {
             "prompt_refine": None,
             "plan_generate": None,
@@ -220,8 +226,6 @@ def default_config() -> dict:
             "step_update": None,
             "memory_write": None,
             "memory_read": None,
-            "rag_add": None,
-            "rag_query": None,
             "computer_use": None,
             "llm_request": None,
             "tool_confirm": None,

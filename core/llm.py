@@ -723,7 +723,7 @@ class LLM:
         )
         return result.get("content") or prompt
 
-    def generate_plan(self, prompt: str) -> dict:
+    def generate_plan(self, prompt: str, model: Optional[str] = None) -> dict:
         external = hooks.call_hook("plan_generate", {"prompt": prompt}, default=None)
         if isinstance(external, dict) and external.get("content"):
             log.info("计划生成（外部接口）: %s", external.get("title", "任务计划"))
@@ -732,8 +732,8 @@ class LLM:
                 "content": external["content"],
                 "complexity": "high",
             }
-        plan_model = None
-        if hasattr(self.config, "get_task_model"):
+        plan_model = model
+        if plan_model is None and hasattr(self.config, "get_task_model"):
             plan_model = self.config.get_task_model("plan")
         try:
             system = prompt_loader.get_plan_prompt(prompt, config=self.config)
@@ -749,31 +749,6 @@ class LLM:
         )
         log.info("计划生成: %d字（model=%s）", len(result.get("content") or ""), plan_model or self.config.model)
         return {"title": "任务计划", "content": result.get("content") or "暂无计划", "complexity": "high"}
-
-    def generate_steps(self, prompt: str, plan_content: str) -> List[str]:
-        external = hooks.call_hook("step_generate", {"prompt": prompt, "plan": plan_content}, default=None)
-        if isinstance(external, dict) and external.get("steps"):
-            return [str(s) for s in external["steps"]]
-        plan_model = self.config.get_task_model("plan") if hasattr(self.config, "get_task_model") else None
-        try:
-            system = prompt_loader.get_steps_prompt(prompt, plan_content, config=self.config)
-        except Exception as e:
-            log.warn("加载 steps.md 失败: %s", e)
-            system = "将任务拆成 3-8 个可执行步骤，每步一行，只输出步骤列表。"
-        result = self.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"任务:\n{prompt}\n\n计划:\n{plan_content}"},
-            ],
-            model=plan_model,
-        )
-        lines = [line.strip() for line in (result.get("content") or "").splitlines() if line.strip()]
-        cleaned = []
-        for line in lines:
-            cleaned.append(line.lstrip("0123456789.、- ").strip() or line)
-        steps = cleaned or ["理解任务", "执行主要工作", "检查并总结"]
-        log.info("步骤生成: %d步", len(steps))
-        return steps
 
     def confirm_plan(self, plan: dict, action: str, feedback: str = "") -> dict:
         external = hooks.call_hook("plan_confirm", {"plan": plan, "action": action, "feedback": feedback}, default=None)

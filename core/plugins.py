@@ -31,6 +31,82 @@ log = get_logger("plugins")
 _ROOT = Path(__file__).resolve().parent.parent
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# 插件配置声明支持的类型（plugin.json 的 config 数组，见 docs/plugin-development.md §9）
+CONFIG_TYPES = ("str", "list", "int", "float", "bool")
+
+
+def _coerce_decl_value(ctype: str, value: Any) -> Any:
+    """按声明类型规整值；不可转换返回 None"""
+    try:
+        if value is None:
+            return None
+        if ctype == "str":
+            return str(value)
+        if ctype == "bool":
+            if isinstance(value, str):
+                return value.strip().lower() in ("true", "1", "yes", "on", "开")
+            return bool(value)
+        if ctype == "int":
+            return int(float(value))
+        if ctype == "float":
+            return float(value)
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+def _parse_config_decls(manifest: dict, pid: str) -> List[dict]:
+    """解析 plugin.json 的 config 声明数组；非法项 warn 后丢弃（不影响装载）"""
+    raw = manifest.get("config")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        log.warn("插件 %s 的 config 声明必须是数组，已忽略", pid)
+        return []
+    decls: List[dict] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            log.warn("插件 %s config 声明项必须是对象: %r", pid, item)
+            continue
+        key = str(item.get("key") or "").strip()
+        ctype = str(item.get("type") or "").strip().lower()
+        if not _KEY_RE.match(key):
+            log.warn("插件 %s config 声明 key 非法（字母开头，字母数字下划线）: %r", pid, key)
+            continue
+        if ctype not in CONFIG_TYPES:
+            log.warn("插件 %s config 声明 %s 类型非法（支持 %s）: %r", pid, key, "/".join(CONFIG_TYPES), ctype)
+            continue
+        if key in seen:
+            log.warn("插件 %s config 声明 key 重复，已跳过: %s", pid, key)
+            continue
+        seen.add(key)
+        decl = {
+            "key": key,
+            "type": ctype,
+            "label": str(item.get("label") or key),
+            "hint": str(item.get("hint") or ""),
+            "default": _coerce_decl_value(ctype, item.get("default")),
+        }
+        if ctype == "list":
+            options = item.get("options")
+            if not isinstance(options, list) or not options:
+                log.warn("插件 %s config 声明 %s 为 list 类型但缺非空 options，已跳过", pid, key)
+                continue
+            decl["options"] = [str(o) for o in options]
+            if decl["default"] is not None and decl["default"] not in decl["options"]:
+                decl["default"] = decl["options"][0]
+        if ctype in ("int", "float"):
+            lo = _coerce_decl_value(ctype, item.get("min"))
+            hi = _coerce_decl_value(ctype, item.get("max"))
+            if lo is not None:
+                decl["min"] = lo
+            if hi is not None:
+                decl["max"] = hi
+        decls.append(decl)
+    return decls
 
 # id -> {"manifest", "dir", "source", "status", "error", "context", "module"}
 _loaded: Dict[str, dict] = {}
@@ -52,6 +128,15 @@ def bind_runtime(app=None, runner=None) -> None:
     if runner is not None:
         _runtime["runner"] = runner
     log.debug("插件运行时已注入: app=%s runner=%s", "有" if app else "-", "有" if runner else "-")
+
+
+def runtime() -> Dict[str, Any]:
+    """只读访问运行时载体 {app, runner}（bind_runtime 注入的对象引用）。
+
+    插件可读取 app 的实时状态（busy / streaming_msg / status / phase_hint）与
+    runner（busy 判定、llm.cancel() 中断在途回合）；未注入时对应值为 None。
+    约定只读：请勿替换其中对象或改动 runner 的调度状态。"""
+    return dict(_runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -221,10 +306,23 @@ class PluginContext:
         self.source = source  # global | project
         self.config = config  # 宿主 Config（只读约定；改配置走 /settings）
         self.workspace = workspace
-        data = (getattr(config, "data", None) or {})
-        self.settings = dict((data.get("plugins_config") or {}).get(pid) or {})
+        # plugin.json 的 config 声明（设置面板插件页与 ctx.settings 缺省值的依据）
+        self.config_decls: List[dict] = _parse_config_decls(manifest, pid)
         self.log = get_logger(f"plugins.{pid}")
         self.ui = PluginUI(self)
+        self._teardowns: List[Callable] = []  # register_teardown 登记，卸载时按序执行
+
+    @property
+    def settings(self) -> dict:
+        """插件配置实时视图：声明缺省 + config.plugins_config[<id>] 持久化值（后者覆盖）。
+
+        每次访问都重读宿主配置——设置面板里的改动无需重载即可被插件读到；
+        需要动态行为的插件请在处理函数内读取本属性，而非在 setup 时缓存。"""
+        data = (getattr(self.config, "data", None) or {})
+        persisted = dict((data.get("plugins_config") or {}).get(self.plugin_id) or {})
+        vals = {d["key"]: d["default"] for d in self.config_decls if d.get("default") is not None}
+        vals.update(persisted)
+        return vals
 
     # ---- hooks ----
 
@@ -338,6 +436,14 @@ class PluginContext:
 
     # ---- 杂项 ----
 
+    def register_teardown(self, fn: Callable[[], Any]) -> Callable:
+        """注册卸载回调：插件被卸载/重载/禁用回滚时按注册顺序执行（异常隔离）。
+
+        用于停止 setup 期间启动的后台线程、释放端口/文件句柄等资源——没有它，
+        /plugin reload 后旧线程会残留（模块级全局变量不跨重载保留，无法自行停止）。"""
+        self._teardowns.append(fn)
+        return fn
+
     def storage_dir(self) -> Path:
         """插件专属持久化目录 {workspace}/.bawcode/plugin-data/<id>/（自动创建）"""
         d = self.workspace / ".bawcode" / "plugin-data" / self.plugin_id
@@ -382,6 +488,8 @@ def _import_entry(pid: str, dir_path: Path, manifest: dict):
 def _load_one(item: dict, config, workspace: Path) -> None:
     pid = item["id"]
     manifest = item["manifest"]
+    # 配置声明先于启用判定解析：禁用/失败插件同样可在设置面板展开查看/编辑
+    decls = _parse_config_decls(manifest, pid)
     enabled, reason = _enabled_of(manifest, config)
     if not enabled:
         _loaded[pid] = {
@@ -392,6 +500,7 @@ def _load_one(item: dict, config, workspace: Path) -> None:
             "error": reason,
             "context": None,
             "module": None,
+            "config_decls": decls,
         }
         log.debug("插件跳过（%s）: %s", reason, pid)
         return
@@ -419,13 +528,15 @@ def _load_one(item: dict, config, workspace: Path) -> None:
         record["hooks"] = sum(1 for lst in hooks.list_hooks().values() for h in lst if h["owner"] == pid)
         record["tools"] = sum(1 for t in register.list_tools() if t.get("owner") == pid)
         record["commands"] = sum(1 for c in commands.list_commands() if c.get("source") == f"plugin:{pid}")
+        record["configs"] = len(ctx.config_decls)
         log.info(
-            "插件已装载: %s v%s（hooks=%s tools=%s commands=%s）",
+            "插件已装载: %s v%s（hooks=%s tools=%s commands=%s configs=%s）",
             pid,
             manifest.get("version"),
             record["hooks"],
             record["tools"],
             record["commands"],
+            record["configs"],
         )
     except Exception as e:
         # 失败即回滚该插件已注册的一切，错误隔离
@@ -435,8 +546,19 @@ def _load_one(item: dict, config, workspace: Path) -> None:
         log.warn("插件装载失败 %s: %s", pid, record["error"])
 
 
+def _run_teardowns(pid: str) -> None:
+    """执行插件登记的卸载回调（停止后台线程/释放资源；异常隔离不影响注销流程）"""
+    ctx = (_loaded.get(pid) or {}).get("context")
+    for fn in list(getattr(ctx, "_teardowns", []) or []):
+        try:
+            fn()
+        except Exception as e:
+            log.warn("插件卸载回调失败 %s: %s", pid, e)
+
+
 def _unload_registrations(pid: str) -> None:
     """按 owner 注销插件在宿主各注册表的登记（hooks/commands/tools/skills）"""
+    _run_teardowns(pid)
     hooks.remove_owner(pid)
     commands.remove_source(f"plugin:{pid}")
     register.unregister_owner(pid)
@@ -521,6 +643,7 @@ def statuses() -> List[dict]:
                 "hooks": rec.get("hooks", 0),
                 "tools": rec.get("tools", 0),
                 "commands": rec.get("commands", 0),
+                "configs": rec.get("configs", 0),
             }
         )
     return rows
@@ -566,6 +689,70 @@ def set_enabled(pid: str, enabled: bool, config) -> bool:
     except Exception as e:
         log.warn("插件启停写配置失败: %s", e)
     return True
+
+
+# ---------------------------------------------------------------------------
+# 插件配置读写（设置面板"插件"标签页与 ctx.settings 的数据层）
+
+
+def declared_configs(pid: str) -> List[dict]:
+    """插件声明的配置项（已校验，含类型/缺省/选项/范围）；未装载返回 []。
+    禁用/失败插件同样返回声明（记录级解析，供设置面板展开编辑）"""
+    rec = _loaded.get(pid) or {}
+    if rec.get("config_decls") is not None:
+        return list(rec["config_decls"])
+    ctx = rec.get("context")
+    return list(getattr(ctx, "config_decls", []) or [])
+
+
+def _persisted_settings(pid: str, config=None) -> dict:
+    cfg_obj = config
+    if cfg_obj is None:
+        rec = _loaded.get(pid)
+        cfg_obj = rec.get("context").config if rec and rec.get("context") else None
+    data = (getattr(cfg_obj, "data", None) or {})
+    return dict((data.get("plugins_config") or {}).get(pid) or {})
+
+
+def config_values(pid: str, config=None) -> dict:
+    """配置合并视图：声明缺省 < 持久化值（后者覆盖）"""
+    vals = {d["key"]: d["default"] for d in declared_configs(pid) if d.get("default") is not None}
+    vals.update(_persisted_settings(pid, config))
+    return vals
+
+
+def get_setting(pid: str, key: str, default: Any = None, config=None) -> Any:
+    vals = config_values(pid, config)
+    return vals[key] if key in vals else default
+
+
+def set_setting(pid: str, key: str, value: Any, config) -> Any:
+    """写入插件配置并持久化（config.plugins_config[<id>][<key>]，写盘）。
+
+    有声明时按声明类型规整并钳制（list 必须命中 options，int/float 遵守
+    min/max）；返回落盘后的实际值，无法规整时抛 ValueError。"""
+    decl = next((d for d in declared_configs(pid) if d["key"] == key), None)
+    if decl is not None:
+        ctype = decl["type"]
+        coerced = _coerce_decl_value(ctype, value)
+        if coerced is None and value is not None:
+            raise ValueError(f"插件 {pid} 配置 {key} 需要 {ctype} 类型，得到 {value!r}")
+        value = coerced
+        if ctype == "list" and value not in decl.get("options", []):
+            raise ValueError(f"插件 {pid} 配置 {key} 必须是 {decl.get('options')} 之一，得到 {value!r}")
+        if ctype in ("int", "float") and value is not None:
+            if "min" in decl:
+                value = max(decl["min"], value)
+            if "max" in decl:
+                value = min(decl["max"], value)
+    pcfg = config.data.setdefault("plugins_config", {})
+    pcfg.setdefault(pid, {})[key] = value
+    try:
+        config.save()
+    except Exception as e:
+        log.warn("插件配置写盘失败: %s", e)
+    log.debug("插件配置已保存: %s.%s = %r", pid, key, value)
+    return value
 
 
 def reset() -> None:

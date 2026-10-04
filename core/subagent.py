@@ -45,7 +45,8 @@ _SUBAGENT_EXCLUDED_TOOLS = {
     "update_step_status",
     "memory_add_fact",
     "memory_add_project_note",
-    "rag_add",
+    # RAG 项目级开关（写插件状态文件，主会话语义；检索/重建对子代理开放）
+    "set_rag",
 }
 
 # 宽窄序：值越大越宽松；钳制规则=派发值不得比继承默认更宽

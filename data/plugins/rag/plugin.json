@@ -1,0 +1,21 @@
+{
+  "id": "rag",
+  "name": "项目 RAG 知识库",
+  "version": "0.3.0",
+  "description": "结构感知项目 RAG：tree-sitter 语义切片（类/函数/方法，注释与 docstring 作匹配基），用户消息主动召回（关键词/嵌入模型），rag_search/rag_index/set_rag 工具；索引手动触发、持久化于项目 .bawcode/plugin-data/rag/（TTL 30 天）",
+  "author": "BAWCode",
+  "entry": "main.py",
+  "config": [
+    { "key": "enabled", "type": "bool", "default": true, "label": "RAG 缺省开关", "hint": "项目级开关用 set_rag 工具或 /rag on|off（存项目数据，优先于本项）" },
+    { "key": "match_mode", "type": "list", "options": ["keyword", "embedding"], "default": "keyword", "label": "主动召回匹配方式", "hint": "keyword=注释/docstring 加权关键词；embedding=嵌入模型（需配置下方三项，失败回落 keyword）" },
+    { "key": "embedding_base_url", "type": "str", "default": "", "label": "嵌入 API Base URL", "hint": "OpenAI 兼容接口，如 https://api.example.com/v1；embedding 模式必填" },
+    { "key": "embedding_model", "type": "str", "default": "", "label": "嵌入模型名", "hint": "如 text-embedding-3-small / bge-m3 等（以服务端为准）" },
+    { "key": "embedding_api_key", "type": "str", "default": "", "label": "嵌入 API Key", "hint": "本地服务可留空（自动用 EMPTY）" },
+    { "key": "embedding_min_score", "type": "float", "default": 0.15, "label": "嵌入召回相似度阈值", "hint": "余弦相似度低于该值的切片不注入" },
+    { "key": "prefix", "type": "str", "default": "项目RAG补充", "label": "补充前缀" },
+    { "key": "top_k", "type": "int", "default": 3, "label": "召回条数上限" },
+    { "key": "budget_chars", "type": "int", "default": 4000, "label": "注入字符预算", "hint": "超出后停止追加切片，首条超长会截断" },
+    { "key": "index_ttl_days", "type": "int", "default": 30, "label": "索引有效期（天）", "hint": "超过后索引文件自动废弃删除，需重新 /rag build" },
+    { "key": "exclude_dirs", "type": "str", "default": "", "label": "额外排除目录", "hint": "逗号分隔目录名；.git/__pycache__/node_modules 等与点目录已内置跳过" }
+  ]
+}

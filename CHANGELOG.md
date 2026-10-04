@@ -1,5 +1,255 @@
 # Changelog
 
+## 2026-10-04 — 工作流改为显式启用：默认直接对话
+
+- **总开关 `workflow.enabled`（默认 false）**：未启用时回合不经工作流节点链——
+  注入系统提示词后直接进工具循环（`workflow.run_turn(None, turn)` →
+  `_run_direct`，行为与最简 default 工作流等价，但工作流从"永远套着的隐形
+  默认链"变为一等显式管线）；启用时按 `workflow.active` 节点链运行。存量
+  config 无该键，深合并后落默认 false，升级即生效。
+- **设置页"系统"标签**：新增「启用工作流」bool 字段（关闭=直接对话，开启=
+  按节点链运行）；「工作流」choice 文案改为"仅在启用工作流时生效"。
+- **/workflow 命令**：`/workflow <名称>` 切换即自动启用（显式选择=使用意图），
+  新增 `/workflow off`（同 直接对话/关闭）停用回直接对话；列表显示当前
+  启用状态。remote-control 的 workflow 切换 API 同语义（切换即启用），
+  workflows 列表接口新增 `enabled` 字段。
+- **验证**：test_workflow 冒烟 48 项全绿（新增开关语义/直连路径用例：
+  系统提示词注入、进工具循环、无计划无步骤启动指令、不经节点链）。
+
+## 2026-10-04 — 步骤拆解归口主 LLM：移除 plan 节点旁路 steps 请求
+
+- **旁路请求移除**：plan 节点不再自行发起步骤拆解 LLM 请求（原
+  `llm.generate_steps`：无工具 schema 约束、非流式、`splitlines` 逐行
+  解析——sensenova-6.8-flash-lite 跑题输出整份 HTML 源码时被逐行误收为
+  1379 步，2026-10-04 00:46 事故；前一日同路径已现 787 步）。删除
+  `llm.generate_steps`、`prompt_loader.get_steps_prompt/steps_prompt_files`
+  与 `core/prompts/steps.md`。
+- **新语义（plan 节点 `steps: true`）**：置 `turn.captured["steps_kickoff"]`
+  标记，execute 节点据其向系统提示词追加内置启动指令
+  （`workflow.STEPS_KICKOFF_BUILTIN`）——主 LLM 在工具循环里调用
+  **generate_steps 工具**（结构化数组参数）落库步骤，再按步骤推进并
+  `update_step_status` 同步进度；schema 约束下不存在文本解析环节，
+  流式/阶段提示/策略门全部复用现有管线。plan 快照消息不再内联
+  steps_snapshot（步骤以 generate_steps 工具时间线节点呈现）。
+- **工具钳制**：generate_steps 工具清洗空项并限 15 条——超限/空列表
+  返回纠错指引交模型自纠；`memory.set_steps` 入参注解放宽为
+  `List[Union[str, dict]]`（str 项归一化为 pending dict，行为不变）。
+- **收尾**：「执行步骤」状态文案移至 execute 节点起点；工作流编辑器
+  plan 节点 steps 参数文案同步新语义；test_workflow 冒烟 40 项全绿
+  （新增工具落库/钳制用例，另修复 default.json 节点数与 generate_plan
+  model 参数两处存量断言过时）。
+
+## 2026-10-03 — RAG 插件 v0.3.0：消息驱动主动召回 + 手动索引持久化 + set_rag 项目开关
+
+- **消息驱动主动召回**（context_supplement 重构）：宿主 payload 新增
+  `user_message`（memory.py 取最后一条可见 user 消息），用户每发送消息即按
+  消息内容检索注入，替代原固定 query 配置。匹配方式 match_mode 可选：
+  - **keyword**：关键词加权命中——doc（注释/docstring，权重 5）> 路由(2) >
+    文件名(1) > 代码体(0.5)，代码块与消息的直接匹配程度刻意压低；
+  - **embedding**：对每个切片的注释/docstring 文本与用户消息各算嵌入向量
+    （OpenAI 兼容 /v1/embeddings，插件独立配置 embedding_base_url/model/
+    api_key），余弦相似度过阈值（embedding_min_score）召回；向量按
+    切片 uid 落盘 embeddings.json（增量只补算变化切片，模型变更即全量失效）；
+    API 未配置/失败回落 keyword。同回合同消息结果缓存（每轮 LLM 调用不重复
+    检索/请求）。doc 即匹配基：切片新增 doc 字段（python docstring+注释、
+    C-like // 与 /* */、ruby/bash #、lua --；markdown/text 正文即 doc）。
+- **索引手动触发 + 持久化**：索引只在显式调用时构建（rag_index 工具或
+  /rag build），不再每回合自动扫描；持久化于 ctx.storage_dir()
+  （{workspace}/.bawcode/plugin-data/rag/）——index.json（切片+stat 表，
+  原子写）、embeddings.json、state.json。生命周期插件自处置：built_at 超
+  index_ttl_days（缺省 30 天）装载时自动废弃删除；/rag clear 手动清除。
+- **工具面调整**：移除 rag_add（记忆相关将独立为插件）与 rag_query 外部
+  接管钩子；新增 **set_rag**（开启/关闭本项目 RAG，写 state.json 持久化，
+  子代理排除名单收录）；rag_search 转纯关键词检索（Agent 主动检索：路由(4)
+  > 代码体(2) > doc(1)，返回带索引信息代码块）；rag_index 手动重建+落盘。
+  policy.SAFE_TOOLS 增 set_rag 去 rag_add；config.context.tool_whitelist 同步；
+  用户命令 /rag：status | build | on | off | clear。
+- **召回排序**：同分偏向更具体切片（路由更深方法>类、内容更紧凑优先）；
+  英文虚词停用词表（"python" 含 "on" 类假阳性）；修复 _parse_code 切片
+  漏 doc 字段导致注释基全空的问题。
+- **验证**：e2e 30 项全绿（工具面/手动触发/keyword 与 embedding 双模式/
+  mock embeddings 服务器/set_rag/磁盘恢复/TTL/exclude_dirs）；插件、设置
+  面板、上下文管理回归通过；真实工作区 95 文件 1603 切片 0.28s，中文消息
+  命中中文 docstring 切片，重载免重建。
+
+## 2026-10-03 — RAG 插件 v0.2.0：结构感知索引（tree-sitter 语义切片）
+
+- **结构感知索引**（data/plugins/rag 重写）：遍历工作区建立"文件结构 × 语法切片"
+  两级索引——tree-sitter 按 AST 提取类/函数/方法，整段代码为一个切片，路由形如
+  `main.py > Computer > use`；markdown 按 ATX 标题分节；纯文本/无定义代码文件整
+  文件兜底。覆盖 24 种扩展名（py/js/ts/tsx/go/rs/java/kt/c/cpp/cs/rb/php/sh/lua/
+  swift/md/txt 等），定义节点类型按语法 node_kind 内省过滤（tree-sitter 0.26 无
+  `Language.node_types`，用 `node_kind_count`+`node_kind_for_id` 枚举）。
+- **增量刷新**：按 (mtime_ns, size) 缓存每文件切片，仅重解析变化文件；首次召回懒
+  构建；上限保护（3000 文件/单文件 256KB/单切片 8000 字符）。内置跳过 .git/
+  __pycache__/node_modules 等与全部点目录，config.exclude_dirs 可追加。
+- **召回携带索引信息**：路由命中加权(4) > 内容命中(1)（手动文档 2），切片以
+  `[文件 > 类 > 方法 | 语言 | L起-L止]` + 完整代码块进上下文；top_k / budget_chars
+  控制注入预算。
+- **工具面**：保留 rag_add（外部向量库扩展点照旧），新增 rag_search（检索索引，
+  外部 rag_query 接管语义同补充）与 rag_index（强制重建+统计）；两者进 policy.py
+  SAFE_TOOLS（只读免确认）。
+- **优雅降级**：tree-sitter 依赖缺失时插件照常装载，工具返回安装提示，手动文档
+  与外部接口不受影响；requirements.txt 增 tree_sitter/tree-sitter-language-pack
+  （ABI 配对 0.26.x + 1.20.x，预编译 wheel 全平台）。
+- **验证**：e2e 28 项全绿（fixture 工作区两级路由/增量/markdown 分节/降级/配置）；
+  插件 e2e 与设置面板回归通过；真实工作区烟雾：95 文件→1584 切片 0.69s，
+  `core/hooks.py > register_hook` 函数级精准召回。
+
+## 2026-10-03 — 默认工作流最简化 + 设置页工作流切换
+
+- **默认工作流最简版**（data/workflows/default.json + workflow.DEFAULT_WORKFLOW）：
+  只剩 system_prompt → execute 两节点，作为通用角色直接执行；计划/审查/任务
+  理解等按需在编辑器添加或切用其它工作流（skill 清单注入也移出默认链）。
+- **设置页切换工作流**（ui.py 系统标签）：新增"工作流"choice 字段，选项为
+  data/workflows/ 下全部已识别工作流（当前激活项即使无文件也列出），←→ 切换、
+  Enter 保存后写 config.workflow.active，下一回合生效；与 /workflow <名称> 等价。
+
+## 2026-09-30 — 工作流扩展：纯 LLM 复杂度判定 / 审查与任务理解节点 / 节点级模型 / 编辑器右侧参数面板
+
+- **analyze 复杂度判定改为纯 LLM**（workflow.py `_exec_analyze`）：独立一次 LLM
+  请求（内置判定提示词 + 完整对话上下文），解析输出 high/low，失败/不可解析
+  回落 `default_level`；结果写 `^{complexity}^` 变量供后续节点提示词引用。
+- **新增 `review` 审查节点**：带工具循环（读代码/查 git/直接修复），内置
+  core/prompts/review.md（审查→反思→修正→结论），`max_rounds` 默认 8、
+  `model_role` 默认 review。
+- **新增 `understand` 任务理解节点**：带工具循环解析意图，缺失信息经 ask_user
+  工具向用户提问（复用 ask_user 选项式交互桥与超时机制），内置
+  core/prompts/understand.md，`capture` 默认 `understanding`。
+- **节点级模型配置**：新字段 `model`（完整 model_name），优先级 model >
+  model_role > 激活模型；不在 `config.list_models()` 时告警回落；
+  `llm.generate_plan/generate_steps` 增 model 参数使 plan 节点同样可指定。
+- **内联提示词与系统提示词覆盖**：节点新字段 `prompt`（内联文本，优先于
+  `prompt_files`）与 `override_system`（true=该节点提示词替换内置系统提示词，
+  默认追加）；由 `_node_stage`/`_stage_system` 统一组装。
+- **编辑器三栏重构**（gui/workflow_editor.py）：新增右侧"节点参数"停靠面板
+  （QDockWidget），单击节点载入配置、修改即时写回并刷新画布节点；支持内联
+  提示词多行编辑、替换系统提示词开关、模型下拉（读 config 全部模型）；
+  移除模态属性对话框（双击节点=聚焦面板）；修复重建画布时 selectionChanged
+  访问已删 C++ 对象的 shiboken 异常。
+- **示例**：data/workflows/understand-plan-execute-review.json
+  （understand→analyze→plan→execute→review 全新管线）。
+
+## 2026-10-03 — 插件配置声明 + 设置面板"插件"标签页（声明式可视化配置）
+
+- **配置声明**（plugin.json `config` 数组）：插件声明配置项即可获得设置面板可视化
+  编辑界面。五种类型 `str`/`list`/`int`/`float`/`bool`；声明项带 key/type/label/hint/
+  default，list 必填 options（左右键循环项），int/float 可选 min/max 钳制。解析在
+  core/plugins.py `_parse_config_decls`：非法项（坏类型/缺 options/重复 key/坏 key）
+  warn 后丢弃不影响装载；缺省值按类型规整。**声明先于启用判定解析**——禁用/失败
+  插件同样可展开查看/编辑配置（装载记录级 config_decls）。
+- **ctx.settings 实时化**：由装载时快照改为实时属性（声明缺省 + plugins_config 持久
+  化值，后者覆盖）——每次访问重读宿主配置，设置面板改动即时生效，无需 /plugin
+  reload；文档提示动态行为在处理函数内读取、勿在 setup 缓存。
+- **设置面板"插件"标签页**（ui.py）：标签页增至 5 个。树状缩进列表——**插件行**显示
+  全部识别到的插件（含禁用/失败附原因），`←→` 开/关（复用 plugins.set_enabled 写盘
+  config.plugins.disable + 立即 reload，通知显示重载计数与启用失败原因）、`Enter`
+  展开/收起配置子列表（▾/▸ 箭头）；**配置行**按类型渲染：bool=勾选框 `[x]`/`[ ]`
+  （Enter/←→）、list=`< 选项 > ←→` 循环、str/int/float=Enter 行编辑（int/float 类型
+  校验失败保留原值）。与既有页不同的**写透语义**：所有插件改动即时写
+  config.plugins_config 并落盘（不经 scratch/Enter 保存流，Esc 放弃不影响已写透项）；
+  字段构建跳过 scratch 播种防陈旧值。
+- **程序侧 API**：plugins.declared_configs(pid) / get_setting(pid, key, default) /
+  set_setting(pid, key, value, config)（按声明规整钳制，list 越界与类型错误抛
+  ValueError）；statuses() 增加 configs 计数。
+- **内置插件声明配置**：rag（enabled bool/query str/prefix str，实时读取，旧
+  config.rag 段优先级置于声明缺省之上、插件配置之下）；hello-plugin v0.2（supplement
+  bool/greet str/style list/shout int——五类型演示，supplement 改为实时门控）。
+- **测试**：develop/test_plugin_settings.py 32 项全绿（声明解析丢弃/规整、钳制与越界
+  拒绝、ctx.settings 实时性、落盘、UI 字段构建/类型映射、启停写盘翻转、pbool/pchoice/
+  ptext 交互语义、渲染快照箭头/勾选框/缩进）；回归 rag 插件 14 项/plugins e2e 56 项/
+  context_mgmt 全绿。
+
+## 2026-10-03 — remote-control v0.2：网页界面全面重写（清新简洁风）+ API 面扩展（未提交）
+
+- **web/index.html 完全重写**（v0.1 深色终端风 → v0.2 浅色清新风，单文件零依赖）：
+  浅色设计系统（teal 主色/白卡片/圆角/软阴影），桌面左侧常驻控制台侧栏（<960px 变
+  抽屉 + 遮罩），消息区聊天气泡范式（user 右侧 teal 气泡、assistant 白卡、system 居中
+  药丸、summary 琥珀卡），markdown-lite 安全渲染（先转义再提取 ``` 围栏 + 行内
+  `code`/**bold**），直播气泡含可折叠思考链。三 tab 侧栏：**会话**（当前会话卡 +
+  新建/重命名/清空，历史会话列表切换/删除，双击确认防误触）；**控制**（访问模式分段
+  选择 auto/manual/full、模型列表切换、工作流切换、回合快照回滚/清空回收站、token
+  计量与查余额）；**信息**（计划+步骤时间线 done/running/failed 状态图标，工具/子代理/
+  技能/MCP/插件/命令帮助手风琴懒加载）。输入栏 `/` 按钮唤起命令面板（/api/commands
+  搜索+点击填充），`/` 开头输入走远程命令；确认卡片底部弹层支持队列（"共 n 个待确认"）
+  与拒绝原因行内输入；25s 空闲轮询 + 消息区签名门禁（无变化不动 DOM 保滚动/展开态）。
+- **插件 API 面扩展**（main.py v0.1 → v0.2，服务于网页功能覆盖）：/api/state 增强
+  （session/plan/steps/model/mode/mode_label/workflow/tokens/queue）；新增 GET
+  /api/sessions /models /tools /agents /skills /mcp /plugins /workflows /undo
+  /commands 与 POST /api/session/{new,clear,rename,switch,delete}、/api/model/switch、
+  /api/mode、/api/workflow/switch、/api/undo、/api/command。会话结构操作在回合进行中
+  拒绝（与主循环 /new /clear /resume /undo 同口径）；/api/command 执行非交互斜杠命令
+  （输出取命令写入会话的反馈文本回流），/settings /resume /refine /run /exit 等需终端
+  交互或同步跑回合的命令拦截（对应能力由专用端点/网页面板覆盖）。
+- **页面放行策略调整**："/" 与 "/index.html" 改为无密钥静态放行（地址栏清洗/手机刷新/
+  历史重开 URL 无密钥时不再 403 白屏），密钥门禁移交页内首检 /api/state（403 →
+  页内"密钥无效"横幅）；全部 /api/* 与 SSE 端点仍强制校验密钥，页面本身不含数据。
+- **测试**：原 develop/test_remote_control_e2e.py 更新 H1/H2（页面放行 + API 403）共
+  56 项全绿；新增 develop/test_remote_control_api_e2e.py 39 项全绿（state 扩展字段；
+  会话列表/切换/重命名/删除/新建/清空与 busy 拒绝；模型/模式/工作流切换与非法值报错；
+  undo 列表与无快照报错；tools/agents/skills/mcp/plugins/commands 清单；/api/command
+  执行回流与交互命令拦截/busy 拒绝；新端点密钥校验抽样）。真机浏览器取证（预览
+  harness develop/preview_remote_control.py 种子数据）：桌面/移动（390×844）双视口
+  截图验证布局、抽屉、计划时间线、工具卡、确认卡队列、命令面板；移动端首开抽屉不
+  加载 tab 数据已修复（openDrawer 缺省激活当前 tab）。
+
+## 2026-10-03 — remote-control 远程控制插件：浏览器远程查看与控制终端（已随 v0.2 重写）
+
+- **官方插件 data/plugins/remote-control/**（id=remote-control）：装载即在后台线程启动
+  标准库 HTTP 服务（ThreadingHTTPServer，无新依赖）。启动生成七天有效期的唯一密钥
+  （secrets.token_urlsafe，落盘 storage_dir/key.json，未过期跨重启复用；过期或
+  /remote revoke 重生成），链接 `http://<局域网IP>:<端口>/?key=<密钥>` 经 notify 于
+  session_start 展示一次；`/remote` 查状态 / `revoke` 重置密钥并踢掉旧连接 / `on|off`
+  启停服务。所有端点经 hmac.compare_digest 校验密钥（安全模型：受信局域网，无 TLS）。
+- **远程控制页 web/index.html**（自包含单文件，深色终端风，移动端适配）：SSE 实时事件流
+  （/api/events）+ 快照拉取（/api/state）。实时观看流式输出增量/工具活动/计划步骤/回合
+  状态；输入框代发消息（ctx.submit_turn，busy 按设置排队/中断）+ 停止按钮
+  （runtime().runner.llm.cancel()）；**工具确认远程代答**——tool_confirm 扩展点（priority
+  50）在有浏览器在线时把确认请求推给页面（允许一次/始终允许/拒绝+原因），
+  confirm_timeout（默认 90s）内未响应或无浏览器在线则交回终端确认面板；密钥从 URL
+  提取后清洗地址栏并存 sessionStorage；revoke 时按密钥纪元断开旧 SSE 连接。
+- **宿主扩展**（现有接口缺口补齐）：core/plugins.py 新增模块级 `runtime()` 只读访问
+  bind_runtime 注入的 {app, runner}，PluginContext 新增 `register_teardown(fn)`——卸载/
+  重载/禁用回滚时按序执行（此前后台线程插件无法在 /plugin reload 时停止自身，
+  存在线程残留与端口占用问题）；core/hooks.py 事件目录新增观察链事件 `stream_delta`
+  （{kind, piece}，流式增量）与 `turn_status`（{status}/{phase}，回合状态），
+  main.py 于 _on_delta 与 TurnIO status/phase 更新点触发。
+- **测试**：develop/test_remote_control_e2e.py 54 项全绿（鉴权 403/页面/快照结构；
+  send idle→start、busy→排队、空消息 400；stop→llm.cancel；SSE 全事件序列经
+  main._before_turn/_after_turn/collect 真实漏斗；远程代答无客户端立即交回/超时交回/
+  deny 实时应答/**真实 mock LLM 回合内 SSE 收 confirm→POST allow_once→工具真实执行**；
+  /remote 五项；reload teardown 停服重绑/旧连接被关/密钥复用/过期重生成）。回归
+  plugins e2e 56 项、rag 14 项全绿。
+- **修复终端链接截断**（core/ui.py help 行渲染）：系统通知/命令反馈行建节点时曾被
+  `_clip(line, 60)` 硬截——含密钥链接（~75 列）被截断无法复制。去掉预截断，节点
+  label 保留完整行，交 _tree_rows 按实时终端宽度折行（`_wrap` 逐字符宽度断行，
+  无空格 URL 可折；续行带树引导线缩进）。develop/test_ui_help_wrap.py 7 项全绿
+  （W110/80/62 三档宽度 × 长短链接 + /remote 反馈，渲染行无损拼出完整 URL），
+  ANSI→HTML 浏览器截图目视折行与双色渲染正常。
+
+## 2026-10-03 — RAG 剥离为官方插件：核心零残留，行为对模型与上下文完全透明
+
+- **剥离**（核心不再含任何 RAG 知识库逻辑）：删除 core/rag.py（内存占位实现，无落盘
+  数据）；memory.py 去除 rag_mod 导入、Memory.rag 单例、rag_add/rag_query 方法与
+  build_context_supplements 内的"项目RAG补充"段；tools.py 移除 rag_add 工具注册；
+  config.py 默认 external_apis 移除 rag_add/rag_query（用户旧配置中的 URL 经 hook 链
+  照常生效）。**有意保留**三处工具名元数据以维持模型侧行为不变：policy.SAFE_TOOLS、
+  context.tool_whitelist、subagent._SUBAGENT_EXCLUDED_TOOLS 中的 "rag_add"（免确认/
+  跨回合保留/子代理屏蔽语义不变，插件禁用时为惰性条目）。
+- **官方插件 data/plugins/rag/**（id=rag）：逐字移植原 RagStore——内存文档列表 +
+  关键词包含匹配兜底（前 3 篇各截 200 字）；rag_add 工具经 ctx.register_tool 注册，
+  **名称/描述/schema/返回文案（"已写入项目 RAG"）与原核心逐字一致**；每回合经
+  context_supplement 注入"项目RAG补充:"段（与原 [记忆补充] 内文案一致）；rag_add/
+  rag_query 扩展点照常触发，外部接口返回 {content}/str 时整体替换本地检索（外部
+  向量库接管语义不变）。私有配置 plugins_config.rag：enabled/query/prefix；旧
+  config.rag 段同样兼容（plugins_config 优先）。
+- **测试**：develop/test_rag_plugin.py 14 项全绿（核心不可导入/Memory 无 rag 接口/
+  [记忆补充] 无 RAG 段；插件装载 owner=rag、schema 与描述逐字一致；写入-检索-补充
+  注入等价、扩展点旁路、外部接管、plugins_config 覆盖与旧段兼容）。回归 plugins
+  e2e 56 项/context_mgmt/context_turn/skills_plan/workflow34/snapshot_undo/skills/
+  session_store/progress_heuristic 全绿。已随基线 913bcbc（feat：完善了插件支持基座）
+  之后实施，本次改动未提交。
+
 ## 2026-10-03 — 插件系统：目录式外部插件装载 + hook 链改造 + 插件开发文档
 
 - **hook 系统**（core/hooks.py 重写）：单事件单处理函数 → 多处理函数**链**，新增两种

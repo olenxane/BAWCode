@@ -1,6 +1,6 @@
 {
   "name": "default",
-  "description": "系统提示词注入 → 技能清单 → 编码执行（计划类需求在编辑器添加 plan 节点）",
+  "description": "最简通用管线：系统提示词注入 → 编码执行（通用角色直接干活；计划/审查等节点在编辑器自行添加）",
   "nodes": [
     {
       "id": "system_prompt",
@@ -8,12 +8,6 @@
       "files": [
         "system_prompt.md"
       ]
-    },
-    {
-      "id": "skills",
-      "type": "skill",
-      "enabled": true,
-      "list": []
     },
     {
       "id": "execute",

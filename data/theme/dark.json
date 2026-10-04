@@ -17,7 +17,8 @@
     "tool_title": "#14BABC",
     "tool_content": "#FFFFFF",
     "subagent": "#F09C58",
-    "tree_guide": "#3A5578"
+    "tree_guide": "#3A5578",
+    "selection_bg": "#2A5286"
   },
   "tips_rotate_seconds": 5
 }

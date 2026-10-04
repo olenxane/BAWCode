@@ -37,28 +37,41 @@ MIME_NODE = "application/x-bawcode-node"
 TYPE_LABELS = {
     "system_prompt": ("系统提示词", "#3A6EA5"),
     "skill": ("技能清单", "#5E8C31"),
+    "understand": ("任务理解", "#2C7A7B"),
+    "analyze": ("复杂度判定", "#B96A1B"),
     "plan": ("任务规划", "#7D4AA0"),
     "execute": ("编码执行", "#2E7D52"),
+    "review": ("审查修正", "#C0392B"),
     "llm": ("通用LLM", "#4682B4"),
 }
 
-# 属性表单 schema：type -> [(key, 标签, 控件类型, 附加参数)]
+# 支持"节点级模型"与"内联提示词/替换系统提示词"的节点集合
+MODEL_TYPES = {"understand", "analyze", "plan", "execute", "review", "llm"}
+PROMPT_TYPES = {"understand", "analyze", "execute", "review", "llm"}
+
+# 属性表单 schema：type -> [(key, 标签, 控件类型, 附加参数)]（仅类型专属字段；
+# model/model_role 与 prompt/override_system/prompt_files 由面板按集合统一生成）
 BOOL, INT, STR, LIST, CHOICE = "bool", "int", "str", "list", "choice"
 FIELD_SCHEMAS = {
     "system_prompt": [("files", "系统提示词文件（逗号分隔）", LIST, None)],
     "skill": [("list", "技能白名单（逗号分隔，空=全部）", LIST, None)],
-    "plan": [("confirm", "计划生成后需用户确认", BOOL, None), ("steps", "计划确认后生成步骤", BOOL, None)],
+    "understand": [
+        ("max_rounds", "理解循环轮数（ask_user 澄清）", INT, (1, 100)),
+        ("capture", "捕获输出为变量名（可空）", STR, None),
+    ],
+    "analyze": [("default_level", "判定失败/不可解析时默认", CHOICE, ["low", "high"])],
+    "plan": [("confirm", "计划生成后需用户确认", BOOL, None), ("steps", "执行前强制拆解步骤（主 LLM 经 generate_steps 工具）", BOOL, None)],
     "execute": [
         ("max_rounds", "工具循环轮数", INT, (1, 200)),
-        ("model_role", "模型角色", CHOICE, ["code", "plan", "review"]),
-        ("prompt_files", "执行前注入提示词（逗号分隔，可空）", LIST, None),
+        ("capture", "捕获输出为变量名（可空）", STR, None),
+    ],
+    "review": [
+        ("max_rounds", "审查循环轮数", INT, (1, 100)),
         ("capture", "捕获输出为变量名（可空）", STR, None),
     ],
     "llm": [
-        ("prompt_files", "提示词文件（逗号分隔）", LIST, None),
-        ("capture", "捕获输出为变量名（可空）", STR, None),
-        ("model_role", "模型角色", CHOICE, ["plan", "code", "review"]),
         ("max_rounds", "工具循环轮数（0=单次无工具）", INT, (0, 200)),
+        ("capture", "捕获输出为变量名（可空）", STR, None),
     ],
 }
 COMMON_FIELDS = [("enabled", "启用节点", BOOL, None)]
@@ -67,8 +80,11 @@ COMMON_FIELDS = [("enabled", "启用节点", BOOL, None)]
 NODE_DEFAULTS = {
     "system_prompt": {"files": ["system_prompt.md"]},
     "skill": {"list": []},
+    "understand": {"prompt_files": ["understand.md"], "capture": "understanding", "max_rounds": 8, "model_role": ""},
+    "analyze": {"default_level": "low", "prompt_files": [], "prompt": "", "model_role": "plan"},
     "plan": {"confirm": True, "steps": True},
     "execute": {"max_rounds": 12, "model_role": "code", "prompt_files": [], "capture": ""},
+    "review": {"prompt_files": ["review.md"], "capture": "review_result", "max_rounds": 8, "model_role": "review"},
     "llm": {"prompt_files": [], "capture": "", "model_role": "plan", "max_rounds": 0},
 }
 
@@ -132,11 +148,11 @@ class NodeItem(QtWidgets.QGraphicsObject):
         self._press_pos = None
 
     def mouseDoubleClickEvent(self, event):
-        self.editor.edit_node(self)
+        self.editor.focus_param_panel(self)
 
     def contextMenuEvent(self, event):
         menu = QtWidgets.QMenu()
-        menu.addAction("属性…", lambda: self.editor.edit_node(self))
+        menu.addAction("参数面板…", lambda: self.editor.focus_param_panel(self))
         menu.addAction("删除节点", lambda: self.editor.delete_nodes([self]))
         menu.addSeparator()
         if self.editor.pending_node is not None:
@@ -253,74 +269,6 @@ class CanvasView(QtWidgets.QGraphicsView):
         super().keyPressEvent(event)
 
 
-class PropertyDialog(QtWidgets.QDialog):
-    """按类型 schema 生成表单；accept 时写回节点 dict"""
-
-    def __init__(self, node: dict, parent=None):
-        super().__init__(parent)
-        self.node = node
-        label, _ = TYPE_LABELS.get(node["type"], (node["type"], "#555"))
-        self.setWindowTitle(f"节点属性 · {label}（{node.get('id', '')}）")
-        form = QtWidgets.QFormLayout(self)
-        self._widgets = {}
-
-        id_edit = QtWidgets.QLineEdit(str(node.get("id", "")))
-        form.addRow("节点 id", id_edit)
-        self._widgets["id"] = id_edit
-
-        for key, title, kind, extra in COMMON_FIELDS + FIELD_SCHEMAS.get(node["type"], []):
-            if kind == BOOL:
-                w = QtWidgets.QCheckBox()
-                w.setChecked(bool(node.get(key, key == "enabled")))
-            elif kind == INT:
-                w = QtWidgets.QSpinBox()
-                lo, hi = extra or (0, 999)
-                w.setRange(lo, hi)
-                w.setValue(int(node.get(key) or (0 if lo == 0 else lo)))
-            elif kind == CHOICE:
-                w = QtWidgets.QComboBox()
-                w.addItems(extra or [])
-                cur = str(node.get(key) or (extra[0] if extra else ""))
-                if cur in (extra or []):
-                    w.setCurrentText(cur)
-            else:  # STR / LIST
-                w = QtWidgets.QLineEdit()
-                val = node.get(key)
-                if isinstance(val, list):
-                    val = ", ".join(str(x) for x in val)
-                w.setText(str(val or ""))
-                if kind == LIST:
-                    w.setPlaceholderText("逗号分隔")
-            form.addRow(title, w)
-            self._widgets[key] = w
-
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
-
-    def apply(self) -> None:
-        for key, w in self._widgets.items():
-            if key == "id":
-                continue
-            if isinstance(w, QtWidgets.QCheckBox):
-                self.node[key] = w.isChecked()
-            elif isinstance(w, QtWidgets.QSpinBox):
-                self.node[key] = w.value()
-            elif isinstance(w, QtWidgets.QComboBox):
-                self.node[key] = w.currentText()
-            else:
-                text = w.text().strip()
-                if key in ("files", "list", "keywords_high", "keywords_low", "prompt_files"):
-                    self.node[key] = [p.strip() for p in text.split(",") if p.strip()]
-                else:
-                    self.node[key] = text
-        new_id = self._widgets["id"].text().strip() or self.node["type"]
-        self.node["id"] = new_id
-
-
 class EditorWindow(QtWidgets.QMainWindow):
     def __init__(self, name: str = ""):
         super().__init__()
@@ -328,9 +276,11 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._nodes: list[NodeItem] = []
         self._edges: list[EdgeItem] = []
         self.pending_node: NodeItem | None = None
+        self._model_names = self._list_model_names()
+        self._panel_item: NodeItem | None = None
 
         self.setWindowTitle(f"BAWCode 工作流编辑器 · {name or '（未保存）'}")
-        self.resize(1080, 680)
+        self.resize(1240, 700)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(central)
@@ -343,6 +293,21 @@ class EditorWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.view, 1)
         self.setCentralWidget(central)
 
+        # 右侧参数面板：单击节点载入配置，编辑即时写回
+        self.param_panel = QtWidgets.QDockWidget("节点参数", self)
+        self.param_panel.setFeatures(
+            QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
+        )
+        self.param_panel.setAllowedAreas(
+            QtCore.Qt.DockWidgetArea.RightDockWidgetArea | QtCore.Qt.DockWidgetArea.LeftDockWidgetArea
+        )
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.param_panel)
+        self._panel_clear()
+        self.scene.selectionChanged.connect(
+            lambda: self._panel_load(self._selected_item())
+        )
+
         toolbar = self.addToolBar("main")
         toolbar.setMovable(False)
         for text, slot in [
@@ -350,7 +315,6 @@ class EditorWindow(QtWidgets.QMainWindow):
             ("打开…", self.open_workflow),
             ("保存", self.save_workflow),
             ("另存为…", self.save_as),
-            ("属性", self.edit_selected),
             ("校验", self.check_chain),
             ("删除选中", self.delete_selected),
         ]:
@@ -358,27 +322,190 @@ class EditorWindow(QtWidgets.QMainWindow):
             action.triggered.connect(slot)
 
         self.statusBar().showMessage(
-            "双击/拖拽面板添加节点 · 点击两节点连线（再次点击取消连线） · 双击节点改属性 · Delete 删除选中"
+            "双击/拖拽面板添加节点 · 点击两节点连线（再次点击取消连线） · 单击节点在右侧编辑参数 · Delete 删除选中"
         )
         if name:
             self.load_from_file(workflow_mod.workflow_path(None, name))
 
-    # --- 节点管理 -------------------------------------------------------
+    @staticmethod
+    def _list_model_names() -> list[str]:
+        """从主配置读取可用模型（model_name = provider_id-model_id）"""
+        try:
+            from core.config import Config
 
-    def edit_node(self, item: NodeItem) -> None:
-        """属性对话框：accept 时把表单写回节点数据并刷新画布"""
-        dlg = PropertyDialog(item.node, self)
-        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            dlg.apply()
-            item.update()
-            self.update_edges()
+            return [
+                str(r.get("model_name"))
+                for r in Config().list_models()
+                if r.get("model_name")
+            ]
+        except Exception:
+            return []
 
-    def edit_selected(self, checked: bool = False) -> None:
-        selected = [n for n in self._nodes if n.isSelected()]
-        if not selected:
-            self.statusBar().showMessage("先单击选中一个节点，再点属性", 3000)
+    def _selected_item(self) -> NodeItem | None:
+        for n in self._nodes:
+            try:
+                if n.isSelected():
+                    return n
+            except RuntimeError:
+                return None  # C++ 对象已被 removeItem 删除（重建画布瞬间触发信号）
+        return None
+
+    # --- 右侧参数面板 ---------------------------------------------------
+
+    def _panel_clear(self) -> None:
+        holder = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(holder)
+        tip = QtWidgets.QLabel("单击节点在此处查看 / 编辑参数\n（修改即时写回节点数据）")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        lay.addStretch(1)
+        self.param_panel.setWidget(holder)
+
+    def _panel_load(self, item: NodeItem | None) -> None:
+        self._panel_item = item
+        if item is None:
+            self._panel_clear()
             return
-        self.edit_node(selected[0])
+        node = item.node
+        ntype = str(node.get("type") or "")
+        label, _ = TYPE_LABELS.get(ntype, (ntype, "#555555"))
+        holder = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(holder)
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignTop)
+
+        def add_text(key: str, title: str, placeholder: str = "", to_list: bool = False) -> None:
+            edit = QtWidgets.QLineEdit()
+            val = node.get(key)
+            edit.setText(", ".join(str(x) for x in val) if isinstance(val, list) else str(val or ""))
+            edit.setPlaceholderText(placeholder)
+
+            def _write() -> None:
+                text = edit.text().strip()
+                node[key] = [p.strip() for p in text.split(",") if p.strip()] if to_list else text
+                item.update()
+
+            edit.textEdited.connect(_write)
+            form.addRow(title, edit)
+
+        def add_bool(key: str, title: str) -> None:
+            box = QtWidgets.QCheckBox()
+            box.setChecked(bool(node.get(key, key == "enabled")))
+
+            def _write(state: int) -> None:
+                node[key] = state == QtCore.Qt.CheckState.Checked.value
+                item.update()
+
+            box.stateChanged.connect(_write)
+            form.addRow(title, box)
+
+        def add_int(key: str, title: str, lo: int, hi: int) -> None:
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(lo, hi)
+            try:
+                spin.setValue(int(node.get(key) or lo))
+            except (TypeError, ValueError):
+                spin.setValue(lo)
+
+            def _write(value: int) -> None:
+                node[key] = int(value)
+                item.update()
+
+            spin.valueChanged.connect(_write)
+            form.addRow(title, spin)
+
+        def add_choice(key: str, title: str, options: list[str]) -> None:
+            combo = QtWidgets.QComboBox()
+            combo.addItem("（默认）", "")
+            for opt in options:
+                combo.addItem(opt, opt)
+            cur = str(node.get(key) or "")
+            idx = combo.findData(cur)
+            if cur and idx < 0:
+                combo.addItem(cur, cur)
+                idx = combo.count() - 1
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+            def _write(index: int) -> None:
+                node[key] = str(combo.itemData(index) or "")
+                item.update()
+
+            combo.currentIndexChanged.connect(_write)
+            form.addRow(title, combo)
+
+        def add_prompt_block() -> None:
+            edit = QtWidgets.QPlainTextEdit(str(node.get("prompt") or ""))
+            edit.setPlaceholderText("内联提示词（优先于提示词文件；支持 ^{var}^ 变量）")
+            edit.setFixedHeight(120)
+
+            def _write() -> None:
+                node["prompt"] = edit.toPlainText()
+                item.update()
+
+            edit.textChanged.connect(_write)
+            form.addRow("提示词（内联）", edit)
+            add_bool("override_system", "替换系统提示词")
+            add_text("prompt_files", "提示词文件（逗号分隔）", "逗号分隔", to_list=True)
+
+        type_label = QtWidgets.QLabel(label)
+        type_label.setStyleSheet(f"color: {TYPE_LABELS.get(ntype, ('', '#888'))[1]}; font-weight: bold;")
+        form.addRow("类型", type_label)
+
+        id_edit = QtWidgets.QLineEdit(str(node.get("id") or ""))
+
+        def _write_id() -> None:
+            node["id"] = id_edit.text().strip() or ntype
+            item.update()
+
+        id_edit.textEdited.connect(_write_id)
+        form.addRow("节点 id", id_edit)
+        add_bool("enabled", "启用节点")
+
+        if ntype in MODEL_TYPES:
+            model_combo = QtWidgets.QComboBox()
+            model_combo.addItem("（跟随角色/激活模型）", "")
+            for name in self._model_names:
+                model_combo.addItem(name, name)
+            cur_model = str(node.get("model") or "")
+            if cur_model and model_combo.findData(cur_model) < 0:
+                model_combo.addItem(cur_model, cur_model)
+            if cur_model:
+                model_combo.setCurrentIndex(model_combo.findData(cur_model))
+
+            def _write_model(index: int) -> None:
+                node["model"] = str(model_combo.itemData(index) or "")
+                item.update()
+
+            model_combo.currentIndexChanged.connect(_write_model)
+            form.addRow("模型", model_combo)
+            add_choice("model_role", "模型角色", ["plan", "code", "review"])
+
+        if ntype in PROMPT_TYPES:
+            add_prompt_block()
+
+        for key, title, kind, extra in FIELD_SCHEMAS.get(ntype, []):
+            if kind == BOOL:
+                add_bool(key, title)
+            elif kind == INT:
+                add_int(key, title, *(extra or (0, 999)))
+            elif kind == CHOICE:
+                add_choice(key, title, list(extra or []))
+            else:
+                add_text(key, title, "逗号分隔" if kind == LIST else "", to_list=kind == LIST)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(holder)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.param_panel.setWidget(scroll)
+
+    def focus_param_panel(self, item: NodeItem) -> None:
+        """选中节点并聚焦右侧参数面板（双击节点 / 右键"参数"入口）"""
+        for n in self._nodes:
+            n.setSelected(n is item)
+        self._panel_load(item)
+        self.param_panel.setVisible(True)
+        self.param_panel.raise_()
 
     def _unique_id(self, ntype: str) -> str:
         ids = {n.node.get("id") for n in self._nodes}
@@ -401,16 +528,22 @@ class EditorWindow(QtWidgets.QMainWindow):
         item.setPos(pos)
         self.scene.addItem(item)
         self._nodes.append(item)
+        self.focus_param_panel(item)  # 新节点默认选中并载入参数面板
         return item
 
     def delete_nodes(self, items: list[NodeItem]) -> None:
+        removed_panel = False
         for item in items:
             self._edges = [e for e in self._edges if e.src is not item and e.dst is not item]
             if self.pending_node is item:
                 self.pending_node = None
+            if self._panel_item is item:
+                removed_panel = True
             self.scene.removeItem(item)
             if item in self._nodes:
                 self._nodes.remove(item)
+        if removed_panel:
+            self._panel_clear()
         self.update_edges()
 
     def delete_selected(self) -> None:
@@ -544,6 +677,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         return True
 
     def new_workflow(self, keep_name: str = "") -> None:
+        self.scene.clearSelection()  # 先清选区，避免 removeItem 触发 selectionChanged 访问将删对象
         for item in list(self._nodes):
             self.scene.removeItem(item)
         for edge in list(self._edges):
@@ -551,6 +685,8 @@ class EditorWindow(QtWidgets.QMainWindow):
         self._nodes.clear()
         self._edges.clear()
         self.clear_pending()
+        self._panel_item = None
+        self._panel_clear()
         if not keep_name:
             self._name = ""
         else:
