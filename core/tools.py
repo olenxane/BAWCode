@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -25,6 +26,10 @@ log = get_logger("tools")
 # 子进程默认超时（秒）；模型传入值的钳制范围，上限防模型传超大值关掉兜底
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 600
+
+# 文件工具输出防护参数
+_READ_MAX_LINES = 2000       # read 单次返回行数上限（防大文件拖爆上下文，续读用 offset 分页）
+_READ_MAX_LINE_CHARS = 2000  # read 单行字符上限（超长行截断，防单行压缩 JSON 炸上下文）
 
 
 def _max_tool_timeout() -> int:
@@ -348,6 +353,12 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
     if b"\x00" in raw[:512]:
         log.warn("读取拒绝，二进制文件: %s", path)
         return "二进制文件，read 工具不适用"
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        log.warn("读取拒绝，UTF-32 编码文件: %s", path)
+        return "二进制文件，read 工具不适用（检测到 UTF-32 编码标记）"
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        log.warn("读取拒绝，UTF-16 编码文件: %s", path)
+        return "二进制文件，read 工具不适用（检测到 UTF-16 编码标记）"
     text, _enc, _ok = _decode_best_effort(raw)
     toolstore.ledger_register(path, text, source="read")
     lines = text.splitlines()
@@ -358,7 +369,20 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
     if start >= total:
         return f"offset 超出范围：文件共 {total} 行"
     end = start + int(limit) if int(limit or 0) > 0 else total
-    page = "\n".join(f"{n:>5}| {t}" for n, t in enumerate(lines[start:end], start=start + 1))
+    capped = end - start > _READ_MAX_LINES
+    if capped:
+        end = start + _READ_MAX_LINES
+    page_lines = []
+    for t in lines[start:end]:
+        if len(t) > _READ_MAX_LINE_CHARS:
+            t = t[:_READ_MAX_LINE_CHARS] + f"…（本行超 {_READ_MAX_LINE_CHARS} 字符已截断）"
+        page_lines.append(t)
+    page = "\n".join(f"{n:>5}| {t}" for n, t in enumerate(page_lines, start=start + 1))
+    if capped:
+        return (
+            f"[已截断：共 {total} 行，本次显示第 {start + 1}-{end} 行，"
+            f"继续读取用 offset={end + 1}]\n{page}"
+        )
     if start > 0 or end < total:
         return f"[第 {start + 1}-{min(end, total)} 行 / 共 {total} 行]\n{page}"
     return page
@@ -385,6 +409,10 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
 def read_image(file_path: str) -> dict:
     """读取本地图片回注多模态消息：返回 {"content", "images"} 约定，
     执行层摘出 images 随消息携带，经 add_tool_result 落为 API 数组形态 content"""
+    sess = _session()
+    cfg = getattr(sess, "config", None) if sess is not None else None
+    if cfg is not None and not cfg.supports_vision:
+        return "当前模型不支持视觉输入，图片内容无法查看；请用文本方式获取该文件的相关信息"
     path = Path(file_path)
     suffix = path.suffix.lower()
     if suffix not in memory_mod.IMAGE_SUFFIXES:
@@ -438,11 +466,35 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
         return "start_line 须 ≥0（0/缺省=整文件覆盖，≥1=自该行起位置写入）"
     if start_line == 0:
         snapshot.capture_before(path, tool="write")
+        if path.exists():
+            if path.is_dir():
+                return f"写入失败：{path} 是目录，不是文件"
+            try:
+                _old, is_crlf, enc, err, bom = _load_editable(path)
+            except OSError as e:
+                return f"读取失败，发生错误: {e}"
+            if err:
+                log.warn("写入中止: %s（%s）", path, err)
+                return (
+                    f"拒绝写入：{path} 含非文本字节（可能是二进制或 UTF-16/32 编码），已保持原文件不变；"
+                    "如确需替换，请先 delete_file 再用 write 新建（新文件将使用 UTF-8）"
+                )
+            # 已有文件：保留原编码与行尾风格（与位置写入/edit_file 同口径）
+            _written, serr = _save_editable_msg(path, content, is_crlf, enc, bom)
+            if serr:
+                return serr
+            toolstore.ledger_register(path, content, source="write")
+            log.info("写入文件: %s（%d字符，覆盖，编码 %s）", path, len(content), enc)
+            suffix = f"（原编码 {enc} 已保留）" if enc != "utf-8" else ""
+            # 返回带路径与体量：不同文件的写入结果可区分（防空转重复判定 + 模型反馈）
+            return f"写入成功: {path}（{len(content)} 字符）{suffix}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        # 新建文件：UTF-8 + 系统默认行尾风格（沿用原 write_text 的 os.linesep 行为）
+        _written, serr = _save_editable_msg(path, content, os.linesep != "\n", "utf-8", False)
+        if serr:
+            return serr
         toolstore.ledger_register(path, content, source="write")
-        log.info("写入文件: %s（%d字符，覆盖）", path, len(content))
-        # 返回带路径与体量：不同文件的写入结果可区分（防空转重复判定 + 模型反馈）
+        log.info("写入文件: %s（%d字符，新建）", path, len(content))
         return f"写入成功: {path}（{len(content)} 字符）"
     # ---- 位置写入（行号口径与 read 的 splitlines 编号一致）----
     if not content:
@@ -454,7 +506,7 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
         log.warn("位置写入门禁拦截: %s", path)
         return refusal
     try:
-        old_content, is_crlf, enc, err = _load_editable(path)
+        old_content, is_crlf, enc, err, _bom = _load_editable(path)
     except OSError as e:
         return f"读取失败，发生错误: {e}"
     if err:
@@ -470,7 +522,9 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
     if old_content.endswith("\n") or content.endswith("\n"):
         new_content += "\n"
     snapshot.capture_before(path, tool="write")
-    _save_editable(path, new_content, is_crlf, enc)
+    _written, serr = _save_editable_msg(path, new_content, is_crlf, enc, _bom)
+    if serr:
+        return serr
     toolstore.ledger_register(path, new_content, source="write")
     total = len(new_content.splitlines())
     log.info("位置写入: %s 自第%d行起写入%d行（现%d行）", path, start_line, len(new_lines), total)
@@ -482,7 +536,11 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
     description=(
         "Edit a file by replacing old_str with new_str. old_str must be copied "
         "verbatim from the file (exact indentation and whitespace) and be unique "
-        "unless replace_all is true; include surrounding lines for context when needed."
+        "unless replace_all is true; include surrounding lines for context when needed. "
+        "If no exact match exists, a line-anchored match tolerant of trailing "
+        "whitespace is attempted automatically (leading indentation is never "
+        "relaxed) and the success message says so; full-width punctuation "
+        "variants are only hinted at on failure, never auto-replaced."
     ),
     usage="edit_file <file_path> <old_str> <new_str> [replace_all]",
     schema={
@@ -526,7 +584,7 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
     if not old_str:
         return "old_str 不能为空"
     try:
-        content, is_crlf, enc, err = _load_editable(path)
+        content, is_crlf, enc, err, bom = _load_editable(path)
     except OSError as e:
         return f"读取失败，发生错误: {e}"
     if err:
@@ -538,19 +596,13 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
         if probe and probe not in content:
             hint += f"另外 old_str 首行「{probe[:80]}」当前不在文件中，old_str 必须与文件现有内容精确一致。"
         return hint
-    count = content.count(old_str)
-    if count == 0:
+    kind, new_content, info = _apply_replacement(content, old_str, new_str, replace_all)
+    if kind == _REPLACE_MISS:
         log.warn("编辑失败，未找到待替换内容: %s", path)
         return _edit_miss_feedback(old_str, content)
-    if count > 1 and not replace_all:
-        spots = []
-        start = 0
-        while True:
-            i = content.find(old_str, start)
-            if i < 0:
-                break
-            spots.append(content.count("\n", 0, i) + 1)
-            start = i + len(old_str)
+    if kind in (_REPLACE_MULTI, _REPLACE_TOL_MULTI):
+        count, spots = info
+        prefix = "" if kind == _REPLACE_MULTI else "精确匹配 0 处；按行尾空白容差"
         lines = content.splitlines()
         ctx = []
         for n in spots[:5]:
@@ -558,42 +610,180 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
             ctx.append(f"  L{n}: {' | '.join(x.strip() for x in window)[:200]}")
         log.warn("编辑中止，匹配到 %d 处: %s", count, path)
         return (
-            f"匹配到 {count} 处（行号: {'、'.join(str(n) for n in spots)}），"
+            f"{prefix}匹配到 {count} 处（行号: {'、'.join(str(n) for n in spots)}），"
             "请为 old_str 扩展上下文精确锚定，或设置 replace_all=true\n"
             "各匹配处上下文：\n" + "\n".join(ctx)
         )
-    new_content = content.replace(old_str, new_str) if replace_all else content.replace(old_str, new_str, 1)
+    count = info
     note = _changed_note(content, new_content)
     snapshot.capture_before(path, tool="edit_file")
-    written = _save_editable(path, new_content, is_crlf, enc)
+    _written, serr = _save_editable_msg(path, new_content, is_crlf, enc, bom)
+    if serr:
+        return serr
     toolstore.ledger_register(path, new_content, source="edit")
-    log.debug("编辑完成: 替换 %d 处，写入 %d 字节", count, written)
-    suffix = f"（原编码 {enc} 已保留）" if enc != "utf-8" else ""
+    log.debug("编辑完成: 替换 %d 处，写入 %d 字节", count, _written)
+    parts = []
+    if kind == _REPLACE_TOL:
+        parts.append("经行尾空白容差匹配")
+    if enc != "utf-8":
+        parts.append(f"原编码 {enc} 已保留")
+    suffix = f"（{'，'.join(parts)}）" if parts else ""
     return f"编辑成功：替换 {count} 处{suffix}\n{note}"
 
 
 def _load_editable(path: Path) -> tuple:
-    """读取待编辑文件：解码探测（utf-8→gbk→有损拒改）+ 行尾归一。
+    """读取待编辑文件：解码探测（utf-8→gbk→有损拒改）+ UTF-16/32 拒改 + UTF-8 BOM 剥离 + 行尾归一。
 
-    返回 (\n 归一文本, 是否 CRLF 主导, 编码名, 错误消息)；错误消息非 None 时其余值无意义。
+    返回 (\\n 归一文本, 是否 CRLF 主导, 编码名, 错误消息, 是否带 UTF-8 BOM)；
+    错误消息非 None 时其余值无意义。BOM 剥离后由 _save_editable 按读取状态还原，
+    模型锚定文件首行时不必（也无法）输入不可见的 BOM 字符。
     """
     raw = path.read_bytes()
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff", b"\xff\xfe", b"\xfe\xff")):
+        return "", False, "utf-8", "文件带 UTF-16/32 编码标记（或非文本字节），拒绝编辑以免损坏", False
+    if b"\x00" in raw[:512]:
+        # 无 BOM 的二进制（GBK 能把控制字节当文本解码成功，必须 NUL 嗅探兜底）
+        return "", False, "utf-8", "文件含非文本字节（NUL），拒绝编辑以免损坏", False
     text, enc, decodable = _decode_best_effort(raw)
     if not decodable:
-        return "", False, "utf-8", "文件含非文本字节（UTF-8/GBK 均无法解码），拒绝编辑以免损坏"
+        return "", False, "utf-8", "文件含非文本字节（UTF-8/GBK 均无法解码），拒绝编辑以免损坏", bom
     crlf = text.count("\r\n")
     is_crlf = crlf > text.count("\n") - crlf
     content = text.replace("\r\n", "\n") if is_crlf else text
-    return content, is_crlf, enc, None
+    return content, is_crlf, enc, None, bom
 
 
-def _save_editable(path: Path, content: str, is_crlf: bool, enc: str) -> int:
-    """按原文件行尾风格与编码字节写回，返回写入字节数"""
+def _save_editable(path: Path, content: str, is_crlf: bool, enc: str, bom: bool = False) -> int:
+    """按原文件行尾风格与编码字节写回（BOM 按读取时状态还原），返回写入字节数"""
     if is_crlf:
         content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+    if bom:
+        content = "\ufeff" + content
     encoded = content.encode(enc)
-    path.write_bytes(encoded)
+    _atomic_write_bytes(path, encoded)
     return len(encoded)
+
+
+def _save_editable_msg(path: Path, content: str, is_crlf: bool, enc: str, bom: bool = False) -> tuple:
+    """_save_editable 兜底包装：目标编码无法表示新内容时转为可读错误。返回 (written, err_msg)"""
+    try:
+        return _save_editable(path, content, is_crlf, enc, bom), ""
+    except UnicodeEncodeError as e:
+        try:
+            bad = content[e.start : e.start + 1]
+        except Exception:
+            bad = "?"
+        log.warn("写入编码失败: %s（%s 无法表示 %r）", path, enc, bad)
+        return 0, (
+            f"写入失败：新内容含「{enc}」编码无法表示的字符（{bad!r}），文件未改动。"
+            "请改用该编码可表示的字符；或先 delete_file 再用 write 新建（新文件将使用 UTF-8）"
+        )
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """原子落盘：同目录临时文件写全后 os.replace，防进程被杀/断电留下截断损坏的半截文件"""
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+# _apply_replacement 结果类别
+_REPLACE_OK = "ok"                # 精确命中（单处，或 replace_all）
+_REPLACE_TOL = "tol"              # 精确 0 命中，行尾空白容差命中（单处，或 replace_all）
+_REPLACE_MISS = "miss"            # 精确与容差均 0 命中
+_REPLACE_MULTI = "multi"          # 精确多处命中且未开 replace_all
+_REPLACE_TOL_MULTI = "tol_multi"  # 容差多处命中且未开 replace_all
+
+
+def _apply_replacement(content: str, old_str: str, new_str: str, replace_all: bool) -> tuple:
+    """edit_file/multi_edit 共用的单项替换核心。
+
+    返回 (kind, 新内容或 None, info)：OK 类 info=替换处数；MULTI 类 info=(处数, 起始行号列表)。
+    替换只发生在内存文本上，落盘由调用方负责。容差命中取磁盘原文行（保留其原行尾空白），
+    行首缩进绝不放宽。"""
+    count = content.count(old_str)
+    if count == 1:
+        return _REPLACE_OK, content.replace(old_str, new_str, 1), 1
+    if count > 1:
+        if replace_all:
+            return _REPLACE_OK, content.replace(old_str, new_str), count
+        return _REPLACE_MULTI, None, (count, _match_spots(content, old_str))
+    spans = _tolerance_spans(content, old_str)
+    if spans:
+        if len(spans) == 1 or replace_all:
+            return _REPLACE_TOL, _splice_spans(content, spans, new_str), len(spans)
+        return _REPLACE_TOL_MULTI, None, (len(spans), [t[0] for t in spans])
+    return _REPLACE_MISS, None, None
+
+
+def _tolerance_spans(content: str, old_str: str) -> list:
+    """行尾空白容差匹配（二级）：old_str 与文件逐行比较，双方 rstrip 后相等即命中。
+
+    返回命中列表 [(起始行号(1基), 区间起, 区间止)]，old_str 以换行结尾时区间吞掉该换行；
+    无命中返回 []。纯空白 old_str 直接不匹配（防误吞整文件）。"""
+    if not old_str or not old_str.strip():
+        return []
+    needle = old_str.split("\n")
+    ends_nl = len(needle) > 1 and needle[-1] == ""
+    if ends_nl:
+        needle = needle[:-1]
+    lines = content.split("\n")
+    n = len(needle)
+    if n == 0 or len(lines) < n:
+        return []
+    cmp_needle = [s.rstrip() for s in needle]
+    starts = [
+        i
+        for i in range(len(lines) - n + 1)
+        if lines[i].rstrip() == cmp_needle[0]
+        and all(lines[i + k].rstrip() == cmp_needle[k] for k in range(1, n))
+    ]
+    if not starts:
+        return []
+    bounds = [0]
+    for ln in lines:
+        bounds.append(bounds[-1] + len(ln) + 1)
+    spans = []
+    for i in starts:
+        s = bounds[i]
+        e = bounds[i + n] - 1
+        if ends_nl and e < len(content) and content[e] == "\n":
+            e += 1
+        spans.append((i + 1, s, e))
+    return spans
+
+
+def _splice_spans(content: str, spans: list, new_str: str) -> str:
+    """把 content 中各 (行号, start, end) 区间依次替换为 new_str（行锚定区间天然不重叠）"""
+    out, prev = [], 0
+    for _line, s, e in spans:
+        out.append(content[prev:s])
+        out.append(new_str)
+        prev = e
+    out.append(content[prev:])
+    return "".join(out)
+
+
+def _match_spots(content: str, needle: str) -> list:
+    """精确匹配的各处起始行号（1 基），多处命中反馈用"""
+    spots = []
+    start = 0
+    while True:
+        i = content.find(needle, start)
+        if i < 0:
+            break
+        spots.append(content.count("\n", 0, i) + 1)
+        start = i + len(needle)
+    return spots
 
 
 @register.register(
@@ -635,10 +825,6 @@ def multi_edit(file_path: str, edits: List[dict]) -> str:
     if not path.exists():
         log.warn("编辑失败，文件不存在: %s", path)
         return "找不到文件"
-    refusal = toolstore.ledger_check(path)
-    if refusal:
-        log.warn("批量编辑门禁拦截: %s", path)
-        return refusal
     if not edits or not isinstance(edits, list):
         return "edits 不能为空"
     items = []
@@ -653,8 +839,12 @@ def multi_edit(file_path: str, edits: List[dict]) -> str:
         if old == new:
             return f"第 {idx} 项 old_str 与 new_str 相同"
         items.append((old, new, bool(e.get("replace_all", False))))
+    refusal = toolstore.ledger_check(path)
+    if refusal:
+        log.warn("批量编辑门禁拦截: %s", path)
+        return refusal
     try:
-        content, is_crlf, enc, err = _load_editable(path)
+        content, is_crlf, enc, err, bom = _load_editable(path)
     except OSError as e:
         return f"读取失败，发生错误: {e}"
     if err:
@@ -662,31 +852,41 @@ def multi_edit(file_path: str, edits: List[dict]) -> str:
         return err
     original = content
     total = 0
+    tol_items = 0
     for idx, (old, new, replace_all) in enumerate(items, 1):
-        count = content.count(old)
-        if count == 0:
+        kind, new_content, info = _apply_replacement(content, old, new, replace_all)
+        if kind == _REPLACE_MISS:
             return f"第 {idx} 项编辑失败，未做任何修改:\n{_edit_miss_feedback(old, content)}"
-        if count > 1 and not replace_all:
-            spots = []
-            start = 0
-            while True:
-                i = content.find(old, start)
-                if i < 0:
-                    break
-                spots.append(content.count("\n", 0, i) + 1)
-                start = i + len(old)
+        if kind == _REPLACE_MULTI:
+            count, spots = info
             return (
                 f"第 {idx} 项匹配到 {count} 处（行号: {'、'.join(str(n) for n in spots)}），"
                 "未做任何修改；请为该项 old_str 扩展上下文，或设置其 replace_all=true"
             )
-        total += count
-        content = content.replace(old, new) if replace_all else content.replace(old, new, 1)
+        if kind == _REPLACE_TOL_MULTI:
+            count, spots = info
+            return (
+                f"第 {idx} 项精确匹配 0 处，按行尾空白容差匹配到 {count} 处"
+                f"（行号: {'、'.join(str(n) for n in spots)}），"
+                "未做任何修改；请为该项 old_str 扩展上下文，或设置其 replace_all=true"
+            )
+        content = new_content
+        total += info
+        if kind == _REPLACE_TOL:
+            tol_items += 1
     note = _changed_note(original, content)
     snapshot.capture_before(path, tool="multi_edit")
-    written = _save_editable(path, content, is_crlf, enc)
+    _written, serr = _save_editable_msg(path, content, is_crlf, enc, bom)
+    if serr:
+        return serr
     toolstore.ledger_register(path, content, source="multi_edit")
-    log.debug("批量编辑完成: %d 项替换 %d 处，写入 %d 字节", len(items), total, written)
-    suffix = f"（原编码 {enc} 已保留）" if enc != "utf-8" else ""
+    log.debug("批量编辑完成: %d 项替换 %d 处，写入 %d 字节", len(items), total, _written)
+    parts = []
+    if tol_items:
+        parts.append(f"{tol_items} 项经行尾空白容差匹配")
+    if enc != "utf-8":
+        parts.append(f"原编码 {enc} 已保留")
+    suffix = f"（{'，'.join(parts)}）" if parts else ""
     return f"multi_edit 成功：{len(items)} 项编辑，共替换 {total} 处{suffix}\n{note}"
 
 
@@ -727,6 +927,8 @@ def delete_file(file_path: str) -> str:
 _SUGGEST_MAX_LINES = 20000
 _SNIPPET_CONTEXT = 3
 _SNIPPET_MAX_LINES = 30
+_NOTE_REGIONS = 3             # 成功回显最多展示的变更区间数（超出提示"另有 K 处"）
+_NOTE_DIFF_MAX_LINES = 20000  # 超过此行数退回单区间首尾扫描（difflib 全量太慢）
 
 # 工具结果失败模式（启发式）：供 UI ✅/❌ 展示与工作流轮次续期判定共用
 _TOOL_FAILURE_PATTERNS = (
@@ -743,6 +945,7 @@ _TOOL_FAILURE_PATTERNS = (
     "old_str 与 new_str 相同",
     "命令被安全策略拒绝",
     "已拒绝",
+    "拒绝写入",
     # MCP 工具（core/mcp.py）：isError 结果与调用失败统一前缀
     "MCP 工具返回错误",
     "MCP 调用失败",
@@ -763,35 +966,47 @@ def tool_failure_hint(content: str) -> bool:
     return False
 
 
-def has_recent_progress(messages: List[dict], window: int = 4) -> bool:
-    """最近工具结果仍有进展：非空、去空白后互不相同（非死循环）、且非全部失败。
-    主循环（workflow._tool_loop 续期判定）与子代理循环共用的防空转判据。
-    去重键含 tool_name：不同工具的相同文案（如 read 与 write）不互判重复；
-    同工具同文案仍算重复（真打转照抓）。"""
-    outputs = [
-        (str(m.get("tool_name") or ""), memory_mod.content_text(m.get("content")))
-        for m in messages or []
-        if m.get("role") == "tool"
-    ]
-    recent = outputs[-window:]
-    if not recent or any(not t.strip() for _, t in recent):
-        return False
-    normalized = {f"{n}|{re.sub(r'\s+', '', t)}" for n, t in recent}
-    if len(normalized) < len(recent):
-        return False
-    if all(tool_failure_hint(t) for _, t in recent):
-        return False
-    return True
+class SpinGuard:
+    """空转计数器（2026-10-05 用户裁决口径）：重复输出出现才开始计数，计满才杀。
+
+    - 结果键 = 工具名 + 去空白内容；某结果的键在本轮之前已出现过 → 该结果计一次重复
+      （即同一输出出现两次及以上，计数才真正开始——首次出现不计）
+    - 本轮含重复 → 计数累加（每条重复 +1）；本轮全部为新结果 → 计数清零
+      （空转被真实进展打断）
+    - 计数达到 kill_count（默认 12）→ spun_out() 为真，由调用方终止回合；
+      未计满期间续期不设次数上限（原 max_rounds_extensions 的"无进展即杀"口径废弃）
+    主循环（core/loop.tool_loop）与子代理循环共用。"""
+
+    def __init__(self, kill_count: int = 12):
+        self.kill_count = max(1, int(kill_count))
+        self.seen: set = set()
+        self.count = 0
+
+    def feed(self, results) -> None:
+        """喂入本轮全部工具结果消息，更新计数（空轮/无结果为清零）"""
+        dups = 0
+        for m in results or []:
+            key = f"{str(m.get('tool_name') or '')}|{re.sub(r'\s+', '', memory_mod.content_text(m.get('content')))}"
+            if key in self.seen:
+                dups += 1
+            else:
+                self.seen.add(key)
+        self.count = self.count + dups if dups else 0
+
+    def spun_out(self) -> bool:
+        return self.count >= self.kill_count
 
 
 def _decode_best_effort(raw: bytes) -> tuple:
-    """文件解码探测：utf-8 → gbk → 有损兜底；返回 (文本, 编码名, 是否纯文本)"""
+    """文件解码探测：utf-8 → gbk → 有损兜底；返回 (文本, 编码名, 是否纯文本)。
+    UTF-8 BOM 剥离（模型锚定/匹配不需要它，写回侧由 _save_editable 按读取状态还原）"""
+    data = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
     for enc in ("utf-8", "gbk"):
         try:
-            return raw.decode(enc), enc, True
+            return data.decode(enc), enc, True
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace"), "utf-8", False
+    return data.decode("utf-8", errors="replace"), "utf-8", False
 
 
 def _edit_miss_feedback(old_str: str, content: str) -> str:
@@ -817,14 +1032,76 @@ def _edit_miss_feedback(old_str: str, content: str) -> str:
         if hits:
             parts.append("文件中最接近的现有行原文（替换时需保留其精确缩进）：")
             parts.extend(f"  L{n}: {t[:200]}" for _, n, t in hits[:3])
+    hint = _unicode_hint(old_str, content)
+    if hint:
+        parts.append(hint)
     parts.append("可先 read 该文件核对实际内容再试")
     return "\n".join(parts)
 
 
+# 三级提示（只提示不代改）的保守规整表：仅同形异码字符，不含全角冒号/逗号等语义敏感字符
+_UNICODE_EQUIV = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u2013": "-", "\u2014": "-", "\u2212": "-",
+    "\u00a0": " ", "\u2002": " ", "\u2003": " ", "\u2007": " ",
+    "\u2008": " ", "\u2009": " ", "\u200a": " ", "\u3000": " ",
+    "\u200b": "", "\ufeff": "",
+})
+
+
+def _unicode_hint(old_str: str, content: str) -> Optional[str]:
+    """0 匹配时的三级提示：全角引号/破折号/特殊空格规整为半角后能否命中，命中只报告位置"""
+    idx = content.translate(_UNICODE_EQUIV).find(old_str.translate(_UNICODE_EQUIV))
+    if idx < 0:
+        return None
+    line = content.count("\n", 0, idx) + 1
+    return (
+        f"提示：把全角引号/破折号/不间断空格等规整为半角后，可在第 {line} 行附近匹配——"
+        "请 read 核对该处的实际字符（可能是全角标点或特殊空格）后修正 old_str"
+    )
+
+
 def _changed_note(old_content: str, new_content: str) -> str:
-    """成功回显：新内容中首个变更区间，前后各扩 _SNIPPET_CONTEXT 行"""
+    """成功回显：新内容中的变更区间（最多 _NOTE_REGIONS 个，各带前后 _SNIPPET_CONTEXT 行）
+    + 增删行统计；单区间沿用「变更片段（第 a-b 行 / 共 N 行）」既有格式"""
     old_lines = old_content.splitlines()
     new_lines = new_content.splitlines()
+
+    def _snippet(sa: int, sb: int, stat: str = "") -> str:
+        body_lines = new_lines[sa:sb]
+        omitted = ""
+        if sb - sa > _SNIPPET_MAX_LINES:
+            body_lines = body_lines[:_SNIPPET_MAX_LINES]
+            omitted = f"，片段超过 {_SNIPPET_MAX_LINES} 行已截断"
+        body = "\n".join(f"{n:>5}| {t}" for n, t in enumerate(body_lines, start=sa + 1))
+        return f"（第 {sa + 1}-{sa + len(body_lines)} 行 / 共 {len(new_lines)} 行{stat}{omitted}）:\n{body}"
+
+    if max(len(old_lines), len(new_lines)) <= _NOTE_DIFF_MAX_LINES:
+        regions = []
+        added = removed = 0
+        matcher = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+        for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            added += b2 - b1
+            removed += a2 - a1
+            regions.append((b1, b2))
+        if regions:
+            stat = f"，+{added}/-{removed} 行" if (added or removed) else ""
+            if len(regions) == 1:
+                a, b = regions[0]
+                sa = max(0, a - _SNIPPET_CONTEXT)
+                sb = min(len(new_lines), (a if b == a else b) + _SNIPPET_CONTEXT)
+                return f"变更片段{_snippet(sa, sb, stat)}"
+            parts = [f"变更统计：+{added}/-{removed} 行（共 {len(regions)} 处变更）"]
+            for r, (a, b) in enumerate(regions[:_NOTE_REGIONS], 1):
+                sa = max(0, a - _SNIPPET_CONTEXT)
+                sb = min(len(new_lines), (a if b == a else b) + _SNIPPET_CONTEXT)
+                parts.append(f"变更片段{r}{_snippet(sa, sb)}")
+            if len(regions) > _NOTE_REGIONS:
+                parts.append(f"（另有 {len(regions) - _NOTE_REGIONS} 处变更未展示）")
+            return "\n".join(parts)
+    # 超大文件：退回首尾扫描取单区间（不含统计）
     i = 0
     while i < min(len(old_lines), len(new_lines)) and old_lines[i] == new_lines[i]:
         i += 1
@@ -832,15 +1109,9 @@ def _changed_note(old_content: str, new_content: str) -> str:
     while j < min(len(old_lines), len(new_lines)) - i and old_lines[len(old_lines) - 1 - j] == new_lines[len(new_lines) - 1 - j]:
         j += 1
     a, b = i, len(new_lines) - j  # 新内容中变更区间 [a, b)，0 基
-    sa, sb = max(0, a - _SNIPPET_CONTEXT), min(len(new_lines), b + _SNIPPET_CONTEXT)
-    body_lines = new_lines[sa:sb]
-    omitted = ""
-    if sb - sa > _SNIPPET_MAX_LINES:
-        body_lines = body_lines[:_SNIPPET_MAX_LINES]
-        omitted = f"（片段超过 {_SNIPPET_MAX_LINES} 行已截断）"
-    body = "\n".join(f"{n:>5}| {t}" for n, t in enumerate(body_lines, start=sa + 1))
-    shown_end = sa + len(body_lines)
-    return f"变更片段（第 {sa + 1}-{shown_end} 行 / 共 {len(new_lines)} 行）{omitted}:\n{body}"
+    sa = max(0, a - _SNIPPET_CONTEXT)
+    sb = min(len(new_lines), b + _SNIPPET_CONTEXT)
+    return f"变更片段{_snippet(sa, sb)}"
 
 
 @register.register(

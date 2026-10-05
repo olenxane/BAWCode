@@ -29,7 +29,7 @@ from core import prompt_loader
 from core import register
 from core.llm import CANCELLED
 from core.log import get_logger
-from core.tools import has_recent_progress
+from core.tools import SpinGuard
 
 log = get_logger("subagent")
 
@@ -435,19 +435,19 @@ def _build_summary(record: dict, final_text: str, cfg: dict, record_path: Option
 
 
 def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict],
-              max_rounds: int, extensions_limit: int, directory: Path) -> tuple:
-    """子代理执行循环。返回 (status, final_text)；防空转与主循环同判据（has_recent_progress）"""
+              max_rounds: int, spin: SpinGuard, directory: Path) -> tuple:
+    """子代理执行循环。返回 (status, final_text)；防空转与主循环同判据（SpinGuard：
+    重复输出才开始计数，整轮全新结果清零，计满 spin_kill_count 终止，无续期次数上限）"""
     llm, io = rt["llm"], rt["io"]
-    extensions = 0
     rounds = 0
     while True:
         if rounds >= max_rounds:
-            if extensions < extensions_limit and has_recent_progress(messages):
-                extensions += 1
-                _live_phase(rt, f"轮次续期 {extensions}/{extensions_limit}")
-                log.info("子代理 #%s 轮次续期 %d/%d", record.get("id"), extensions, extensions_limit)
-            else:
+            if spin.spun_out():
+                log.info("子代理 #%s 空转计数满 %d 次，终止", record.get("id"), spin.count)
                 return ("max_rounds", "")
+            spin_text = f"空转计数 {spin.count}/{spin.kill_count}"
+            _live_phase(rt, f"轮次续期 · {spin_text}")
+            log.info("子代理 #%s 轮次续期，%s", record.get("id"), spin_text)
         rounds += 1
         record["rounds"] = rounds
         if io.cancelled() or llm.cancelled():
@@ -485,14 +485,18 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
             }
         )
         _live_phase(rt, f"工具调用中 · 第{rounds}轮")
+        round_results = []
         for call in tool_calls:
             item = _execute_one(rt, call, str(record.get("permission") or "auto"))
             messages.append(item)
+            round_results.append(item)
             record["tools_used"] = _int(record.get("tools_used"), 0) + 1
             failed = "❌" if _failure_hint(item.get("content")) else "✅"
             _live_tool(rt, f"⚙ {call.get('name')} {failed}")
             if io.cancelled() or llm.cancelled():
                 return ("interrupted", "")
+        # 空转计数：本轮结果喂入计数器（重复才计，整轮全新清零）
+        spin.feed(round_results)
         # 每轮落盘：崩溃/中断时记录可恢复
         _save_record(directory, record)
     # 不可达出口：轮次终止统一在循环内返回
@@ -611,10 +615,10 @@ def _tool_task(
         app.subagent_stream = {"id": record_id, "role": role, "phase": "运行中", "text": "", "tools": []}
 
     wf_cfg = (getattr(config, "data", None) or {}).get("workflow") or {}
-    extensions_limit = max(0, _int(wf_cfg.get("max_rounds_extensions"), 5))
+    spin = SpinGuard(_int(wf_cfg.get("spin_kill_count"), 12))
     try:
         status, final_text = _run_loop(
-            rt, record, messages, _sub_tool_defs(), cfg["max_rounds"], extensions_limit, directory
+            rt, record, messages, _sub_tool_defs(), cfg["max_rounds"], spin, directory
         )
     except Exception as exc:
         log.error("子代理 #%s 执行异常: %r", record_id, exc)

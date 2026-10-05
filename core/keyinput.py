@@ -103,7 +103,13 @@ def _is_char_press(key, data: str) -> bool:
     return isinstance(key, str) and len(key) == 1 and ord(key) >= 32
 
 
-def _fold_paste_run(presses: List, i: int, n: int) -> Optional[Tuple[str, int]]:
+# 最近一次 paste 折叠时刻（monotonic 秒）：长粘贴被 20fps 帧泵劈成多批时，
+# 后续批次的残余字符段据此降低折叠阈值续接为 paste（模块级，测试可直接复位）
+_LAST_PASTE = [0.0]
+_PASTE_CONT_WINDOW = 0.3  # 续接窗口秒数
+
+
+def _fold_paste_run(presses: List, i: int, n: int, cont: bool = False) -> Optional[Tuple[str, int]]:
     """conhost 粘贴折叠启发式：presses[i:] 起的连续段满足粘贴特征时折叠为单 paste。
 
     终端拦截 Ctrl+V 后，剪贴板文本以按键记录流到达，与逐键打字同形。批次内
@@ -111,6 +117,8 @@ def _fold_paste_run(presses: List, i: int, n: int) -> Optional[Tuple[str, int]]:
       - 段内出现"中部"回车/Tab（非批尾）→ 多行粘贴（否则会逐行提交）
       - 纯可打印字符连续 ≥ _PASTE_BURST_MIN（单行长文本；打字/自动重复在帧泵
         批次里到不了这个量级）
+      - cont=True（距上次折叠不足 _PASTE_CONT_WINDOW）：任意非空段即折叠——
+        长粘贴的跨批次残余不再以逐字符形态漏过
     段折叠为单个 paste 事件（回车→\\n、Tab→\\t）；段尾紧随的批尾回车视为剪贴板
     尾部换行并入。≤320 字符折叠后与逐键插入等价，无行为回归面。
     返回 (paste文本, 消费后的下一索引)；不满足特征返回 None。"""
@@ -126,7 +134,7 @@ def _fold_paste_run(presses: List, i: int, n: int) -> Optional[Tuple[str, int]]:
         else:
             break
         j += 1
-    if not (interior_break or chars >= _PASTE_BURST_MIN) or j == i:
+    if not (interior_break or chars >= (_PASTE_BURST_MIN if not cont else 1)) or j == i:
         return None
     text_parts = []
     for p in presses[i:j]:
@@ -191,12 +199,15 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
             i = j
             continue
 
-        # conhost 粘贴折叠启发式：与逐键打字同形的剪贴板按键段折叠为单 paste 事件
-        folded = _fold_paste_run(presses, i, n)
+        # conhost 粘贴折叠启发式：与逐键打字同形的剪贴板按键段折叠为单 paste 事件；
+        # 刚发生过折叠时残余段按续接窗口降低阈值（长粘贴跨批次劈开的收尾）
+        cont = (time.monotonic() - _LAST_PASTE[0]) < _PASTE_CONT_WINDOW
+        folded = _fold_paste_run(presses, i, n, cont=cont)
         if folded is not None:
             text, j = folded
             out.append(KeyEvent("paste", text))
-            _flog("paste folded len=%d" % len(text))
+            _LAST_PASTE[0] = time.monotonic()
+            _flog("paste folded len=%d cont=%s" % (len(text), cont))
             i = j
             continue
 
@@ -297,6 +308,9 @@ try:
 except ImportError:  # pragma: no cover - 无 prompt_toolkit 时翻译层不可用
     _K = None
     _KEY_MAP, _COMBO_MAP, _CTRL_LETTERS = {}, {}, {}
+    # 折叠启发式兜底常量（_K is None 时 translate 提前返回，永不触达；补全只为模块属性一致）
+    _PASTE_BREAK_KEYS = set()
+    _PASTE_BURST_MIN = 0
 
 
 # ----- 强制事件记录路径（鼠标修复） -----

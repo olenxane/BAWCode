@@ -1,5 +1,227 @@
 # Changelog
 
+## 2026-10-05 — 编辑工具加固：容差匹配/原子写/BOM/read 上限/write 编码保持（对照 qwen-code 调研落地）
+
+- **P1 容差匹配分级**（edit_file/multi_edit 共用 `_apply_replacement` 核心）：精确 0 命中时
+  自动尝试**行尾空白容差**（二级，行锚定 rstrip 相等即命中，**行首缩进绝不放宽**防错误作用
+  域；单处命中或 replace_all 才执行，多处命中报行号不代劳；替换吞掉 old_str 末尾换行防残
+  留空行），成功消息标注"经行尾空白容差匹配"；**Unicode 等价规整**（三级：全角引号/破折
+  号/不间断空格等保守映射，0 匹配反馈里只提示位置不代改，不含全角冒号/逗号等语义敏感字
+  符）。参照 qwen-code editHelper 三级渐进匹配，未引入 Levenshtein 类模糊匹配。
+- **P0-B 原子写**（用户裁决 B 案：只做原子写，砍写前 mtime 复核——并发碰撞概率经核算为
+  毫秒级窗口低频事件，入口三态门禁已覆盖绝大多数漂移）：`_atomic_write_bytes` 同目录临
+  时文件 + `os.replace`，edit_file/multi_edit/write/位置写入全部接入，防进程被杀/断电留
+  下截断损坏文件；顺带修 `_save_editable` 编码不可表示（如 GBK 文件写 emoji）时转为可读
+  报错且文件未动。
+- **P2 一组**：① read 默认 2000 行上限（超出提示 offset 续读）+ 单行 2000 字符截断，防大
+  文件/单行压缩 JSON 拖爆上下文；② UTF-8 BOM 剥离还原（read/_load_editable 剥、
+  _save_editable 按读取状态还原，首行锚定不再被不可见 BOM 破坏）+ UTF-16/32 BOM 拒改
+  （read 标注编码标记，write 全覆盖拒绝并指引 delete_file 重建）+ `_load_editable` 增
+  NUL 嗅探（无 BOM 二进制 GBK 误解码防覆写）；③ write 全覆盖已有文件改为**保留原编码与
+  行尾**（与位置写入/edit_file 同口径，GBK+CRLF 双保留），新建文件维持 UTF-8+os.linesep；
+  ④ 成功回显多区间（difflib opcodes，散布变更最多展示 3 处+「另有 K 处」，单区间格式不
+  变）+ 增删行统计（+N/-M 行）。
+- **测试**：develop/test_edit_tolerance.py 新增 48 项（容差单处/多处/replace_all/缩进不
+  放宽/吞换行/模型侧尾随空白、Unicode 提示、BOM、UTF-16BE+单行无 NUL 走 BOM 分支、
+  read 上限/续读/超长行、GBK+CRLF 保持、二进制拒写、编码失败不动文件、原子写无 .tmp 残
+  留、多区间回显、失败模式表兼容）；test_edit_search 43/test_file_ledger/test_p1p2_tools
+  36/mock_llm 全管线/无头 e2e/context×4/plugins/emotion 全绿。CRLF 文件容差路径真机取证
+  通过（\r\n 保留）。新增失败文案「拒绝写入」入 _TOOL_FAILURE_PATTERNS。
+
+## 2026-10-05 — 空转机制定案：SpinGuard 计数器（重复才计数、计满 12 才杀）+ 无续期上限
+
+- **口径定案**（用户裁决，替代同日早先的"窗口重复合计 ≥2 即判空转"）：防空转从
+  "窗口判进展"整体换成 **SpinGuard 计数器**（core/tools.py）——结果键（工具名+
+  去空白内容）在**本轮之前已出现过**（即同一输出出现两次及以上）才开始计数；每条
+  重复结果 +1；**整轮全新结果清零**（空转被真实进展打断）；计满
+  `workflow.spin_kill_count`（默认 12，设置页可改）终止回合。**未计满期间续期不设
+  次数上限**——原 max_rounds_extensions"无进展即杀/续期用尽"口径废弃（配置键保留
+  兼容但不再读取），正常推进的回合可以一直跑。execute_command 无输出的常量
+  "执行完成。"在窗口口径下的误杀路径随窗口机制一并消失。
+- **接入**：loop.tool_loop 与子代理 _run_loop 换用 SpinGuard（每轮工具结果喂入、
+  cap 检查改判计数是否计满；终止文案"空转计数满 N 次（重复输出过多）"）；设置页
+  "轮次续期上限"字段改为"空转计数上限"（spin_kill_count）。
+- **测试**：develop/test_progress_heuristic.py 重写为 SpinGuard 全矩阵 13 项（两次
+  事故序列复放不终止、持续打转/交替重复计满即杀、清零重累计、跨工具键、自定义阈值、
+  空轮安全）；回归 workflow54/rollback/snapshot/context_turn/plan_steps_tree/
+  session_store/skills 全绿。
+
+## 2026-10-05 — 防空转改重复计数口径 + 工具节点命令头显示
+
+- **防空转口径改判**（用户裁决，第二次实战误伤驱动）：`has_recent_progress` 不再要求
+  窗口 4 内结果互不相同（那是从第一次调用就计数，"执行完成。"×2 即误杀正常校验循
+  环），改为**窗口内重复合计 ≥2 次才判空转**——键=工具名+去空白内容；偶发一次重复
+  （两条不同命令都恰好无输出、不同文件写入）视为正常推进，交替重复/同文案连发仍捕
+  获。原 write 返回带路径与去重键含工具名两修复保留。两次事故序列均入回归
+  （develop/test_progress_heuristic.py 12 项）。
+- **工具节点命令头显示**：会话树中 execute_command/run_program 的结果单行节点与
+  tool_call 信封节点显示**提取的简洁命令**（前两个 token，clip 24 显示宽），替代干
+  巴的工具名——实现为 `_build_tree` 前置命令头索引（tool_call 信封按 tool_call_id
+  关联到结果消息，结果消息不带参数），无索引回落工具名（core/ui.py `_command_head`）。
+- **测试**：test_progress_heuristic 12 项（两事故序列复放+新口径全矩阵）、
+  test_plan_steps_tree 24 项（+4 命令断言）；回归 workflow54/rollback/snapshot/
+  context_turn/session_store/skills/p1p2(36/0) 全绿。
+
+## 2026-10-05 — 阶段提示常驻定案：发消息即显示直至回合结束，各阶段仅换文案池，弹窗期间隐藏
+
+- **常驻语义**（main.py `_agent_turn_impl`）：用户消息发出即 `_set_phase("思考中")`，
+  覆盖此前的空窗（系统提示词注入/计划生成等回前阶段无提示）；回合结束由
+  `_agent_turn` finally 清空——中断/出错/正常完成全路径一致。完成后的
+  maybe_compress 压缩期不显示（正文已上屏，避免"仍在思考"误导）。
+- **文案池机制**（core/ui.py）：新增 `_PHASE_POOLS`（key=「 · 」前的阶段基名），
+  各阶段共用同一转轮+4s 轮换机制、仅池不同——思考中沿用原 14 句池；工具调用中
+  （"调用工具中/等待工具返回/处理工具输出"）、待确认（"等待确认/等待你的决定"）
+  新增；带工具名后缀的阶段轮换基名、保留后缀（如「等待工具返回 · read」）；
+  未登记阶段按原样显示。
+- **弹窗隐藏**：`_serve_ui_request` 执行 confirm/ask/choose/line 弹窗（含其内部
+  嵌套渲染）期间置 `_dialog_active`，渲染分支据此与 `confirm_mode` 抑制提示行
+  （空行占位不跳版）。`_ui_req` 从不清空故不能直接作信号，需独立标志。
+- **测试**：新增 develop/test_phase_hint.py（8 项：思考/工具/待确认池轮换与
+  后缀保留、未登记阶段原样、确认面板与对话框期间隐藏、空阶段空行、常驻显示）；
+  e2e（S4 回合起点阶段）与 tree/toggle/nav/fold/refresh/autoscroll/key_binding/
+  keymap/paint_throttle/textbuf/input_layout/session_store/backspace_refresh/
+  input_cursor_display/context 四套件回归全绿。
+
+## 2026-10-05 — 工具执行阶段提示：树底转轮行带上工具名，确认等待期显示「待确认 · 工具名」
+
+- **问题定性**：树底阶段提示行在「思考中」阶段常驻可见（LLM 推理持续数秒，
+  转轮+轮换文案），但工具执行窗口毫秒级且只有笼统的「工具调用中」四个字，
+  用户感知为"调工具时没有文案"。渲染路径无缺陷（无头验证 hint 行正常
+  出画，e2e S4 一直断言到「工具调用中」入历史），属信息量+可见性问题。
+- **逐工具阶段提示**（core/loop.py tool_loop）：ALLOW 分支执行前
+  `io.phase(f"工具调用中 · {工具名}")`，执行期间树底转轮行显示当前工具；
+  确认分支弹面板前 `io.phase(f"待确认 · {工具名}")`，与执行中区分。慢工具
+  （execute_command/computer_use 等）执行全程可见，快工具逐条刷新。
+- **测试**：test_e2e_mock_llm 新增 S4b（phase_history 含「工具调用中 ·
+  list_directory」带名条目）；全套件回归绿。另：并行会话的树引导线重写
+  （_flatten_tree 四元组+guide、工具节点收起仅标题行、鼠标事件值带按键
+  前缀）与本次改动合并无冲突；test_tree_fold 已适配新元组形状与新工具
+  节点语义；test_mouse_wheel 尚按旧鼠标值格式断言（left: 前缀契约变更
+  属引导线会话在途工作，未代改）。
+
+## 2026-10-05 — 修复：访问模式双源失联（UI 显示与策略判定不一致）
+
+- **现象**：页脚显示"完全访问"而 execute_command 仍弹确认面板；会话里用 Shift+Tab
+  切的模式重启后不继承。
+- **根因**：访问模式存在两个失联的状态源——UI 显示读 `app.mode`（内存），策略判定
+  读 `config.mode` 属性（`llm.evaluate_tool`）。四个写入路径中只有 `/mode` 命令三处
+  同步（app.mode + config.mode + 持久化 ui.mode）；**Shift+Tab/`~` 键位切换
+  （ui.py cycle_mode 调用点）只改 app.mode**——不落盘、不同步策略源；设置页 apply
+  只落盘 ui.mode 不同步 config.mode 属性。且 `config.mode` 属性仅在 `apply_active`
+  尾部初始化，模式语义散落多处。
+- **修复（单一事实源）**：`Config.mode` 改为 property——getter/setter 都读写
+  `data.ui.mode`（读取校验合法值、缺失/非法回落 auto；setter 忽略非法值），删除
+  `apply_active` 尾部的属性赋值；Shift+Tab 键位路径同步 `config.mode` 并落盘
+  （与 `/mode` 等价，重启继承）；设置页即时路径同步 `config.mode`（落盘随"保存"）。
+  `/mode` 命令与 headless `--full` 走 setter 幂等兼容，remote-control 模式 API 不变。
+- **验证**：探针六项（启动恢复/full 回填/setter 同步/非法值忽略/full 放行 execute_command
+  对比 auto 确认/空配置回落）全过；test_headless_e2e（--full 读 config.mode）、
+  test_remote_control_e2e、test_remote_control_api_e2e（模式 API）、
+  test_e2e_mock_llm（策略指纹）、test_plugins_e2e 全绿。
+
+## 2026-10-05 — 工作流节点树显标记 + 回合末剥离复核
+
+- **节点标记进会话树**：`run_workflow` 在每个节点执行前落一条 `type="workflow_node"`
+  系统标记消息（content=节点显示名 `NODE_LABELS`，extras 带 node_id/node_type）；
+  会话树在该轮用户消息下按时间线渲染 `⚙ 节点 · <显示名>[ · node_id]`（ui.py
+  `_build_tree` 新分支），逐节点推进可见、最后一条即当前节点；标记随消息持久化，
+  /resume 与树回退语义与普通消息一致。直接对话路径（run_direct）不产生标记。
+- **出站隔离**：`memory._api_session_item`（不进 API）与 `_api_visible`（不参与
+  压缩与轮次统计）两处排除表同步加入 `workflow_node`——标记纯 UI 层，模型不可见；
+  `finalize_turn` 只处理 tool 消息与 thinking 字段，标记不受回合末剥离影响。
+- **回合末剥离复核（工作流/直接对话两路径）**：`finalize_turn` 位于 `_agent_turn`
+  的 finally（main.py:536-551），包住回合实现全部出口（正常/出错/中断），与是否
+  启用工作流无关——工具记录剥离为简明记录（保护最近 strip_keep_recent 条）、
+  白名单超预算最老先外置、思维链打标停止并回，下一轮起模型不可见。真实管线取证：
+  test_context_turn_integration（run_direct 路径：第二回合上下文为简明记录、无
+  思维链残留）与 test_context_mgmt（剥离/保护/幂等）全过。
+- **修复**：上一条重构中 `run_workflow` 的节点循环被误缩进进 `if not
+  any(system_prompt)` 块（含 system_prompt 节点的工作流整链跳过、静默
+  "complete"）——由新增标记断言暴露，已修正；test_workflow 54 项全绿
+  （新增第 14 节：标记按链序/显示名/node_id、出站排除、直接对话无标记）。
+- **验证**：test_e2e_skills_plan（工作流真实管线）与 test_e2e_mock_llm 全绿；
+  offscreen 导入自检通过。
+
+## 2026-10-05 — 新插件：emotion-detector 情绪识别（无状态单轮注入）
+
+- **插件** `data/plugins/emotion-detector/`（plugin.json + main.py）：检测用户消息中的
+  愤怒/不耐烦/急躁语气，命中时经 `context_supplement` 扩展点向当前回合注入
+  `[情绪提示]`（随 `[插件补充]` system 消息进模型上下文，位于系统提示词之后、
+  用户消息之前），引导 Agent 诚恳认错道歉、多汇报好消息、简化回复、安抚情绪。
+  零宿主改动，完全复用现有注入逻辑。
+- **注入语义**（按用户裁决收敛）：无持久化、无延续状态机——命中当轮生效（回合内
+  工具循环每轮推理都带，Agent 干活中途不遗忘），下一回合不命中即消失。插件为
+  纯函数，同回合多次重建上下文天然幂等，无需去重状态。
+- **分级词表**：strong 愤怒/辱骂（他妈/卧槽/废物/tmd/wtf…，ASCII 词加 \b 边界）、
+  weak 不耐烦/质疑（你在干什么/你为什么/都跟你说了/服了…），强级优先。中文无词
+  边界，靠不收易误报短词规避（滚/垃圾/没用不收，"垃圾回收"是正当技术词）；
+  lookbehind 防误报（我妈的/姨妈的/说服了不算）。配置面：`extra_keywords`（追加，
+  按强级处理）/`disabled_keywords`（**文本片段级屏蔽**——先替换原文再匹配，屏蔽
+  "你他妈"时同句短词"他妈"不误命中且不牵连"妈的"）/`enabled`，设置面板实时生效。
+- **命令** `/emotion [status|on|off|test <文本>]`：test 返回命中级别、命中词与注入
+  预览；on/off 经 plugins.set_setting 持久化。
+- **测试** `develop/test_emotion_plugin.py`（真实管线 + mock LLM 全程真实 HTTP）：
+  35 项全绿——检测纯函数 16 项（含误报样例）、真实回合出站消息取证（[插件补充]
+  含情绪提示、位置在用户消息之前、未命中回合无注入）、同回合重复构建一致性、
+  /emotion 命令与 off/on 实时开关、卸载后注册面归零。重构（core/loop.py 落地）
+  之后的当前树上复跑通过。
+
+## 2026-10-05 — 重构：回合运行时归位 core/loop.py，工作流与核心解耦
+
+- **职责归位**：新增回合运行时 `core/loop.py`——`TurnIO`/`TurnContext`/`TurnInterrupt`/
+  `TurnStop`、工具调用循环 `tool_loop`（原 `workflow._tool_loop`，权限判定/确认桥/
+  轮次续期防空转/上下文压缩/token 计量整体迁入）、系统提示词注入 `ensure_system_prompt`、
+  直接对话 `run_direct`（原 `_run_direct`，含 `config.workflow.max_rounds` 全局覆盖语义）。
+  依赖单向化：`core.workflow → core.loop`，loop 不回引 workflow。
+- **workflow.py 瘦身为纯编排层**：只留加载/校验/清单/激活与 8 种节点执行器；
+  `system_prompt` 节点改薄封装 `ensure_system_prompt`；`run_turn` 移除（直接对话归
+  loop，节点链归 `run_workflow`）。
+- **main.py 回合驱动改造**：回合循环组装 `loop_mod.TurnIO/TurnContext`；工作流启用时
+  lazy import 后走 `run_workflow`，未启用走 `loop_mod.run_direct`——直接对话路径零
+  workflow 依赖（已验证：main 导入后 `core.workflow` 不进 sys.modules）；`/workflow`
+  命令 handler 同步 lazy import。
+- **反向依赖清理**：`Config.workflow_path()` 去工作流模块委托，本地化实现（新增
+  `Config.workflow_active()`，路径规则与 `workflow.workflow_path` 一致）；`tools.py`
+  防空转判据注释指向更新。
+- **测试跟进**：test_workflow.py 回合运行时符号改从 loop 取，`run_turn` 两处调用改
+  `run_direct`/`run_workflow`。
+- **验证**：test_workflow 48/48、e2e mock_llm / skills_plan（enabled=true 走
+  run_workflow 真实管线）/ headless（run_direct 真实入口）/ plugins / remote_control /
+  remote_control_api / mcp / paste / vision 全绿；offscreen 导入自检通过。
+  test_editor_smoke 的 PropertyDialog 导入失败为存量问题（该类已不在
+  gui/workflow_editor.py，本轮未触碰该文件）。
+
+## 2026-10-04 — 修复轮：视觉模型 gate / 剪贴板健壮性 / 无头错误面 / 折叠续接 / 门禁二进制探测
+
+- **视觉能力按模型 gate**：`apply_active()` 拍平激活模型的 `modalities` 为
+  `supports_vision`（配置层字段本已存在，严格默认 `["text"]` 逐模型显式开启，
+  当前激活模型已标注 vision）。降级三处：`read_image` 非视觉模型返回纯文本
+  说明不附图；粘贴纯图不落盘不插入（状态行提示）；`main.py` 附图消费点不编码
+  图片块（正文路径文本保留，双保险）。
+- **剪贴板健壮性**：OpenClipboard 被占用重试 3 次 × 50ms；纯图粘贴异步化——
+  PowerShell 落盘移入 daemon 线程，结果经单槽（`(True, 路径|None)` 元组协议，
+  失败与未完成不混同）由帧尾 `_tick_paste_async` 取回插入，消除 0.5~1s 帧阻塞，
+  忙标志防连按重入；`gc_temp_images()` 启动回收 data/temp 过期图片（7 天封顶），
+  交互/无头启动并排 webfetch_gc 调用。
+- **无头 --json 错误面**：`_AgentRunner.last_error` 槽记录回合崩溃；工具循环
+  LLM 错误经 `turn.captured["turn_error"]` → `app.last_turn_error` 上浮；
+  `--json` 增加 `"error"` 字段，修正"错误文本成为最后一条 assistant 消息导致
+  ok 误判 true"的 bug（有 error 时 ok=false、退出码 1，非 json 模式错误走
+  stderr）。
+- **粘贴折叠跨批次续接**：模块级"最近折叠时刻"，300ms 内到达的后续字符段
+  降低阈值折叠为 paste——长粘贴被 20fps 帧泵劈开的残余段不再以逐字符形态
+  漏过（≤320 场景结果与逐键插入等价）。
+- **keyinput 卫生**：ImportError 兜底分支补 `_PASTE_BREAK_KEYS/_PASTE_BURST_MIN`
+  定义（该路径永不触达，属性一致性补全）。
+- **编辑门禁二进制探测**（防模型死循环）：台账无记录时先做 NUL 探测，二进制
+  直接答复"是二进制文件，不支持编辑"——原文案引导"先 read"而 read 拒收二进制
+  且不登记，模型无出口；multi_edit 的 edits 参数校验挪到门禁之前（畸形调用
+  拿到参数错误而非门禁文案）。
+- **验证**：test_paste_e2e 31 项、test_vision_e2e 15 项（含 gate 两态）、
+  test_headless_e2e 12 项（含 S5 LLM 失败场景）全绿；回归 edit_search 43/0、
+  p1p2 36/0、tree_toggle 13/0（台账门禁后跟进 read 登记，纯测试跟进不入库）、
+  main/workflow/context/file_ledger 全绿。
+
 ## 2026-10-04 — Ctrl+V 粘贴适配：占位符机制 + 取图/取文件通路
 
 - **占位机制（仅输入框）**：粘贴文本 ≤320 字直贴；超出只放 `[粘贴:N字符]`

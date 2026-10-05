@@ -1,0 +1,13 @@
+{
+  "id": "emotion-detector",
+  "name": "情绪识别",
+  "version": "0.1.0",
+  "description": "检测用户消息中的愤怒/不耐烦/急躁语气，经 context_supplement 向当前回合注入情绪提示，引导 Agent 诚恳认错道歉、多汇报好消息、简化回复、安抚情绪；无状态单轮注入，命中当轮生效，下回合不命中即消失",
+  "author": "BAWCode",
+  "entry": "main.py",
+  "config": [
+    { "key": "enabled", "type": "bool", "default": true, "label": "启用情绪识别", "hint": "关闭后不再检测与注入；/emotion on|off 同效" },
+    { "key": "extra_keywords", "type": "str", "default": "", "label": "追加关键词", "hint": "逗号分隔，按强级（愤怒）处理" },
+    { "key": "disabled_keywords", "type": "str", "default": "", "label": "屏蔽关键词", "hint": "逗号分隔，从内置词表屏蔽易误报词" }
+  ]
+}

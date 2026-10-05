@@ -48,11 +48,19 @@ def read_clipboard() -> dict:
 
 def _win_clipboard_payload() -> dict:
     """Windows 剪贴板读取（ctypes，无新依赖）：HDROP 文件列表 > 文本 > 图片探测。
+    OpenClipboard 被其他进程短暂占用时重试 3 次 × 50ms。
     图片字节经 PowerShell 落盘（剪贴板关闭后调用，GetImage 自行开剪贴板）。"""
     import ctypes
 
     user32 = ctypes.windll.user32
-    if not user32.OpenClipboard(0):
+    opened = False
+    for _ in range(3):
+        if user32.OpenClipboard(0):
+            opened = True
+            break
+        time.sleep(0.05)
+    if not opened:
+        log.warn("剪贴板打开失败（重试 3 次仍被占用）")
         return {"kind": "none"}
     has_hd = bool(user32.IsClipboardFormatAvailable(15))   # CF_HDROP
     has_txt = bool(user32.IsClipboardFormatAvailable(13))  # CF_UNICODETEXT
@@ -94,6 +102,28 @@ def paste_temp_dir() -> Path:
     d = Path(__file__).resolve().parent.parent / "data" / "temp"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+_PASTE_TEMP_MAX_AGE = 7 * 86400  # 剪贴板图片寿命封顶（应用级共享目录，无会话判据可依）
+
+
+def gc_temp_images() -> int:
+    """启动回收 data/temp 剪贴板图片：mtime 超期删除。返回删除数；异常吞掉不阻启动"""
+    cutoff = time.time() - _PASTE_TEMP_MAX_AGE
+    freed = 0
+    try:
+        for p in paste_temp_dir().glob("clipboard-*.png"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    freed += 1
+            except OSError as exc:
+                log.warn("剪贴板图片清理失败 %s: %s", p.name, exc)
+    except OSError as exc:
+        log.warn("剪贴板图片目录扫描失败（忽略）: %r", exc)
+    if freed:
+        log.info("pasteboard 回收：%d 个过期剪贴板图片已删除", freed)
+    return freed
 
 
 def save_clipboard_image() -> Optional[Path]:
@@ -208,16 +238,21 @@ class PasteBuffer:
         self.image_paths.append(sp)
         return sp
 
-    def accept_clipboard(self) -> Tuple[List[str], str]:
+    def accept_clipboard(self, supports_vision: bool = True, data: Optional[dict] = None) -> Tuple[List[str], str]:
         """应用侧剪贴板粘贴（Ctrl+V 热键）：文件列表/文本/纯图片三分支。
+        supports_vision=False 时纯图片分支不落盘不插入（视觉模型才编码图片块）；
+        data 为预读的剪贴板 payload（异步路径由 UI 先探测 kind 再决定同步/后台），缺省自读。
         返回 (逐项插入文本列表, 状态行提示)；提示为空串表示无需更新状态行"""
-        data = read_clipboard()
+        if data is None:
+            data = read_clipboard()
         kind = (data or {}).get("kind")
         if kind == "paths":
             return [self.accept_path(p) for p in data["paths"]], ""
         if kind == "text":
             return [self.accept_text(str(data.get("text") or ""))], ""
         if kind == "image":
+            if not supports_vision:
+                return [], "当前模型不支持视觉输入，剪贴板图片未插入"
             saved = save_clipboard_image()
             if saved is not None:
                 return [self.accept_image(saved)], ""

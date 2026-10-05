@@ -6,6 +6,10 @@
 按复杂度路由节点的机制（analyze 节点 + gate 门槛）已于 2026-09-30 移除，
 引擎为无条件线性链——备份见 _recycle/gate-routing-20260930/。
 
+回合执行机制（UI 桥 TurnIO / 上下文 TurnContext / 工具调用循环 tool_loop /
+系统提示词注入 / 直接对话 run_direct）归位回合运行时 core/loop.py，本模块
+只负责节点链编排，经其执行（依赖单向：workflow → loop）。
+
 节点类型（内置执行器）：
   system_prompt — 指定初始化注入哪些系统提示词文件（缺省走 config.prompt.system_files）
   skill         — 是否注入技能清单 / 白名单过滤（经 core/skills.set_injection）
@@ -31,22 +35,31 @@ from __future__ import annotations
 import copy
 import json
 import re
-import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from core import policy
 from core import prompt_loader
-from core import register
-from core.llm import CANCELLED, get_system_prompt
+from core.llm import CANCELLED
 from core.log import get_logger
-from core.tools import has_recent_progress
+from core.loop import TurnContext, TurnInterrupt, TurnStop, check_cancel, ensure_system_prompt, tool_loop
 
 log = get_logger("workflow")
 
 _ROOT = Path(__file__).resolve().parent.parent
 
 NODE_TYPES = ("system_prompt", "skill", "understand", "analyze", "plan", "execute", "review", "llm")
+
+# 节点类型 → 会话树显示名（workflow_node 标记消息用；未列出的类型原样显示）
+NODE_LABELS = {
+    "system_prompt": "系统提示词注入",
+    "skill": "技能清单注入",
+    "understand": "任务理解",
+    "analyze": "复杂度判定",
+    "plan": "生成计划",
+    "execute": "执行编码",
+    "review": "审查与修正",
+    "llm": "LLM 阶段",
+}
 
 # 节点内置提示词兜底（默认引用 core/prompts/ 下同名 md，可被节点 prompt/prompt_files 覆盖）
 JUDGE_PROMPT_BUILTIN = (
@@ -89,52 +102,6 @@ DEFAULT_WORKFLOW: dict = {
         {"id": "execute", "type": "execute", "max_rounds": 12, "model_role": "code"},
     ],
 }
-
-
-class TurnInterrupt(Exception):
-    """回合被取消/中断：调用方按中断语义收尾（_aborted）"""
-
-
-class TurnStop(Exception):
-    """回合正常终止：处理器已写入消息与状态（用户取消/计划未确认/出错/轮次上限）"""
-
-
-class TurnIO:
-    """UI 桥回调集合：引擎经此移交交互，不反向依赖 UI"""
-
-    def __init__(
-        self,
-        status: Optional[Callable[[str], None]] = None,
-        choose: Optional[Callable] = None,
-        line: Optional[Callable] = None,
-        cancelled: Optional[Callable[[], bool]] = None,
-        on_delta: Optional[Callable] = None,
-        clear_stream: Optional[Callable[[], None]] = None,
-        tool_confirm: Optional[Callable[[dict], dict]] = None,
-        phase: Optional[Callable[[str], None]] = None,
-    ):
-        self.status = status or (lambda text: None)
-        self.choose = choose
-        self.line = line
-        self.cancelled = cancelled or (lambda: False)
-        self.on_delta = on_delta
-        self.clear_stream = clear_stream or (lambda: None)
-        self.tool_confirm = tool_confirm
-        self.phase = phase or (lambda text: None)
-
-
-class TurnContext:
-    """单回合上下文：引擎各节点共享的运行态与捕获变量"""
-
-    def __init__(self, session, llm, app, config, user_text: str, io: TurnIO):
-        self.session = session
-        self.llm = llm
-        self.app = app
-        self.config = config
-        self.user_text = user_text
-        self.io = io
-        self.system_prompt_text = ""
-        self.captured: Dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -231,12 +198,7 @@ def load_workflow(config, name: Optional[str] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 运行器
-
-
-def _check_cancel(turn: TurnContext) -> None:
-    if turn.io.cancelled():
-        raise TurnInterrupt()
+# 节点公共组装
 
 
 def _role_model(config, role: Any) -> Optional[str]:
@@ -315,23 +277,7 @@ def _combine_system(*parts: str) -> Optional[str]:
 
 def _exec_system_prompt(node: dict, turn: TurnContext) -> None:
     files = [str(f) for f in (node.get("files") or [])] or None
-    try:
-        turn.system_prompt_text = get_system_prompt(config=turn.config, files=files)
-    except Exception as e:
-        log.warn("系统提示词加载失败，使用兜底: %s", e)
-        turn.system_prompt_text = (
-            "你是 BAWCode 编码 Agent。根据用户任务与记忆/计划/步骤工作。回复使用简洁中文。"
-        )
-    if not any(m.get("type") == "system_prompt" for m in turn.session.messages):
-        names = files or list(prompt_loader.system_prompt_files(turn.config))
-        turn.session.add_message(
-            "system",
-            "注入系统提示词",
-            type="system_prompt",
-            files=names or ["system_prompt.md"],
-        )
-        log.info("注入系统提示词: %s", ", ".join(names or ["system_prompt.md"]))
-        turn.io.status("注入系统提示词")
+    ensure_system_prompt(turn, files)
 
 
 def _exec_skill(node: dict, turn: TurnContext) -> None:
@@ -412,7 +358,7 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
     if plan_model is None:
         plan_model = _role_model(turn.config, node.get("model_role") or "plan")
     plan = llm.generate_plan(turn.user_text, model=plan_model)
-    _check_cancel(turn)
+    check_cancel(turn)
     session.set_plan(
         plan.get("title", "任务计划"),
         plan.get("content", ""),
@@ -439,144 +385,6 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
     )
 
 
-def _has_recent_progress(session, window: int = 4) -> bool:
-    """最近工具结果仍有进展（判据见 core.tools.has_recent_progress）"""
-    return has_recent_progress(getattr(session, "messages", None) or [], window=window)
-
-
-def _tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, model: Optional[str]) -> dict:
-    """工具调用循环（自 main.py 迁入）：返回 {"status", "content"}
-
-    status: complete（模型不再调用工具，回合完成）/ error / max_rounds。
-    取消/中断抛 TurnInterrupt；cancel 检查点与消息入库路径与迁移前一致。
-    轮次用尽时不再硬中断：若最近工具调用仍有进展（成功/非空/互不相同/非全失败）
-    则自动续期（上限 config.workflow.max_rounds_extensions），直到无进展或续期用尽。
-    """
-    io, session, llm = turn.io, turn.session, turn.llm
-    wf_cfg = (getattr(turn.config, "data", None) or {}).get("workflow") or {}
-    try:
-        extensions_limit = max(0, int(wf_cfg.get("max_rounds_extensions", 5)))
-    except (TypeError, ValueError):
-        extensions_limit = 5
-    extensions = 0
-    round_no = 0
-    while True:
-        if round_no >= max(1, max_rounds):
-            if extensions < extensions_limit and _has_recent_progress(session):
-                extensions += 1
-                log.info(
-                    "轮次用尽但最近工具调用仍有进展，续期 %d/%d", extensions, extensions_limit
-                )
-                io.status(f"轮次续期 {extensions}/{extensions_limit}")
-            else:
-                reason = f"达到最大工具轮次（{max_rounds}轮）"
-                if extensions:
-                    reason += f"及 {extensions} 次续期"
-                if extensions_limit <= 0 or not _has_recent_progress(session):
-                    reason += "，最近工具调用无进展"
-                session.add_message("assistant", f"{reason}。")
-                log.warn("%s", reason)
-                io.status("轮次上限")
-                return {"status": "max_rounds", "content": ""}
-        round_no += 1
-        _check_cancel(turn)
-        io.status(f"推理 · 第{round_no + 1}轮")
-        io.phase("思考中")
-        payload = session.build_messages(extra_system=extra_system)
-        llm.meter.measure_context(payload)
-        response = llm.chat(payload, tools=register.get_tool_defs(), model=model, on_delta=io.on_delta)
-        io.clear_stream()  # 树尾直播收口：正式消息按现有路径入库
-        if turn.app is not None:
-            turn.app.token_meter = llm.meter
-        if response.get("error") == CANCELLED or io.cancelled():
-            raise TurnInterrupt()
-        if response.get("error"):
-            log.error("第%d轮推理返回错误: %s", round_no + 1, response["error"])
-            session.add_message("assistant", response["error"])
-            io.status("出错")
-            return {"status": "error", "content": ""}
-        if (response.get("content") or response.get("reasoning")) and not response.get("tool_calls"):
-            # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
-            extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
-            session.add_message("assistant", response["content"], **extra)
-        tool_calls = response.get("tool_calls") or []
-        if not tool_calls:
-            io.phase("")  # 回合完成：状态行空行占位
-            log.info("任务完成（共%d轮推理）", round_no + 1)
-            if not io.cancelled():
-                session.maybe_compress(llm_fn=lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
-            io.status("就绪")
-            return {"status": "complete", "content": response.get("content") or ""}
-
-        # description 是调用意图的简明说明（回合末剥离后的留档记录）：
-        # 提取后从 arguments 剔除，策略判定/指纹白名单/确认面板/工具执行均不可见
-        for call in tool_calls:
-            args = call.get("arguments")
-            if isinstance(args, dict) and "description" in args:
-                call["description"] = str(args.pop("description") or "")
-
-        io.phase("工具调用中")
-        pending = []
-        allowed_results = []
-        log.debug("第%d轮返回 %d 个工具调用", round_no + 1, len(tool_calls))
-        for call in tool_calls:
-            action, reason = llm.evaluate_tool(call.get("name"), call.get("arguments") or {})
-            if action == policy.ALLOW:
-                allowed_results.append((call, llm.execute_approved_tool(call)))
-            elif action == policy.CONFIRM:
-                pending.append(call)
-            else:
-                allowed_results.append(
-                    (
-                        call,
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id"),
-                            "tool_name": call.get("name"),
-                            "content": policy.default_reject_message(reason),
-                            "type": "tool",
-                        },
-                    )
-                )
-
-        # DeepSeek Tool Calls：保留 assistant 工具轮（含 content + tool_calls）；
-        # thinking 与正文并存时以 thinking 字段留档（出站时并回 content）
-        thinking_extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
-        session.add_message(
-            "assistant",
-            response.get("content") or "",
-            type="tool_call",
-            tool_calls=[
-                {
-                    "id": c.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                    "name": c.get("name"),
-                    "arguments": c.get("arguments") or {},
-                    "type": c.get("type") or "function",
-                }
-                for c in tool_calls
-            ],
-            **thinking_extra,
-        )
-
-        for call, item in allowed_results:
-            session.add_tool_result(call, item["content"], item.get("images"))
-        io.status(f"工具 {len(allowed_results)} 完成 · 待确认 {len(pending)}")
-
-        for call in pending:
-            if io.tool_confirm is None:
-                result = {"content": policy.default_reject_message("无确认通道")}
-            else:
-                result = io.tool_confirm(call)
-            session.add_tool_result(call, result["content"], result.get("images"))
-            _check_cancel(turn)
-            io.status(f"确认完成 · {call.get('name')}")
-
-        if turn.app is not None:
-            turn.app.token_meter = llm.meter
-        io.status("继续")
-    # while 循环不可达出口：轮次终止统一在循环内 max_rounds 分支返回
-
-
 def _exec_analyze(node: dict, turn: TurnContext) -> None:
     """复杂度判定：独立一次 LLM 请求，输出 high/low；失败/不可解析回落 default_level"""
     io, session, llm = turn.io, turn.session, turn.llm
@@ -589,7 +397,7 @@ def _exec_analyze(node: dict, turn: TurnContext) -> None:
     payload = session.build_messages(extra_system=_stage_system(turn, node, stage))
     result = llm.chat(payload, model=_node_model(turn.config, node), on_delta=io.on_delta)
     io.clear_stream()
-    _check_cancel(turn)
+    check_cancel(turn)
     reply = ""
     if result.get("error"):
         log.warn("复杂度判定请求失败: %s，回落 %s", result["error"], default_level)
@@ -617,7 +425,7 @@ def _run_aux_loop(node: dict, turn: TurnContext, builtin: str, default_rounds: i
         max_rounds = int(node.get("max_rounds") or default_rounds)
     except (TypeError, ValueError):
         max_rounds = default_rounds
-    result = _tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
+    result = tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
     capture = str(node.get("capture") or "").strip()
     if capture and result.get("content"):
         turn.captured[capture] = result["content"].strip()
@@ -655,7 +463,7 @@ def _exec_execute(node: dict, turn: TurnContext) -> None:
     stage = _node_stage(turn, node)
     if turn.captured.pop("steps_kickoff", None):
         stage = _combine_system(stage, STEPS_KICKOFF_BUILTIN)
-    result = _tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
+    result = tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
     if result["status"] != "complete":
         raise TurnStop()
     capture = str(node.get("capture") or "").strip()
@@ -676,7 +484,7 @@ def _exec_llm(node: dict, turn: TurnContext) -> None:
 
     if max_rounds > 0:
         # 带工具的分析/测试类节点：非致命（error/轮次上限不阻断后续节点）
-        result = _tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
+        result = tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
         content = result["content"]
         if result["status"] == "error":
             log.warn("工作流 llm 节点(id=%s)推理出错，继续后续节点", node.get("id"))
@@ -686,7 +494,7 @@ def _exec_llm(node: dict, turn: TurnContext) -> None:
         payload = session.build_messages(extra_system=_stage_system(turn, node, stage))
         result = llm.chat(payload, model=model, on_delta=io.on_delta)
         io.clear_stream()
-        _check_cancel(turn)
+        check_cancel(turn)
         if result.get("error"):
             log.warn("工作流 llm 节点(id=%s)出错: %s，继续后续节点", node.get("id"), result["error"])
             io.status("节点出错 · 继续")
@@ -720,9 +528,9 @@ def run_workflow(workflow: dict, turn: TurnContext) -> str:
 
     skills_mod.set_injection(enabled=None, allow=None)
     if not any(n.get("type") == "system_prompt" for n in nodes):
-        _exec_system_prompt({}, turn)  # 保持旧行为：默认注入 config.prompt.system_files
+        ensure_system_prompt(turn)  # 保持旧行为：默认注入 config.prompt.system_files
     for node in nodes:
-        _check_cancel(turn)
+        check_cancel(turn)
         if not node.get("enabled", True):
             log.debug("节点已停用，跳过: %s", node.get("id"))
             continue
@@ -730,7 +538,18 @@ def run_workflow(workflow: dict, turn: TurnContext) -> str:
         if runner is None:
             log.warn("未知节点类型，跳过: id=%s type=%r", node.get("id"), node.get("type"))
             continue
-        log.info("工作流节点: %s（%s）", node.get("id"), node.get("type"))
+        ntype = str(node.get("type") or "")
+        # 节点标记落会话：树在该轮用户消息下按时间线显示节点推进
+        # （type=workflow_node 不进 API、不参与压缩统计——memory 两处排除表同步）
+        nid = str(node.get("id") or "")
+        turn.session.add_message(
+            "system",
+            NODE_LABELS.get(ntype, ntype or "节点"),
+            type="workflow_node",
+            node_id=nid,
+            node_type=ntype,
+        )
+        log.info("工作流节点: %s（%s）", nid, ntype)
         runner(node, turn)
     return "complete"
 
@@ -738,26 +557,3 @@ def run_workflow(workflow: dict, turn: TurnContext) -> str:
 def workflow_enabled(config) -> bool:
     """工作流总开关（config.workflow.enabled）：默认关闭=直接对话，设置页显式启用"""
     return bool(((getattr(config, "data", None) or {}).get("workflow") or {}).get("enabled", False))
-
-
-_DIRECT_EXECUTE_NODE = {"id": "direct", "type": "execute", "max_rounds": 12, "model_role": "code"}
-
-
-def run_turn(workflow: Optional[dict], turn: TurnContext) -> str:
-    """回合入口：workflow=None（未启用工作流）直接对话，否则按节点链运行"""
-    if workflow is None:
-        return _run_direct(turn)
-    return run_workflow(workflow, turn)
-
-
-def _run_direct(turn: TurnContext) -> str:
-    """直接对话（工作流未启用）：注入系统提示词后进工具循环，不经节点链。
-
-    行为与最简 default 工作流等价，但作为一等状态存在——工作流是显式启用的
-    处理管线，而非"永远套着一层看不见的默认链"。"""
-    from core import skills as skills_mod
-
-    skills_mod.set_injection(enabled=None, allow=None)
-    _exec_system_prompt({}, turn)
-    _exec_execute(dict(_DIRECT_EXECUTE_NODE), turn)
-    return "complete"

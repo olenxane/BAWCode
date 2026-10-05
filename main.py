@@ -12,8 +12,10 @@ if str(_ROOT) not in sys.path:
 
 from core import commands
 from core import hooks
+from core import loop as loop_mod
 from core import mcp as mcp_mod
 from core import memory as memory_mod
+from core import pasteboard as pasteboard_mod
 from core import plugins as plugins_mod
 from core import policy
 from core import project_identity
@@ -23,7 +25,6 @@ from core import snapshot as snapshot_mod
 from core import subagent as subagent_mod
 from core import tools as tools_mod  # noqa: F401
 from core import ui
-from core import workflow as workflow_mod
 from core.config import Config
 from core.llm import CANCELLED, LLM
 from core.log import get_logger
@@ -291,6 +292,8 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         "/workflow", hint="工作流 · 列表/切换/停用/编辑", usage="/workflow [名称|off|edit [名称]]", source="builtin"
     )
     def _workflow(ctx, args):
+        from core import workflow as workflow_mod  # lazy：直接对话路径不加载工作流模块
+
         arg = (args or "").strip()
         parts = arg.split(maxsplit=1)
         head = parts[0].lower() if parts else ""
@@ -585,12 +588,13 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
 
     log.info("任务开始: %s", user_text)
-    # 粘贴附图（输入框占位符=图片路径，提交时入队）：与正文一并落为多模态数组
+    # 粘贴附图（输入框占位符=图片路径，提交时入队）：与正文一并落为多模态数组；
+    # 非视觉模型不编码图片块（路径作为普通文本保留在正文里）
     pending = None
     pending_q = getattr(app, "pending_images", None)
     if pending_q:
         pending = pending_q.pop(0)
-    if pending:
+    if pending and getattr(llm.config, "supports_vision", True):
         parts, notes = memory_mod.build_image_parts(pending)
         content: list = [{"type": "text", "text": user_text}]
         if notes:
@@ -607,13 +611,16 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     )
     mode = app.mode
     _syncq(task=user_text, status=f"{policy.MODE_LABELS.get(mode, mode)} · 分析")
+    # 阶段提示自用户消息发出即常驻（首轮思考），直至回合结束由 finally 清空
+    _set_phase("思考中")
     if _cancelled():
         _aborted()
         return
 
-    # 外置工作流：按 data/workflows/<active>.json 的节点链驱动一轮回合
-    # （系统提示词注入/分析/规划/编码等均为节点，增删改走编辑器或直接改 JSON）
-    io = workflow_mod.TurnIO(
+    # 回合驱动：未启用工作流=直接对话（core/loop 回合运行时）；启用时按
+    # data/workflows/<active>.json 的节点链运行（系统提示词注入/分析/规划/编码
+    # 等均为节点，增删改走编辑器或直接改 JSON）
+    io = loop_mod.TurnIO(
         status=_set_status,
         choose=lambda options, prompt: _bridge_choose(app, options, prompt, _cancelled),
         line=lambda prompt: _bridge_line(app, prompt, llm.config, _cancelled),
@@ -623,13 +630,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         tool_confirm=lambda call: _handle_tool_confirm(llm, app, session, call, _cancelled),
         phase=_set_phase,
     )
-    wf = None
-    if workflow_mod.workflow_enabled(llm.config):
-        wf = workflow_mod.load_workflow(llm.config)
-        log.info("工作流: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
-    else:
-        log.info("工作流未启用：直接对话（设置页\"系统\"标签可启用）")
-    turn = workflow_mod.TurnContext(
+    turn = loop_mod.TurnContext(
         session=session, llm=llm, app=app, config=llm.config, user_text=user_text, io=io
     )
     # 子代理运行时随回合绑定/解绑：task 工具经此取得 llm/io/app/session
@@ -641,13 +642,22 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
 
     tools_mod.set_ask_user_bridge(_bridge_ask)  # ask_user 工具经此弹面板（回合内有效）
     try:
-        workflow_mod.run_turn(wf, turn)
-    except workflow_mod.TurnInterrupt:
+        if ((getattr(llm.config, "data", None) or {}).get("workflow") or {}).get("enabled", False):
+            from core import workflow as workflow_mod  # lazy：仅启用工作流时加载编排层
+
+            wf = workflow_mod.load_workflow(llm.config)
+            log.info("工作流: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
+            workflow_mod.run_workflow(wf, turn)
+        else:
+            log.info("工作流未启用：直接对话（设置页\"系统\"标签可启用）")
+            loop_mod.run_direct(turn)
+    except loop_mod.TurnInterrupt:
         _aborted()
-    except workflow_mod.TurnStop:
+    except loop_mod.TurnStop:
         pass
     finally:
         tools_mod.set_ask_user_bridge(None)
+        app.last_turn_error = turn.captured.pop("turn_error", None)  # 无头 --json 消费
 
 
 class _AgentRunner:
@@ -664,6 +674,7 @@ class _AgentRunner:
         self.app = app
         self.config = config
         self.busy = False
+        self.last_error = None  # 最近回合的异常文本（无头 --json 消费；交互模式仅诊断用）
         self._queue: list = []
         self._lock = threading.Lock()
 
@@ -731,6 +742,7 @@ class _AgentRunner:
                 _agent_turn(self.llm, self.session, text, self.app, runner=self)
             except Exception as exc:
                 log.error("agent 回合异常: %r", exc)
+                self.last_error = str(exc)  # 无头 --json 的 error 字段来源（崩溃类）
                 try:
                     self.session.add_message("system", f"回合异常: {exc}", type="help")
                 except Exception:
@@ -839,6 +851,7 @@ def main_headless(args) -> int:
     plugins_mod.load(config, workspace=Path.cwd())
     session = memory_mod.init_session(config, project_identity_data=identity)
     tools_mod.webfetch_gc()
+    pasteboard_mod.gc_temp_images()
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
@@ -878,12 +891,16 @@ def main_headless(args) -> int:
     elapsed = time.monotonic() - started
     last = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
     response = str((last or {}).get("content") or "").strip()
-    log.info("无头运行结束 · %.2fs · 回复 %d 字", elapsed, len(response))
+    # 错误双来源：回合崩溃（runner.last_error）> 工具循环 LLM 错误（app.last_turn_error）
+    error = getattr(runner, "last_error", None) or getattr(app, "last_turn_error", None)
+    ok = bool(response) and not error
+    log.info("无头运行结束 · %.2fs · 回复 %d 字 · error=%r", elapsed, len(response), error)
     if args.json:
         print(json.dumps(
             {
-                "ok": bool(response),
+                "ok": ok,
                 "response": response,
+                "error": error,
                 "session_id": session.session_id,
                 "project_id": session.project_id,
                 "elapsed_s": round(elapsed, 2),
@@ -895,7 +912,9 @@ def main_headless(args) -> int:
             print(response)
         else:
             print("（本轮未产生文本回复；详情见 data/log）", file=sys.stderr)
-    return 0 if response else 1
+        if error:
+            print(f"回合错误: {error}", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def main() -> None:
@@ -911,7 +930,8 @@ def main() -> None:
     )
     plugins_mod.load(config, workspace=Path.cwd())  # 外部插件装载（先于会话初始化，插件可收到 session_start）
     session = memory_mod.init_session(config, project_identity_data=identity)
-    tools_mod.webfetch_gc()  # 启动探测：闲置会话（1 天无更新）的 webfetch 图片目录回收，活跃会话图片 30 天封顶
+    tools_mod.webfetch_gc()
+    pasteboard_mod.gc_temp_images()  # 启动回收 data/temp 过期剪贴板图片（7 天封顶）
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})

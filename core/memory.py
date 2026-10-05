@@ -837,7 +837,7 @@ class Memory:
     @staticmethod
     def _api_visible(item: dict) -> bool:
         """与 _api_session_item 同规则的可见性判断（UI 专用注入不参与压缩与轮次统计）"""
-        return (item.get("type") or "") not in ("system_prompt", "help")
+        return (item.get("type") or "") not in ("system_prompt", "help", "workflow_node")
 
     def _count_tokens(self, messages: List[dict]) -> int:
         """tiktoken 计消息列表 token；不可用时字符数减半兜底（与 estimate_context_tokens 同策略）"""
@@ -1133,7 +1133,7 @@ class Memory:
         content = item.get("content") or ""
         mtype = item.get("type") or ""
         # UI 专用注入提示不进 API
-        if mtype in ("system_prompt", "help"):
+        if mtype in ("system_prompt", "help", "workflow_node"):
             return {}
         # content 原样出站：str 或数组形态（多模态图片块）均透传
         out: dict = {"role": role, "content": content if isinstance(content, (str, list)) else str(content)}

@@ -213,6 +213,14 @@ def ledger_check(path: Path) -> Optional[str]:
     """edit/位置写入门禁：返回 None=放行；否则为拒绝消息（含原因、变更区间与窄读建议）"""
     entry = _ledger.get(_ledger_key(path))
     if entry is None:
+        # 二进制文件 read 工具不适用（不登记），门禁若照常引导"先 read"会让模型
+        # 在"edit 让你 read / read 拒收二进制"之间死循环；先做 NUL 探测给出终局答复
+        try:
+            with path.open("rb") as fh:
+                if b"\x00" in fh.read(512):
+                    return f"编辑被拒绝：{path} 是二进制文件，不支持编辑。"
+        except OSError:
+            pass
         return (
             f"编辑被拒绝：{path} 本次会话尚未 read 过。"
             "请先用 read 工具读取该文件（可用 offset/limit 分段），再执行编辑。"

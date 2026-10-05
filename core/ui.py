@@ -59,8 +59,23 @@ _THINKING_PHRASES = (
     "梳理思路", "整理上下文", "排查疑点", "串联线索", "打腹稿", "翻找思路", "灵感加载中",
 )
 _HINT_ROTATE_SECONDS = 4.0
+# 树底阶段文案池：key=「 · 」前的阶段基名，值=按时间槽轮换的文案元组（帧循环无状态、线程安全）；
+# 带后缀的阶段（如「工具调用中 · read」）轮换基名文案、保留后缀；未登记的阶段按原样显示
+_PHASE_POOLS = {
+    "思考中": _THINKING_PHRASES,
+    "工具调用中": ("调用工具中", "等待工具返回", "处理工具输出"),
+    "待确认": ("等待确认", "等待你的决定"),
+}
 # 控制台鼠标 y → compose 行号偏移（rich Live 主屏模式 1:1；真机如有固定偏差在此校准）
 _MOUSE_Y_OFFSET = 0
+
+def _command_head(command: str, limit: int = 24) -> str:
+    """命令头提取：取前两个 token，clip 到 limit 显示宽——供树节点显示简洁命令"""
+    parts = str(command or "").strip().split()
+    if not parts:
+        return ""
+    return _clip(" ".join(parts[:2]), limit)
+
 
 DEFAULT_COLORS = {
     "title": (87, 199, 255),
@@ -603,6 +618,10 @@ class TuiApp:
         # pending_images 由 _dispatch_key 提交时入队、_agent_turn 逐回合出队编码
         self.paste = pasteboard.PasteBuffer()
         self.pending_images: List[str] = []
+        self.config = None  # bind_config 时填充；粘贴 gate 提前读
+        # _paste_async：后台图片落盘单槽（后台线程单写、帧尾 _tick_paste_async 取回清空）
+        self._paste_async = None
+        self._paste_async_busy = False
         self.scroll = 0
         self.input_scroll = 0
         self.cand_scroll = 0
@@ -657,6 +676,8 @@ class TuiApp:
         self.sessions_notice = ""
         # 工具确认面板：取代输入框位置，↑↓ 选择 · Enter 确认 · 可输入拒绝原因
         self.confirm_mode = False
+        # 树底阶段提示的隐藏信号：confirm/ask/choose/line 弹窗执行期间为 True（_serve_ui_request 维护）
+        self._dialog_active = False
         self.confirm_tool: dict = {}
         self.confirm_index = 0
         self.confirm_reason_mode = False
@@ -756,6 +777,7 @@ class TuiApp:
             getattr(config, "mode", "-"),
             getattr(config, "theme", "-"),
         )
+        self.config = config
         self.model_name = config.model_name
         self.api_key_set = bool(config.api_key)
         ui_cfg = (config.data or {}).get("ui") or {}
@@ -1008,6 +1030,26 @@ class TuiApp:
         def _parent() -> TreeNode:
             return current_turn if current_turn is not None else task_node
 
+        # 命令头索引：从 tool_call 信封提取 execute_command/run_program 的简洁命令
+        #（结果消息不带参数，按 tool_call_id 关联到调用），供结果单行节点与信封节点显示
+        cmd_heads: Dict[str, str] = {}
+        for item in self.messages[-200:]:
+            if item.get("type") != "tool_call":
+                continue
+            for c in item.get("tool_calls") or []:
+                if not isinstance(c, dict):
+                    continue
+                args = c.get("arguments") or {}
+                head = ""
+                if c.get("name") == "execute_command":
+                    head = _command_head(memory_mod.content_text(args.get("command")))
+                elif c.get("name") == "run_program":
+                    rest = " ".join(str(a) for a in (args.get("args") or [])[:2])
+                    head = _command_head((str(args.get("program") or "") + " " + rest).strip())
+                cid = str(c.get("id") or "")
+                if cid and head:
+                    cmd_heads[cid] = head
+
         for index, item in enumerate(self.messages[-200:]):
             role = item.get("role")
             content = memory_mod.content_text(item.get("content"))
@@ -1041,7 +1083,9 @@ class TuiApp:
                     icon = "❌" if failed else "✅"
                     # 结果正文 trim 后再拼（纯空白结果不挂悬空「 · 」）；内部换行保留供展开查看
                     result_text = content.strip()
-                    label = f"⚙ {tool_name or 'tool'} {icon}{image_note}"
+                    # execute_command/run_program 显示提取的命令头（无索引回落工具名）
+                    display = cmd_heads.get(str(item.get("tool_call_id") or "")) or tool_name or "tool"
+                    label = f"⚙ {display} {icon}{image_note}"
                     if result_text:
                         label = f"{label} · {result_text}"
                     node = TreeNode(
@@ -1063,11 +1107,27 @@ class TuiApp:
                     default_expanded=False,
                     detail="",
                 )
+            elif msg_type == "workflow_node":
+                # 工作流节点标记（run_workflow 在每个节点执行前落库）：
+                # 该轮用户消息下按时间线显示节点推进，最后一条即当前节点
+                nid = str(item.get("node_id") or "")
+                ntype = str(item.get("node_type") or "")
+                label = f"⚙ 节点 · {content.strip()}"
+                if nid and nid != ntype:
+                    label += f" · {nid}"
+                node = TreeNode(
+                    f"msg:{index}",
+                    label,
+                    "workflow_node",
+                    default_expanded=False,
+                    detail="",
+                )
             elif msg_type == "tool_call":
                 names = []
                 for c in item.get("tool_calls") or []:
                     if isinstance(c, dict):
-                        names.append(str(c.get("name") or ""))
+                        # execute_command/run_program 优先显示命令头
+                        names.append(cmd_heads.get(str(c.get("id") or "")) or str(c.get("name") or ""))
                 # 模型随工具调用输出的说明文字是给用户看的话：独立成 assistant 节点
                 # 全文展示；不并进可折叠的工具节点（否则默认被折叠藏住，且部分模型
                 # 的 content 带 \n\n 包裹，展开后标题行悬空「 · 」+ 空行）
@@ -1645,15 +1705,20 @@ class TuiApp:
             else:
                 self._row_meta["scrollbar_on"] = 0
         lines.extend(body)
-        # 树底阶段提示（用户规格）：Agent 产出阶段"思考中"、工具执行"工具调用中"、完成空行占位
-        # 盲文方点阵转轮 + 暖黄（原用 err 红色，语义与"出错"混淆）；「思考中」轮换文案池
+        # 树底阶段提示（用户规格）：用户消息发出后常驻显示，直至本轮 Agent 结束；
+        # 各阶段共用转轮+轮换机制，仅文案池不同（base 匹配 _PHASE_POOLS，后缀保留）；
+        # 确认面板/对话框（confirm/ask/choose/line）期间隐藏，空行占位
         hint = (self.phase_hint or "").strip()
-        if hint:
+        if hint and not self.confirm_mode and not self._dialog_active:
             frame = _SPINNER_FRAMES[int(time.time() * 12) % len(_SPINNER_FRAMES)]
-            if hint == "思考中":
-                slot = int(time.time() // _HINT_ROTATE_SECONDS) % len(_THINKING_PHRASES)
-                hint = _THINKING_PHRASES[slot]
-            lines.append(self.c("warn") + _pad(_clip(f" {frame} {hint}", w), w) + self.RESET)
+            base, sep, detail = hint.partition(" · ")
+            pool = _PHASE_POOLS.get(base)
+            if pool:
+                slot = int(time.time() // _HINT_ROTATE_SECONDS) % len(pool)
+                text = pool[slot] + (f" · {detail}" if sep and detail else "")
+            else:
+                text = hint
+            lines.append(self.c("warn") + _pad(_clip(f" {frame} {text}", w), w) + self.RESET)
         else:
             lines.append("")
         lines.append(self._rule(w))
@@ -1894,8 +1959,9 @@ class TuiApp:
                 if result is not None:
                     return result
 
-            # 帧尾：UI 请求桥 + 选区边缘自动滚动 + 无条件渲染 + 补足帧周期
+            # 帧尾：UI 请求桥 + 后台图片落盘结果 + 选区边缘自动滚动 + 无条件渲染 + 补足帧周期
             self._serve_ui_request()
+            self._tick_paste_async()
             self._selection_tick()
             self.render()
             frame_deadline += self._frame_time
@@ -1921,13 +1987,44 @@ class TuiApp:
             self._buf_insert(inserted)
 
     def _handle_clipboard_paste(self) -> None:
-        """应用侧读剪贴板（Ctrl+V 热键）：文件列表/文本/纯图片三分支"""
-        texts, status = self.paste.accept_clipboard()
+        """应用侧读剪贴板（Ctrl+V 热键）：文件列表/文本同步插入；纯图片后台落盘
+        （PowerShell 0.5~1s，不阻帧循环），完成结果经 _paste_async 单槽由帧尾取回；
+        非视觉模型纯图片分支不落盘不插入（状态行提示）"""
+        supports = bool(getattr(self.config, "supports_vision", True)) if self.config else True
+        if self._paste_async_busy:
+            self.status = "剪贴板图片正在处理…"
+            return
+        data = pasteboard.read_clipboard()
+        if (data or {}).get("kind") == "image" and supports:
+            self._paste_async_busy = True
+            self.status = "正在读取剪贴板图片…"
+
+            def _save_bg():
+                # 单槽协议：(True, 落盘路径|None)——None 结果也要能取回，不能与"未完成"混同
+                self._paste_async = (True, pasteboard.save_clipboard_image())
+
+            threading.Thread(target=_save_bg, daemon=True, name="bawcode-paste-img").start()
+            self.render()
+            return
+        texts, status = self.paste.accept_clipboard(supports_vision=supports, data=data)
         for t in texts:
             if t:
                 self._buf_insert(t)
         if status:
             self.status = status
+        self.render()
+
+    def _tick_paste_async(self) -> None:
+        """帧尾检查后台图片落盘结果（单槽跨线程：后台线程单写、帧循环取回清空）"""
+        if self._paste_async is None:
+            return
+        _, path = self._paste_async
+        self._paste_async, self._paste_async_busy = None, False
+        if path is not None:
+            self._buf_insert(self.paste.accept_image(path))
+            self.status = "剪贴板图片已插入（发送时随消息编码）"
+        else:
+            self.status = "剪贴板图片保存失败（详见日志）"
         self.render()
 
     def _dispatch_key(self, kind: str, value: Any, config=None) -> Optional[str]:
@@ -1941,6 +2038,15 @@ class TuiApp:
         # 模式切换始终优先
         if kind == "mode_switch" or self._is_mode_switch(kind, value):
             mode = self.cycle_mode()
+            # 单一事实源同步：策略（config.mode，读 data.ui.mode）与持久化值跟随
+            # UI 显示——否则页脚显示完全访问而策略仍按旧模式弹确认、重启后丢失
+            config = getattr(self, "config", None)
+            if config is not None:
+                try:
+                    config.mode = mode
+                    config.save()
+                except Exception as e:
+                    log.warn("模式切换写配置失败: %s", e)
             self.status = f"{policy.MODE_LABELS.get(mode, mode)}"
             self.render()
             return None
@@ -2559,6 +2665,8 @@ class TuiApp:
         if req is None or req.get("served"):
             return
         req["served"] = True
+        # 弹窗（含其内部嵌套渲染）期间抑制树底阶段提示
+        self._dialog_active = True
         try:
             kind = req["kind"]
             payload = req["payload"] or {}
@@ -2579,6 +2687,8 @@ class TuiApp:
         except Exception as exc:
             log.error("UI 请求执行失败: %r", exc)
             result = CANCEL_RESULT
+        finally:
+            self._dialog_active = False
         req["result"] = result
         req["event"].set()
 
@@ -3403,7 +3513,7 @@ class TuiApp:
                 {"key": "compress_summary_max_tokens", "label": "摘要上限token", "type": "text", "current": mem_cfg.get("compress_summary_max_tokens", 1024)},
                 {"key": "tool_whitelist", "label": "工具白名单", "type": "text", "current": ", ".join(str(x) for x in (ctx_cfg.get("tool_whitelist") or [])), "hint": "逗号分隔 · 白名单工具结果跨回合保留"},
                 {"key": "max_tool_rounds", "label": "最大工具轮数", "type": "text", "current": wf_cfg.get("max_rounds", 0), "hint": "0=用工作流文件值 · 超限后仍有进展会自动续期"},
-                {"key": "max_rounds_extensions", "label": "轮次续期上限", "type": "text", "current": wf_cfg.get("max_rounds_extensions", 5), "hint": "有进展续期次数上限，0=禁用续期"},
+                {"key": "spin_kill_count", "label": "空转计数上限", "type": "text", "current": wf_cfg.get("spin_kill_count", 12), "hint": "重复输出计满即终止回合；未满期间续期不限次"},
                 {"key": "max_tool_timeout", "label": "命令超时上限秒", "type": "text", "current": tools_cfg.get("max_timeout", 600), "hint": "execute_command/run_program 传入超时的钳制上限（1-∞）"},
                 {"key": "ask_user_timeout", "label": "询问自动超时", "type": "bool", "current": bool(tools_cfg.get("ask_user_timeout", True)), "hint": "←→ 开/关 · 开启后询问框 5 分钟未选择自动跳过"},
                 {"key": "workflow_enabled", "label": "启用工作流", "type": "bool", "current": bool(wf_cfg.get("enabled", False)), "hint": "←→ 关=直接对话 · 开=按工作流节点链运行（下一回合生效）"},
@@ -3837,6 +3947,9 @@ class TuiApp:
             self.load_theme(str(self.settings_scratch[key]))
         elif key == "mode":
             self.mode = str(self.settings_scratch[key])
+            # 即时同步策略源（config.mode 读 data.ui.mode）；落盘随设置页"保存"完成
+            if self.config is not None:
+                self.config.mode = str(self.settings_scratch[key])
 
     def _provider_live_models(self, config, pid: str) -> List[dict]:
         """提供商实时模型列表：config + 工作副本（模型页增改）"""
@@ -4190,9 +4303,9 @@ class TuiApp:
                 wf_cfg["max_rounds"] = max(0, int(float(s["max_tool_rounds"])))
             except (TypeError, ValueError):
                 pass
-        if "max_rounds_extensions" in s:
+        if "spin_kill_count" in s:
             try:
-                wf_cfg["max_rounds_extensions"] = max(0, int(float(s["max_rounds_extensions"])))
+                wf_cfg["spin_kill_count"] = max(1, int(float(s["spin_kill_count"])))
             except (TypeError, ValueError):
                 pass
         if "max_tool_timeout" in s:

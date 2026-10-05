@@ -1,9 +1,11 @@
 #此文件实现配置文件读取和保存功能（多 provider）
 import copy
 import json
+import re
 from pathlib import Path
 from typing import List, Optional
 
+from core import policy
 from core.log import get_logger, init as init_logging
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -157,21 +159,23 @@ def default_config() -> dict:
         # 回退内置默认工作流；设置页"系统"标签可切换 enabled/active，/workflow 命令
         # 切换即自动启用；编辑器 gui/workflow_editor.py（/workflow edit）。
         # max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
-        # max_rounds_extensions：轮次用尽后基于"最近工具调用仍有进展"的续期次数上限
+        # spin_kill_count：空转计数上限（core/tools.SpinGuard）——重复输出出现才开始
+        # 计数、整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限
         "workflow": {
             "enabled": False,
             "dir": "data/workflows",
             "active": "default",
             "max_rounds": 0,
-            "max_rounds_extensions": 5,
+            "spin_kill_count": 12,
         },
         # 子代理系统（core/subagent.py）：task 工具派发独立上下文子代理，
         # query_subagent 查询其工作过程。enabled=false 不注册工具（模型侧不可见）。
         # 全程轨迹落盘 dir/{project_id}/{session_id}/{id}.json；角色=系统提示词
         # persona（agents_dir 下 <role>.json，内置 universal），模型经角色 model
         # 字段指定；权限继承主代理（手动模式主代理→auto）且只可收紧不可放宽。
-        # max_rounds 单次派发轮次上限（配合 workflow.max_rounds_extensions 的
-        # 进展续期）；result_char_cap 结果摘要字符上限；query_default_rounds 查询默认轮数
+        # max_rounds 单次派发轮次上限（配合 workflow.spin_kill_count 空转计数：
+        # 重复输出才计数、全新结果清零，计满终止）；result_char_cap 结果摘要字符上限；
+        # query_default_rounds 查询默认轮数
         "subagent": {
             "enabled": True,
             "dir": "data/subagents",
@@ -449,11 +453,17 @@ class Config:
     def get_task_model(self, role: str) -> str:
         return self.task_models().get(role) or self.active_model_name()
 
-    def workflow_path(self, name: Optional[str] = None) -> Path:
-        """工作流 JSON 路径（name 缺省取 active）"""
-        from core import workflow as workflow_mod
+    def workflow_active(self) -> str:
+        """激活工作流名（config.workflow.active，缺省 default）"""
+        return str(((self.data or {}).get("workflow") or {}).get("active") or "default").strip()
 
-        return workflow_mod.workflow_path(self, name or workflow_mod.active_name(self))
+    def workflow_path(self, name: Optional[str] = None) -> Path:
+        """工作流 JSON 路径（name 缺省取 active）；规则与 core/workflow.py.workflow_path 一致"""
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", str(name or self.workflow_active()).strip())
+        rel = ((self.data or {}).get("workflow") or {}).get("dir") or "data/workflows"
+        d = Path(rel)
+        base = d if d.is_absolute() else Path(__file__).resolve().parent.parent / rel
+        return base / f"{safe or 'default'}.json"
 
     def set_task_model(self, role: str, model_name: str) -> bool:
         if role not in TASK_ROLES:
@@ -750,12 +760,32 @@ class Config:
         self.temperature = provider.get("temperature", 1.0)
         self.context_window = model_row.get("context_window", 0) if model_row else 0
         self.max_tokens = model_row.get("max_tokens", 2048) if model_row else 2048
+        self.modalities = list((model_row or {}).get("modalities") or ["text"])
+        self.supports_vision = "vision" in self.modalities
         self.balance_url = provider.get("balance_url", "")
         system = self.data.get("system", {})
         self.font_size = system.get("font_size", 16)
         ui = self.data.get("ui", {})
         self.theme = ui.get("theme", "dark")
-        self.mode = ui.get("mode", "auto")
+
+    @property
+    def mode(self) -> str:
+        """访问模式（单一事实源 data.ui.mode）。
+
+        策略判定（llm.evaluate_tool）、UI 显示（TuiApp.mode）与重启恢复共用此值，
+        避免"页脚显示完全访问而策略仍按 auto 弹确认"的双源失联——历史问题：
+        Shift+Tab 只改 app.mode、设置页只落盘 ui.mode，config.mode 属性只在
+        /mode 命令里同步。读取时校验合法值，缺失/非法回落 auto。"""
+        raw = str(((self.data or {}).get("ui") or {}).get("mode") or "").strip().lower()
+        return raw if raw in policy.MODES else policy.MODE_AUTO
+
+    @mode.setter
+    def mode(self, value: str) -> None:
+        v = str(value or "").strip().lower()
+        if v not in policy.MODES:
+            log.warn("忽略非法访问模式: %r（可选 %s）", value, "/".join(policy.MODES))
+            return
+        self.data.setdefault("ui", {})["mode"] = v
 
     def save(self) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
