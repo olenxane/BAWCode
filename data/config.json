@@ -1,0 +1,224 @@
+{
+  "providers": [
+    {
+      "provider_id": "deepseek",
+      "name": "deepseek",
+      "api_key": "",
+      "base_url": "https://api.deepseek.com/v1",
+      "default_model_id": "deepseek-flash",
+      "temperature": 1.0,
+      "balance_url": "https://api.deepseek.com/user/balance",
+      "models": [
+        {
+          "model_id": "deepseek-flash",
+          "context_window": 1000000,
+          "max_tokens": 384000,
+          "temperature": 1.0,
+          "modalities": [
+            "text"
+          ],
+          "thinking_effort": "high"
+        },
+        {
+          "model_id": "deepseek-v4-pro",
+          "context_window": 1000000,
+          "max_tokens": 384000,
+          "temperature": 1.0,
+          "modalities": [
+            "text"
+          ],
+          "thinking_effort": "high"
+        }
+      ]
+    },
+    {
+      "provider_id": "sensenova",
+      "name": "sensenova",
+      "api_key": "",
+      "base_url": "https://token.sensenova.cn/v1",
+      "default_model_id": "sensenova-6.8-flash-lite",
+      "temperature": 1.0,
+      "balance_url": "",
+      "models": [
+        {
+          "model_id": "sensenova-6.8-flash-lite",
+          "context_window": 256000,
+          "max_tokens": 32000,
+          "temperature": 1.0,
+          "modalities": [
+            "text",
+            "vision"
+          ],
+          "thinking_effort": "high"
+        },
+        {
+          "model_id": "glm-5.2",
+          "context_window": 1000000,
+          "max_tokens": 256000,
+          "temperature": 1.0,
+          "modalities": [
+            "text"
+          ],
+          "thinking_effort": "high"
+        }
+      ]
+    }
+  ],
+  "active_provider_id": "sensenova",
+  "active_model_id": "sensenova-6.8-flash-lite",
+  "task_models": {
+    "plan": "sensenova-sensenova-6.8-flash-lite",
+    "code": "sensenova-sensenova-6.8-flash-lite",
+    "review": "sensenova-sensenova-6.8-flash-lite"
+  },
+  "prompt": {
+    "dir": "core/prompts",
+    "system_files": [
+      "system_prompt.md"
+    ],
+    "plan_files": [
+      "plan.md"
+    ]
+  },
+  "system": {
+    "font_size": 16
+  },
+  "ui": {
+    "theme": "dark",
+    "mode": "auto",
+    "busy_send_mode": "queue",
+    "logo": true,
+    "send": "ctrl+enter",
+    "newline": "shift+enter",
+    "switch_focus": "tab",
+    "switch_mode": "shift+tab",
+    "expand": "['right', 'l']",
+    "collapse": "['left', 'h']",
+    "toggle_fold": [
+      "enter",
+      "space"
+    ],
+    "scroll_up": "pageup",
+    "scroll_down": "pagedown",
+    "complete": "tab",
+    "collapse_done_steps": true,
+    "scroll_v0": 1.0,
+    "scroll_hold_ms": 150,
+    "scroll_max_step": 20,
+    "tip_interval": 5.0,
+    "settings_debounce_ms": 350,
+    "font_size": 16
+  },
+  "llm": {
+    "retry_times": 3,
+    "retry_delay": 1.0,
+    "stream": true
+  },
+  "log": {
+    "level": "debug",
+    "modules": {},
+    "console": false,
+    "days_to_keep": 14
+  },
+  "memory": {
+    "longterm_path": "data/memory.json",
+    "longterm_dir": "data/memory",
+    "auto_compress": true,
+    "compress_threshold": 0.8,
+    "compress_keep_recent_tokens": 16384,
+    "compress_summary_max_tokens": 1024,
+    "strip_tool_history": true,
+    "strip_tool_keep": 6
+  },
+  "context": {
+    "tool_whitelist": [
+      "write_plan",
+      "update_plan",
+      "generate_steps",
+      "update_step_status",
+      "read_memory",
+      "read_image",
+      "read",
+      "edit_file",
+      "write",
+      "task"
+    ],
+    "whitelist_budget_tokens": 32768,
+    "inline_limit_tokens": 4096,
+    "large_tools": [
+      "read",
+      "search",
+      "write",
+      "edit_file"
+    ],
+    "inline_limit_tokens_large": 32768,
+    "persist_dir": "data/toolcalls",
+    "strip_keep_recent": 0
+  },
+  "skills": {
+    "enabled": true,
+    "dir": "data/skills",
+    "metadata_budget_tokens": 1024
+  },
+  "command_plugins": [
+    "data/commands"
+  ],
+  "plugins": {
+    "enabled": true,
+    "dir": "data/plugins",
+    "disable": [
+      "hello-plugin"
+    ]
+  },
+  "plugins_config": {},
+  "workflow": {
+    "enabled": false,
+    "dir": "data/workflows",
+    "active": "gui-test",
+    "max_rounds": 0,
+    "max_rounds_extensions": 5
+  },
+  "subagent": {
+    "enabled": true,
+    "dir": "data/subagents",
+    "agents_dir": "data/agents",
+    "max_rounds": 20,
+    "result_char_cap": 3000,
+    "query_default_rounds": 3
+  },
+  "tools": {
+    "max_timeout": 600,
+    "ask_user_timeout": true
+  },
+  "mcp": {
+    "enabled": false,
+    "servers": {},
+    "discovery_timeout_stdio": 30,
+    "discovery_timeout_http": 5,
+    "call_timeout": 600,
+    "auto_reconnect": true
+  },
+  "snapshot": {
+    "enabled": true,
+    "dir": "data/snapshots",
+    "trash_dir": "data/trash",
+    "max_turns": 10,
+    "max_file_bytes": 20971520,
+    "inventory_max_files": 50000
+  },
+  "external_apis": {
+    "prompt_refine": null,
+    "plan_generate": null,
+    "plan_confirm": null,
+    "step_generate": null,
+    "step_update": null,
+    "memory_write": null,
+    "memory_read": null,
+    "computer_use": null,
+    "llm_request": null,
+    "tool_confirm": null,
+    "complexity_judge": null,
+    "rag_add": null,
+    "rag_query": null
+  }
+}
