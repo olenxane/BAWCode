@@ -172,6 +172,7 @@ my-plugin/
 | `core.plugins.runtime()` | 模块级函数：只读运行时载体 `{app, runner}` | §12 |
 | `ctx.submit_turn(text)` | 以用户语义提交一条消息开启回合 | §4.4 |
 | `ctx.notify(text)` | 用户可见通知（写入会话系统消息） | §4.4 |
+| `ctx.request_llm_retry()` | 请求重试当前失败的 LLM 请求（仅 API 错误等待态有效） | §4.5 |
 
 ### 4.3 持久化：`ctx.storage_dir()`
 
@@ -255,6 +256,31 @@ ctx.register_hook("before_turn", _on_before_turn)
 - `cancelled` 回调可选传入（如 `llm.cancelled`）；回合被用户中断时面板应尽快放弃
 - 注意 `before_turn` 返回空白的语义是"不参与改写"（原输入照常进行），**没有中止回合的
   通道**——需要放弃任务时请改写成无操作说明（如上例）
+
+#### `ctx.request_llm_retry()` —— 请求重试失败的 LLM 请求
+
+回合遇到瞬态 API 错误（429 限频、5xx、网络超时）且自动重试耗尽后，进入**错误等待态**：
+终端状态行提示 `Ctrl+Y 重试 / Esc 放弃`，回合在此暂停（不写任何会话消息）。此时插件可
+调用本接口代替用户按键触发重试：
+
+| 项 | 说明 |
+|------|------|
+| 返回 | `True` = 已触发重试；`False` = 当前无等待态（回合未出错、错误属 401 等确定性失败、或用户已放弃） |
+| 线程 | 任意线程（内部为事件置位，非阻塞） |
+| 典型场景 | 远程控制端点的"重试"按钮、监控插件在检测到限频解除后自动放行 |
+
+```python
+def _api_retry(payload):
+    if ctx.request_llm_retry():
+        ctx.notify("[助手] 已代为触发重试")
+    return None
+
+ctx.register_external_api("llm_retry", _api_retry)
+```
+
+等待态的退出途径：Ctrl+Y 或本接口触发重试（同一请求重发，不计轮次、不影响会话）；
+Esc 放弃；提交新消息自动放弃（消息按 busy_send_mode 排队/中断接力）；
+`config.llm.retry_wait_seconds` 超时（0=无限等待，默认值）。
 
 
 ---

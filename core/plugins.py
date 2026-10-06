@@ -427,14 +427,20 @@ class PluginContext:
                 session.add_message("system", text, type="help")
                 app = _runtime.get("app")
                 if app is not None:
-                    try:
-                        app.refresh_from_session(session, render=False)
-                    except Exception:
-                        pass
+                    app.refresh_from_session(session, render=False)
         except Exception as e:
             self.log.warn("notify 失败: %s", e)
 
     # ---- 杂项 ----
+
+    def request_llm_retry(self) -> bool:
+        """请求重试当前失败的 LLM 请求：仅当回合正处于 API 错误等待态（瞬态错误
+        自动重试耗尽后，终端提示 Ctrl+Y 重试）时有效；返回是否成功触发。"""
+        app = _runtime.get("app")
+        if app is None:
+            return False
+        fn = getattr(app, "request_llm_retry", None)
+        return bool(fn()) if callable(fn) else False
 
     def register_teardown(self, fn: Callable[[], Any]) -> Callable:
         """注册卸载回调：插件被卸载/重载/禁用回滚时按注册顺序执行（异常隔离）。
@@ -471,7 +477,8 @@ def _import_entry(pid: str, dir_path: Path, manifest: dict):
         raise ImportError(f"无法构造模块 spec: {entry_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    sys.path.insert(0, str(dir_path))
+    # 追加而非插首：插件目录不得遮蔽标准库/宿主/其他插件的同名模块
+    sys.path.append(str(dir_path))
     _runtime_paths.append(str(dir_path))
     try:
         spec.loader.exec_module(module)
@@ -490,6 +497,20 @@ def _load_one(item: dict, config, workspace: Path) -> None:
     manifest = item["manifest"]
     # 配置声明先于启用判定解析：禁用/失败插件同样可在设置面板展开查看/编辑
     decls = _parse_config_decls(manifest, pid)
+    if item.get("error"):
+        # 清单读取/解析失败：以失败状态呈现真实原因，而非误报为"禁用"
+        _loaded[pid] = {
+            "manifest": manifest,
+            "dir": item["dir"],
+            "source": item["source"],
+            "status": "failed",
+            "error": item["error"],
+            "context": None,
+            "module": None,
+            "config_decls": decls,
+        }
+        log.warn("插件清单异常 %s: %s", pid, item["error"])
+        return
     enabled, reason = _enabled_of(manifest, config)
     if not enabled:
         _loaded[pid] = {
@@ -538,8 +559,10 @@ def _load_one(item: dict, config, workspace: Path) -> None:
             record["commands"],
             record["configs"],
         )
-    except Exception as e:
-        # 失败即回滚该插件已注册的一切，错误隔离
+    except (Exception, SystemExit) as e:
+        # SystemExit 不继承 Exception：插件 import 期 sys.exit() 不得击穿隔离
+        # （否则后续插件与技能全部停装，且状态误标 loaded）；KeyboardInterrupt 保持穿透
+        # 失败即回滚该插件已注册的一切与 sys.path 残留，错误隔离
         _unload_registrations(pid)
         record["status"] = "failed"
         record["error"] = f"{type(e).__name__}: {e}"
@@ -557,13 +580,20 @@ def _run_teardowns(pid: str) -> None:
 
 
 def _unload_registrations(pid: str) -> None:
-    """按 owner 注销插件在宿主各注册表的登记（hooks/commands/tools/skills）"""
+    """按 owner 注销插件在宿主各注册表的登记（hooks/commands/tools/skills/sys.path）"""
     _run_teardowns(pid)
     hooks.remove_owner(pid)
     commands.remove_source(f"plugin:{pid}")
     register.unregister_owner(pid)
     module_name = f"bawcode_plugin_{re.sub(r'[^A-Za-z0-9_]', '_', pid)}"
     sys.modules.pop(module_name, None)
+    rec = _loaded.get(pid)
+    if rec:
+        dir_text = str(rec["dir"])
+        if dir_text in sys.path:
+            sys.path.remove(dir_text)
+        if dir_text in _runtime_paths:
+            _runtime_paths.remove(dir_text)
 
 
 def _sync_plugin_skills(workspace: Path) -> None:
@@ -674,7 +704,8 @@ def status_listing() -> str:
 
 def set_enabled(pid: str, enabled: bool, config) -> bool:
     """启停插件并持久化到 config.plugins.disable（写盘）；返回插件是否存在"""
-    if pid not in _loaded and not any(r["id"] == pid for r in statuses()):
+    # statuses() 完全派生自 _loaded，存在性判断以此为准
+    if pid not in _loaded:
         return False
     data = config.data
     plugins_cfg = data.setdefault("plugins", {})

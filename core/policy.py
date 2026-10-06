@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -26,6 +27,9 @@ MODE_LABELS = {
 ALLOW = "allow"
 CONFIRM = "confirm"
 DENY = "deny"
+
+# 路径类工具：文件系统副作用，通配放行需限定项目边界
+PATH_TOOLS = ("write", "edit_file", "delete_file")
 
 # 只读安全工具（manual 也放行）
 SAFE_TOOLS = {
@@ -57,10 +61,38 @@ SAFE_TOOLS = {
     "delete_memory",
 }
 
-# 命令白名单片段（manual/auto 判为相对安全）
-_SAFE_CMD_RE = re.compile(
-    r"(?i)(^|\s|/|\\)(ls|dir|pwd|cd|echo|cat|head|tail|tree|where|which|env|set|ver|version|python\s+-V|pip\s+show|git\s+status|git\s+log|git\s+branch|type)(\s|$)",
-)
+# 只读动词表：SAFE 判定要求整条命令无管道/链式/重定向（复合命令一律不走 SAFE），
+# 且首词（取文件名部分）在此表内——关键词子串匹配会让 "dir | powershell ..." 误判安全
+SAFE_VERBS = {
+    "ls", "dir", "pwd", "cd", "echo", "cat", "head", "tail", "tree",
+    "where", "which", "env", "set", "ver", "version", "type",
+}
+# 两段式只读命令（首词 + 子命令/标志）
+SAFE_VERB_PAIRS = {
+    "git status", "git log", "git branch", "pip show", "python -v", "python3 -v",
+}
+
+
+def has_shell_operator(cmd: str) -> bool:
+    """双引号外出现管道/链式/重定向/换行即视为复合命令（cmd 下单引号非引用，一并按操作符处理）"""
+    in_dq = False
+    for ch in cmd:
+        if ch == '"':
+            in_dq = not in_dq
+        elif not in_dq and ch in "|;&<>\n":
+            return True
+    return False
+
+
+def readonly_simple_cmd(cmd: str) -> bool:
+    """单条无操作符命令，首词属于只读动词表（含两段式组合）"""
+    tokens = cmd.strip().split()
+    if not tokens:
+        return False
+    first = tokens[0].lower().replace("\\", "/").rsplit("/", 1)[-1]
+    if first in SAFE_VERBS:
+        return True
+    return " ".join([first] + [t.lower() for t in tokens[1:2]]) in SAFE_VERB_PAIRS
 _DANGEROUS_CMD_RE = re.compile(
     r"""(?xi)
     (?:
@@ -84,14 +116,13 @@ _DANGEROUS_CMD_RE = re.compile(
     """
 )
 
-_VERSION_RE = re.compile(r"(?i)(-v|--version|version)\s*$")
-
 # 删除类命令硬拒绝（完全访问模式也不例外）：shell 直删不可恢复，文件删除一律走
 # delete_file 工具（移入项目回收站，可 /undo 回滚、/clear-trash 真正清空）。
-# 只匹配命令首词或分隔符（|;&）之后的删除词，避免 "python app.py del" 这类参数误伤
+# 只匹配命令首词或分隔符（|;& 与换行，shell 下换行即命令分隔）之后的删除词，
+# 避免 "python app.py del" 这类参数误伤
 _DELETE_CMD_RE = re.compile(
-    r"(?ix)(?:^|[|;&])\s*(?:[a-z]:\S+\s+)?(?:rm|rmdir|rd|del|erase|deltree|rimraf)(?:\s|$)|"
-    r"(?:^|[|;&])\s*remove-item(?:\s|$)"
+    r"(?ix)(?:^|[|;&\r\n])\s*(?:[a-z]:\S+\s+)?(?:rm|rmdir|rd|del|erase|deltree|rimraf)(?:\s|$)|"
+    r"(?:^|[|;&\r\n])\s*remove-item(?:\s|$)"
 )
 _DELETE_DENY_REASON = (
     "删除类命令被拦截（不可恢复）：请改用 delete_file 工具"
@@ -100,7 +131,8 @@ _DELETE_DENY_REASON = (
 
 
 def project_root() -> Path:
-    return _ROOT
+    # allowlist 按项目键控：项目即进程启动目录（与 ensure_project_identity(Path.cwd()) 同源）
+    return Path.cwd()
 
 
 def allowlist_path(root: Optional[Path] = None) -> Path:
@@ -119,6 +151,11 @@ def load_allowlist(root: Optional[Path] = None) -> Dict[str, list]:
             return {"rules": []}
         data = json.loads(raw)
         if isinstance(data, dict) and isinstance(data.get("rules"), list):
+            # 存量清洗：路径类工具的工具级通配（如 write|*）放行范围无界，加载即剔除
+            data["rules"] = [
+                r for r in data["rules"]
+                if not (r.get("tool") in PATH_TOOLS and (r.get("fingerprint") or "") == f"{r.get('tool')}|*")
+            ]
             return data
         log.warn("allowlist 格式异常，忽略: %s", path)
     except (json.JSONDecodeError, OSError) as e:
@@ -151,7 +188,10 @@ def fingerprint(tool_name: str, args: Optional[dict]) -> str:
         prog = str(args.get("program") or "").lower()
         return f"run_program|{prog}"
     if tool_name in ("write", "edit_file", "delete_file"):
-        path = str(args.get("file_path") or "").replace("\\", "/").lower()
+        path = str(args.get("file_path") or "").replace("\\", "/")
+        if sys.platform == "win32":
+            # Windows 路径大小写不敏感，指纹归一小写；其余平台保留大小写
+            path = path.lower()
         return f"{tool_name}|{path}"
     # 其他：工具名 + 参数键排序摘要
     keys = sorted(args.keys())
@@ -170,6 +210,21 @@ def similar_fingerprint(tool_name: str, args: Optional[dict]) -> str:
         parts = cmd.strip().split()
         return f"execute_command|{(parts[0].lower() if parts else '')}"
     return fingerprint(tool_name, args).split("|")[0] + "|*"
+
+
+def path_in_scope(tool_name: str, fp: str, root: Path) -> bool:
+    """路径类工具的通配放行仅限项目根内：allowlist 按项目键控，
+    write|* 这类工具级通配若不限定边界，可免确认写 hosts/.ssh 等项目外文件"""
+    if tool_name not in PATH_TOOLS:
+        return True
+    target = fp.split("|", 1)[1] if "|" in fp else ""
+    if not target:
+        return False
+    try:
+        Path(target).resolve().relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _command_text(tool_name: str, args: dict) -> str:
@@ -191,16 +246,13 @@ def is_safe_call(tool_name: str, args: Optional[dict]) -> bool:
         cmd = _command_text(tool_name, args)
         if not cmd.strip():
             return False
+        # 危险词全串扫描为独立第二层；复合命令（管道/链式/重定向）一律不 SAFE，
+        # 落回确认路径——"| powershell"、"| nc" 这类外发链由此拦下
         if _DANGEROUS_CMD_RE.search(cmd):
             return False
-        if _VERSION_RE.search(cmd.strip()):
-            return True
-        if _SAFE_CMD_RE.search(cmd):
-            # 安全命令若含重定向写、rm 等仍拦截
-            if re.search(r"(>>|>|\|\s*(rm|del)|;|\&\&)", cmd):
-                return False
-            return True
-        return False
+        if has_shell_operator(cmd):
+            return False
+        return readonly_simple_cmd(cmd)
     # 未知工具：保守
     return False
 
@@ -213,15 +265,19 @@ def evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pat
 
 
 def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Path] = None) -> Tuple[str, str]:
+    root = root or project_root()
     # 删除类命令硬安全栏：先于一切模式判定（full 也不例外）
     if tool_name == "execute_command" and _DELETE_CMD_RE.search(str((args or {}).get("command") or "")):
         return DENY, _DELETE_DENY_REASON
-    if mode == MODE_FULL or not mode:
+    if mode == MODE_FULL:
         return ALLOW, "full"
+    if not mode:
+        # 失效关闭：未知模式不放假放行
+        return CONFIRM, "unknown_mode"
     if not tool_name:
         return CONFIRM, "unknown_tool"
 
-    # 项目始终允许规则
+    # 项目始终允许规则（路径类工具的通配命中需通过项目边界校验）
     rules = load_allowlist(root).get("rules") or []
     fp = fingerprint(tool_name, args)
     sfp = similar_fingerprint(tool_name, args)
@@ -229,7 +285,13 @@ def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pa
         if rule.get("tool") != tool_name:
             continue
         pattern = rule.get("fingerprint") or ""
-        if pattern in (fp, sfp) or (pattern.endswith("|*") and fp.startswith(pattern[:-1])):
+        if pattern in (fp, sfp) and not pattern.endswith("|*"):
+            return ALLOW, f"allowlist:{pattern}"
+        if (
+            pattern.endswith("|*")
+            and fp.startswith(pattern[:-1])
+            and path_in_scope(tool_name, fp, root)
+        ):
             return ALLOW, f"allowlist:{pattern}"
 
     if mode == MODE_MANUAL:

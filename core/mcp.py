@@ -377,25 +377,52 @@ async def _disconnect_coro(name: str):
             pass
 
 
-def _worker(config, name: str, entry: dict, cfg: dict) -> None:
-    """连接 worker（后台线程）：单个服务器失败不拖累其他服务器"""
-    _ensure_loop()
+def _init_state(name: str, entry: dict) -> dict:
+    """服务器状态条目取回/初始化（缺省 CONNECTING，transport 由配置推导）"""
+    return _STATE.setdefault(
+        name,
+        {"status": CONNECTING, "last_error": "", "transport": _transport_of(entry), "tools": [], "server_tool": {}},
+    )
+
+
+def _connect_once(name: str, entry: dict, cfg: dict) -> None:
+    """一次连接尝试：置 CONNECTING → 连接协程 → 失败落 DISCONNECTED + last_error。
+    inflight 互斥由调用方负责（_connect_attempt 或 reconnect 的前置闸）"""
+    state = _init_state(name, entry)
+    state["status"] = CONNECTING
+    try:
+        _submit(_connect_coro(name, entry, cfg), timeout=cfg.get("discovery_timeout_stdio", 30) + 30)
+    except BaseException as exc:
+        state["status"] = DISCONNECTED
+        state["last_error"] = _brief_error(exc)
+        log.error("MCP 连接失败 %s: %s", name, state["last_error"])
+
+
+def _connect_attempt(name: str, entry: dict, cfg: dict) -> bool:
+    """带 inflight 互斥的一次连接尝试；已在途返回 False"""
     with _LOCK:
         if name in _INFLIGHT:
-            return
+            return False
         _INFLIGHT.add(name)
     try:
-        state = _STATE.setdefault(name, {"status": CONNECTING, "last_error": "", "transport": _transport_of(entry), "tools": [], "server_tool": {}})
-        state["status"] = CONNECTING
-        try:
-            _submit(_connect_coro(name, entry, cfg), timeout=cfg["discovery_timeout_stdio"] + 30)
-        except BaseException as exc:
-            state["status"] = DISCONNECTED
-            state["last_error"] = _brief_error(exc)
-            log.error("MCP 连接失败 %s: %s", name, state["last_error"])
+        _connect_once(name, entry, cfg)
+        return True
     finally:
         with _LOCK:
             _INFLIGHT.discard(name)
+
+
+def _disconnect_quiet(name: str) -> None:
+    """重连前的静默断开：旧连接清理失败不阻断后续重连"""
+    try:
+        _submit(_disconnect_coro(name), timeout=8)
+    except Exception:
+        pass
+
+
+def _worker(config, name: str, entry: dict, cfg: dict) -> None:
+    """连接 worker（后台线程）：单个服务器失败不拖累其他服务器"""
+    _connect_attempt(name, entry, cfg)
 
 
 def _brief_error(exc: BaseException) -> str:
@@ -421,26 +448,9 @@ def _reconnect_after_failure(name: str) -> None:
     entry = handle.get("entry")
     if not entry:
         return
-    try:
-        _submit(_disconnect_coro(name), timeout=8)
-    except Exception:
-        pass
-    with _LOCK:
-        if name in _INFLIGHT:
-            return
-        _INFLIGHT.add(name)
-    try:
-        state = _STATE.setdefault(name, {"status": CONNECTING, "last_error": "", "transport": _transport_of(entry), "tools": [], "server_tool": {}})
-        state["status"] = CONNECTING
-        cfg = mcp_cfg(_LAST_CONFIG[0]) if _LAST_CONFIG[0] else _MCP_DEFAULTS
-        try:
-            _submit(_connect_coro(name, entry, cfg), timeout=cfg.get("discovery_timeout_stdio", 30) + 30)
-        except BaseException as exc:
-            state["status"] = DISCONNECTED
-            state["last_error"] = _brief_error(exc)
-    finally:
-        with _LOCK:
-            _INFLIGHT.discard(name)
+    _disconnect_quiet(name)
+    cfg = mcp_cfg(_LAST_CONFIG[0]) if _LAST_CONFIG[0] else dict(_MCP_DEFAULTS)
+    _connect_attempt(name, entry, cfg)
 
 
 def _make_wrapper(server: str, handle: dict, original: str, schema: dict, call_timeout: int, cfg: dict):
@@ -501,10 +511,7 @@ def register_tools(config) -> bool:
     _ensure_loop()
     for name, entry in entries.items():
         name = str(name)
-        _STATE.setdefault(
-            name,
-            {"status": CONNECTING, "last_error": "", "transport": _transport_of(entry), "tools": [], "server_tool": {}},
-        )
+        _init_state(name, entry)
         threading.Thread(target=_worker, args=(config, name, entry, cfg), daemon=True, name=f"mcp-{name}").start()
     log.info("MCP 桥接启动: %d 个服务器后台连接中", len(entries))
     return True
@@ -558,10 +565,7 @@ def reconnect(name: str) -> tuple:
 
     def _worker() -> None:
         try:
-            try:
-                _submit(_disconnect_coro(name), timeout=8)
-            except Exception:
-                pass
+            _disconnect_quiet(name)
             handle = _RUNTIME["handles"].get(name) or {}
             entry = handle.get("entry")
             if entry is None:
@@ -569,13 +573,8 @@ def reconnect(name: str) -> tuple:
                 _STATE[name]["last_error"] = "无连接配置缓存，请重启程序"
                 return
             cfg = mcp_cfg(_LAST_CONFIG[0]) if _LAST_CONFIG[0] else dict(_MCP_DEFAULTS)
-            state = _STATE[name]
-            state["status"] = CONNECTING
-            try:
-                _submit(_connect_coro(name, entry, cfg), timeout=cfg.get("discovery_timeout_stdio", 30) + 30)
-            except BaseException as exc:
-                state["status"] = DISCONNECTED
-                state["last_error"] = _brief_error(exc)
+            # inflight 闸由 reconnect 前置持有，此处直接尝试连接
+            _connect_once(name, entry, cfg)
         finally:
             with _LOCK:
                 _INFLIGHT.discard(name)

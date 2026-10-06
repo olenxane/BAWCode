@@ -44,8 +44,6 @@ _SUBAGENT_EXCLUDED_TOOLS = {
     "update_plan",
     "generate_steps",
     "update_step_status",
-    "memory_add_fact",
-    "memory_add_project_note",
     # RAG 项目级开关（写插件状态文件，主会话语义；检索/重建对子代理开放）
     "set_rag",
 }
@@ -225,8 +223,10 @@ def _records_dir(config, session) -> Path:
 
 
 def _record_path(directory: Path, record_id: str) -> Path:
-    safe = str(record_id).strip() or "0"
-    return directory / f"{safe}.json"
+    # id 由 _next_id 生成为纯数字；外部入参（query_subagent/resume_id）同样只接受纯数字，
+    # 防止 ".."、盘符等内容注入路径读到目录外文件（0.json 不存在，等效查无此记录）
+    safe = str(record_id).strip()
+    return directory / f"{safe if safe.isdigit() else '0'}.json"
 
 
 def _next_id(directory: Path) -> str:
@@ -437,11 +437,21 @@ def _build_summary(record: dict, final_text: str, cfg: dict, record_path: Option
 def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict],
               max_rounds: int, spin: SpinGuard, directory: Path) -> tuple:
     """子代理执行循环。返回 (status, final_text)；防空转与主循环同判据（SpinGuard：
-    重复输出才开始计数，整轮全新结果清零，计满 spin_kill_count 终止，无续期次数上限）"""
+    重复/近似重复输出才开始计数，整轮全新结果清零，计满 spin_kill_count 终止）；
+    续期总量受 config.workflow.max_total_rounds 兜底保险丝约束（默认 100）"""
     llm, io = rt["llm"], rt["io"]
+    wf_cfg = (getattr(rt.get("config"), "data", None) or {}).get("workflow") or {}
+    try:
+        fuse_cfg = int(wf_cfg.get("max_total_rounds") or 0)
+    except (TypeError, ValueError):
+        fuse_cfg = 0
+    total_cap = fuse_cfg if fuse_cfg > 0 else max(100, max(1, max_rounds))
     rounds = 0
     while True:
         if rounds >= max_rounds:
+            if rounds >= total_cap:
+                log.info("子代理 #%s 回合计达兜底上限 %d 轮，终止", record.get("id"), total_cap)
+                return ("max_rounds", "")
             if spin.spun_out():
                 log.info("子代理 #%s 空转计数满 %d 次，终止", record.get("id"), spin.count)
                 return ("max_rounds", "")
@@ -469,32 +479,36 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
             if content:
                 messages.append({"role": "assistant", "content": content})
             return ("done", content)
-        messages.append(
+        norm_calls = [
             {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [
-                    {
-                        "id": str(c.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
-                        "name": c.get("name"),
-                        "arguments": c.get("arguments") if isinstance(c.get("arguments"), dict) else {},
-                        "type": "function",
-                    }
-                    for c in tool_calls
-                ],
+                "id": str(c.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
+                "name": c.get("name"),
+                "arguments": c.get("arguments") if isinstance(c.get("arguments"), dict) else {},
+                "type": "function",
             }
-        )
+            for c in tool_calls
+        ]
+        messages.append({"role": "assistant", "content": content, "tool_calls": norm_calls})
         _live_phase(rt, f"工具调用中 · 第{rounds}轮")
         round_results = []
-        for call in tool_calls:
-            item = _execute_one(rt, call, str(record.get("permission") or "auto"))
-            messages.append(item)
-            round_results.append(item)
-            record["tools_used"] = _int(record.get("tools_used"), 0) + 1
-            failed = "❌" if _failure_hint(item.get("content")) else "✅"
-            _live_tool(rt, f"⚙ {call.get('name')} {failed}")
-            if io.cancelled() or llm.cancelled():
-                return ("interrupted", "")
+        processed = []
+        try:
+            for call in norm_calls:
+                item = _execute_one(rt, call, str(record.get("permission") or "auto"))
+                messages.append(item)
+                round_results.append(item)
+                processed.append(call)
+                record["tools_used"] = _int(record.get("tools_used"), 0) + 1
+                failed = "❌" if _failure_hint(item.get("content")) else "✅"
+                _live_tool(rt, f"⚙ {call.get('name')} {failed}")
+                if io.cancelled() or llm.cancelled():
+                    return ("interrupted", "")
+        finally:
+            # 中断/异常时补齐未执行调用的 tool 结果，保持与 assistant.tool_calls 配对，
+            # 否则落盘的消息列表在 resume 后会被 API 以配对不全拒绝
+            for call in norm_calls:
+                if call not in processed:
+                    messages.append(_normalize_tool_msg(call, "工具执行被中断，未获得结果"))
         # 空转计数：本轮结果喂入计数器（重复才计，整轮全新清零）
         spin.feed(round_results)
         # 每轮落盘：崩溃/中断时记录可恢复
@@ -505,10 +519,7 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
 def _failure_hint(content: Any) -> bool:
     from core.tools import tool_failure_hint
 
-    try:
-        return bool(tool_failure_hint(str(content or "")))
-    except Exception:
-        return False
+    return bool(tool_failure_hint(str(content or "")))
 
 
 # ---------------------------------------------------------------------------

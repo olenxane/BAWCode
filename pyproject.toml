@@ -1,11 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "bawcode"
 version = "0.1.0"
 description = "BAWCode coding agent"
 requires-python = ">=3.10"
+# 核心硬依赖：缺失则启动即崩（与 requirements.txt 顶部一致）
 dependencies = [
     "openai>=1.40.0",
     "rich>=13.0.0",
     "tiktoken>=0.7.0",
+    "wcwidth>=0.8.0",
+    "prompt_toolkit>=3.0.53",
+    "pyyaml>=6.0",
     "mcp>=1.2.0",
 ]
+
+[project.optional-dependencies]
+# 可选功能组：缺失时对应功能降级提示，主程序可用（与 requirements.txt 分组注释一致）
+gui = ["PySide6>=6.6"]
+webfetch = ["requests>=2.31.0", "beautifulsoup4>=4.12.0", "lxml>=5.0.0"]
+rag = ["tree_sitter>=0.26,<0.27", "tree-sitter-language-pack>=1.20,<1.21"]
+qbridge = ["websockets>=13"]
+
+[tool.setuptools]
+# 源码运行为主（data/ 运行时资源不入包）；此处仅保证 pip install . 可构建
+packages = ["core", "gui"]

@@ -13,6 +13,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 _handlers: Dict[str, Callable] = {}
 _metas: Dict[str, dict] = {}
 _aliases: Dict[str, str] = {}
+# 插件覆盖同名内建命令时的原条目留底：插件卸载后恢复（与 register 的机制同构）
+_overridden: Dict[str, dict] = {}
 # 命令参数补全器：name -> fn(config, arg) -> list[dict]
 _ARG_COMPLETERS: Dict[str, Callable] = {}
 # 补全器来源归属：name -> source（插件卸载时仅注销自己注册的补全器）
@@ -62,12 +64,7 @@ def _complete_mode(config, arg: str) -> List[dict]:
 
 
 def _complete_theme(config, arg: str) -> List[dict]:
-    names = ["dark", "ocean"]
-    if config is not None and hasattr(config, "list_themes"):
-        try:
-            names = config.list_themes() or names
-        except Exception:
-            pass
+    names = (config.list_themes() if config is not None else []) or ["dark", "ocean"]
     items = [{"name": f"/theme {n}", "hint": "主题", "source": "arg", "callable": True} for n in names]
     return _filter_arg_items(items, arg)
 
@@ -130,10 +127,17 @@ register_arg_completer("/skill", _complete_skill)
 register_arg_completer("/workflow", _complete_workflow)
 
 
-def set_handler(name: str, handler: Callable) -> None:
+def set_handler(name: str, handler: Callable, source: str = "runtime") -> None:
     key = _normalize(name)
     if not key or handler is None:
         return
+    if source.startswith("plugin:") and key in _handlers and key not in _overridden:
+        # 插件覆盖真实存在的同名命令：留底原条目，插件卸载时恢复
+        # （仅首次覆盖留底；空桩与同来源重注册不留底）
+        _overridden[key] = {
+            "meta": dict(_metas[key]) if key in _metas else None,
+            "handler": _handlers[key],
+        }
     _handlers[key] = handler
     _metas.setdefault(key, {"hint": "", "usage": "", "aliases": [], "source": "runtime"})
     log.debug("注册命令: %s", key)
@@ -174,12 +178,12 @@ def register(
     source: str = "builtin",
 ):
     def _bind(fn: Callable) -> Callable:
-        set_handler(name, fn)
+        set_handler(name, fn, source)
         set_meta(name, hint=hint, usage=usage, aliases=aliases, source=source)
         return fn
 
     if handler is not None:
-        set_handler(name, handler)
+        set_handler(name, handler, source)
         set_meta(name, hint=hint, usage=usage, aliases=aliases, source=source)
         return handler
     return _bind
@@ -239,6 +243,13 @@ def remove_source(source: str) -> List[str]:
             if _aliases.get(alias) == key:
                 _aliases.pop(alias, None)
         _handlers.pop(key, None)
+        backup = _overridden.pop(key, None)
+        if backup is not None:
+            # 恢复被覆盖的内建命令（handler 与元数据任一有留底即恢复对应部分）
+            if backup.get("meta") is not None:
+                _metas[key] = backup["meta"]
+            if backup.get("handler") is not None:
+                _handlers[key] = backup["handler"]
     # 补全器按来源整体清理：插件可给内建命令挂补全器，注销不随插件自身命令走
     for key, src in list(_ARG_COMPLETER_SOURCES.items()):
         if src == source:
@@ -270,7 +281,12 @@ def complete(prefix: str, limit: int = 12, config: Any = None) -> List[dict]:
     # 参数补全：已出现空格，或命令名已精确命中且带参数片段
     completer = _ARG_COMPLETERS.get(resolved) or _ARG_COMPLETERS.get(head)
     if completer is not None and (has_arg_sep or (arg and resolved in _ARG_COMPLETERS)):
-        items = completer(config, arg)
+        try:
+            items = completer(config, arg)
+        except Exception as e:
+            # 插件补全器异常隔离：本函数处于输入帧循环内，不能被打断
+            log.warn("参数补全器异常 %s: %s", resolved or head, e)
+            items = []
         if items:
             return items[:limit]
         if has_arg_sep:

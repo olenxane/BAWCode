@@ -1,4 +1,4 @@
-#该部分是工具的具体实现，需要补齐常用工具，包含：基础的文件编辑、computer-use相关、终端命令调用、程序调用、计划编写、步骤生成、步骤更新、计划更新
+#工具的具体实现：文件读写与编辑、终端命令与程序调用、内容搜索、网页抓取、计划与步骤、关键词记忆、技能加载、computer-use 外部接口
 import base64
 import difflib
 import hashlib
@@ -235,7 +235,7 @@ def set_ask_user_bridge(fn) -> None:
 
 
 def _ask_user_timeout() -> int:
-    """自动超时秒数：开关开启固定 5 分钟（兼容旧数字配置，>0 视为开），关=0 禁用"""
+    """自动超时秒数：开关开启固定 5 分钟（数字配置 >0 视为开），关=0 禁用"""
     try:
         session = memory_mod.get_session()
         data = getattr(getattr(session, "config", None), "data", None) or {}
@@ -489,7 +489,7 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
             # 返回带路径与体量：不同文件的写入结果可区分（防空转重复判定 + 模型反馈）
             return f"写入成功: {path}（{len(content)} 字符）{suffix}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 新建文件：UTF-8 + 系统默认行尾风格（沿用原 write_text 的 os.linesep 行为）
+        # 新建文件：UTF-8 + 系统默认行尾风格
         _written, serr = _save_editable_msg(path, content, os.linesep != "\n", "utf-8", False)
         if serr:
             return serr
@@ -670,10 +670,7 @@ def _save_editable_msg(path: Path, content: str, is_crlf: bool, enc: str, bom: b
     try:
         return _save_editable(path, content, is_crlf, enc, bom), ""
     except UnicodeEncodeError as e:
-        try:
-            bad = content[e.start : e.start + 1]
-        except Exception:
-            bad = "?"
+        bad = content[e.start : e.start + 1]
         log.warn("写入编码失败: %s（%s 无法表示 %r）", path, enc, bad)
         return 0, (
             f"写入失败：新内容含「{enc}」编码无法表示的字符（{bad!r}），文件未改动。"
@@ -967,30 +964,54 @@ def tool_failure_hint(content: str) -> bool:
 
 
 class SpinGuard:
-    """空转计数器（2026-10-05 用户裁决口径）：重复输出出现才开始计数，计满才杀。
+    """空转计数器：重复输出出现才开始计数，计满才杀。
 
-    - 结果键 = 工具名 + 去空白内容；某结果的键在本轮之前已出现过 → 该结果计一次重复
-      （即同一输出出现两次及以上，计数才真正开始——首次出现不计）
+    - 结果键 = 工具名 + 目标（read 结果自带 file_path）或去空白内容；键在本轮之前
+      已出现过 → 该结果计一次重复（同一输出出现两次及以上，计数才真正开始）
+    - read 按文件路径判重：同文件反复读即空转，覆盖"读一个正在变化的文件"这类
+      内容每次微变、内容键永不命中的空转
+    - 其他工具在精确键之外辅以前缀相似度（≥0.9）判重，覆盖结果仅数字微变的空转
     - 本轮含重复 → 计数累加（每条重复 +1）；本轮全部为新结果 → 计数清零
       （空转被真实进展打断）
-    - 计数达到 kill_count（默认 12）→ spun_out() 为真，由调用方终止回合；
-      未计满期间续期不设次数上限（原 max_rounds_extensions 的"无进展即杀"口径废弃）
+    - 计数达到 kill_count（默认 12）→ spun_out() 为真，由调用方终止回合
     主循环（core/loop.tool_loop）与子代理循环共用。"""
+
+    FUZZ_RATIO = 0.9
+    FUZZ_PREFIX = 512
+    RECENT_CAP = 32
 
     def __init__(self, kill_count: int = 12):
         self.kill_count = max(1, int(kill_count))
         self.seen: set = set()
+        self.recent: dict = {}
         self.count = 0
 
     def feed(self, results) -> None:
         """喂入本轮全部工具结果消息，更新计数（空轮/无结果为清零）"""
         dups = 0
         for m in results or []:
-            key = f"{str(m.get('tool_name') or '')}|{re.sub(r'\s+', '', memory_mod.content_text(m.get('content')))}"
-            if key in self.seen:
-                dups += 1
+            tool = str(m.get("tool_name") or "")
+            target = str(m.get("file_path") or "")
+            if target:
+                key = f"{tool}|{target}"
+                dup = key in self.seen
+                if not dup:
+                    self.seen.add(key)
             else:
-                self.seen.add(key)
+                body = re.sub(r"\s+", "", memory_mod.content_text(m.get("content")))
+                key = f"{tool}|{body}"
+                probe = body[: self.FUZZ_PREFIX]
+                recent = self.recent.setdefault(tool, [])
+                dup = key in self.seen or any(
+                    difflib.SequenceMatcher(None, probe, old).ratio() >= self.FUZZ_RATIO
+                    for old in recent
+                )
+                if not dup:
+                    self.seen.add(key)
+                    recent.append(probe)
+                    del recent[: -self.RECENT_CAP]
+            if dup:
+                dups += 1
         self.count = self.count + dups if dups else 0
 
     def spun_out(self) -> bool:
@@ -1356,6 +1377,8 @@ def _rg_search(
     except OSError:
         return None
     matches = []
+    # 达到条数上限主动停读时进程会被 kill，退出码不可作为执行失败依据
+    hit_limit = False
     try:
         for line in proc.stdout:
             try:
@@ -1369,6 +1392,7 @@ def _rg_search(
             text = (data.get("lines") or {}).get("text") or ""
             matches.append((path_text, int(data.get("line_number") or 0), text.rstrip("\r\n")))
             if len(matches) >= max_matches:
+                hit_limit = True
                 break
     finally:
         if proc.poll() is None:
@@ -1378,7 +1402,7 @@ def _rg_search(
         except subprocess.TimeoutExpired:
             pass
     # 退出码 2 = 执行出错（典型为 rust 正则不兼容），交兜底路径处理
-    if proc.returncode and proc.returncode not in (0, 1):
+    if not hit_limit and proc.returncode and proc.returncode not in (0, 1):
         return None
     return matches
 
@@ -1544,7 +1568,9 @@ def run_program(
         output = (result.stdout or "") + (result.stderr or "")
         if result.returncode != 0:
             log.warn("程序退出码 %d: %s", result.returncode, " ".join(cmd))
-        return output.strip() or f"程序退出码 {result.returncode}"
+            # 退出码进返回值：与 execute_command 同口径，供失败启发式与模型感知
+            return f"命令退出码 {result.returncode}\n{output}".strip()
+        return output.strip() or "命令退出码 0"
     except subprocess.TimeoutExpired:
         log.warn("程序超时（>%ds）: %s", timeout, " ".join(cmd))
         return f"程序超时（>{timeout}s）"
@@ -1974,10 +2000,10 @@ def webfetch(url: str, timeout: int = 30) -> str:
 
     if "application/json" in ctype:
         text = content.decode("utf-8", errors="replace")
-    elif "html" in ctype or "xml" in ctype or not ctype:
+    elif "html" in ctype or "xml" in ctype or "text" in ctype or not ctype:
         soup = BeautifulSoup(content, "lxml")
         if soup.find("html") is None and b"<html" not in content[:2048].lower():
-            # 非 HTML 响应（纯文本等）：按文本直出
+            # 非 HTML 响应（text/plain 等纯文本）：按文本直出
             text = content.decode("utf-8", errors="replace")
         else:
             title, body = _webfetch_render(soup, final_url)
@@ -2095,8 +2121,7 @@ def update_plan(
 def generate_steps(steps: List[str], external_handler=None) -> str:
     """步骤生成；用户参与型，预留外部 API 接口
 
-    步骤由主 LLM 结构化传入：清洗空行并钳制数量（旁路文本解析时代模型跑题
-    曾把整份 HTML 源码逐行收成 1379 步，2026-10-04），超限报错交模型自纠。"""
+    步骤由主 LLM 结构化传入：清洗空行并钳制数量，超限报错交模型自纠。"""
     session = _session()
     if session is None:
         return "记忆会话未初始化"
@@ -2347,9 +2372,6 @@ def delete_memory(keyword: str, type: str = "project") -> str:
     if status == "error":
         return "删除失败: 文件系统错误，详见日志"
     return f"已删除{('全局' if type == 'global' else '项目')}记忆「{key}」"
-
-
-# rag_add 工具已剥离为官方插件 data/plugins/rag（同名同 schema，经 ctx.register_tool 注册）
 
 
 @register.register(

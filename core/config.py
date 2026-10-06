@@ -1,7 +1,9 @@
 #此文件实现配置文件读取和保存功能（多 provider）
 import copy
 import json
+import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -186,8 +188,8 @@ def default_config() -> dict:
         },
         # 工具执行层（core/tools.py）：max_timeout 为模型传入 timeout 参数的
         # 钳制上限（execute_command/run_program），防止模型传超大值绕过卡死兜底；
-        # ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟），
-        # 兼容旧数字配置（>0 视为开）
+        # ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟；
+        # 数字配置 >0 视为开）
         "tools": {
             "max_timeout": 600,
             "ask_user_timeout": True,
@@ -221,8 +223,7 @@ def default_config() -> dict:
             "max_file_bytes": 20971520,
             "inventory_max_files": 50000,
         },
-        # 核心功能外部 API（UI/改配置不挂接口；早期 rag_add/rag_query 钩子已随
-        # RAG 插件 v0.3 移除——检索改插件内建（关键词/嵌入模型），无外部接管点）
+        # 核心功能外部 API（UI/改配置不挂接口）
         "external_apis": {
             "prompt_refine": None,
             "plan_generate": None,
@@ -321,6 +322,7 @@ class Config:
 
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+        self.load_error = ""  # 启动提示用：坏配置被隔离时记录原因
         self.data = default_config()
         self._load()
         init_logging(self.data.get("log") or {})
@@ -331,23 +333,54 @@ class Config:
         if not self.config_path.exists():
             log.info("配置文件不存在，使用内置默认配置: %s", self.config_path)
             return
-        raw = self.config_path.read_text(encoding="utf-8").strip()
+        try:
+            # utf-8-sig：容忍记事本等工具写入的 BOM
+            raw = self.config_path.read_text(encoding="utf-8-sig").strip()
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            self._quarantine_bad_config(f"配置文件读取失败: {e}")
+            return
         if not raw:
             log.info("配置文件为空，使用内置默认配置: %s", self.config_path)
             return
         try:
             loaded = json.loads(raw)
         except json.JSONDecodeError as e:
-            log.error("配置文件 JSON 解析失败 %s: %s", self.config_path, e)
-            raise
-        if isinstance(loaded, dict):
-            log.debug("已加载配置: %s", self.config_path)
-            self.data = _deep_merge(self.data, loaded)
-            self._migrate_legacy()
-            self.apply_active()
+            self._quarantine_bad_config(f"配置文件 JSON 解析失败: {e}")
+            return
+        if not isinstance(loaded, dict):
+            self._quarantine_bad_config(f"配置顶层应为对象，实际为 {type(loaded).__name__}")
+            return
+        log.debug("已加载配置: %s", self.config_path)
+        self.data = _deep_merge(self.data, loaded)
+        self._sanitize_data()
+        self._migrate_legacy()
+        self.apply_active()
+
+    def _quarantine_bad_config(self, reason: str) -> None:
+        """坏配置隔离：原文件改名留底（不静默覆盖用户数据），以默认配置启动"""
+        backup = self.config_path.with_name(
+            f"{self.config_path.name}.bad-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        try:
+            os.replace(self.config_path, backup)
+            self.load_error = f"{reason}，已回退默认配置（原文件留底为 {backup.name}）"
+            log.error("%s（原文件留底为 %s）", reason, backup.name)
+        except OSError as e:
+            self.load_error = f"{reason}，已回退默认配置（留底失败，文件未动）"
+            log.error("%s，且留底失败: %s", reason, e)
+
+    def _sanitize_data(self) -> None:
+        """字段级矫正：类型不符的关键容器回退为空，避免下游 .get/迭代崩溃"""
+        if not isinstance(self.data.get("providers"), list):
+            self.data["providers"] = []
+        # 非 dict 的 provider 条目（脏数据）直接丢弃
+        self.data["providers"] = [p for p in self.data["providers"] if isinstance(p, dict)]
+        for key in ("ui", "system", "context", "workflow", "task_models", "external_apis", "log"):
+            if not isinstance(self.data.get(key), dict):
+                self.data[key] = {}
 
     def _migrate_legacy(self) -> None:
-        """兼容旧扁平 provider 字段，并规范化 models / task_models"""
+        """扁平 provider 字段归一化为 models 结构，并规范化 models / task_models"""
         if "providers" in self.data and self.data["providers"]:
             first = self.data["providers"][0]
             if "provider_id" not in first and "name" in first:
@@ -366,12 +399,15 @@ class Config:
             if provider.get("base_url"):
                 provider["base_url"] = normalize_base_url(str(provider["base_url"]))
             provider["models"] = [
-                normalize_model_entry(m) for m in (provider.get("models") or []) if m.get("model_id") or m.get("model")
+                normalize_model_entry(m)
+                for m in (provider.get("models") or [])
+                # 非 dict 的脏条目（如手写成 ["deepseek-chat"] 简写）直接丢弃
+                if isinstance(m, dict) and (m.get("model_id") or m.get("model"))
             ]
         task_models = self.data.setdefault("task_models", {})
         for role in TASK_ROLES:
             task_models.setdefault(role, self.active_model_name() if hasattr(self, "model_name") else "")
-        # 工具白名单迁移：read/edit_file/write 后补（旧配置文件的列表会整组覆盖默认值）
+        # 工具白名单缺省后补 read/edit_file/write（配置文件里显式列表会整组覆盖默认值）
         ctx_cfg = self.data.setdefault("context", {})
         whitelist = ctx_cfg.setdefault("tool_whitelist", [])
         for name in ("read", "edit_file", "write"):
@@ -445,7 +481,6 @@ class Config:
                 if name and name != active:
                     log.warn("task_models.%s=%s 不可用，回退激活模型 %s", role, name, active)
                 defaults[role] = active
-                self.data.setdefault("task_models", {})[role] = active
             else:
                 defaults[role] = row.get("model_name") or name
         return defaults
@@ -772,10 +807,9 @@ class Config:
     def mode(self) -> str:
         """访问模式（单一事实源 data.ui.mode）。
 
-        策略判定（llm.evaluate_tool）、UI 显示（TuiApp.mode）与重启恢复共用此值，
-        避免"页脚显示完全访问而策略仍按 auto 弹确认"的双源失联——历史问题：
-        Shift+Tab 只改 app.mode、设置页只落盘 ui.mode，config.mode 属性只在
-        /mode 命令里同步。读取时校验合法值，缺失/非法回落 auto。"""
+        策略判定（llm.evaluate_tool）、UI 显示（TuiApp.mode）与重启恢复共用此值；
+        切换入口（Shift+Tab、设置页、/mode 命令）均经本属性落盘同步。
+        读取时校验合法值，缺失/非法回落 auto。"""
         raw = str(((self.data or {}).get("ui") or {}).get("mode") or "").strip().lower()
         return raw if raw in policy.MODES else policy.MODE_AUTO
 
@@ -789,12 +823,13 @@ class Config:
 
     def save(self) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.data["active_provider_id"] = self.data.get("active_provider_id")
-        self.data["active_model_id"] = self.data.get("active_model_id")
-        self.config_path.write_text(
+        # 原子写：防进程中断留下半截配置（与 session_store/memory 同款）
+        tmp = self.config_path.with_name(self.config_path.name + ".tmp")
+        tmp.write_text(
             json.dumps(self.data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp, self.config_path)
         log.debug("配置已保存: %s", self.config_path)
 
     def list_themes(self) -> List[str]:

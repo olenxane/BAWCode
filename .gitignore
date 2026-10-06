@@ -18,6 +18,8 @@ data/trash/
 # 运行时产物（插件数据/临时POC/记忆快照）
 .bawcode/
 data/memory.json
+# 含明文 api_key，禁止入库；模板见 data/config.example.json
+data/config.json
 data/memory/Agent.md.bak
 data/memory/global/
 data/memory/Projects/

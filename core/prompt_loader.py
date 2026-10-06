@@ -41,28 +41,25 @@ def prompt_dir(config=None) -> Path:
     return DEFAULT_PROMPT_DIR
 
 
-def system_prompt_files(config=None) -> List[str]:
+def _prompt_files(config, key: str, default: List[str]) -> List[str]:
+    """config.prompt.<key> 覆盖缺省文件清单"""
     if config is not None:
-        files = ((config.data or {}).get("prompt") or {}).get("system_files")
+        files = ((config.data or {}).get("prompt") or {}).get(key)
         if files:
             return list(files)
-    return ["system_prompt.md"]
+    return list(default)
+
+
+def system_prompt_files(config=None) -> List[str]:
+    return _prompt_files(config, "system_files", ["system_prompt.md"])
 
 
 def plan_prompt_files(config=None) -> List[str]:
-    if config is not None:
-        files = ((config.data or {}).get("prompt") or {}).get("plan_files")
-        if files:
-            return list(files)
-    return ["plan.md"]
+    return _prompt_files(config, "plan_files", ["plan.md"])
 
 
 def compress_prompt_files(config=None) -> List[str]:
-    if config is not None:
-        files = ((config.data or {}).get("prompt") or {}).get("compress_files")
-        if files:
-            return list(files)
-    return ["compress.md"]
+    return _prompt_files(config, "compress_files", ["compress.md"])
 
 
 def memory_paths(config=None) -> Dict[str, Path]:
@@ -105,11 +102,15 @@ def build_variable_context(
             cwd=str(ws),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2,
         )
         if r.returncode == 0:
             git_branch = (r.stdout or "").strip()
-    except Exception:
+    except Exception as e:
+        # git 不存在/超时等：分支名可缺省，仅留诊断痕迹
+        log.debug("git 分支读取失败 %s: %s", ws, e)
         git_branch = ""
 
     now = datetime.now()
@@ -211,10 +212,16 @@ def load_prompt_file(path: Path, variables: Optional[Dict[str, Any]] = None) -> 
     if not path.exists():
         log.warn("提示词文件不存在: %s", path)
         return None
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as e:
-        log.warn("提示词读取失败 %s: %s", path, e)
+    # 三级解码：utf-8 → gbk（记事本 ANSI 另存）→ 有损兜底，解码失败不阻塞启动
+    raw = None
+    for enc in ("utf-8", "gbk"):
+        try:
+            raw = path.read_text(encoding=enc)
+            break
+        except (OSError, UnicodeDecodeError) as e:
+            last_err = e
+    if raw is None:
+        log.warn("提示词读取失败 %s: %s", path, last_err)
         return None
     if not raw.strip():
         log.debug("提示词文件为空，跳过: %s", path)

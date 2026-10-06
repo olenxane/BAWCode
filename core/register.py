@@ -8,6 +8,8 @@ log = get_logger("register")
 
 # name -> 工具元数据
 _registry: Dict[str, dict] = {}
+# 插件覆盖同名内建工具时的原条目留底：插件卸载后恢复内建
+_overridden: Dict[str, dict] = {}
 
 
 def register(
@@ -28,6 +30,10 @@ def register(
 
     def decorator(func: Callable) -> Callable:
         tool_name = name or func.__name__
+        existing = _registry.get(tool_name)
+        if owner and existing is not None and existing.get("owner") != owner and tool_name not in _overridden:
+            # 插件覆盖非本归属的已有工具：留底原条目，卸载时恢复
+            _overridden[tool_name] = existing
         _registry[tool_name] = {
             "name": tool_name,
             "func": func,
@@ -63,12 +69,16 @@ def unregister(name: str) -> bool:
 
 
 def unregister_owner(owner: str) -> List[str]:
-    """注销某归属（插件）注册的全部工具，返回被注销的工具名列表"""
+    """注销某归属（插件）注册的全部工具并恢复被覆盖的内建工具，返回被注销的工具名列表"""
     if not owner:
         return []
     removed = [n for n, t in _registry.items() if t.get("owner") == owner]
     for n in removed:
-        _registry.pop(n, None)
+        original = _overridden.pop(n, None)
+        if original is not None:
+            _registry[n] = original
+        else:
+            _registry.pop(n, None)
     if removed:
         log.debug("注销 owner=%s 的工具: %s", owner, ",".join(removed))
     return removed

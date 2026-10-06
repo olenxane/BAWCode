@@ -277,6 +277,4 @@ def ledger_diff_regions(path: Path, max_regions: int = 5) -> tuple:
         if len(regions) < max_regions:
             # 以新文件行号报告（模型重读的是新文件）；纯删除区间为空时报告插入位置
             regions.append(f"L{b1 + 1}-L{b2}" if b2 > b1 else f"L{b1 + 1}前")
-    if len(regions) == max_regions and changed and _re.search(r"L\d+", "、".join(regions)):
-        pass  # 区间已截断到 max_regions，错误消息里以"共变更约N行"兜底
     return regions, changed

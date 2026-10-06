@@ -50,6 +50,7 @@ EVENTS: Dict[str, dict] = {
     "computer_use": {"kind": "call", "desc": "computer-use 外部执行接口"},
     "llm_request": {"kind": "call", "desc": "整段接管/转发 LLM 请求（返回 chat 响应结构生效）"},
     "tool_confirm": {"kind": "call", "desc": "工具确认代答（返回 {action: allow_once|allow_always|deny} 生效；None 交回 UI 面板）"},
+    "ui_request": {"kind": "call", "desc": "交互弹窗代答 confirm/choose/line/ask（返回与键盘输入同语义的应答值生效；None 交回 UI 面板）"},
     # ---- 生命周期事件 ----
     "session_start": {"kind": "collect", "desc": "会话初始化完成（collect）"},
     "before_turn": {"kind": "call", "desc": "回合开始，可改写 user_text（返回 {user_text: ...} 生效）"},
@@ -59,6 +60,7 @@ EVENTS: Dict[str, dict] = {
     "before_tool": {"kind": "call", "desc": "工具执行前，可改写 args 或拒绝执行"},
     "after_tool": {"kind": "collect", "desc": "工具执行后通知（collect）"},
     "context_supplement": {"kind": "collect", "desc": "回合上下文补充文本（collect，返回 str 生效）"},
+    "message_added": {"kind": "collect", "desc": "会话消息新增通知 {role, content, type, ...extra}（collect，content 可能为多模态数组；处理函数内禁止再写会话消息，否则递归）"},
 }
 
 

@@ -17,9 +17,9 @@ SESSION_VERSION = 1
 
 
 def new_session_id() -> str:
-    """生成会话 ID：20260926-143022-ab12（时间可排序 + 短随机后缀防同秒碰撞）"""
+    """生成会话 ID：20260926-143022-ab12cd34（时间可排序 + 随机后缀降低同秒碰撞概率）"""
     now = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{now}-{uuid.uuid4().hex[:4]}"
+    return f"{now}-{uuid.uuid4().hex[:8]}"
 
 
 def sessions_dir(config, project_id: str) -> Path:
@@ -67,8 +67,58 @@ def list_sessions(directory: Path) -> List[dict]:
     return items
 
 
+def heal_orphan_tool_calls(messages: list) -> int:
+    """补齐孤儿 tool_calls：assistant 带 tool_calls 但缺配对 tool 结果时（历史中断所致）
+    在该 assistant 的 tool 结果段末尾合成占位结果，否则后续每次请求会被 API 以
+    配对不全拒绝。返回补齐条数"""
+    result_ids = {
+        str(m.get("tool_call_id"))
+        for m in messages
+        if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    extras: dict = {}
+    for i, m in enumerate(messages):
+        patched = []
+        for c in m.get("tool_calls") or []:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id") or "")
+            if not cid or cid in result_ids:
+                continue
+            result_ids.add(cid)
+            name = str(c.get("name") or "")
+            patched.append({
+                "role": "tool",
+                "type": "tool",
+                "tool_call_id": cid,
+                "tool_name": name,
+                "description": name,
+                "content": "[会话修复：该调用无结果记录（历史中断所致）]",
+            })
+        if patched:
+            extras[i] = patched
+    if not extras:
+        return 0
+    # 重组：带孤儿的 assistant 先接上紧随其后的既有 tool 结果段，再补孤儿
+    out = []
+    i = 0
+    while i < len(messages):
+        out.append(messages[i])
+        if i in extras:
+            j = i + 1
+            while j < len(messages) and str(messages[j].get("role")) == "tool":
+                out.append(messages[j])
+                j += 1
+            out.extend(extras[i])
+            i = j
+            continue
+        i += 1
+    messages[:] = out
+    return sum(len(v) for v in extras.values())
+
+
 def load_session_data(directory: Path, session_id: str) -> Optional[dict]:
-    """按 id 加载完整会话数据（messages/plan/steps 原样）"""
+    """按 id 加载完整会话数据（messages/plan/steps 原样，孤儿 tool_calls 顺带修复）"""
     path = directory / f"{session_id}.json"
     if not path.exists():
         log.warn("会话文件不存在: %s", path)
@@ -78,6 +128,10 @@ def load_session_data(directory: Path, session_id: str) -> Optional[dict]:
     except (OSError, json.JSONDecodeError) as e:
         log.error("会话文件解析失败 %s: %s", path, e)
         return None
+    if isinstance(data, dict) and isinstance(data.get("messages"), list):
+        healed = heal_orphan_tool_calls(data["messages"])
+        if healed:
+            log.warn("会话 %s 修复 %d 条孤儿工具结果", session_id, healed)
     return data if isinstance(data, dict) else None
 
 

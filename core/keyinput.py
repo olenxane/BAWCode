@@ -1,27 +1,26 @@
 # -*- coding: utf-8 -*-
-"""终端输入栈：prompt_toolkit 输入后端（2026-09-28 自 core/input_pt.py 转正）
+"""终端输入栈：prompt_toolkit 输入后端。
 
 公开契约：read_key_event / read_events / read_key / flush_input /
-direction_of / supported_kinds + KeyEvent NamedTuple。
+direction_of + KeyEvent NamedTuple。
 
-数据源为 Win32 INPUT_RECORD 事件流：BawWin32Input 强制使用 ConsoleInputReader
-（pt 默认经 _is_win_vt100_input_enabled 试探切到 Vt100ConsoleInputReader，该
-路径丢弃 MOUSE_EVENT 记录——鼠标滚轮/拖拽全断，2026-09-28 修复）；翻译层
-KeyPress → KeyEvent；读取循环后台线程 + 队列，read_events(0) 非阻塞供拍帧泵。
-旧实现（msvcrt/自研 FSM/滴灌）在 _recycle/keyinput.py。
+数据源：Windows 下强制 ConsoleInputReader 事件记录路径（pt 默认经
+_is_win_vt100_input_enabled 试探切到 Vt100ConsoleInputReader，该路径丢弃
+MOUSE_EVENT 记录——鼠标滚轮/拖拽全断）；其他平台走 pt 的 Vt100 输入路径
+（键盘可用，鼠标不支持）。翻译层 KeyPress → KeyEvent；读取循环后台线程 +
+队列，read_events(0) 非阻塞供拍帧泵。
 
-物理键位（2026-09-28 定案）：
+物理键位：
   Enter        → submit（直接发送）
   Ctrl+Enter   → newline（pt 形态为 Escape+ControlM 序列，此处折叠）
   Ctrl+J       → newline（同形 ControlJ；VT 路径下 Ctrl+Enter 落为 \n 亦兼容）
   Shift+Enter  → 与 Enter 同形 → submit（事件流固有限制，无法区分）
   Alt+Enter    → newline（同形折叠）
-  submit_ctrl 事件不再产生：keymap 的 send=ctrl+enter 绑定随之闲置；
+  submit_ctrl 事件不产生：keymap 的 send=ctrl+enter 绑定闲置；
   如需独立发送键可配置 send=f5 等（Enter 始终发送）。
 """
 from __future__ import annotations
 
-import logging
 import os
 import queue
 import sys
@@ -30,6 +29,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
+
+from core.log import get_logger
 
 
 class KeyEvent(NamedTuple):
@@ -40,12 +41,11 @@ class KeyEvent(NamedTuple):
 TICK = KeyEvent("tick", "")
 Event = KeyEvent  # 别名
 
-log = logging.getLogger("keyinput")
+log = get_logger("keyinput")
 
 _WINDOWS = sys.platform == "win32"
-# 取证日志开关（延续旧栈的 BAW_LOG_KEYINPUT 工具链）
-# 【取证期临时默认开启】诊断鼠标事件，结束后改回 == "1"
-_LOG_ON = os.environ.get("BAW_LOG_KEYINPUT", "1") != "0"
+# 输入层取证日志开关：环境变量 BAW_LOG_KEYINPUT=1 开启（默认关闭）
+_LOG_ON = os.environ.get("BAW_LOG_KEYINPUT") == "1"
 _LOG_PATH = Path(__file__).resolve().parent.parent / "develop" / "pt_input.log"
 
 
@@ -76,8 +76,8 @@ def _hotkey(name: str, ctrl: bool, alt: bool, shift: bool) -> KeyEvent:
 def _mouse_event(data: str) -> Optional[KeyEvent]:
     """WindowsMouseEvent data = "button;event_type;X;Y"（0-based 单元格）。
 
-    pt 枚举值实测为大写（'NONE;SCROLL_UP;76;19'，2026-09-28 取证），统一
-    lower 后匹配；MOUSE_UP 的 button 为 NONE，不参与按下态判定。"""
+    pt 枚举值为大写（如 'NONE;SCROLL_UP;76;19'），统一 lower 后匹配；
+    MOUSE_UP 的 button 为 NONE，不参与按下态判定。"""
     try:
         button, et, xs, ys = (data or "").split(";")
     except ValueError:
@@ -154,7 +154,7 @@ def _fold_paste_run(presses: List, i: int, n: int, cont: bool = False) -> Option
 def translate_key_presses(presses: List) -> List[KeyEvent]:
     """一批 KeyPress → KeyEvent 列表。
 
-    序列折叠：Escape+ControlM → newline（Ctrl+Enter，2026-09-28 定案）；
+    序列折叠：Escape+ControlM → newline（Ctrl+Enter）；
     Escape+可见字符 → 该字符（legacy 的 alt 前缀忽略行为）。
     粘贴：BracketedPaste（自带 data 或后随同批可见字符）合成单个 paste 事件。
     """
@@ -168,8 +168,7 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
         nxt = presses[i + 1] if i + 1 < n else None
 
         # Ctrl+Enter（pt 形态 Escape+ControlM）/ Alt+Enter 前缀折叠 → 换行
-        # （2026-09-28 键位定案：Enter 直接发送，Ctrl+Enter 换行；
-        #   Shift+Enter 与 Enter 同形，无法区分）
+        # （Enter 直接发送；Shift+Enter 与 Enter 同形，无法区分）
         if key == _K.Escape and nxt is not None:
             if nxt.key == _K.ControlM:
                 out.append(KeyEvent("newline", ""))
@@ -282,7 +281,7 @@ try:
             if _k is not None:
                 _COMBO_MAP[_k] = _base
 
-    # Ctrl+字母：与 legacy _CTRL 表对齐（C/U/M/J 已在 _KEY_MAP 单列）
+    # Ctrl+字母组合（C/U/M/J 已在 _KEY_MAP 单列）
     _CTRL_LETTERS = {
         _K.ControlA: "a", _K.ControlB: "b", _K.ControlD: "d", _K.ControlE: "e",
         _K.ControlF: "f", _K.ControlG: "g", _K.ControlH: "h", _K.ControlI: "i",
@@ -322,8 +321,8 @@ def _baw_win32_input_cls():
     TERMINAL_INPUT）选择 Vt100ConsoleInputReader——该路径的 _get_keys 只解码
     KEY_EVENT，MOUSE_EVENT 记录被丢弃（滚轮/滑块拖拽全断）；VT 路径的鼠标
     需应用主动发 \\x1b[?1000h 上报序列，裸 reader 没有。此处强制回到
-    ConsoleInputReader 事件记录路径（旧栈同源）：MOUSE_EVENT →
-    WindowsMouseEvent → 翻译层；raw_mode 也不再设置输入 VT。
+    ConsoleInputReader 事件记录路径：MOUSE_EVENT → WindowsMouseEvent →
+    翻译层；raw_mode 也不再设置输入 VT。
     """
     try:
         from prompt_toolkit.input.win32 import ConsoleInputReader, Win32Input
@@ -357,18 +356,20 @@ class _PtReader:
             if self._started:
                 return
             self._started = True
-        if not _WINDOWS:
-            return
         try:
             from prompt_toolkit.input import create_input
 
-            cls = _baw_win32_input_cls()
-            try:
-                self._input = (cls or create_input)()
-            except Exception:
+            if _WINDOWS:
+                cls = _baw_win32_input_cls()
+                try:
+                    self._input = (cls or create_input)()
+                except Exception:
+                    self._input = create_input()
+            else:
+                # POSIX：pt 的 Vt100 输入路径（键盘可用；无 Win32 事件记录，鼠标不支持）
                 self._input = create_input()
             self._raw = self._input.raw_mode()
-            self._raw.__enter__()  # 与 legacy get_reader().__enter__() 同生命周期
+            self._raw.__enter__()  # raw 模式与 paused() 的暂挂/恢复配对
             threading.Thread(target=self._pump, daemon=True, name="bawcode-pt-input").start()
             log.info("pt 输入后端启动: %s", type(self._input).__name__)
             _flog("started reader=%s" % type(self._input).__name__)
@@ -377,13 +378,16 @@ class _PtReader:
             _flog("start failed: %r" % (exc,))
 
     def _pump(self) -> None:
+        # POSIX 的 read_keys(timeout=None) 阻塞到有键，传小超时保证暂停协议与帧泵响应；
+        # Windows 的 ConsoleInputReader 保持默认（timeout=None）不变
+        timeout = None if _WINDOWS else 0.05
         try:
             while True:
                 if self._pause_req.is_set():
                     self._parked.set()
                     time.sleep(0.02)
                     continue
-                presses = self._input.read_keys()
+                presses = self._input.read_keys(timeout)
                 if presses:
                     self._q.put(presses)
                 else:
@@ -502,13 +506,3 @@ def direction_of(kind: str, value: str) -> Optional[str]:
             if v == d or v.endswith("+" + d):
                 return d
     return None
-
-
-def supported_kinds() -> tuple:
-    return (
-        "tick", "char", "submit", "submit_ctrl", "newline", "tab", "mode_switch",
-        "backspace", "delete", "up", "down", "left", "right", "home", "end",
-        "scroll_up", "scroll_down", "escape", "interrupt", "clear", "hotkey",
-        "paste", "paste_start", "paste_end", "mouse_wheel", "mouse",
-        "mouse_down", "mouse_move", "mouse_up",
-    )

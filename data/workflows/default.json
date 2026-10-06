@@ -1,19 +1,31 @@
 {
   "name": "default",
-  "description": "最简通用管线：系统提示词注入 → 编码执行（通用角色直接干活；计划/审查等节点在编辑器自行添加）",
+  "description": "",
   "nodes": [
     {
       "id": "system_prompt",
       "type": "system_prompt",
+      "enabled": true,
       "files": [
         "system_prompt.md"
       ]
     },
     {
+      "id": "plan",
+      "type": "plan",
+      "enabled": true,
+      "confirm": true,
+      "steps": false,
+      "model_role": "plan"
+    },
+    {
       "id": "execute",
       "type": "execute",
-      "max_rounds": 12,
-      "model_role": "code"
+      "enabled": true,
+      "max_rounds": 9,
+      "model_role": "code",
+      "prompt_files": [],
+      "capture": ""
     }
   ]
 }

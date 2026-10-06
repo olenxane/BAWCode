@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """外置工作流引擎：data/workflows/<name>.json 声明式线性节点链。
 
-一轮 agent 回合的处理管线不再硬编码于 main.py，而是按配置文件的节点列表
-顺序执行；"不想要计划/测试"等取舍由用户在编辑器里增删节点表达。
-按复杂度路由节点的机制（analyze 节点 + gate 门槛）已于 2026-09-30 移除，
-引擎为无条件线性链——备份见 _recycle/gate-routing-20260930/。
+一轮 agent 回合的处理管线按配置文件的节点列表顺序执行，引擎为无条件
+线性链；"不想要计划/测试"等取舍由用户在编辑器里增删节点表达。
 
 回合执行机制（UI 桥 TurnIO / 上下文 TurnContext / 工具调用循环 tool_loop /
 系统提示词注入 / 直接对话 run_direct）归位回合运行时 core/loop.py，本模块
@@ -85,8 +83,7 @@ UNDERSTAND_PROMPT_BUILTIN = (
     "只输出任务理解本身，不要开始执行任务。"
 )
 # plan 节点 steps=true 时交付给 execute 的启动指令：步骤拆解由主 LLM 经 generate_steps
-# 工具完成（结构化参数），不再走节点旁路 LLM 请求（旁路输出无 schema 约束，按行解析
-# 会把模型的跑题长文整体误收为步骤，2026-10-04 1379 步事故）
+# 工具完成（结构化参数，出参受 schema 约束）
 STEPS_KICKOFF_BUILTIN = (
     "开始执行前，先调用 generate_steps 工具把当前计划拆解为可执行步骤"
     "（3-8 条，动词开头、每步具体可验证），之后再按步骤推进；"
@@ -190,7 +187,6 @@ def load_workflow(config, name: Optional[str] = None) -> dict:
     for index, node in enumerate(data["nodes"]):
         node = dict(node)
         node.setdefault("id", f"n{index + 1}")
-        node.setdefault("gate", "always")
         node.setdefault("enabled", True)
         normalized.append(node)
     data["nodes"] = normalized
@@ -290,7 +286,7 @@ def _exec_skill(node: dict, turn: TurnContext) -> None:
 
 
 def _plan_confirm_loop(turn: TurnContext) -> None:
-    """计划确认交互：0/1/2/3 菜单，修改后必须二次确认（自 main.py 迁入）"""
+    """计划确认交互：0/1/2/3 菜单，修改后必须二次确认"""
     io, session, llm = turn.io, turn.session, turn.llm
     confirmed = False
     for _edit_round in range(3):
@@ -528,7 +524,7 @@ def run_workflow(workflow: dict, turn: TurnContext) -> str:
 
     skills_mod.set_injection(enabled=None, allow=None)
     if not any(n.get("type") == "system_prompt" for n in nodes):
-        ensure_system_prompt(turn)  # 保持旧行为：默认注入 config.prompt.system_files
+        ensure_system_prompt(turn)  # 默认注入 config.prompt.system_files
     for node in nodes:
         check_cancel(turn)
         if not node.get("enabled", True):

@@ -34,7 +34,6 @@ import queue
 import secrets
 import socket
 import threading
-import time
 import uuid
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -96,7 +95,8 @@ def setup(ctx):
 
     # ---- 配置 ----
     port = int(ctx.settings.get("port") or 8399)
-    bind = str(ctx.settings.get("bind") or "0.0.0.0")
+    # 缺省只绑本机回环（公网隧道/SSH 转发均可用）；需局域网访问在插件设置里显式配 bind=0.0.0.0
+    bind = str(ctx.settings.get("bind") or "127.0.0.1")
     remote_confirm = bool(ctx.settings.get("remote_confirm", True))
     confirm_timeout = float(ctx.settings.get("confirm_timeout") or 90)
     max_history = int(ctx.settings.get("max_history") or 80)
@@ -258,10 +258,7 @@ def setup(ctx):
             answered = item["event"].wait(timeout=confirm_timeout)
         finally:
             with st.lock:
-                try:
-                    st.confirms.remove(item)
-                except ValueError:
-                    pass
+                st.confirms.remove(item)
         resp = item["response"]
         if answered and isinstance(resp, dict):
             action = str(resp.get("action") or "").lower()
@@ -423,11 +420,8 @@ def setup(ctx):
         session.start_new_session()
         app = _app()
         if app is not None:
-            try:
-                app.task = ""
-                app.status = "新会话已开启"
-            except Exception:
-                pass
+            app.task = ""
+            app.status = "新会话已开启"
         _app_refresh(session)
         _broadcast({"t": "reset"})
         return {"ok": True, "result": "新会话已开启"}
@@ -442,11 +436,8 @@ def setup(ctx):
         session.clear()
         app = _app()
         if app is not None:
-            try:
-                app.task = ""
-                app.status = "会话已清空"
-            except Exception:
-                pass
+            app.task = ""
+            app.status = "会话已清空"
         _app_refresh(session)
         _broadcast({"t": "reset"})
         return {"ok": True, "result": "会话已清空"}
@@ -486,11 +477,8 @@ def setup(ctx):
         session.switch_to(data)
         app = _app()
         if app is not None:
-            try:
-                app._tree_follow_tail = True  # 切换后贴底显示恢复的消息
-                app.status = f"已切换: {session.session_title or session.session_id}"
-            except Exception:
-                pass
+            app._tree_follow_tail = True  # 切换后贴底显示恢复的消息
+            app.status = f"已切换: {session.session_title or session.session_id}"
         _app_refresh(session)
         _broadcast({"t": "reset"})
         return {"ok": True, "result": f"已切换: {session.session_title or session.session_id}"}
@@ -570,10 +558,7 @@ def setup(ctx):
             return {"ok": False, "message": "模式: auto | manual | full"}
         app = _app()
         if app is not None:
-            try:
-                app.mode = mode
-            except Exception:
-                pass
+            app.mode = mode
         ctx.config.data.setdefault("ui", {})["mode"] = mode
         ctx.config.mode = mode
         ctx.config.save()
@@ -644,10 +629,7 @@ def setup(ctx):
         session.add_message("system", text, type="help")
         app = _app()
         if app is not None:
-            try:
-                app.status = f"已回滚回合 #{result['seq']}"
-            except Exception:
-                pass
+            app.status = f"已回滚回合 #{result['seq']}"
         _app_refresh(session)
         _broadcast({"t": "reset"})
         return {"ok": True, "result": text}
@@ -767,12 +749,13 @@ def setup(ctx):
     def _check_key(self) -> bool:
         given = (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
         real = str(st.key_data.get("key") or "")
-        return bool(real) and hmac.compare_digest(real, given)
+        # compare_digest 对非 ASCII str 抛 TypeError，统一按字节比较
+        return bool(real) and hmac.compare_digest(real.encode("utf-8"), given.encode("utf-8"))
 
     def _make_handler():
         class Handler(BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):  # 静默：默认写 stderr 会刷 TUI
-                ctx.log.debug("http %s", fmt % args)
+            def log_message(self, fmt, *args):  # 静默：默认写 stderr 会刷 TUI；query 含密钥不落日志
+                ctx.log.debug("http %s", (fmt % args).split("?", 1)[0])
 
             def _json(self, code, obj):
                 body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -897,7 +880,7 @@ def setup(ctx):
                     result = ctx.submit_turn(text)  # 返回状态说明（提交/排队/中断）
                     self._json(200, {"ok": True, "result": result})
                 elif path == "/api/stop":
-                    runner = plugins_mod.runtime().get("runner") if plugins_mod else None
+                    runner = _runner()
                     if runner is None:
                         self._json(200, {"ok": False, "message": "调度器未就绪"})
                         return
@@ -911,6 +894,16 @@ def setup(ctx):
                         return
                     cancel()
                     self._json(200, {"ok": True, "result": "已请求中断在途回合"})
+                elif path == "/api/turn/retry":
+                    app = _app()
+                    fn = getattr(app, "request_llm_retry", None) if app is not None else None
+                    if not callable(fn):
+                        self._json(200, {"ok": False, "message": "运行时不支持重试"})
+                        return
+                    if fn():
+                        self._json(200, {"ok": True, "result": "已触发重试"})
+                    else:
+                        self._json(200, {"ok": False, "message": "当前无等待重试的错误"})
                 elif path == "/api/confirm":
                     cid = str(data.get("id") or "")
                     with st.lock:

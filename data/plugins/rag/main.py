@@ -32,13 +32,14 @@ set_rag 的项目级开关存 state.json（不随索引过期）。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
@@ -455,7 +456,6 @@ def setup(ctx):
         changed = 0
         nfiles = 0
         nchunks = 0
-        embedded = 0
         with lock:
             root = str(ctx.workspace)
             seen = set()
@@ -469,7 +469,8 @@ def setup(ctx):
                     continue
                 ext = os.path.splitext(rel)[1].lower()
                 try:
-                    data = open(full, "rb").read()
+                    with open(full, "rb") as fh:
+                        data = fh.read()
                 except OSError:
                     continue
                 if ext in LANG_BY_EXT:
@@ -492,7 +493,7 @@ def setup(ctx):
                 changed += 1
             for rel in [r for r in docs_index if r not in seen]:
                 del docs_index[rel]
-            # 向量维护：模型变更即全量失效；uid 失效清理 + 变化切片补算
+            # 向量维护：模型变更即全量失效；uid 失效清理
             model_now = _emb_config()[1]
             if emb_model_used and model_now and emb_model_used != model_now:
                 embs.clear()
@@ -503,25 +504,30 @@ def setup(ctx):
                     live_uids.add(_uid(ch))
             for uid in [u for u in embs if u not in live_uids]:
                 embs.pop(uid, None)
-            if _emb_ready() and (not emb_model_used or emb_model_used == model_now):
-                todo = [( _uid(ch), ch["doc"]) for ent in docs_index.values()
-                        for ch in ent["chunks"]
-                        if _uid(ch) not in embs and ch.get("doc")]
-                todo = todo[:_EMB_MAX_CHUNKS]
-                if todo:
-                    vecs = _embed_texts([t for _, t in todo])
-                    if vecs is not None:
-                        for (uid, _), v in zip(todo, vecs):
-                            embs[uid] = v
-                        embedded = len(todo)
-                        emb_model_used = model_now
-            stats = {"files": nfiles, "chunks": nchunks, "changed": changed,
-                     "elapsed": time.monotonic() - t0, "embedded": embedded}
+            # 补算清单在锁内取快照；嵌入请求在锁外执行（网络 I/O 持锁会阻塞召回与状态查询）
+            todo = [(_uid(ch), ch["doc"]) for ent in docs_index.values()
+                    for ch in ent["chunks"]
+                    if _uid(ch) not in embs and ch.get("doc")]
+        embedded = 0
+        if todo and _emb_ready() and (not emb_model_used or emb_model_used == model_now):
+            todo = todo[:_EMB_MAX_CHUNKS]
+            vecs = _embed_texts([t for _, t in todo])
+            if vecs is not None:
+                with lock:
+                    for (uid, _), v in zip(todo, vecs):
+                        embs[uid] = v
+                    embedded = len(todo)
+                    emb_model_used = model_now
+        stats = {"files": nfiles, "chunks": nchunks, "changed": changed,
+                 "elapsed": time.monotonic() - t0, "embedded": embedded}
+        with lock:
             _persist(stats)
         return stats
 
     def _uid(ch: dict) -> str:
-        return f"{ch['file']}#{ch['line0']}"
+        # uid 含内容指纹：行内编辑（起始行不变）也能让旧向量失效重算，避免旧向量持续召回
+        digest = hashlib.md5(ch["doc"].encode("utf-8")).hexdigest()[:8]
+        return f"{ch['file']}#{ch['line0']}#{digest}"
 
     # ---------- 召回 ----------
 
@@ -733,16 +739,19 @@ def setup(ctx):
                 meta["built_at"] = ""
             return "已清除索引文件（set_rag 的项目开关保留）"
         # status
-        nchunks = sum(len(e["chunks"]) for e in docs_index.values())
+        with lock:
+            nchunks = sum(len(e["chunks"]) for e in docs_index.values())
+            nfiles_idx = len(docs_index)
+            has_vecs = bool(embs) and emb_model_used == _emb_config()[1]
         age = _age_days(meta["built_at"])
         base, model, _ = _emb_config()
         emb_state = "关闭" if _mode() == "keyword" else (
-            f"{model}@{base}（向量{'就绪' if embs and emb_model_used == model else '未构建，请 /rag build'}）")
+            f"{model}@{base}（向量{'就绪' if has_vecs else '未构建，请 /rag build'}）")
         return ("RAG 状态：{}\n索引：{}（{} 文件 / {} 切片，{}）\n匹配模式：{}\n"
                 "索引位置：{}".format(
                     "开启" if _enabled() else "关闭",
                     "已构建" if meta["built_at"] else "未构建（/rag build 手动触发）",
-                    len(docs_index), nchunks,
+                    nfiles_idx, nchunks,
                     f"年龄 {age:.1f} 天" if age is not None else "-",
                     "嵌入模型 " + emb_state if _mode() == "embedding" else "关键词",
                     index_file))

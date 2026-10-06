@@ -1,0 +1,20 @@
+{
+  "id": "qbridge",
+  "name": "QQ 桥接",
+  "version": "0.1.0",
+  "description": "经 OneBot 11 正向 WebSocket 连接 QQ 机器人框架（NapCat/LLOneBot/Lagrange 等），双向同步终端与 QQ：终端消息（回复/过程动态/系统提示）同步到 QQ，QQ 消息与图片注入终端，确认/选择框映射到 QQ 远程应答",
+  "author": "BAWCode",
+  "entry": "main.py",
+  "config": [
+    { "key": "enabled", "type": "bool", "default": false, "label": "装载即启动", "hint": "/qbridge on|off 同效" },
+    { "key": "ws_url", "type": "str", "default": "ws://127.0.0.1:3001", "label": "OneBot WS 地址", "hint": "机器人框架的正向 WebSocket 服务端地址" },
+    { "key": "access_token", "type": "str", "default": "", "label": "access_token（可选）", "hint": "框架设置了访问令牌时填写；留空则不带鉴权头" },
+    { "key": "self_id", "type": "str", "default": "", "label": "机器人QQ号（可选）", "hint": "留空则连接后经 get_login_info 自动获取" },
+    { "key": "target", "type": "str", "default": "", "label": "同步目标（可选）", "hint": "private/<QQ号> 或 group/<群号>；留空则自动绑定首个消息来源" },
+    { "key": "allow_users", "type": "str", "default": "", "label": "控制白名单", "hint": "逗号分隔的QQ号；严格模式：仅名单内可向终端发消息/应答交互，留空=QQ侧纯只读镜像" },
+    { "key": "confirm_via_qq", "type": "bool", "default": true, "label": "工具确认映射到QQ", "hint": "终端提交新消息可随时转回终端面板" },
+    { "key": "sync_tools", "type": "bool", "default": true, "label": "同步工具活动", "hint": "每次工具执行推送一行摘要" },
+    { "key": "sync_system", "type": "bool", "default": true, "label": "同步系统消息", "hint": "命令回显/插件通知等系统消息转发到 QQ" },
+    { "key": "max_len", "type": "int", "default": 2000, "min": 200, "max": 4000, "label": "单条消息上限", "hint": "超长文本按此长度分段发送" }
+  ]
+}

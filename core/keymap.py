@@ -164,22 +164,13 @@ def binding_tokens(binding: Any) -> List[str]:
     return out
 
 
-def direction_of(kind: str, value: str) -> Optional[str]:
-    tok = event_token(kind, value)
-    for d in ("up", "down", "left", "right"):
-        if tok == d or tok.endswith("+" + d):
-            return d
-    return None
-
-
 class Keymap:
     """(context, token) -> Action 的编译倒排表。"""
 
-    __slots__ = ("_table", "_names")
+    __slots__ = ("_table",)
 
     def __init__(self) -> None:
         self._table: Dict[Tuple[str, str], Action] = {}
-        self._names: Dict[str, List[str]] = {}
 
     def compile(self, settings: Optional[Mapping[str, Any]] = None) -> None:
         merged: Dict[str, List[str]] = {k: list(v) for k, v in _DEFAULT_BINDINGS.items()}
@@ -192,7 +183,6 @@ class Keymap:
             if not merged[k]:
                 merged[k] = list(_DEFAULT_BINDINGS.get(k, []))
 
-        self._names = merged
         table: Dict[Tuple[str, str], Action] = {}
 
         # 1) 编辑默认（输入上下文）
@@ -258,23 +248,3 @@ class Keymap:
         if kind == "submit":
             return Action.SUBMIT
         return Action.IGNORE
-
-    def label(self, setting: str) -> str:
-        toks = self._names.get(setting) or _DEFAULT_BINDINGS.get(setting) or []
-        return toks[0] if toks else ""
-
-    def tokens(self, setting: str) -> List[str]:
-        return list(self._names.get(setting) or _DEFAULT_BINDINGS.get(setting) or [])
-
-
-_default_keymap: Optional[Keymap] = None
-
-
-def get_keymap(settings: Optional[Mapping[str, Any]] = None) -> Keymap:
-    global _default_keymap
-    if _default_keymap is None:
-        _default_keymap = Keymap()
-        _default_keymap.compile(settings)
-    elif settings is not None:
-        _default_keymap.compile(settings)
-    return _default_keymap

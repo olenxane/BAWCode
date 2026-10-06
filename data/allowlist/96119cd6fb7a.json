@@ -29,10 +29,6 @@
       "fingerprint": "write|d:/windows11/桌面/code/bawcode/about_sensenova.html"
     },
     {
-      "tool": "write",
-      "fingerprint": "write|*"
-    },
-    {
       "tool": "update_step_status",
       "fingerprint": "4bb764d5f08f1b6c|*"
     },

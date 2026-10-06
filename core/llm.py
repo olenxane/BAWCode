@@ -6,7 +6,6 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-from pathlib import Path
 from typing import Any, List, Optional
 
 try:
@@ -27,10 +26,26 @@ from core.log import get_logger
 
 log = get_logger("llm")
 
-_ROOT = Path(__file__).resolve().parent.parent
-
 # chat() 取消哨兵：异步回合中断时返回，调用方据此丢弃在途回合
 CANCELLED = "__CANCELLED__"
+
+# 可通过等待解除的 HTTP 状态（限频/服务端瞬态）：自动重试；其余 4xx（401 鉴权、
+# 404 模型不存在、400 参数等确定性失败）直接报错
+_RETRYABLE_STATUS = {408, 409, 429}
+
+
+def _is_retryable_error(e: BaseException) -> bool:
+    """判定异常是否属于可通过时间解除的瞬态错误（自动重试与手动重试等待态的依据）"""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in _RETRYABLE_STATUS or 500 <= e.code <= 599
+    # openai SDK：APIStatusError 族携带 status_code；超时/连接错误无码但属瞬态
+    status = getattr(e, "status_code", None)
+    if isinstance(status, int) and status > 0:
+        return status in _RETRYABLE_STATUS or 500 <= status <= 599
+    if type(e).__name__ in ("APITimeoutError", "APIConnectionError"):
+        return True
+    # 无状态码的网络层异常（URLError/DNS/连接拒绝/超时）
+    return isinstance(e, (urllib.error.URLError, ConnectionError, TimeoutError))
 
 
 def _fallback_system_prompt() -> str:
@@ -49,14 +64,6 @@ def get_system_prompt(config=None, files: Optional[List[str]] = None, **kwargs) 
     except Exception as e:
         log.warn("加载系统提示词失败，使用兜底: %s", e)
         return _fallback_system_prompt()
-
-
-# 兼容旧 import：惰性取当前配置提示词
-class _SystemPromptProxy(str):
-    pass
-
-
-SYSTEM_PROMPT = _SystemPromptProxy(_fallback_system_prompt())
 
 
 class _StreamAggregate:
@@ -226,16 +233,12 @@ class LLM:
         """
         cfg = self.config
         name = model or getattr(cfg, "model_name", None) or cfg.active_model_name()
-        row = None
-        if hasattr(cfg, "resolve_model_row"):
-            row = cfg.resolve_model_row(name)
-        if row is None and hasattr(cfg, "find_model"):
+        row = cfg.resolve_model_row(name)
+        if row is None:
             row = cfg.find_model(name)
         if row is None or not row.get("api_key"):
-            active_name = cfg.active_model_name() if hasattr(cfg, "active_model_name") else name
-            active_row = None
-            if hasattr(cfg, "find_model"):
-                active_row = cfg.find_model(active_name)
+            active_name = cfg.active_model_name()
+            active_row = cfg.find_model(active_name)
             if active_row and active_row.get("api_key"):
                 log.warn("模型 %s 不可用（无凭证/未找到），回退 %s", name, active_name)
                 row = active_row
@@ -256,7 +259,8 @@ class LLM:
             "api_key": row.get("api_key") or "",
             "base_url": normalize_base_url(row.get("base_url") or ""),
             "provider_id": row.get("provider_id") or "",
-            "temperature": row.get("temperature") or getattr(cfg, "temperature", 1.0),
+            # 0 是合法配置值（贪心解码），判缺省用 is None 而非 or
+            "temperature": getattr(cfg, "temperature", 1.0) if row.get("temperature") is None else row.get("temperature"),
             "max_tokens": row.get("max_tokens") or getattr(cfg, "max_tokens", 2048),
             "model_name": row.get("model_name") or name,
             "thinking_effort": row.get("thinking_effort") or "none",
@@ -561,10 +565,12 @@ class LLM:
                         if agg is None:
                             return {"content": "", "tool_calls": [], "error": CANCELLED}
                         if agg.error:
-                            # midway：partial 已上屏，不重试，错误随结果返回
+                            # midway：partial 已上屏，不自动重试（重试交由手动重试等待态），
+                            # 错误随结果返回
                             result = self._normalize(agg.to_response(), keep_reasoning=bool(tools))
                             self.meter.record_api_usage(result.get("raw", {}).get("usage"))
                             result["error"] = agg.error
+                            result["retryable"] = True
                             return result
                         data = agg.to_response()
                 else:
@@ -588,6 +594,10 @@ class LLM:
                 attempt += 1
                 log.warn("LLM 调用失败(第%d/%d次): %s", attempt, max(retry_times, 0) + 1, e)
                 log.debug("异常详情:\n%s", traceback.format_exc())
+                if not _is_retryable_error(e):
+                    # 401/404/400 等确定性失败：重试无意义，直接报错
+                    log.error("不可自动重试的错误（%s.%s），终止重试", type(e).__module__, type(e).__name__)
+                    break
                 if attempt > max(retry_times, 0):
                     break
                 if retry_delay > 0:
@@ -598,7 +608,13 @@ class LLM:
                     base_url=req.get("base_url"),
                 )
         log.error("LLM 调用最终失败: %s", last_error)
-        return {"content": "", "tool_calls": [], "error": f"LLM 调用失败: {last_error}"}
+        return {
+            "content": "",
+            "tool_calls": [],
+            "error": f"LLM 调用失败: {last_error}",
+            # 瞬态错误（自动重试已耗尽）允许进入手动重试等待态；确定性失败直接报
+            "retryable": _is_retryable_error(last_error) if last_error else False,
+        }
 
     def _normalize(self, data: Any, keep_reasoning: bool = False) -> dict:
         if isinstance(data, dict) and data.get("content") is not None and "tool_calls" in data:

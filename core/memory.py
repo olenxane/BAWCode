@@ -1,5 +1,4 @@
 #该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.工具调用记录管理（白名单保留/回合末剥离/结果外置磁盘）3.长期记忆写入配置4.在agent对话时提供记忆补充内容
-#（RAG 知识库已剥离为官方插件 data/plugins/rag，经 context_supplement 扩展点接入）
 import json
 import os
 import re
@@ -285,42 +284,49 @@ class Memory:
             )
 
     def _migrate_legacy_json(self) -> None:
-        """旧 memory.json 有 facts 时迁入 Agent.md，避免丢失"""
+        """旧 memory.json 的 facts/notes 迁入 md 文件（幂等）。
+
+        已落入 md 的条目同步从内存清除，防止 save_longterm 把它们原样写回
+        memory.json（否则下次启动重复注入，md 文件永远无法退役）；有残留则
+        保留待下次启动重试，不丢数据。"""
         facts = self.longterm.get("facts") or []
         notes = self.longterm.get("project_notes") or []
         if not facts and not notes:
             return
+        facts_left = list(facts)
         try:
             text = self.agent_md_path.read_text(encoding="utf-8") if self.agent_md_path.exists() else ""
         except OSError:
             text = ""
-        changed = False
         if facts and "## 用户偏好" in text:
             for f in facts:
                 line = f"- {f}"
                 if line not in text:
                     text = text.replace("## 用户偏好", f"## 用户偏好\n{line}", 1)
-                    changed = True
+            self.agent_md_path.write_text(text, encoding="utf-8")
+            facts_left = []
+        notes_left = list(notes)
         if notes and self.project_md_path.exists():
             try:
                 ptext = self.project_md_path.read_text(encoding="utf-8")
             except OSError:
                 ptext = ""
-            for n in notes:
-                line = f"- {n}"
-                if line not in ptext:
-                    ptext = ptext.replace("## 项目约定", f"## 项目约定\n{line}", 1)
-                    changed = True
-            if changed:
+            if "## 项目约定" in ptext:
+                for n in notes:
+                    line = f"- {n}"
+                    if line not in ptext:
+                        ptext = ptext.replace("## 项目约定", f"## 项目约定\n{line}", 1)
                 self.project_md_path.write_text(ptext, encoding="utf-8")
-        if changed:
-            self.agent_md_path.write_text(text, encoding="utf-8")
+                notes_left = []
+        if not facts_left and not notes_left:
             backup = self.longterm_path.with_suffix(".json.bak")
             try:
                 self.longterm_path.replace(backup)
                 log.info("旧 memory.json 已迁移并备份: %s", backup)
             except OSError:
                 log.warn("memory.json 备份失败")
+        self.longterm["facts"] = facts_left
+        self.longterm["project_notes"] = notes_left
 
     def save_longterm(self, external_handler=None) -> None:
         """写入长期记忆（md 为事实来源；json 仅作兼容快照）"""
@@ -352,29 +358,14 @@ class Memory:
         except OSError:
             return ""
 
-    def _append_to_md(self, path: Path, section: str, line: str) -> bool:
-        try:
-            text = path.read_text(encoding="utf-8") if path.exists() else ""
-        except OSError:
-            text = ""
-        if not text:
-            text = f"# 记忆\n\n## {section}\n"
-        entry = f"- {line}"
-        if entry in text:
-            return False
-        if f"## {section}" in text:
-            text = text.replace(f"## {section}", f"## {section}\n{entry}", 1)
-        else:
-            text = text.rstrip() + f"\n\n## {section}\n{entry}\n"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        return True
-
     def add_message(self, role: str, content: str, **extra) -> dict:
         """追加一条消息，extra 可含 type/tool_name/tool_call_id/tool_calls"""
         message = {"role": role, "content": content}
         message.update(extra)
         self.messages.append(message)
+        # message_added 观察链：外部同步/转发方消费（content 可能为多模态数组）；
+        # 处理函数异常已在 hooks 内隔离，处理函数内不得再写会话消息（会递归）
+        hooks.collect_hook("message_added", {"role": role, "content": content, **extra})
         if role == "user" and self._compress_fail_streak:
             # 新用户回合复位压缩熔断：上轮的 API 故障可能已恢复，重试频率限制为每回合一轮
             self._compress_fail_streak = 0
@@ -388,30 +379,7 @@ class Memory:
         )
         return message
 
-    def add_fact(self, fact: str, scope: str = "agent") -> None:
-        """写入长期记忆事实；scope=agent → Agent.md，project → 项目 md"""
-        if not fact:
-            return
-        # 兼容旧精确去重
-        if fact in self.longterm.get("facts", []):
-            return
-        self.longterm.setdefault("facts", []).append(fact)
-        path = self.agent_md_path if scope != "project" else self.project_md_path
-        section = "用户偏好" if scope != "project" else "项目约定"
-        self._append_to_md(path, section, fact)
-        self.save_longterm()
-        log.info("写入长期记忆(%s): %s -> %s", scope, fact, path)
-
-    def add_project_note(self, note: str) -> None:
-        if not note:
-            return
-        if note not in self.longterm.get("project_notes", []):
-            self.longterm.setdefault("project_notes", []).append(note)
-        self._append_to_md(self.project_md_path, "项目约定", note)
-        self.save_longterm()
-        log.info("写入项目记忆: %s", note)
-
-    # ----- 关键词记忆（多 md 文件，替换旧 Agent.md 长文体系） -----
+    # ----- 关键词记忆（多 md 文件） -----
     # global/{关键词}.md 全局记忆：build_context_supplements 全量常驻注入（不设预算）；
     # Projects/{pid}/{关键词}.md 项目记忆：仅注入关键词索引，正文按需 read_memory；
     # 旧 Agent.md / Projects/{pid}.md 启动时一次性拆分迁移（.bak 备份，幂等）
@@ -655,14 +623,7 @@ class Memory:
 
     def estimate_context_tokens(self) -> int:
         """当前上下文 token 估计：优先 tiktoken，不可用时按字符粗折算"""
-        from core import tokens as tokenmod
-
-        model = getattr(self.config, "model_name", "") or ""
-        try:
-            return tokenmod.count_message_tokens(self.messages, model)
-        except Exception:
-            chars = self.estimate_token_chars()
-            return max(1, chars // 2)
+        return self._count_tokens(self.messages)
 
     # ----- 工具调用记录管理（白名单保留 / 回合末剥离 / 结果外置磁盘） -----
 
@@ -794,10 +755,7 @@ class Memory:
             parts.append(f"完整输出: {message['persist_path']}")
         if message.get("tool_name") == "read" and message.get("file_path"):
             # 剥离后的 read 记录升级为状态路标：模型据此判断可否直接 edit_file，免一次试探
-            try:
-                parts.append(f"[{toolstore.ledger_fresh_hint(Path(message['file_path']))}]")
-            except (OSError, ValueError):
-                pass
+            parts.append(f"[{toolstore.ledger_fresh_hint(Path(message['file_path']))}]")
         message["content"] = " ".join(parts)
         message["stripped"] = True
         return True
@@ -840,7 +798,7 @@ class Memory:
         return (item.get("type") or "") not in ("system_prompt", "help", "workflow_node")
 
     def _count_tokens(self, messages: List[dict]) -> int:
-        """tiktoken 计消息列表 token；不可用时字符数减半兜底（与 estimate_context_tokens 同策略）"""
+        """tiktoken 计消息列表 token；不可用时字符数减半兜底（estimate_context_tokens 共用）"""
         from core import tokens as tokenmod
 
         model = getattr(self.config, "model_name", "") or ""
@@ -938,8 +896,9 @@ class Memory:
             return ""
         old_tokens = self._count_tokens(old_segment)
 
+        # content 取纯文本部分：数组形态（图片块）直接内插会把 base64 整段拼进提示词
         history_text = "\n".join(
-            f"{m.get('role')}: {m.get('content')}"
+            f"{m.get('role')}: {content_text(m.get('content'))}"
             for m in old_segment
             if self._api_visible(m)
         )

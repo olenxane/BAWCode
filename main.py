@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -154,9 +155,6 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         if not name:
             _echo(ctx, "主题: " + ", ".join(themes))
             return True
-        if name not in themes:
-            # 仍尝试载入，无效会回落默认
-            pass
         ctx["config"].data.setdefault("ui", {})["theme"] = name
         ctx["config"].theme = name
         ctx["app"].load_theme(name)
@@ -620,6 +618,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     # 回合驱动：未启用工作流=直接对话（core/loop 回合运行时）；启用时按
     # data/workflows/<active>.json 的节点链运行（系统提示词注入/分析/规划/编码
     # 等均为节点，增删改走编辑器或直接改 JSON）
+    retry_wait = getattr(app, "wait_llm_retry", None)  # 无头桩无此方法：不提供手动重试
     io = loop_mod.TurnIO(
         status=_set_status,
         choose=lambda options, prompt: _bridge_choose(app, options, prompt, _cancelled),
@@ -629,6 +628,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         clear_stream=lambda: setattr(app, "streaming_msg", None),
         tool_confirm=lambda call: _handle_tool_confirm(llm, app, session, call, _cancelled),
         phase=_set_phase,
+        wait_llm_retry=(lambda text: retry_wait(text, _cancelled)) if retry_wait else None,
     )
     turn = loop_mod.TurnContext(
         session=session, llm=llm, app=app, config=llm.config, user_text=user_text, io=io
@@ -677,6 +677,7 @@ class _AgentRunner:
         self.last_error = None  # 最近回合的异常文本（无头 --json 消费；交互模式仅诊断用）
         self._queue: list = []
         self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
 
     def mode(self) -> str:
         ui_cfg = (self.config.data or {}).get("ui") or {}
@@ -697,6 +698,7 @@ class _AgentRunner:
                 return False
             self._set_busy(True)
         t = threading.Thread(target=self._run, args=(text,), daemon=True, name="bawcode-agent")
+        self._thread = t
         t.start()
         return True
 
@@ -708,7 +710,9 @@ class _AgentRunner:
             if self.busy:
                 return
             self._set_busy(True)
-        threading.Thread(target=self._run, args=(None,), daemon=True, name="bawcode-agent").start()
+        t = threading.Thread(target=self._run, args=(None,), daemon=True, name="bawcode-agent")
+        self._thread = t
+        t.start()
 
     def submit(self, text: str) -> str:
         """busy 期间的发送语义；返回给用户看的状态说明"""
@@ -756,10 +760,13 @@ class _AgentRunner:
             text = None
 
     def cancel_and_join(self, timeout: float = 3.0) -> None:
-        """退出前中止在途请求并等待线程收尾"""
+        """退出前中止在途请求并等待线程收尾（限时）"""
         self.llm.cancel()
         with self._lock:
             self._queue.clear()
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout)
 
 
 class _HeadlessApp:
@@ -921,6 +928,8 @@ def main() -> None:
     # 尽早开启 Windows 输入/输出 VT，便于 Shift+Tab → ESC [ Z
     ui._enable_windows_ansi()
     config = Config()
+    if config.load_error:
+        print(f"[配置] {config.load_error}", file=sys.stderr)
     identity = project_identity.ensure_project_identity(Path.cwd())
     log.info(
         "BAWCode 启动 · 配置=%s · 模型=%s · project_id=%s",
@@ -986,7 +995,11 @@ def main() -> None:
                 session.add_message("system", note, type="help")
                 _sync(app, session)
                 continue
-            runner.start(text)
+            if not runner.start(text):
+                # busy 检查与 start 之间后台通知可能已置忙：入队接力，不丢输入
+                note = runner.submit(text)
+                session.add_message("system", note, type="help")
+                _sync(app, session)
     except KeyboardInterrupt:
         log.info("用户中断（Ctrl+C）")
         session.save_longterm()

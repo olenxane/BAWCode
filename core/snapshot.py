@@ -1,5 +1,5 @@
 #回合级文件快照与回滚（/undo）+ 项目回收站（delete_file / /clear-trash）
-#与用户确认的管线（2026-10-02）：
+#快照管线行为：
 #- 回合开始做轻量清单（路径+mtime+size，不含内容），回合末对账——execute_command 等
 #  绕过写入工具的改动至少能在 /undo 里明确列出"无法自动还原"，不装作没发生
 #- 四个文件写入工具（write 全量/位置、edit_file、multi_edit）+ delete_file 在改动前
@@ -36,6 +36,9 @@ _SNAPSHOT_DEFAULTS = {
     "inventory_max_files": 50000,
 }
 
+# 单回合字节留底总量上限（与单文件上限并存，防大量小文件把磁盘写爆）
+_TURN_BYTES_TOTAL_MAX = 256 * 1024 * 1024
+
 # 清单遍历跳过的目录名（构建产物/VCS/工具自身数据，量大且无对账价值）
 _INVENTORY_SKIP_DIRS = {
     ".git", ".svn", ".hg", "node_modules", "__pycache__", ".venv", "venv",
@@ -58,7 +61,7 @@ def _int(value: Any, default: int) -> int:
 
 
 def snapshot_cfg(config) -> dict:
-    """配置解析：默认值 + 类型钳制集中一处（照 subagent_cfg 范式）"""
+    """配置解析：默认值 + 类型钳制集中一处"""
     data = dict(_SNAPSHOT_DEFAULTS)
     data.update((getattr(config, "data", None) or {}).get("snapshot") or {})
     data["enabled"] = bool(data.get("enabled", True))
@@ -167,7 +170,7 @@ def capture_before(path: Path, tool: str = "") -> None:
             except OSError:
                 size = 0
             limit = turn["cfg"]["max_file_bytes"]
-            if size > limit or turn["bytes_total"] + size > 256 * 1024 * 1024:
+            if size > limit or turn["bytes_total"] + size > _TURN_BYTES_TOTAL_MAX:
                 rec["skip_reason"] = f"文件 {size} 字节超限未留底"
             else:
                 try:
@@ -223,8 +226,9 @@ def end_turn() -> Optional[dict]:
         if current is not None:
             captured = set(turn["files"])
             # 自身产物不算外部改动：本回合刚写的 blob、移入回收站的文件
-            snap_prefix = str(_snapshots_dir(cfg, turn["project_id"], turn["session_id"]))
-            trash_prefix = str(_trash_base(cfg, turn["project_id"]))
+            # （前缀比对带分隔符边界，防 project_id 互为前缀时误判）
+            snap_prefix = str(_snapshots_dir(cfg, turn["project_id"], turn["session_id"])) + os.sep
+            trash_prefix = str(_trash_base(cfg, turn["project_id"])) + os.sep
             for key, (mtime, size) in current.items():
                 before = turn["inventory"].get(key)
                 if key in captured or before == (mtime, size):
@@ -290,9 +294,10 @@ def list_turns(config, project_id: str, session_id: str) -> List[dict]:
     base = _snapshots_dir(cfg, project_id, session_id)
     turns = []
     if base.is_dir():
-        for child in sorted(base.iterdir(), key=lambda c: c.name):
+        # 序号目录按数值排序：零填充 4 位，≥10000 后字典序不再等于数值序
+        for child in sorted((c for c in base.iterdir() if c.name.isdigit()), key=lambda c: int(c.name)):
             index_path = child / "index.json"
-            if not (child.is_dir() and child.name.isdigit() and index_path.exists()):
+            if not (child.is_dir() and index_path.exists()):
                 continue
             try:
                 index = json.loads(index_path.read_text(encoding="utf-8"))

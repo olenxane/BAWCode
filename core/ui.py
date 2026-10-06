@@ -19,7 +19,9 @@ except ImportError:
     HAS_RICH = False
 
 from core import commands as cmdsys
+from core import hooks as hooks_mod
 from core import keymap as keymap_mod
+from core import mcp as mcp_mod
 from core import memory as memory_mod
 from core import pasteboard
 from core import policy
@@ -40,8 +42,8 @@ from core.log import get_logger, init as init_logging
 
 log = get_logger("ui")
 
-# UI 请求桥的取消哨兵（与 core.llm.CANCELLED 同值：桥等待被取消时回填给 agent 线程）
-CANCEL_RESULT = "__CANCELLED__"
+# UI 请求桥的取消哨兵：复用 llm 的常量，桥等待被取消时回填给 agent 线程
+from core.llm import CANCELLED as CANCEL_RESULT
 
 _CONSOLE = Console(soft_wrap=True, force_terminal=True) if HAS_RICH else None
 _app: Optional["TuiApp"] = None
@@ -90,8 +92,8 @@ DEFAULT_COLORS = {
     "highlight_bg": (31, 78, 121),
     # 会话消息配色：角色徽标用饱和色加粗，正文由角色色混合 ink 生成浅色变体
     "user_msg": (70, 184, 178),      # 46b8b2 明青
-    "agent": (143, 191, 106),        # 8fbf6a 新叶绿（原 80944e 偏浊）
-    "thinking": (79, 163, 159),      # 4fa39f 灰青（原 045f62 过暗难读）
+    "agent": (143, 191, 106),        # 8fbf6a 新叶绿
+    "thinking": (79, 163, 159),      # 4fa39f 灰青
     "tool_title": (20, 186, 188),    # 14babc
     "tool_content": (255, 255, 255), # 纯白
     "subagent": (240, 156, 88),      # f09c58 子代理节点/直播（暖橙，与主对话区分）
@@ -137,8 +139,6 @@ def _enable_windows_ansi() -> None:
 
 
 def _term_size() -> Tuple[int, int]:
-    import os
-
     cols = os.environ.get("COLUMNS") or os.environ.get("BAW_COLS")
     rows = os.environ.get("LINES") or os.environ.get("BAW_LINES")
     if cols and rows:
@@ -301,11 +301,6 @@ def _pad(text: str, width: int) -> str:
     return text if visible >= width else text + " " * (width - visible)
 
 
-def _split_by_width(text: str, cut: int) -> tuple:
-    """按显示宽度切开：cut 为光标前应占用的列宽（含宽字符）。"""
-    return split_at_cells(text, cut)
-
-
 def _wrap(text: str, width: int) -> List[str]:
     if width <= 0:
         return [""]
@@ -463,12 +458,6 @@ class Layout:
             cells = max(0, cells)
         return visual_row, cells
 
-    def window(self, start_row: int, height: int) -> List[str]:
-        rows = self.visual_rows()
-        start = max(0, min(start_row, max(0, len(rows) - 1)))
-        vis = rows[start : start + max(1, height)]
-        return list(vis) + [""] * max(0, height - len(vis))
-
 
 def _oneline(text: str, limit: int = 80) -> str:
     plain = _ANSI_RE.sub("", str(text or "")).replace("\n", " ")
@@ -476,14 +465,15 @@ def _oneline(text: str, limit: int = 80) -> str:
 
 
 def _git_branch() -> str:
+    # 项目即进程启动目录（与 ensure_project_identity(Path.cwd()) 同源）
     try:
-        head = Path(__file__).resolve().parents[1] / ".git" / "HEAD"
+        head = Path.cwd() / ".git" / "HEAD"
         if head.exists():
             ref = head.read_text(encoding="utf-8", errors="replace").strip()
             if ref.startswith("ref:"):
                 return ref.split("/")[-1] or "main"
             return ref[:7] if ref else "main"
-    except Exception:
+    except OSError:
         pass
     return "main"
 
@@ -545,42 +535,6 @@ def _logo_frames() -> List[List[str]]:
     return frames
 
 
-def show_startup_logo(seconds: float = 1.5, project_name: str = "BAWCode") -> None:
-    """程序真正启动时在主屏幕显示 Logo（不进入 TUI 备用屏，不占用对话区）"""
-    import os
-
-    if os.environ.get("BAW_NO_LOGO") == "1":
-        return
-    _enable_windows_ansi()
-    frames = _logo_frames()
-    steps = max(1, int(seconds / 0.25))
-    dim = _fg(DEFAULT_COLORS["dim"])
-    title_c = _fg(DEFAULT_COLORS["title"])
-    try:
-        for i in range(steps):
-            art = frames[i % len(frames)]
-            w, h = _term_size()
-            lines = [""] * h
-            top = max(2, h // 2 - len(art) // 2 - 1)
-            lines[0] = title_c + f" {project_name} " + "\033[0m"
-            for j, row in enumerate(art):
-                if 0 <= top + j < h:
-                    indent = max(0, (w - _display_width(row)) // 2)
-                    lines[top + j] = " " * indent + row
-            tip = "启动中…"
-            if top + len(art) + 1 < h:
-                lines[top + len(art) + 1] = " " * max(0, (w - len(tip)) // 2) + dim + tip + "\033[0m"
-            parts = [f"\033[{r + 1};1H\033[2K{_clip_keep_ansi(lines[r], w)}" for r in range(h)]
-            sys.stdout.write("".join(parts) + "\033[J")
-            sys.stdout.flush()
-            time.sleep(0.25)
-        # 清空主屏，准备进入 TUI
-        sys.stdout.write("\033[2J\033[H")
-        sys.stdout.flush()
-    except Exception:
-        pass
-
-
 class TreeNode:
     __slots__ = ("id", "label", "kind", "children", "default_expanded", "summary", "detail")
 
@@ -592,6 +546,17 @@ class TreeNode:
         self.default_expanded = default_expanded
         self.summary = summary
         self.detail = detail
+
+
+class _LlmRetryGate:
+    """LLM 错误手动重试闸：agent 线程在 wait 上阻塞，主线程按键/插件置位放行"""
+
+    __slots__ = ("error", "retry", "give_up")
+
+    def __init__(self, error: str):
+        self.error = error
+        self.retry = threading.Event()
+        self.give_up = threading.Event()
 
 
 class TuiApp:
@@ -622,6 +587,8 @@ class TuiApp:
         # _paste_async：后台图片落盘单槽（后台线程单写、帧尾 _tick_paste_async 取回清空）
         self._paste_async = None
         self._paste_async_busy = False
+        # LLM 错误手动重试闸（agent 线程等待、主线程按键/插件放行；None=非等待态）
+        self._llm_retry_gate: Optional[_LlmRetryGate] = None
         self.scroll = 0
         self.input_scroll = 0
         self.cand_scroll = 0
@@ -765,10 +732,7 @@ class TuiApp:
         # 配色已变：会话树行缓存失效（缓存 key 不含主题，否则残留旧配色直到内容变化）
         self._tree_rows_key = None
         self._tree_sig = None
-        try:
-            self.keys["tip_interval"] = self.theme.get("tips_rotate_seconds", 5)
-        except Exception:
-            pass
+        self.keys["tip_interval"] = self.theme.get("tips_rotate_seconds", 5)
 
     def bind_config(self, config) -> None:
         log.debug(
@@ -876,10 +840,6 @@ class TuiApp:
         sys.stdout.flush()
         self._entered = False
 
-    def show_logo(self, seconds: float = 1.5) -> None:
-        """兼容入口：转发到启动 Logo（主屏幕）"""
-        show_startup_logo(seconds, self.project_name)
-
     def refresh_from_session(self, session, task: Optional[str] = None, render: bool = True) -> None:
         self.messages = list(getattr(session, "messages", []) or [])
         self.plan = dict(getattr(session, "plan", {}) or {})
@@ -959,8 +919,6 @@ class TuiApp:
             if role == "system" and mtype not in ("", None) and content:
                 # 帮助/命令结果等也占用会话区
                 return True
-            if role == "system" and content and mtype == "help":
-                return True
         if self.steps:
             return True
         plan = self.plan or {}
@@ -971,8 +929,6 @@ class TuiApp:
 
     def _show_splash_logo(self) -> bool:
         """空会话区显示 Logo；界面开始展示其他文字时消失"""
-        import os
-
         if os.environ.get("BAW_NO_LOGO") == "1":
             return False
         if not self.logo_enabled:
@@ -1376,13 +1332,7 @@ class TuiApp:
         return out
 
     def _mcp_line(self) -> str:
-        # import 须在 try 内：mcp 模块任何静态错误都不能拖垮整棵会话树的渲染
-        try:
-            from core import mcp as mcp_mod
-
-            return mcp_mod.status_line()
-        except Exception:
-            return ""
+        return mcp_mod.status_line()
 
     def _tree_signature(self) -> tuple:
         """会话内容签名：命中则复用 _build_tree 结果，避免每帧全量重建（流式增长亦靠它失效）"""
@@ -1807,23 +1757,20 @@ class TuiApp:
         while len(lines) < h:
             lines.append(" ")
         # 记录输入/状态行号，供局部重绘
-        try:
-            input_start = None
-            # 从后往前找「→项目」信息行，其前为输入区
-            for i, ln in enumerate(lines):
-                plain = _ANSI_RE.sub("", ln)
-                if plain.startswith("→"):
-                    self._row_meta["info"] = i
-                    self._row_meta["status"] = min(h - 1, i + 3)
-                    self._row_meta["tip"] = min(h - 1, i + 1)
-                    input_start = max(0, i - input_zone_h - 2)
-                    break
-            if input_start is None:
-                input_start = max(0, h - input_zone_h - 5)
-            self._row_meta["input_start"] = input_start
-            self._row_meta["input_h"] = input_zone_h
-        except Exception:
-            pass
+        input_start = None
+        # 从后往前找「→项目」信息行，其前为输入区
+        for i, ln in enumerate(lines):
+            plain = _ANSI_RE.sub("", ln)
+            if plain.startswith("→"):
+                self._row_meta["info"] = i
+                self._row_meta["status"] = min(h - 1, i + 3)
+                self._row_meta["tip"] = min(h - 1, i + 1)
+                input_start = max(0, i - input_zone_h - 2)
+                break
+        if input_start is None:
+            input_start = max(0, h - input_zone_h - 5)
+        self._row_meta["input_start"] = input_start
+        self._row_meta["input_h"] = input_zone_h
         return lines[:h]
 
     def render(self, *args, **kwargs) -> None:
@@ -1881,10 +1828,11 @@ class TuiApp:
         self._cand_text = text
         self._cand_cursor = self.cursor
         self._cand_config = config
-        start = self._word_start()
-        word = text[start : self.cursor] if start <= self.cursor else ""
-        if word.startswith("/"):
-            self.candidates = cmdsys.complete(word, config=config)
+        # 传整段光标前文本：cmdsys.complete 依据空格区分命令名/参数补全，
+        # 只传当前词会让 /model deep 之类的参数补全永远无法触发
+        frag = text[: self.cursor]
+        if frag.startswith("/"):
+            self.candidates = cmdsys.complete(frag, config=config)
             if self.candidate_index >= len(self.candidates):
                 self.candidate_index = 0
         else:
@@ -1902,15 +1850,49 @@ class TuiApp:
         end = self.cursor
         while end < len(text) and not text[end].isspace():
             end += 1
-        # /model deepseek-chat 需要整段替换
-        if " " in name:
-            new_text = name + " " + text[end:]
-            self._buf_set(new_text, len(name) + 1)
-        else:
-            new_text = text[:start] + name + " " + text[end:]
-            self._buf_set(new_text, start + len(name) + 1)
+        # 替换当前词（命令名或参数片段），补空格便于继续输入
+        new_text = text[:start] + name + " " + text[end:]
+        self._buf_set(new_text, start + len(name) + 1)
         self.candidates = []
         self.candidate_index = 0
+        return True
+
+    # ----- LLM 错误手动重试闸 -----
+
+    def wait_llm_retry(self, error_text: str, cancelled) -> bool:
+        """API 错误等待态（TurnIO 桥，agent 线程调用）：状态行显示错误与按键提示。
+        返回 True=用户按 Ctrl+Y 重试；Esc 放弃、提交消息自动放弃、回合取消或
+        llm.retry_wait_seconds 超时（0=无限等待）亦放弃。等待期间其余交互不受影响。"""
+        gate = _LlmRetryGate(_oneline(str(error_text or ""), 200))
+        self._llm_retry_gate = gate
+        self.status = f"API 错误 · {gate.error} · Ctrl+Y 重试 / Esc 放弃"
+        timeout = 0.0
+        cfg = getattr(self, "config", None)
+        if cfg is not None:
+            try:
+                timeout = float((cfg.data or {}).get("llm", {}).get("retry_wait_seconds", 0) or 0)
+            except (TypeError, ValueError):
+                timeout = 0.0
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+        try:
+            while True:
+                if gate.retry.wait(0.1):
+                    return True
+                if gate.give_up.is_set() or cancelled():
+                    return False
+                if deadline is not None and time.monotonic() >= deadline:
+                    log.warn("LLM 重试等待超时（%.0fs），放弃", timeout)
+                    return False
+        finally:
+            if self._llm_retry_gate is gate:
+                self._llm_retry_gate = None
+
+    def request_llm_retry(self) -> bool:
+        """请求重试当前失败的 LLM 请求（插件接口同源）：仅错误等待态有效，返回是否触发"""
+        gate = self._llm_retry_gate
+        if gate is None:
+            return False
+        gate.retry.set()
         return True
 
     def _scroll_step(self, direction: str) -> int:
@@ -2000,8 +1982,15 @@ class TuiApp:
             self.status = "正在读取剪贴板图片…"
 
             def _save_bg():
-                # 单槽协议：(True, 落盘路径|None)——None 结果也要能取回，不能与"未完成"混同
-                self._paste_async = (True, pasteboard.save_clipboard_image())
+                # 单槽协议 (True, 路径|None)：成败都回填并复位 busy，防帧循环永久卡"正在处理"
+                try:
+                    result = pasteboard.save_clipboard_image()
+                except Exception as e:
+                    log.warn("剪贴板图片落盘失败: %r", e)
+                    result = None
+                finally:
+                    self._paste_async = (True, result)
+                    self._paste_async_busy = False
 
             threading.Thread(target=_save_bg, daemon=True, name="bawcode-paste-img").start()
             self.render()
@@ -2056,6 +2045,16 @@ class TuiApp:
             self._handle_clipboard_paste()
             return None
 
+        # LLM 错误重试闸激活时：Ctrl+Y 放行重试、Esc 放弃；其余按键照常分发
+        gate = self._llm_retry_gate
+        if gate is not None:
+            if kind == "hotkey" and str(value) == "ctrl+y":
+                gate.retry.set()
+                return None
+            if kind == "escape":
+                gate.give_up.set()
+                return None
+
         act = self.keymap.resolve(ctx, kind, value)
         # Tab：输入框 complete 优先，再 focus；树上 focus
         if kind == "tab" or act in (Action.COMPLETE, Action.FOCUS_NEXT):
@@ -2079,8 +2078,6 @@ class TuiApp:
                 self.render()
                 return None
             # SEND 在树上也提交
-            if self.focus == "tree" and act == Action.SEND:
-                pass
             line = self._buf_text()
             if line.startswith("/"):
                 # 命令行不展开粘贴占位（占位机制只服务对话消息）
@@ -2091,6 +2088,9 @@ class TuiApp:
                     self.pending_images.append(images)
             if line.strip():
                 self.input_history.append(line)
+                if self._llm_retry_gate is not None:
+                    # 等待重试时提交新消息：自动放弃当前错误，消息经 busy 队列接力
+                    self._llm_retry_gate.give_up.set()
             self.hist_index = len(self.input_history)
             self._buf_clear()
             self.candidates = []
@@ -2183,10 +2183,8 @@ class TuiApp:
         dirn = _key_direction(kind, value)
         if dirn == "up":
             self._on_up()
-            return None
-        if dirn == "down":
+        elif dirn == "down":
             self._on_down()
-            return None
         return None
 
     def _scroll_delta(self, kind: str, value: Any) -> int:
@@ -2640,7 +2638,22 @@ class TuiApp:
     # ----- UI 请求桥：agent 线程经此把交互弹窗移交主线程执行 -----
 
     def request_ui(self, kind: str, payload: dict) -> dict:
-        """agent 线程发起交互请求（confirm/choose/line）；结果经 wait_ui 取回"""
+        """agent 线程发起交互请求（confirm/choose/line）；结果经 wait_ui 取回。
+
+        ui_request 变换链：插件/外部接口可代答——非 None 返回视为立即应答
+        （wait_ui 直通返回，终端面板不再弹出）；全 None 走原终端面板路径。"""
+        hooked = hooks_mod.call_hook("ui_request", {"kind": kind, **(payload or {})}, default=None)
+        if hooked is not None:
+            req = {
+                "kind": kind,
+                "payload": payload or {},
+                "result": hooked,
+                "event": threading.Event(),
+                "served": True,  # 已由扩展点应答，_serve_ui_request 跳过
+            }
+            req["event"].set()
+            self._ui_req = req
+            return req
         req = {
             "kind": kind,
             "payload": payload or {},
@@ -2993,7 +3006,7 @@ class TuiApp:
                         self.render()
                         continue
                     return {"action": action, "reason": ""}
-                # 数字快捷键（兼容旧习惯 1/2/3）
+                # 数字快捷键 1/2/3
                 if kind == "char" and value in ("1", "2", "3"):
                     idx = int(value) - 1
                     action = options[idx]
@@ -3019,8 +3032,6 @@ class TuiApp:
         self.messages.append({"role": "system", "content": content, "type": "help"})
         # 写入 session，避免随后 _sync 用 session 覆盖后选项消失
         try:
-            from core import memory as memory_mod
-
             sess = memory_mod.get_session()
             if sess is not None:
                 sess.add_message("system", content, type="help")
@@ -3889,16 +3900,9 @@ class TuiApp:
         options = list(field.get("options") or [])
         if not options:
             return
-        try:
-            cur = self.settings_scratch.get(key, field.get("current"))
-            if cur not in options:
-                idx = 0
-            else:
-                idx = options.index(cur)
-            nxt = (idx + direction) % len(options)
-            self.settings_scratch[key] = options[nxt]
-        except Exception:
-            self.settings_scratch[key] = options[0]
+        cur = self.settings_scratch.get(key, field.get("current"))
+        idx = options.index(cur) if cur in options else 0
+        self.settings_scratch[key] = options[(idx + direction) % len(options)]
         # 选择提供商/模型后重建字段
         if key == "switch_provider":
             # 切换编辑目标提供商；“(新建)” 清空表单
@@ -4190,10 +4194,7 @@ class TuiApp:
         if existing:
             provider["models"] = existing.get("models") or []
             provider["default_model_id"] = s.get("default_model_id") or existing.get("default_model_id")
-        try:
-            config.add_or_update_provider(provider)
-        except Exception:
-            pass
+        config.add_or_update_provider(provider)
         # 激活提供商
         self._settings_apply_active_provider(config)
         config.apply_active()
@@ -4380,27 +4381,6 @@ def get_app() -> TuiApp:
     if _app is None:
         _app = TuiApp()
     return _app
-
-
-def chatbox(messages=None, task="", plan=None, steps=None, status="") -> None:
-    """会话区刷新（UI 不提供外部 API）"""
-    app = get_app()
-    if messages is not None:
-        app.messages = list(messages)
-    if plan is not None:
-        app.plan = dict(plan)
-    if steps is not None:
-        app.steps = list(steps)
-    if task:
-        app.task = task
-    if status:
-        app.status = status
-    app.render()
-
-
-def input_box(prompt: str = "> ", config=None) -> str:
-    app = get_app()
-    return app.read_line(prompt, config=config)
 
 
 def settings(config) -> dict:
