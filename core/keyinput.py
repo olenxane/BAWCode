@@ -26,6 +26,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
@@ -350,6 +351,8 @@ class _PtReader:
         # 暂停协议：内建 input() 临时接管控制台时停泵 + 恢复 cooked 模式
         self._pause_req = threading.Event()
         self._parked = threading.Event()
+        self._pending: deque = deque()
+        self.dead = threading.Event()
 
     def start(self) -> None:
         with self._lock:
@@ -378,8 +381,7 @@ class _PtReader:
             _flog("start failed: %r" % (exc,))
 
     def _pump(self) -> None:
-        # POSIX 的 read_keys(timeout=None) 阻塞到有键，传小超时保证暂停协议与帧泵响应；
-        # Windows 的 ConsoleInputReader 保持默认（timeout=None）不变
+        # POSIX 传小超时保证暂停协议与帧泵响应；Windows read_keys(self) 阻塞读不收超时参数
         timeout = None if _WINDOWS else 0.05
         try:
             while True:
@@ -387,7 +389,7 @@ class _PtReader:
                     self._parked.set()
                     time.sleep(0.02)
                     continue
-                presses = self._input.read_keys(timeout)
+                presses = self._input.read_keys() if _WINDOWS else self._input.read_keys(timeout)
                 if presses:
                     self._q.put(presses)
                 else:
@@ -397,16 +399,21 @@ class _PtReader:
         except Exception as exc:  # noqa: B014 - 后台线程兜底
             log.error("pt 读键线程退出: %r", exc)
             _flog("pump exit: %r" % (exc,))
+            self.dead.set()
 
     def read_events(self, timeout: float = 0.02) -> List[KeyEvent]:
         self.start()
         if self._input is None:
             return []
         out: List[KeyEvent] = []
+        # 单事件消费者的余量先出（IME 一次上屏/快速键入会成批到达）
+        while self._pending:
+            out.append(self._pending.popleft())
         try:
-            batch = self._q.get(timeout=timeout)
+            # 已有余量时不再等待新批，避免逐事件多出 20ms 延迟
+            batch = self._q.get_nowait() if out else self._q.get(timeout=timeout)
         except queue.Empty:
-            return []
+            return out
         out.extend(translate_key_presses(batch))
         while True:
             try:
@@ -417,7 +424,11 @@ class _PtReader:
 
     def read_event(self, timeout: float = 0.02) -> KeyEvent:
         evs = self.read_events(timeout)
-        return evs[0] if evs else TICK
+        if not evs:
+            return TICK
+        if len(evs) > 1:
+            self._pending.extend(evs[1:])
+        return evs[0]
 
     def flush_input(self) -> None:
         if self._input is not None:
@@ -425,6 +436,7 @@ class _PtReader:
                 self._input.flush_keys()
             except Exception:
                 pass
+        self._pending.clear()
         while True:
             try:
                 self._q.get_nowait()
@@ -451,6 +463,12 @@ def read_key_event(timeout: float = 0.02) -> Event:
 def read_events(timeout: float = 0.02) -> List[Event]:
     """一次整批：返回逻辑事件列表；无事件返回 []（不含 tick）。"""
     return get_reader().read_events(timeout)
+
+
+def pump_dead() -> bool:
+    """读键线程是否已崩溃：UI 阻塞弹窗据此逃逸，避免无键可达时永久卡死"""
+    r = _reader
+    return bool(r and r.dead.is_set())
 
 
 def read_key(timeout: float = 0.0) -> Optional[Event]:

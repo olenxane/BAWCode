@@ -35,8 +35,8 @@ log = get_logger("subagent")
 
 _ROOT = Path(__file__).resolve().parent.parent
 
-# 子代理不可用的工具：递归防线（task/query_subagent）+ 会话状态工具（内部用
-# memory.get_session() 全局单例，子代理调用会污染主会话计划/记忆）
+# 子代理不可用的工具：task/query_subagent 递归防线，加经 memory.get_session() 全局单例操作的
+# 会话状态工具，子代理调用会污染主会话计划与记忆
 _SUBAGENT_EXCLUDED_TOOLS = {
     "task",
     "query_subagent",
@@ -44,7 +44,7 @@ _SUBAGENT_EXCLUDED_TOOLS = {
     "update_plan",
     "generate_steps",
     "update_step_status",
-    # RAG 项目级开关（写插件状态文件，主会话语义；检索/重建对子代理开放）
+    # RAG 项目级开关写插件状态文件，属主会话语义；检索/重建对子代理开放
     "set_rag",
 }
 
@@ -223,8 +223,8 @@ def _records_dir(config, session) -> Path:
 
 
 def _record_path(directory: Path, record_id: str) -> Path:
-    # id 由 _next_id 生成为纯数字；外部入参（query_subagent/resume_id）同样只接受纯数字，
-    # 防止 ".."、盘符等内容注入路径读到目录外文件（0.json 不存在，等效查无此记录）
+    # id 由 _next_id 生成为纯数字；外部入参 query_subagent/resume_id 同样只接受纯数字，
+    # 防止 ".."、盘符等内容注入路径读到目录外文件，0.json 不存在时等效查无此记录
     safe = str(record_id).strip()
     return directory / f"{safe if safe.isdigit() else '0'}.json"
 
@@ -276,7 +276,7 @@ def list_records(config, session) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 直播槽（app.subagent_stream：单写者=agent 线程，签名失效驱动帧循环重绘）
+# 直播槽 app.subagent_stream，单写者=agent 线程，签名失效驱动帧循环重绘
 
 
 def _live(rt: dict) -> Optional[dict]:
@@ -509,7 +509,7 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
             for call in norm_calls:
                 if call not in processed:
                     messages.append(_normalize_tool_msg(call, "工具执行被中断，未获得结果"))
-        # 空转计数：本轮结果喂入计数器（重复才计，整轮全新清零）
+        # 空转计数：本轮结果喂入计数器，重复才计，整轮全新清零
         spin.feed(round_results)
         # 每轮落盘：崩溃/中断时记录可恢复
         _save_record(directory, record)
@@ -570,12 +570,12 @@ def _tool_task(
         messages.append({"role": "user", "content": task_text})
         origin_task = str(source.get("task") or "")
         if resume_id:
-            # 恢复：沿用原编号与记录（含 resumed 计数）
+            # 恢复：沿用原编号与记录，含 resumed 计数
             record_id = str(source.get("id"))
             resumed = _int(source.get("resumed"), 0) + 1
             created_at = str(source.get("created_at") or now)
         else:
-            # context_id 派生：新编号新记录，上下文（含源系统提示词）原样承接
+            # context_id 派生：新编号新记录，上下文含源系统提示词原样承接
             record_id = _next_id(directory)
             resumed = 0
             created_at = now
@@ -734,7 +734,7 @@ def _tool_query_subagent(id: str, rounds: int = 0) -> str:
 
 
 def register_tools(config) -> bool:
-    """注册 task / query_subagent；subagent.enabled=false 时不注册（模型侧完全不可见）"""
+    """注册 task / query_subagent；subagent.enabled=false 时不注册，模型侧完全不可见"""
     cfg = subagent_cfg(config)
     if not cfg["enabled"]:
         log.info("子代理系统未启用，跳过工具注册")
@@ -743,9 +743,12 @@ def register_tools(config) -> bool:
     register.register(
         name="task",
         description=(
-            "派发子代理执行独立子任务：子代理拥有独立上下文与受限工具，只把最终结果"
-            "返回本对话。适用于会产生大量中间输出、无需用户交互的调研/审查/独立执行；"
-            "task 必须自足完整（子代理看不到主对话历史）。一次派发一个。"
+            "Dispatch a subagent to run an independent subtask: the subagent has "
+            "its own context and a restricted toolset and returns only the final "
+            "result to this conversation. Use for research/review/self-contained "
+            "execution that produces large intermediate output and needs no user "
+            "interaction. The task prompt must be self-contained (the subagent "
+            "cannot see the main conversation history). Dispatch one at a time"
         ),
         usage="task <role> <task> [permission] [context]",
         schema={
@@ -754,33 +757,34 @@ def register_tools(config) -> bool:
                 "role": {
                     "type": "string",
                     "enum": sorted(_SPECS),
-                    "description": "子代理角色（决定系统提示词与模型），见 /agents",
+                    "description": "Subagent role, decides its system prompt and model; see /agents",
                 },
                 "task": {
                     "type": "string",
-                    "description": "子任务提示词：目标、范围、期望产出形式，自足完整",
+                    "description": "Subtask prompt stating goal, scope and expected output format; must be self-contained",
                 },
                 "permission": {
                     "type": "string",
                     "enum": ["", "auto", "manual", "full"],
                     "description": (
-                        "工具权限；留空=跟随主代理（手动模式主代理时为 auto）。"
-                        "只允许收紧不允许放宽，放宽会被钳制回继承默认"
+                        "Tool permission; empty = inherit from the main agent (auto "
+                        "when the main agent runs in manual mode). May only tighten, "
+                        "never loosen; looser values are clamped back to the inherited default"
                     ),
                 },
                 "context": {
                     "type": "string",
-                    "description": "可选：主代理显式补充的背景文本（已知路径/结论），不自动注入会话上下文",
+                    "description": "Optional background text provided explicitly by the main agent (known paths/conclusions); session context is not auto-injected",
                 },
                 "resume_id": {
                     "type": "string",
-                    "description": "恢复指定编号子代理：沿用其完整上下文继续（此时 role 被忽略）",
+                    "description": "Resume the subagent with this id, continuing with its full context (role is ignored)",
                 },
                 "context_id": {
                     "type": "string",
                     "description": (
-                        "以指定编号子代理的上下文为初始上下文派发新编号子代理"
-                        "（此时 role 仅作记录标签，系统提示词与模型沿用源）"
+                        "Dispatch a new subagent seeded with the context of the given "
+                        "subagent id (role is only a label; system prompt and model come from the source)"
                     ),
                 },
             },
@@ -790,17 +794,18 @@ def register_tools(config) -> bool:
     register.register(
         name="query_subagent",
         description=(
-            "查询本对话中某子代理的工作上下文：返回其最后 n 轮消息（输出与工具调用）。"
-            "需要子代理过程细节而不仅是结果摘要时使用"
+            "Query a subagent's working context in this conversation: returns its "
+            "last n rounds of messages (outputs and tool calls). Use when you need "
+            "process details rather than just the result summary"
         ),
         usage="query_subagent <id> [rounds]",
         schema={
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "子代理编号，如 \"1\""},
+                "id": {"type": "string", "description": "Subagent id, e.g. \"1\""},
                 "rounds": {
                     "type": "integer",
-                    "description": "返回最后 n 轮，默认见配置（0=全部）",
+                    "description": "Return the last n rounds, default from config (0 = all)",
                 },
             },
             "required": ["id"],

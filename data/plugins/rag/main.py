@@ -637,8 +637,8 @@ def setup(ctx):
         schema={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "关键词：符号名/类名/函数名/注释词"},
-                "top_k": {"type": "integer", "description": "返回条数上限（缺省用配置 top_k）"},
+                "query": {"type": "string", "description": "Keywords: symbol/class/function names or comment words"},
+                "top_k": {"type": "integer", "description": "Max results to return, default from config top_k"},
             },
             "required": ["query"],
         },
@@ -682,7 +682,7 @@ def setup(ctx):
             "type": "object",
             "properties": {
                 "enabled": {"type": "boolean",
-                            "description": "true=开启本项目 RAG，false=关闭"},
+                            "description": "true = enable RAG for this project, false = disable"},
             },
             "required": ["enabled"],
         },

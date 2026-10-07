@@ -93,6 +93,27 @@ def readonly_simple_cmd(cmd: str) -> bool:
     if first in SAFE_VERBS:
         return True
     return " ".join([first] + [t.lower() for t in tokens[1:2]]) in SAFE_VERB_PAIRS
+
+
+def readonly_compound_cmd(cmd: str) -> bool:
+    """复合命令逐段判定：引号外按 |;& 与换行切分，重定向直接否，每段须为只读简单命令"""
+    segs, cur, in_dq = [], [], False
+    for ch in cmd:
+        if ch == '"':
+            in_dq = not in_dq
+            cur.append(ch)
+        elif in_dq:
+            cur.append(ch)
+        elif ch in "<>":
+            return False
+        elif ch in "|;&\n":
+            segs.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    segs.append("".join(cur))
+    segs = [s for s in segs if s.strip()]
+    return bool(segs) and all(readonly_simple_cmd(s) for s in segs)
 _DANGEROUS_CMD_RE = re.compile(
     r"""(?xi)
     (?:
@@ -246,13 +267,11 @@ def is_safe_call(tool_name: str, args: Optional[dict]) -> bool:
         cmd = _command_text(tool_name, args)
         if not cmd.strip():
             return False
-        # 危险词全串扫描为独立第二层；复合命令（管道/链式/重定向）一律不 SAFE，
-        # 落回确认路径——"| powershell"、"| nc" 这类外发链由此拦下
+        # 危险词全串扫描为独立第二层；复合命令逐段只读判定——"| powershell"、"| nc"
+        # 这类外发链因段不只读落回确认，重定向（写文件）同样不放行
         if _DANGEROUS_CMD_RE.search(cmd):
             return False
-        if has_shell_operator(cmd):
-            return False
-        return readonly_simple_cmd(cmd)
+        return readonly_compound_cmd(cmd)
     # 未知工具：保守
     return False
 

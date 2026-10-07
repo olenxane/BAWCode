@@ -1,6 +1,6 @@
 #该脚本负责工具调用结果的外置存储：超限/被剥离的工具输出以调用id为文件名落盘，
 #供模型后续用 read 工具分批回读；提供 token 计量切片、原子写入与会话清理。
-#文件布局：data/toolcalls/{project_id}/{session_id}/{call_id}.txt（与 sessions/ 同范式）
+#文件布局：data/toolcalls/{project_id}/{session_id}/{call_id}.txt，与 sessions/ 同范式
 import json
 import os
 import time
@@ -26,7 +26,7 @@ def store_dir(config, project_id: str, session_id: str) -> Path:
 
 
 def count_tokens_safe(text: str, model: str = "") -> int:
-    """token 计数兜底：tiktoken 不可用时按字符数折半（与 memory 退化口径一致）"""
+    """token 计数兜底：tiktoken 不可用时按字符数折半，与 memory 退化口径一致"""
     if not text:
         return 0
     try:
@@ -99,12 +99,12 @@ def persist(
 
 
 def header_line_count() -> int:
-    """外置文件元数据头行数（正文自该行+1 起，供指针提示分页起点）"""
+    """外置文件元数据头行数，正文自该行+1 起，供指针提示分页起点"""
     return 10
 
 
 def pointer_line(path: Optional[Path], total_lines: int) -> str:
-    """行内消息中的落盘指针（模型据此用 read offset/limit 分批回读）"""
+    """行内消息中的落盘指针，模型据此用 read offset/limit 分批回读"""
     if path is None:
         return "完整输出外置失败，仅保留行内部分"
     start = header_line_count() + 1
@@ -116,7 +116,7 @@ def pointer_line(path: Optional[Path], total_lines: int) -> str:
 
 
 def clear_session(config, project_id: str, session_id: str) -> int:
-    """清理会话对应的全部外置记录（/clear 用），返回删除文件数"""
+    """清理会话对应的全部外置记录，/clear 用，返回删除文件数"""
     directory = store_dir(config, project_id, session_id)
     if not directory.exists():
         return 0
@@ -140,13 +140,13 @@ def clear_session(config, project_id: str, session_id: str) -> int:
     return removed
 
 
-# ----- 文件状态台账（edit/位置写入门禁）-----
-# read/write/edit 成功后登记磁盘基线（md5+mtime+size+行数）与内存快照（LRU 上限）；
-# edit/位置 write 前校验三态：无记录拒绝（要求先 read）、新鲜放行（哪怕 read 内容
-# 已被剥离/压缩——锚点是台账不是对话历史）、内容漂移拒绝并附变更区间行号与窄读建议。
-# 台账是会话级 RAM 状态，随会话生命周期重置（memory.__init__/switch_to/start_new_session/clear）；
-# 快照仅存内存（工具函数无 session 上下文，落盘版待台账持久化时一并考虑），LRU 淘汰后
-# 漂移检测退化为"已变化但无法给出区间"。
+# ----- 文件状态台账，edit/位置写入门禁 -----
+# read/write/edit 成功后登记磁盘基线 md5+mtime+size+行数 与内存快照 LRU 上限；
+# edit/位置 write 前校验三态：无记录拒绝要求先 read；新鲜放行，哪怕 read 内容已被剥离
+# 或压缩——锚点是台账不是对话历史；内容漂移拒绝并附变更区间行号与窄读建议。
+# 台账是会话级 RAM 状态，随会话生命周期在 memory.__init__/switch_to/start_new_session/clear 重置；
+# 快照仅存内存，工具函数无 session 上下文，落盘版待台账持久化时一并考虑；
+# LRU 淘汰后漂移检测退化为"已变化但无法给出区间"。
 import difflib
 import hashlib
 import re as _re
@@ -169,12 +169,12 @@ def _file_md5(path: Path) -> str:
 
 
 def ledger_reset() -> None:
-    """清空台账（会话初始化/切换/清空时调用，防跨会话串状态）"""
+    """清空台账，会话初始化/切换/清空时调用，防跨会话串状态"""
     _ledger.clear()
 
 
 def ledger_register(path: Path, text: str = "", source: str = "") -> None:
-    """登记/更新文件基线：对磁盘现状取 md5 指纹，保存行数与文本快照（供漂移时算 diff）"""
+    """登记/更新文件基线：对磁盘现状取 md5 指纹，保存行数与文本快照供漂移时算 diff"""
     key = _ledger_key(path)
     try:
         st = path.stat()
@@ -196,7 +196,7 @@ def ledger_register(path: Path, text: str = "", source: str = "") -> None:
 
 
 def ledger_fresh_hint(path: Path) -> str:
-    """剥离 read 记录时的新鲜度提示（仅比 mtime/size，不做全文哈希）"""
+    """剥离 read 记录时的新鲜度提示，仅比 mtime/size，不做全文哈希"""
     entry = _ledger.get(_ledger_key(path))
     if entry is None:
         return "文件不在台账中，edit_file 前请先 read"
@@ -210,11 +210,10 @@ def ledger_fresh_hint(path: Path) -> str:
 
 
 def ledger_check(path: Path) -> Optional[str]:
-    """edit/位置写入门禁：返回 None=放行；否则为拒绝消息（含原因、变更区间与窄读建议）"""
+    """edit/位置写入门禁：返回 None=放行，否则为拒绝消息，含原因、变更区间与窄读建议"""
     entry = _ledger.get(_ledger_key(path))
     if entry is None:
-        # 二进制文件 read 工具不适用（不登记），门禁若照常引导"先 read"会让模型
-        # 在"edit 让你 read / read 拒收二进制"之间死循环；先做 NUL 探测给出终局答复
+        # 二进制文件 read 不登记，若照常引导先 read 会让模型在 edit 与 read 间死循环，先做 NUL 探测给终局答复
         try:
             with path.open("rb") as fh:
                 if b"\x00" in fh.read(512):
@@ -233,7 +232,7 @@ def ledger_check(path: Path) -> Optional[str]:
         return None
     current_md5 = _file_md5(path)
     if current_md5 == entry["md5"]:
-        # 触碰未变内容（保存但无改动）：刷新缓存口径，避免下次重复全文哈希
+        # 触碰未变内容即保存但无改动，刷新缓存口径避免下次重复全文哈希
         entry["mtime_ns"], entry["size"] = st.st_mtime_ns, st.st_size
         return None
     regions, changed = ledger_diff_regions(path)
@@ -253,7 +252,7 @@ def ledger_check(path: Path) -> Optional[str]:
 
 
 def ledger_diff_regions(path: Path, max_regions: int = 5) -> tuple:
-    """当前磁盘内容 vs 上次快照的变更区间（新文件行号口径）与变更行数；快照不可用返回空"""
+    """当前磁盘内容与上次快照的变更区间，新文件行号口径，附变更行数；快照不可用返回空"""
     entry = _ledger.get(_ledger_key(path))
     old_text = (entry or {}).get("snapshot") or ""
     if not old_text:
@@ -275,6 +274,6 @@ def ledger_diff_regions(path: Path, max_regions: int = 5) -> tuple:
             continue
         changed += max(a2 - a1, b2 - b1)
         if len(regions) < max_regions:
-            # 以新文件行号报告（模型重读的是新文件）；纯删除区间为空时报告插入位置
+            # 以新文件行号报告，模型重读的是新文件；纯删除区间为空时报告插入位置
             regions.append(f"L{b1 + 1}-L{b2}" if b2 > b1 else f"L{b1 + 1}前")
     return regions, changed

@@ -34,7 +34,7 @@
     {
       "provider_id": "sensenova",
       "name": "sensenova",
-      "api_key": "",
+      "api_key": "sk-ly1ItkjnuIMBetGs9lCGYwMvoetmqQ1G",
       "base_url": "https://token.sensenova.cn/v1",
       "default_model_id": "sensenova-6.8-flash-lite",
       "temperature": 1.0,
@@ -85,7 +85,7 @@
   },
   "ui": {
     "theme": "dark",
-    "mode": "auto",
+    "mode": "manual",
     "busy_send_mode": "queue",
     "logo": true,
     "send": "ctrl+enter",
@@ -176,6 +176,7 @@
     "dir": "data/workflows",
     "active": "gui-test",
     "max_rounds": 0,
+    "spin_kill_count": 12,
     "max_rounds_extensions": 5
   },
   "subagent": {

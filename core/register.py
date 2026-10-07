@@ -25,7 +25,7 @@ def register(
     :param description: 工具描述，供模型选择
     :param usage: 用法说明
     :param schema: JSON Schema 参数结构
-    :param owner: 归属标识（插件 id），便于整体注销
+    :param owner: 归属标识即插件 id，便于整体注销
     """
 
     def decorator(func: Callable) -> Callable:
@@ -64,12 +64,12 @@ def has_tool(name: str) -> bool:
 
 
 def unregister(name: str) -> bool:
-    """注销工具（MCP 重连时撤销已下线的工具）；返回是否确有注销"""
+    """注销工具，MCP 重连时撤销已下线的工具；返回是否确有注销"""
     return _registry.pop(name, None) is not None
 
 
 def unregister_owner(owner: str) -> List[str]:
-    """注销某归属（插件）注册的全部工具并恢复被覆盖的内建工具，返回被注销的工具名列表"""
+    """注销某归属插件的全部工具并恢复被覆盖的内建工具，返回被注销的工具名列表"""
     if not owner:
         return []
     removed = [n for n, t in _registry.items() if t.get("owner") == owner]
@@ -85,7 +85,7 @@ def unregister_owner(owner: str) -> List[str]:
 
 
 def call(tool_name: str, **kwargs: Any) -> Any:
-    """调用已注册工具（首参命名避开 kwargs 撞名：工具形参可含 name）"""
+    """调用已注册工具；首参命名避开 kwargs 撞名，工具形参可含 name"""
     if tool_name not in _registry:
         log.warn("调用未注册工具: %s", tool_name)
         return f"工具不存在: {tool_name}"
@@ -96,16 +96,16 @@ def call(tool_name: str, **kwargs: Any) -> Any:
         log.debug("工具调用 %s 用时 %.3fs", tool_name, time.monotonic() - started)
 
 
-# 调用说明参数：每次工具调用随 arguments 传入，回合末作为该调用的简明记录
-# （见 memory.finalize_turn）；执行前会被剥除，不进入工具函数
+# 调用说明参数：随每次工具调用的 arguments 传入，回合末作为该调用的留档记录，见 memory.finalize_turn
+# 执行前会被剥除，不进入工具函数
 DESCRIPTION_PARAM = {
     "type": "string",
-    "description": "本次工具调用的简短说明（一句话，说明本次调用想做什么，供调用记录留档）",
+    "description": "One-sentence note of what this tool call intends to do, kept as the record of this call",
 }
 
 
 def _with_description_param(schema: Optional[dict]) -> dict:
-    """向工具参数 schema 注入公共 description 属性（幂等，不覆盖已有定义）"""
+    """向工具参数 schema 注入公共 description 属性，幂等不覆盖已有定义"""
     base = dict(schema or {"type": "object", "properties": {}, "required": []})
     properties = dict(base.get("properties") or {})
     properties.setdefault("description", dict(DESCRIPTION_PARAM))
@@ -118,8 +118,8 @@ def _with_description_param(schema: Optional[dict]) -> dict:
 
 
 def get_tool_defs() -> List[dict]:
-    """导出 OpenAI function calling 格式的工具定义（自动注入公共 description 参数）。
-    迭代用快照：MCP 工具经后台线程注册，避免注册期间字典变更导致 RuntimeError"""
+    """导出 OpenAI function calling 格式工具定义，自动注入公共 description 参数
+    迭代用快照：MCP 工具经后台线程注册，防注册期间字典变更 RuntimeError"""
     defs = []
     for tool in list(_registry.values()):
         defs.append(

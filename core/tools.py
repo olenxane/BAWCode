@@ -23,17 +23,17 @@ from core.log import get_logger
 
 log = get_logger("tools")
 
-# 子进程默认超时（秒）；模型传入值的钳制范围，上限防模型传超大值关掉兜底
-DEFAULT_TIMEOUT = 60
-MAX_TIMEOUT = 600
+# 子进程默认超时
+DEFAULT_TIMEOUT = 320
+MAX_TIMEOUT = 3200
 
 # 文件工具输出防护参数
-_READ_MAX_LINES = 2000       # read 单次返回行数上限（防大文件拖爆上下文，续读用 offset 分页）
-_READ_MAX_LINE_CHARS = 2000  # read 单行字符上限（超长行截断，防单行压缩 JSON 炸上下文）
+_READ_MAX_LINES = 2000       # read 单次返回行数上限，防大文件拖爆上下文，续读用 offset 分页
+_READ_MAX_LINE_CHARS = 2000  # read 单行字符上限，防超长单行炸上下文
 
 
 def _max_tool_timeout() -> int:
-    """超时上限（tools.max_timeout，设置页可调）；会话不可用或非法值回退内置默认"""
+    """超时上限"""
     try:
         session = memory_mod.get_session()
         data = getattr(getattr(session, "config", None), "data", None) or {}
@@ -53,7 +53,7 @@ def _clamp_timeout(value) -> int:
 
 
 def _console_output_encoding() -> str:
-    """控制台输出代码页（中文 Windows 默认 cp936）；子进程输出按它解码"""
+    """控制台输出代码页；子进程输出按它解码"""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -72,14 +72,19 @@ def _session():
 
 @register.register(
     name="execute_command",
-    description="Execute a command in the terminal (foreground or background)",
+    description=(
+        "Run a shell command through the system shell; stdout and stderr are "
+        "merged in the result, and a non-zero exit code is reported with the "
+        "output. Use mode='background' for long-running commands. Prefer "
+        "dedicated tools (read/write/edit_file/search/...) over shell commands"
+    ),
     usage="execute_command <command>",
     schema={
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Command to execute in the terminal",
+                "description": "The command to execute",
             },
             "cwd": {
                 "type": "string",
@@ -87,12 +92,16 @@ def _session():
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in seconds (foreground only), clamped to 1-600",
+                "description": "Timeout in seconds, foreground mode only",
             },
             "mode": {
                 "type": "string",
                 "enum": ["foreground", "background"],
-                "description": "foreground=等待完成并直接返回输出；background=立即返回，输出落盘文件，完成后系统自动通知（timeout 不生效）",
+                "description": (
+                    "foreground = wait for completion and return output directly; "
+                    "background = return immediately, output goes to a file on disk "
+                    "and the system notifies on completion (timeout is ignored)"
+                ),
             },
         },
         "required": ["command"],
@@ -134,14 +143,13 @@ def execute_command(
         return f"执行失败: {e}"
 
 
-# ----- 后台执行（execute_command mode=background）：Popen 不等待，输出落盘，
-# 监视线程 wait 后经 notifier（main 注册的 runner.notify）发起新回合通知 -----
+# execute_command 后台执行：监视线程在进程退出后经 main 注册的 runner.notify 发起新回合通知
 
 _bg_notifier = None  # Callable[[str], None]：main.py 启动 _AgentRunner 后注册 runner.notify
 
 
 def set_background_notifier(fn) -> None:
-    """注册后台任务完成通知通道（runner.notify：idle 开新回合，busy 排队）"""
+    """注册后台任务完成通知通道"""
     global _bg_notifier
     _bg_notifier = fn
 
@@ -192,7 +200,7 @@ def _execute_command_background(command: str, cwd: Optional[str]) -> str:
 
 
 def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: str, started: float) -> None:
-    """后台监视线程：进程退出后关文件句柄并通知（无通道时仅落日志）"""
+    """后台监视线程：进程退出后关文件句柄并通知，无通道时仅落日志"""
     try:
         code = proc.wait()
     except Exception as exc:
@@ -218,24 +226,23 @@ def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: 
         log.error("后台任务通知投递失败 id=%s: %r", task_id, exc)
 
 
-# ----- ask_user：询问用户意见（选项+自由输入，可自动超时） -----
-# 交互经 UI 请求桥（main._agent_turn_impl 回合内绑定，回合末解绑）：
-# agent 线程发请求阻塞等结果，主线程弹面板收键盘（复用 confirm 面板管线）
+# ask_user：询问用户意见
+# 交互经UI请求桥main._agent_turn_impl回合内绑定，回合末解绑
 
 _ask_bridge = None  # Callable[[dict], dict]
 
-# 自动超时时长（秒）：开关型配置，开启即固定 5 分钟
+# 自动超时秒数：开关型配置，开启即固定 5 分钟
 ASK_USER_TIMEOUT = 300
 
 
 def set_ask_user_bridge(fn) -> None:
-    """注册 ask_user 的 UI 交互桥（payload -> result dict）"""
+    """注册 ask_user 的 UI 交互桥：payload 进，result dict 出"""
     global _ask_bridge
     _ask_bridge = fn
 
 
 def _ask_user_timeout() -> int:
-    """自动超时秒数：开关开启固定 5 分钟（数字配置 >0 视为开），关=0 禁用"""
+    """自动超时秒数：开关开启固定 5 分钟，数字配置 >0 视为开，关=0 禁用"""
     try:
         session = memory_mod.get_session()
         data = getattr(getattr(session, "config", None), "data", None) or {}
@@ -249,33 +256,38 @@ def _ask_user_timeout() -> int:
 
 @register.register(
     name="ask_user",
-    description="Ask the user for a decision via an interactive dialog",
+    description=(
+        "Ask the user a clarifying question with selectable options; use when "
+        "requirements are ambiguous or an approach needs confirmation. The user "
+        "may also type a free-form answer; on timeout or skip the result says so "
+        "and you should proceed with existing information instead of waiting"
+    ),
     usage="ask_user <question> <options...>",
     schema={
         "type": "object",
         "properties": {
             "question": {
                 "type": "string",
-                "description": "要询问用户的问题（一句话）",
+                "description": "The question to ask, one sentence",
             },
             "options": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "title": {"type": "string", "description": "选项概述（短语）"},
-                        "description": {"type": "string", "description": "选项具体描述（做法/后果/理由）"},
+                        "title": {"type": "string", "description": "Short option label"},
+                        "description": {"type": "string", "description": "What the option does, its consequence or rationale"},
                     },
                     "required": ["title"],
                 },
-                "description": "候选项列表（2-4 个为宜）；界面自动附加一项自由输入供用户自填意见",
+                "description": "Candidate options, 2-4 recommended",
             },
         },
         "required": ["question", "options"],
     },
 )
 def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
-    """询问用户意见：弹交互框（概述+描述选项、末位自由输入），超时自动跳过"""
+    """询问用户意见：弹概述+描述选项交互框，末位自由输入，超时自动跳过"""
     if not isinstance(question, str) or not question.strip():
         return "参数错误: question 不能为空"
     opts = []
@@ -315,8 +327,10 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
 @register.register(
     name="read",
     description=(
-        "Read the content of a text file with line-number prefixes "
-        "(supports line-based paging via offset/limit; use the numbers to anchor edit_file)"
+        "Read a text file with line-number prefixes; use the numbers to anchor "
+        "edit_file. Long files are paged via offset/limit, and each read "
+        "registers the file baseline required before edit_file or positional "
+        "write — read a file before editing it"
     ),
     usage="read <file_path> [offset] [limit]",
     schema={
@@ -339,7 +353,7 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
     },
 )
 def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
-    """读取指定文件内容（带行号前缀，供 edit_file 锚定）；offset/limit 可选，按行分页"""
+    """读取指定文件内容，带行号前缀供 edit_file 锚定；offset/limit 可选按行分页"""
     path = Path(file_path)
     log.debug("读取文件: %s offset=%s limit=%s", path, offset or "-", limit or "-")
     try:
@@ -400,15 +414,14 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "图片文件路径（png/jpg/jpeg/gif/webp/bmp，单图上限 4MB）",
+                "description": "Image file path (png/jpg/jpeg/gif/webp/bmp, max 4MB per image)",
             },
         },
         "required": ["file_path"],
     },
 )
 def read_image(file_path: str) -> dict:
-    """读取本地图片回注多模态消息：返回 {"content", "images"} 约定，
-    执行层摘出 images 随消息携带，经 add_tool_result 落为 API 数组形态 content"""
+    """读取本地图片回注多模态消息：返回 {"content", "images"}，执行层摘出 images 落为 API 数组形态 content"""
     sess = _session()
     cfg = getattr(sess, "config", None) if sess is not None else None
     if cfg is not None and not cfg.supports_vision:
@@ -459,7 +472,7 @@ def read_image(file_path: str) -> dict:
     },
 )
 def write(file_path: str, content: str, start_line: int = 0) -> str:
-    """写入文件；缺省整文件覆盖；start_line≥1 时为位置写入（同 edit 门槛，其余行保留，越界追加）"""
+    """写入文件；缺省整文件覆盖；start_line≥1 为位置写入，同 edit 门禁，其余行保留，越界追加"""
     path = Path(file_path)
     start_line = int(start_line or 0)
     if start_line < 0:
@@ -479,14 +492,14 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
                     f"拒绝写入：{path} 含非文本字节（可能是二进制或 UTF-16/32 编码），已保持原文件不变；"
                     "如确需替换，请先 delete_file 再用 write 新建（新文件将使用 UTF-8）"
                 )
-            # 已有文件：保留原编码与行尾风格（与位置写入/edit_file 同口径）
+            # 已有文件：保留原编码与行尾风格，与位置写入/edit_file 同口径
             _written, serr = _save_editable_msg(path, content, is_crlf, enc, bom)
             if serr:
                 return serr
             toolstore.ledger_register(path, content, source="write")
             log.info("写入文件: %s（%d字符，覆盖，编码 %s）", path, len(content), enc)
             suffix = f"（原编码 {enc} 已保留）" if enc != "utf-8" else ""
-            # 返回带路径与体量：不同文件的写入结果可区分（防空转重复判定 + 模型反馈）
+            # 返回带路径与体量：区分不同文件的写入结果，防空转误判
             return f"写入成功: {path}（{len(content)} 字符）{suffix}"
         path.parent.mkdir(parents=True, exist_ok=True)
         # 新建文件：UTF-8 + 系统默认行尾风格
@@ -496,7 +509,7 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
         toolstore.ledger_register(path, content, source="write")
         log.info("写入文件: %s（%d字符，新建）", path, len(content))
         return f"写入成功: {path}（{len(content)} 字符）"
-    # ---- 位置写入（行号口径与 read 的 splitlines 编号一致）----
+    # ---- 位置写入，行号口径与 read 的 splitlines 编号一致 ----
     if not content:
         return "位置写入的 content 不能为空（清空文件请省略 start_line 整文件覆盖）"
     if not path.exists():
@@ -632,18 +645,17 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
 
 
 def _load_editable(path: Path) -> tuple:
-    """读取待编辑文件：解码探测（utf-8→gbk→有损拒改）+ UTF-16/32 拒改 + UTF-8 BOM 剥离 + 行尾归一。
+    """读取待编辑文件：解码探测 utf-8→gbk→有损拒改，UTF-16/32 与 NUL 拒改，UTF-8 BOM 剥离，行尾归一。
 
-    返回 (\\n 归一文本, 是否 CRLF 主导, 编码名, 错误消息, 是否带 UTF-8 BOM)；
-    错误消息非 None 时其余值无意义。BOM 剥离后由 _save_editable 按读取状态还原，
-    模型锚定文件首行时不必（也无法）输入不可见的 BOM 字符。
+    返回 (归一文本, 是否 CRLF 主导, 编码名, 错误消息, 是否带 UTF-8 BOM)，错误消息非 None 时其余值无意义。
+    BOM 剥离后由 _save_editable 按读取状态还原，模型锚定文件首行时无需输入不可见的 BOM 字符。
     """
     raw = path.read_bytes()
     bom = raw.startswith(b"\xef\xbb\xbf")
     if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff", b"\xff\xfe", b"\xfe\xff")):
         return "", False, "utf-8", "文件带 UTF-16/32 编码标记（或非文本字节），拒绝编辑以免损坏", False
     if b"\x00" in raw[:512]:
-        # 无 BOM 的二进制（GBK 能把控制字节当文本解码成功，必须 NUL 嗅探兜底）
+        # 无 BOM 的二进制：GBK 能把控制字节当文本解码成功，必须 NUL 嗅探兜底
         return "", False, "utf-8", "文件含非文本字节（NUL），拒绝编辑以免损坏", False
     text, enc, decodable = _decode_best_effort(raw)
     if not decodable:
@@ -655,7 +667,7 @@ def _load_editable(path: Path) -> tuple:
 
 
 def _save_editable(path: Path, content: str, is_crlf: bool, enc: str, bom: bool = False) -> int:
-    """按原文件行尾风格与编码字节写回（BOM 按读取时状态还原），返回写入字节数"""
+    """按原文件行尾风格与编码字节写回，BOM 按读取时状态还原，返回写入字节数"""
     if is_crlf:
         content = content.replace("\r\n", "\n").replace("\n", "\r\n")
     if bom:
@@ -679,7 +691,7 @@ def _save_editable_msg(path: Path, content: str, is_crlf: bool, enc: str, bom: b
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """原子落盘：同目录临时文件写全后 os.replace，防进程被杀/断电留下截断损坏的半截文件"""
+    """原子落盘：同目录临时文件写全后 os.replace，防进程被杀或断电留下截断损坏的半截文件"""
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -694,19 +706,18 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 
 
 # _apply_replacement 结果类别
-_REPLACE_OK = "ok"                # 精确命中（单处，或 replace_all）
-_REPLACE_TOL = "tol"              # 精确 0 命中，行尾空白容差命中（单处，或 replace_all）
+_REPLACE_OK = "ok"                # 精确命中，单处或 replace_all
+_REPLACE_TOL = "tol"              # 精确 0 命中，行尾空白容差命中，单处或 replace_all
 _REPLACE_MISS = "miss"            # 精确与容差均 0 命中
 _REPLACE_MULTI = "multi"          # 精确多处命中且未开 replace_all
 _REPLACE_TOL_MULTI = "tol_multi"  # 容差多处命中且未开 replace_all
 
 
 def _apply_replacement(content: str, old_str: str, new_str: str, replace_all: bool) -> tuple:
-    """edit_file/multi_edit 共用的单项替换核心。
+    """edit_file/multi_edit 共用的单项替换核心；只在内存文本上替换，落盘由调用方负责。
 
-    返回 (kind, 新内容或 None, info)：OK 类 info=替换处数；MULTI 类 info=(处数, 起始行号列表)。
-    替换只发生在内存文本上，落盘由调用方负责。容差命中取磁盘原文行（保留其原行尾空白），
-    行首缩进绝不放宽。"""
+    返回 (kind, 新内容或 None, info)，OK 类 info=替换处数，MULTI 类 info=(处数, 起始行号列表)。
+    容差命中取磁盘原文行并保留其原行尾空白，行首缩进绝不放宽。"""
     count = content.count(old_str)
     if count == 1:
         return _REPLACE_OK, content.replace(old_str, new_str, 1), 1
@@ -723,10 +734,10 @@ def _apply_replacement(content: str, old_str: str, new_str: str, replace_all: bo
 
 
 def _tolerance_spans(content: str, old_str: str) -> list:
-    """行尾空白容差匹配（二级）：old_str 与文件逐行比较，双方 rstrip 后相等即命中。
+    """二级行尾空白容差匹配：old_str 与文件逐行比较，双方 rstrip 后相等即命中。
 
-    返回命中列表 [(起始行号(1基), 区间起, 区间止)]，old_str 以换行结尾时区间吞掉该换行；
-    无命中返回 []。纯空白 old_str 直接不匹配（防误吞整文件）。"""
+    返回命中列表 [(起始行号1基, 区间起, 区间止)]，old_str 以换行结尾时区间吞掉该换行，无命中返回 []。
+    纯空白 old_str 直接不匹配，防误吞整文件。"""
     if not old_str or not old_str.strip():
         return []
     needle = old_str.split("\n")
@@ -760,7 +771,7 @@ def _tolerance_spans(content: str, old_str: str) -> list:
 
 
 def _splice_spans(content: str, spans: list, new_str: str) -> str:
-    """把 content 中各 (行号, start, end) 区间依次替换为 new_str（行锚定区间天然不重叠）"""
+    """把 content 中各 (行号, start, end) 区间依次替换为 new_str；行锚定区间天然不重叠"""
     out, prev = [], 0
     for _line, s, e in spans:
         out.append(content[prev:s])
@@ -771,7 +782,7 @@ def _splice_spans(content: str, spans: list, new_str: str) -> str:
 
 
 def _match_spots(content: str, needle: str) -> list:
-    """精确匹配的各处起始行号（1 基），多处命中反馈用"""
+    """精确匹配各处起始行号，1 基，多处命中反馈用"""
     spots = []
     start = 0
     while True:
@@ -816,7 +827,7 @@ def _match_spots(content: str, needle: str) -> list:
     },
 )
 def multi_edit(file_path: str, edits: List[dict]) -> str:
-    """批量编辑：按数组顺序校验并应用，全部通过后一次性写回（原子），失败不留任何修改"""
+    """批量编辑：按数组顺序校验并应用，全部通过后一次性原子写回，失败不留任何修改"""
     path = Path(file_path)
     log.info("批量编辑: %s（%d 项）", path, len(edits or []))
     if not path.exists():
@@ -890,21 +901,23 @@ def multi_edit(file_path: str, edits: List[dict]) -> str:
 @register.register(
     name="delete_file",
     description=(
-        "删除单个文件（安全删除）：文件不会直接销毁，而是移入项目回收站，"
-        "用户可 /undo 回滚本次删除、/clear-trash 真正清空。仅支持文件，不支持目录。"
-        "execute_command 的 rm/del 等删除命令会被安全策略直接拒绝，删除文件一律用本工具。"
+        "Delete a single file safely: the file is moved to the project trash "
+        "rather than destroyed, recoverable via /undo, truly emptied via "
+        "/clear-trash. Files only, no directories. Shell delete commands like "
+        "rm/del are rejected by the safety policy — always delete files with "
+        "this tool"
     ),
     usage="delete_file <file_path>",
     schema={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "要删除的文件路径（绝对路径或相对当前目录）"},
+            "file_path": {"type": "string", "description": "File path to delete, absolute or relative to the current directory"},
         },
         "required": ["file_path"],
     },
 )
 def delete_file(file_path: str) -> str:
-    """删除文件：移入项目回收站（可 /undo 回滚、/clear-trash 真正清空）"""
+    """删除文件：移入项目回收站，可 /undo 回滚、/clear-trash 真正清空"""
     path = Path(file_path)
     if not path.exists():
         return f"找不到文件: {file_path}"
@@ -924,10 +937,10 @@ def delete_file(file_path: str) -> str:
 _SUGGEST_MAX_LINES = 20000
 _SNIPPET_CONTEXT = 3
 _SNIPPET_MAX_LINES = 30
-_NOTE_REGIONS = 3             # 成功回显最多展示的变更区间数（超出提示"另有 K 处"）
-_NOTE_DIFF_MAX_LINES = 20000  # 超过此行数退回单区间首尾扫描（difflib 全量太慢）
+_NOTE_REGIONS = 3             # 成功回显最多展示的变更区间数，超出提示另有 K 处
+_NOTE_DIFF_MAX_LINES = 20000  # 超过此行数退回单区间首尾扫描，difflib 全量太慢
 
-# 工具结果失败模式（启发式）：供 UI ✅/❌ 展示与工作流轮次续期判定共用
+# 工具结果失败启发式模式：UI 状态展示与工作流轮次续期判定共用
 _TOOL_FAILURE_PATTERNS = (
     "命令退出码 ",
     "工具执行错误",
@@ -943,7 +956,7 @@ _TOOL_FAILURE_PATTERNS = (
     "命令被安全策略拒绝",
     "已拒绝",
     "拒绝写入",
-    # MCP 工具（core/mcp.py）：isError 结果与调用失败统一前缀
+    # MCP 工具的 isError 结果与调用失败统一前缀
     "MCP 工具返回错误",
     "MCP 调用失败",
 )
@@ -964,17 +977,12 @@ def tool_failure_hint(content: str) -> bool:
 
 
 class SpinGuard:
-    """空转计数器：重复输出出现才开始计数，计满才杀。
+    """空转计数器：结果重复出现才开始计数，计满才终止回合，主循环与子代理循环共用。
 
-    - 结果键 = 工具名 + 目标（read 结果自带 file_path）或去空白内容；键在本轮之前
-      已出现过 → 该结果计一次重复（同一输出出现两次及以上，计数才真正开始）
-    - read 按文件路径判重：同文件反复读即空转，覆盖"读一个正在变化的文件"这类
-      内容每次微变、内容键永不命中的空转
-    - 其他工具在精确键之外辅以前缀相似度（≥0.9）判重，覆盖结果仅数字微变的空转
-    - 本轮含重复 → 计数累加（每条重复 +1）；本轮全部为新结果 → 计数清零
-      （空转被真实进展打断）
-    - 计数达到 kill_count（默认 12）→ spun_out() 为真，由调用方终止回合
-    主循环（core/loop.tool_loop）与子代理循环共用。"""
+    结果键取工具名+目标，read 以 file_path 为目标，其余工具取去空白内容并辅以
+    ≥0.9 前缀相似度判重，覆盖读变化中文件、结果仅数字微变这类空转；
+    本轮含重复则计数累加，全部为新结果则清零；达到 kill_count 即 spun_out() 为真。
+    """
 
     FUZZ_RATIO = 0.9
     FUZZ_PREFIX = 512
@@ -987,7 +995,7 @@ class SpinGuard:
         self.count = 0
 
     def feed(self, results) -> None:
-        """喂入本轮全部工具结果消息，更新计数（空轮/无结果为清零）"""
+        """喂入本轮全部工具结果消息并更新计数，空轮或无结果为清零"""
         dups = 0
         for m in results or []:
             tool = str(m.get("tool_name") or "")
@@ -1019,8 +1027,7 @@ class SpinGuard:
 
 
 def _decode_best_effort(raw: bytes) -> tuple:
-    """文件解码探测：utf-8 → gbk → 有损兜底；返回 (文本, 编码名, 是否纯文本)。
-    UTF-8 BOM 剥离（模型锚定/匹配不需要它，写回侧由 _save_editable 按读取状态还原）"""
+    """文件解码探测：utf-8→gbk→有损兜底，返回 (文本, 编码名, 是否纯文本)；BOM 剥离，写回侧由 _save_editable 还原"""
     data = raw[3:] if raw.startswith(b"\xef\xbb\xbf") else raw
     for enc in ("utf-8", "gbk"):
         try:
@@ -1060,7 +1067,7 @@ def _edit_miss_feedback(old_str: str, content: str) -> str:
     return "\n".join(parts)
 
 
-# 三级提示（只提示不代改）的保守规整表：仅同形异码字符，不含全角冒号/逗号等语义敏感字符
+# 三级提示只提示不代改的保守规整表：仅同形异码字符，不含全角冒号/逗号等语义敏感字符
 _UNICODE_EQUIV = str.maketrans({
     "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
     "\u2013": "-", "\u2014": "-", "\u2212": "-",
@@ -1083,8 +1090,8 @@ def _unicode_hint(old_str: str, content: str) -> Optional[str]:
 
 
 def _changed_note(old_content: str, new_content: str) -> str:
-    """成功回显：新内容中的变更区间（最多 _NOTE_REGIONS 个，各带前后 _SNIPPET_CONTEXT 行）
-    + 增删行统计；单区间沿用「变更片段（第 a-b 行 / 共 N 行）」既有格式"""
+    """成功回显：新内容中的变更区间，最多 _NOTE_REGIONS 个各带前后 _SNIPPET_CONTEXT 行，附增删行统计；
+    单区间沿用「变更片段（第 a-b 行 / 共 N 行）」既有格式"""
     old_lines = old_content.splitlines()
     new_lines = new_content.splitlines()
 
@@ -1122,7 +1129,7 @@ def _changed_note(old_content: str, new_content: str) -> str:
             if len(regions) > _NOTE_REGIONS:
                 parts.append(f"（另有 {len(regions) - _NOTE_REGIONS} 处变更未展示）")
             return "\n".join(parts)
-    # 超大文件：退回首尾扫描取单区间（不含统计）
+    # 超大文件：退回首尾扫描取单区间，不含统计
     i = 0
     while i < min(len(old_lines), len(new_lines)) and old_lines[i] == new_lines[i]:
         i += 1
@@ -1226,12 +1233,12 @@ def glob(pattern: str, path: str = ".") -> str:
     return "\n".join(lines)
 
 
-# search/glob 目录遍历统一跳过的目录名（小写比较），rg 与纯 Python 兜底共用
+# search/glob 目录遍历统一跳过的目录名，小写比较，rg 与纯 Python 兜底共用
 _SKIP_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", "node_modules",
     ".venv", "venv", ".idea", ".vscode", "dist", "build", "_recycle",
 }
-# 纯 Python 路径单文件扫描上限（rg 路径不设，自行流式截断）
+# 纯 Python 路径单文件扫描上限，rg 路径不设限自行流式截断
 _SEARCH_MAX_FILE_BYTES = 8 * 1024 * 1024
 _MATCH_LINE_MAX_CHARS = 200
 
@@ -1295,7 +1302,7 @@ def search(
     single_file = root.is_file()
     max_matches = max(1, int(max_matches or 50))
     context = min(max(int(context or 0), 0), 5)
-    # rg 快路径（rust 正则不兼容 python 语法时退出码 2 → 落到纯 Python 兜底）
+    # rg 快路径，rust 正则不兼容 python 语法时退出码 2，落到纯 Python 兜底
     rg_bin = shutil.which("rg")
     matches = None
     if rg_bin:
@@ -1311,7 +1318,7 @@ def search(
 
 
 def _glob_regex(pattern: str) -> "re.Pattern":
-    """glob → 正则：** 跨目录（含零层），* 单层，? 单字符；不区分大小写"""
+    """glob → 正则：** 跨目录含零层，* 单层，? 单字符；不区分大小写"""
     out = []
     i = 0
     while i < len(pattern):
@@ -1353,8 +1360,8 @@ def _rg_search(
 ) -> Optional[List[tuple]]:
     """ripgrep 快路径：--json 流式解析，达到上限即终止。
 
-    返回 (绝对路径, 行号, 行文本) 列表；None 表示 rg 不可用/正则不兼容，走纯 Python 兜底。
-    rg 默认按 UTF-8 解码，GBK 等编码文件会被当作二进制跳过（与 read 工具 utf-8 口径一致）。
+    返回 (绝对路径, 行号, 行文本) 列表；None 表示 rg 不可用或正则不兼容，走纯 Python 兜底。
+    rg 默认按 UTF-8 解码，GBK 等编码文件会被当作二进制跳过，与 read 工具 utf-8 口径一致。
     """
     cmd = [rg_bin, "--json", "--no-messages", "--no-require-git"]
     if not case_sensitive:
@@ -1401,7 +1408,7 @@ def _rg_search(
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-    # 退出码 2 = 执行出错（典型为 rust 正则不兼容），交兜底路径处理
+    # 退出码 2 为执行出错，典型是 rust 正则不兼容，交兜底路径处理
     if not hit_limit and proc.returncode and proc.returncode not in (0, 1):
         return None
     return matches
@@ -1414,7 +1421,7 @@ def _python_search(
     max_matches: int,
     single_file: bool,
 ) -> List[tuple]:
-    """纯 Python 兜底：os.walk + 逐行扫描，支持 GBK（经 _decode_best_effort）"""
+    """纯 Python 兜底：os.walk + 逐行扫描，支持 GBK，经 _decode_best_effort"""
     matcher = _file_matcher(glob) if glob else None
     root_s = str(root)
     if single_file:
@@ -1509,7 +1516,7 @@ def _render_search(
 
 
 def _load_lines(full: str) -> Optional[List[str]]:
-    """上下文块渲染用：读全文行；失败返回 None（该文件退化为仅匹配行）"""
+    """上下文块渲染用：读全文行，失败返回 None，该文件退化为仅匹配行"""
     try:
         text, _enc, _ok = _decode_best_effort(Path(full).read_bytes())
         return text.splitlines()
@@ -1580,7 +1587,7 @@ def run_program(
 
 
 # ----- webfetch：以真实浏览器头抓取页面，剥离脚本/导航/广告等噪音，
-# 块级结构转 markdown-ish 文本返回（bs4+lxml 缺失时优雅降级为依赖提示）-----
+# 块级结构转 markdown 文本返回；bs4+lxml 缺失时优雅降级为依赖提示 -----
 
 _WEBFETCH_HEADERS = {
     "User-Agent": (
@@ -1597,14 +1604,14 @@ _WEBFETCH_HEADERS = {
     "Cache-Control": "max-age=0",
 }
 _WEBFETCH_MAX_BYTES = 5 * 1024 * 1024  # 响应体上限，防超大页面
-_WEBFETCH_MAX_CHARS = 50000            # 返回文本硬顶（无外置机制兜底时防撑爆上下文）
+_WEBFETCH_MAX_CHARS = 50000            # 返回文本硬顶，webfetch 无外置兜底，防撑爆上下文
 _WEBFETCH_DROP_TAGS = frozenset({
     "script", "style", "noscript", "template", "svg", "iframe", "object", "embed",
     "link", "meta", "head", "nav", "header", "footer", "aside", "form", "button",
     "select", "option", "input", "textarea", "label", "dialog",
 })
 _WEBFETCH_ROLES = frozenset({"navigation", "banner", "contentinfo", "complementary", "search"})
-# 启发式噪音 class/id 关键词（保守集合：只打明显广告/追踪/装饰，避免误伤正文）
+# 启发式噪音 class/id 关键词，保守集合，只打明显广告/追踪/装饰，避免误伤正文
 _WEBFETCH_NOISE_HINTS = (
     "advert", "sponsor", "promo", "cookie", "consent", "gdpr", "newsletter",
     "subscribe", "breadcrumb", "social-share", "share-bar", "popup", "banner",
@@ -1620,12 +1627,11 @@ _WEBFETCH_MAX_IMAGES = 20              # 单页保留上限，防图片瀑布页
 _WEBFETCH_IMG_MAX_BYTES = 10 * 1024 * 1024
 _WEBFETCH_IMG_TIMEOUT = 10             # 单图下载超时
 _WEBFETCH_IMG_WORKERS = 8
-# 图片生命周期跟随所属会话活跃度（启动时探测会话文件 mtime）：
-# 会话 1 天无更新（或会话已不存在）→ 其 webfetch_imgs 整目录回收；
-# 会话活跃的图片寿命另按文件 mtime 封顶 30 天
+# 图片生命周期跟随所属会话活跃度，启动时探测会话文件 mtime：
+# 会话 1 天无更新或已不存在则整目录回收，活跃会话的单图按 mtime 封顶 30 天
 _WEBFETCH_SESSION_IDLE = 86400
 _WEBFETCH_IMG_MAX_AGE = 30 * 86400
-_WEBFETCH_IMG_SKIP_HINTS = (           # 装饰图 URL 启发式（icon/logo/头像/占位）
+_WEBFETCH_IMG_SKIP_HINTS = (           # 装饰图 URL 启发式：icon/logo/头像/占位
     "icon", "favicon", "logo", "sprite", "avatar", "emoji", "spacer",
     "pixel", "blank", "badge", "rating",
 )
@@ -1633,7 +1639,7 @@ _WEBFETCH_IMG_LAZY_ATTRS = ("src", "data-src", "data-original", "data-lazy-src",
 
 
 def _webfetch_deps():
-    """webfetch 依赖（requests/bs4/lxml）；缺失返回 None 由调用方给依赖提示"""
+    """webfetch 依赖 requests/bs4/lxml，缺失返回 None 由调用方给依赖提示"""
     try:
         import requests
         from bs4 import BeautifulSoup, NavigableString, Tag
@@ -1657,7 +1663,7 @@ def _webfetch_is_noise(node) -> bool:
 
 
 def _webfetch_clean(root) -> None:
-    """整棵摘除噪音标签与启发式噪音节点（先收集后摘除，避免遍历中改树）"""
+    """整棵摘除噪音标签与启发式噪音节点，先收集后摘除，避免遍历中改树"""
     from bs4 import Comment
     doomed = [
         node
@@ -1671,7 +1677,7 @@ def _webfetch_clean(root) -> None:
 
 
 def _webfetch_img_dir() -> Path:
-    """图片临时保存目录：外置存储下 webfetch_imgs/，无会话退项目根 data/webfetch_imgs（锚定绝对路径防 cwd 漂移）"""
+    """图片临时保存目录：外置存储下 webfetch_imgs/，无会话退项目根 data/webfetch_imgs，锚定绝对路径防 cwd 漂移"""
     session = memory_mod.get_session()
     if session is not None:
         d = toolstore.store_dir(session.config, session.project_id, session.session_id) / "webfetch_imgs"
@@ -1682,9 +1688,8 @@ def _webfetch_img_dir() -> Path:
 
 
 def webfetch_gc() -> None:
-    """启动时图片回收：按 {persist_dir}/{project}/{session}/webfetch_imgs 遍历，
-    会话文件（data/sessions/{project}/{session}.json）1 天无更新或不存在 → 整目录释放；
-    会话活跃的目录内单图 mtime 超 30 天封顶删除。异常不阻塞启动。"""
+    """启动时图片回收：遍历各会话的 webfetch_imgs，会话文件 1 天无更新或不存在则整目录释放，
+    活跃会话内单图 mtime 超 30 天封顶删除；异常不阻塞启动。"""
     try:
         session = memory_mod.get_session()
         config = getattr(session, "config", None) if session is not None else None
@@ -1734,7 +1739,7 @@ def _webfetch_img_src(img) -> str:
 
 
 def _webfetch_img_rejected(src: str, img) -> bool:
-    """装饰图判定：URL 提示词（icon/logo/头像等）或声明确尺寸过小（<64px）"""
+    """装饰图判定：URL 含 icon/logo/头像等提示词，或声明确尺寸小于 64px"""
     low = src.lower()
     if any(h in low for h in _WEBFETCH_IMG_SKIP_HINTS):
         return True
@@ -1764,11 +1769,11 @@ def _webfetch_collect_images(root, Tag) -> list:
     return targets[:_WEBFETCH_MAX_IMAGES]
 
 
-_webfetch_page_url = [""]  # 当前抓取页面 URL（相对图片地址拼接用）
+_webfetch_page_url = [""]  # 当前抓取页面 URL，相对图片地址拼接用
 
 
 def _webfetch_save_image(key: str, content: bytes, mime: str) -> Path:
-    """图片落盘：文件名=sha1 前 12 位 + 扩展名（mime → URL 后缀 → .img 兜底）"""
+    """图片落盘：文件名=sha1 前 12 位+扩展名，扩展名按 mime→URL 后缀→.img 兜底"""
     ext = {
         "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
         "image/webp": ".webp", "image/svg+xml": ".svg", "image/bmp": ".bmp",
@@ -1936,25 +1941,30 @@ def _webfetch_render(soup, page_url: str) -> tuple:
 
 @register.register(
     name="webfetch",
-    description="Fetch a web page with real-browser headers and return the cleaned main text (noise stripped)",
+    description=(
+        "Fetch a web page with real-browser headers and return the cleaned main "
+        "text as markdown (scripts/nav/ads stripped). Content images are saved "
+        "to disk and annotated in place with their paths — use read_image to "
+        "view them. Use this instead of curl/wget in execute_command"
+    ),
     usage="webfetch <url> [timeout]",
     schema={
         "type": "object",
         "properties": {
             "url": {
                 "type": "string",
-                "description": "完整 URL（http/https）",
+                "description": "Full URL, must start with http(s)://",
             },
             "timeout": {
                 "type": "integer",
-                "description": "请求超时秒数，可选，默认 30，钳制 1-120",
+                "description": "Request timeout in seconds, optional, default 30, clamped to 1-120",
             },
         },
         "required": ["url"],
     },
 )
 def webfetch(url: str, timeout: int = 30) -> str:
-    """网页抓取：真实浏览器行为 + 噪音剥离 + 正文提取；正文图片下载落盘并原位标注路径（供多模态模型读取）"""
+    """网页抓取：真实浏览器行为+噪音剥离+正文提取；正文图片下载落盘并原位标注路径供多模态读取"""
     deps = _webfetch_deps()
     if deps is None:
         return "webfetch 依赖缺失（requests/beautifulsoup4/lxml），请 pip install -r requirements.txt"
@@ -2003,7 +2013,7 @@ def webfetch(url: str, timeout: int = 30) -> str:
     elif "html" in ctype or "xml" in ctype or "text" in ctype or not ctype:
         soup = BeautifulSoup(content, "lxml")
         if soup.find("html") is None and b"<html" not in content[:2048].lower():
-            # 非 HTML 响应（text/plain 等纯文本）：按文本直出
+            # 非 HTML 响应如 text/plain 纯文本，按文本直出
             text = content.decode("utf-8", errors="replace")
         else:
             title, body = _webfetch_render(soup, final_url)
@@ -2119,9 +2129,7 @@ def update_plan(
     },
 )
 def generate_steps(steps: List[str], external_handler=None) -> str:
-    """步骤生成；用户参与型，预留外部 API 接口
-
-    步骤由主 LLM 结构化传入：清洗空行并钳制数量，超限报错交模型自纠。"""
+    """步骤生成，用户参与型预留外部 API；步骤由主 LLM 结构化传入，清洗空行并钳制数量，超限报错交模型自纠"""
     session = _session()
     if session is None:
         return "记忆会话未初始化"
@@ -2184,7 +2192,12 @@ def update_step_status(step_id: int, status: str, detail: str = "", external_han
 
 @register.register(
     name="computer_use",
-    description="External computer-use interface for GUI operations",
+    description=(
+        "External computer-use interface for native GUI operations such as "
+        "screenshot, click and type. Requires an external handler configured "
+        "via config.external_apis.computer_use or a runtime hook; without one "
+        "the call returns a setup hint"
+    ),
     usage="computer_use <action> [params]",
     schema={
         "type": "object",
@@ -2202,9 +2215,8 @@ def update_step_status(step_id: int, status: str, detail: str = "", external_han
     },
 )
 def computer_use(action: str, params: Optional[dict] = None, external_handler=None) -> str:
-    """computer-use 相关能力，必须通过外部 API 接入。
-    外部处理器返回 dict 时可携带 "images"（截图等本地图片路径列表）：
-    执行层会摘出随工具结果回注，模型即可看到截图（多模态约定同 read_image）"""
+    """computer-use 能力，必须经外部 API 接入；处理器返回 dict 可携带 images 本地图片路径列表，
+    执行层摘出随工具结果回注，多模态约定同 read_image"""
     log.info("computer_use: %s params=%s", action, sorted((params or {}).keys()))
     result = hooks.call_user_participating(
         "computer_use",
@@ -2234,12 +2246,12 @@ def computer_use(action: str, params: Optional[dict] = None, external_handler=No
     schema={
         "type": "object",
         "properties": {
-            "keyword": {"type": "string", "description": "记忆关键词（简短短语，作为文件名）"},
-            "content": {"type": "string", "description": "记忆正文（markdown）"},
+            "keyword": {"type": "string", "description": "Memory keyword, a short phrase used as the file name"},
+            "content": {"type": "string", "description": "Memory body in markdown"},
             "type": {
                 "type": "string",
                 "enum": ["global", "project"],
-                "description": "global=所有项目生效（正文随每轮上下文常驻注入）；project=仅当前项目（仅关键词入索引，正文需 read_memory 读取）",
+                "description": "global = applies to all projects, body injected into every turn's context; project = current project only, only the keyword enters the index and the body must be read via read_memory",
             },
         },
         "required": ["keyword", "content", "type"],
@@ -2271,14 +2283,14 @@ def write_memory(keyword: str, content: str, type: str = "project") -> str:
     schema={
         "type": "object",
         "properties": {
-            "keyword": {"type": "string", "description": "要更新的记忆关键词"},
-            "content": {"type": "string", "description": "新的记忆正文（整体替换）"},
+            "keyword": {"type": "string", "description": "Keyword of the memory to update"},
+            "content": {"type": "string", "description": "New memory body, full replacement"},
             "type": {
                 "type": "string",
                 "enum": ["global", "project"],
-                "description": "记忆作用域（global/project）",
+                "description": "Memory scope, global or project",
             },
-            "new_keyword": {"type": "string", "description": "可选：新关键词（改名=移动文件）"},
+            "new_keyword": {"type": "string", "description": "Optional new keyword; renaming moves the file"},
         },
         "required": ["keyword", "content", "type"],
     },
@@ -2311,7 +2323,7 @@ def update_memory(keyword: str, content: str, type: str = "project", new_keyword
             "keywords": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "要读取的项目记忆关键词列表（见 [项目记忆索引]；全局记忆正文已随上下文注入无需读取）",
+                "description": "Project memory keywords to read, see the [项目记忆索引] section; global memory bodies are already injected into context and need no read",
             },
         },
         "required": ["keywords"],
@@ -2348,11 +2360,11 @@ def read_memory(keywords: Optional[List[str]] = None) -> str:
     schema={
         "type": "object",
         "properties": {
-            "keyword": {"type": "string", "description": "要删除的记忆关键词"},
+            "keyword": {"type": "string", "description": "Keyword of the memory to delete"},
             "type": {
                 "type": "string",
                 "enum": ["global", "project"],
-                "description": "记忆作用域（global/project）",
+                "description": "Memory scope, global or project",
             },
         },
         "required": ["keyword", "type"],
@@ -2381,13 +2393,13 @@ def delete_memory(keyword: str, type: str = "project") -> str:
     schema={
         "type": "object",
         "properties": {
-            "skill": {"type": "string", "description": "技能名（见 [可用技能] 清单）"},
+            "skill": {"type": "string", "description": "Skill name, see the [可用技能] list"},
         },
         "required": ["skill"],
     },
 )
 def load_skill(skill: str) -> str:
-    """技能正文按需加载（渐进式披露第二层）；超限由 add_tool_result 行内限额统一外置"""
+    """技能正文按需加载，渐进式披露第二层；超限由 add_tool_result 行内限额统一外置"""
     from core import skills as skills_mod
 
     session = _session()

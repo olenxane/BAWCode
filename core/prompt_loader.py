@@ -272,7 +272,12 @@ def get_system_prompt(
             f"工作区：{variables.get('workspace_path', '')}。"
             "复杂任务先规划再执行。回复使用简洁中文。"
         )
-    return join_segments(segs)
+    out = join_segments(segs)
+    # cwd 注入：模板未引用 workspace_path，缺它会自造绝对路径把文件写到工作区之外
+    ws = str(variables.get("workspace_path") or "")
+    if ws:
+        out += f"\n\n当前工作目录：{ws}。文件操作的相对路径均基于此目录。"
+    return out
 
 
 def get_plan_prompt(

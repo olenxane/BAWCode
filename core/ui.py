@@ -661,7 +661,9 @@ class TuiApp:
         self._ui_req: Optional[dict] = None
         self._input_prompt = "> "
         # 渲染接管：rich Live（enter() 时启动）；_frame_time 为固定帧周期（TMP 同款 20fps）
-        self._live: Optional["Live"] = None
+        self._live: Optional["Live"] = None  # 保留字段兼容 leave()；渲染走行级 diff 直写
+        self._last_lines: Optional[list] = None
+        self._last_w = 0
         self._frame_time = 1.0 / 20
         self._row_meta: Dict[str, int] = {}
         self.keymap = Keymap()
@@ -795,7 +797,7 @@ class TuiApp:
           模式无 2004；参照项目 TMP 也不开——这是两进程间唯一的控制台状态差）。
           粘贴改走 keyinput 的 conhost 启发式（批次中部回车/Tab → paste 事件）。
           调试可设 BAW_BRACKETED_PASTE=1 强制开启，=0 全平台强制关闭。
-        - 隐藏光标交给 Live（console.show_cursor）。
+        - 隐藏光标由 enter 直写 \033[?25l（原 rich Live 代管，现为行级 diff 直写）。
         """
         _enable_windows_ansi()
         if self._entered:
@@ -810,15 +812,8 @@ class TuiApp:
         # 开启鼠标捕获后，终端内文本选择需 Shift+拖拽。关闭用 BAW_MOUSE=0
         _mouse_on = os.environ.get("BAW_MOUSE", "1") != "0"
         _mouse_seq = "\033[?1000h\033[?1002h\033[?1006h" if _mouse_on else ""
-        sys.stdout.write("\033[2J\033[H" + ("\033[?2004h" if _paste_on else "") + _mouse_seq)
+        sys.stdout.write("\033[2J\033[H\033[?25l" + ("\033[?2004h" if _paste_on else "") + _mouse_seq)
         sys.stdout.flush()
-        if HAS_RICH and _CONSOLE is not None:
-            self._live = Live(
-                console=_CONSOLE,
-                screen=False,        # 主屏（TMP 同款；备用屏有 TSF IME 失同步问题）
-                auto_refresh=False,  # 应用每帧驱动刷新（TMP 同款）
-            )
-            self._live.start()
         self._entered = True
 
     def leave(self) -> None:
@@ -1774,25 +1769,29 @@ class TuiApp:
         return lines[:h]
 
     def render(self, *args, **kwargs) -> None:
-        """整帧渲染：rich Live 接管输出（TMP app.py:1632 同构）。
+        """整帧渲染：行级 diff 直写（替代 rich Live 整帧重写）。
 
-        _compose_plain 继续产出带 ANSI 的行字符串（复用全部现有着色/裁剪/
-        换行逻辑），Text.from_ansi 桥接为 rich renderable 后交 Live.update——
-        rich 负责帧缓冲 diff、光标与终端写，应用每帧无条件调用本方法。
+        _compose_plain 产出带 ANSI 的行字符串（复用全部现有着色/裁剪/换行
+        逻辑），与上帧按行比对，仅重写变化行——rich Live 的 LiveRender 无
+        diff 每帧真实写整帧，输入/流式期整帧擦写是闪烁根因。
         """
         w, h = _term_size()
         lines = self._compose_plain(w, h)
         if len(lines) < h:
             lines = list(lines) + [""] * (h - len(lines))
         lines = lines[:h]
-        if self._live is not None:
-            renderable = Group(*[Text.from_ansi(_clip_keep_ansi(l, w)) for l in lines])
-            self._live.update(renderable, refresh=True)
+        last = self._last_lines
+        if last is None or len(last) != h or self._last_w != w:
+            # 首帧/尺寸变化：清屏后整帧重写（低频事件，resize 缩小时残留行必须清）
+            parts = [f"\033[2J\033[H"] + [f"\033[{i + 1};1H\033[2K{_clip_keep_ansi(l, w)}" for i, l in enumerate(lines)]
         else:
-            # Live 未启动（理论不达：render 均发生在 enter 之后）；兜底直写
-            parts = [f"\033[{i + 1};1H\033[2K{_clip_keep_ansi(l, w)}" for i, l in enumerate(lines)]
+            parts = [f"\033[{i + 1};1H\033[2K{_clip_keep_ansi(l, w)}"
+                     for i, (o, l) in enumerate(zip(last, lines)) if o != l]
+        if parts:
             sys.stdout.write("".join(parts))
             sys.stdout.flush()
+        self._last_lines = lines
+        self._last_w = w
 
     # ----- 输入 / 补全 -----
     def _word_start(self) -> int:
@@ -1943,6 +1942,9 @@ class TuiApp:
 
             # 帧尾：UI 请求桥 + 后台图片落盘结果 + 选区边缘自动滚动 + 无条件渲染 + 补足帧周期
             self._serve_ui_request()
+            if self._dialog_active and _pump_dead():
+                # 读键泵崩溃：对话框永远等不到键，按空行收场防回合永久挂起
+                return ""
             self._tick_paste_async()
             self._selection_tick()
             self.render()
@@ -2843,6 +2845,9 @@ class TuiApp:
                         if sec != self._ask_last_sec:
                             self._ask_last_sec = sec
                             self.render()
+                    elif _pump_dead():
+                        # 无期限 ask 遇泵崩溃：无键可达，按取消收场防永久卡死
+                        return {"status": "cancelled"}
                     continue
                 if kind in ("mode_switch",):
                     continue
@@ -2947,6 +2952,9 @@ class TuiApp:
                 ev = _read_key()
                 kind, value = ev if ev is not None else ("tick", "")
                 if kind in ("tick", "mode_switch"):
+                    if kind == "tick" and _pump_dead():
+                        # 读键泵崩溃：无键可达，默认拒绝收场防弹窗永久卡死
+                        return {"action": "reject", "reason": "输入线程已退出"}
                     continue
                 if self.confirm_reason_mode:
                     # 拒绝原因输入态
@@ -4365,6 +4373,13 @@ def _read_key():
     from core import keyinput
 
     return keyinput.read_key_event()
+
+
+def _pump_dead():
+    """读键泵是否已崩溃（keyinput 死亡哨兵）"""
+    from core import keyinput
+
+    return keyinput.pump_dead()
 
 
 def _read_events(timeout: float = 0.0):
