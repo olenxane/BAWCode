@@ -1,0 +1,41 @@
+{
+  "id": "computer-use",
+  "name": "Computer Use",
+  "version": "0.1.0",
+  "description": "GUI 自动化：截图/点击/滚动/键入/按键/窗口管理（pyautogui 后端，截图随屏幕尺寸自适应缩放回注）",
+  "author": "BAWCode",
+  "config": [
+    {
+      "key": "auto_screenshot",
+      "type": "bool",
+      "label": "动作后自动截图",
+      "default": true,
+      "hint": "click/scroll/type/key/window_focus 执行后自动附一张新截图供模型确认效果"
+    },
+    {
+      "key": "screenshot_max_edge",
+      "type": "int",
+      "label": "截图长边上限(px)",
+      "default": 1280,
+      "min": 640,
+      "max": 2048,
+      "hint": "回注截图按屏幕原生尺寸等比缩放到该长边内；屏幕本就更小则原样回注，坐标比例随屏幕自适应"
+    },
+    {
+      "key": "settle_ms",
+      "type": "int",
+      "label": "动作后等待(ms)",
+      "default": 350,
+      "min": 100,
+      "max": 2000,
+      "hint": "等待界面响应完成后再截图"
+    },
+    {
+      "key": "clipboard_restore",
+      "type": "bool",
+      "label": "粘贴后恢复剪贴板",
+      "default": true,
+      "hint": "非 ASCII 文本（中文等）自动走剪贴板粘贴，完成后恢复原剪贴板内容"
+    }
+  ]
+}
