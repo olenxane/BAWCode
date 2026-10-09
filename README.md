@@ -11,7 +11,7 @@
   embedding 双模式，随用户消息主动注入，开箱即用+
 - **工具结果全生命周期管理**：完整输出外置磁盘、行内只留摘要与取回路径；白名单
   工具保留原文、回合末剥离其余，目前来看上下文的管理效果还是不错的
-- **防误删机制**：shell 删除命令硬拦截，文件删除一律进项目回收站；每回合文件快照，
+- **防误删机制**：shell 删除命令被拦截并改为移入项目回收站，文件不会真正删除，需 /clear-trash 才彻底清空；每回合文件快照，
   会话树里可撤回到某一轮消息，md5校验防止修改冲突
 - **防空转熔断**：重复调用工具无进展时开始计数、计满才终止，正常推进无轮次上限——替代
   固定 max-iterations 的一刀切，既防烧 拉闸，防止模型吃白饭
@@ -54,7 +54,7 @@ python main.py                    # 进入 TUI
 | `providers` / `active_provider_id` / `active_model_id` | 供应商与模型（OpenAI 兼容 base_url） |
 | `task_models` | plan / code / review 分角色模型 |
 | `llm` | `retry_times` / `retry_delay` / `retry_wait_seconds` / `stream` 等 |
-| `ui` | 主题、busy_send_mode（排队/中断）、访问模式等 |
+| `ui` | 主题、访问模式等（回合中 Enter 插话并入本轮 · Ctrl+Q 排队为新回合） |
 | `context` | 工具结果白名单、行内 token 上限、外置目录、压缩阈值 |
 | `memory` | 记忆目录、会话存储位置 |
 | `workflow` / `subagent` / `mcp` / `snapshot` / `skills` / `plugins` | 各子系统开关与参数 |
@@ -74,7 +74,7 @@ python main.py                    # 进入 TUI
 
 ## 内置工具（节选）
 
-读写编辑：`read` `read_image` `write` `edit_file` `multi_edit` `delete_file`（进回收站）；
+读写编辑：`read`（文本与图片）`write` `edit_file` `delete_file`（进回收站）；
 检索：`search` `glob` `list_directory`；执行：`execute_command` `run_program`；
 网络：`webfetch`；规划：`write_plan` `update_plan` `generate_steps` `update_step_status`；
 记忆：`write_memory` `update_memory` `read_memory` `delete_memory`；

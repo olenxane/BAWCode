@@ -430,8 +430,8 @@ class Memory:
         path = d / f"{key}.md"
         if path.exists():
             return "exists", key
-        d.mkdir(parents=True, exist_ok=True)
         try:
+            d.mkdir(parents=True, exist_ok=True)
             path.write_text(str(content or ""), encoding="utf-8")
         except OSError as e:
             log.error("写入记忆失败 %s: %s", path, e)
@@ -744,10 +744,11 @@ class Memory:
                 str(message.get("tool_name") or ""),
                 {}, str(message.get("description") or ""), text,
             )
-            if path is not None:
-                message["persisted"] = True
-                message["persist_path"] = str(path)
-                message["total_lines"] = len(text.splitlines())
+            if path is None:
+                return False
+            message["persisted"] = True
+            message["persist_path"] = str(path)
+            message["total_lines"] = len(text.splitlines())
         parts = [f"[{prefix}·{message.get('tool_name') or 'tool'}]"]
         if message.get("description"):
             parts.append(str(message["description"]))

@@ -335,20 +335,23 @@
   .cmd-row .c-name { font-family: var(--mono); font-size: 13px; color: var(--accent-deep); flex: none; }
   .cmd-row .c-hint { font-size: 12px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  /* 设置面板 */
-  .st-sec { margin-bottom: 14px; }
-  .st-sec > .st-head {
-    font-size: 12px; color: var(--faint); margin: 0 2px 6px; display: flex; align-items: center;
-    cursor: pointer; user-select: none;
+  /* 设置模态弹窗 */
+  #settings-modal { max-width: 560px; width: 100%; }
+  #settings-modal .m-head { padding: 12px 14px 8px; display: flex; align-items: center; gap: 8px; }
+  #settings-modal .m-head .t { font-weight: 650; font-size: 15px; }
+  #settings-modal .m-head .x { margin-left: auto; color: var(--faint); font-size: 18px; padding: 4px 8px; }
+  #settings-modal .m-tabs { display: flex; gap: 4px; padding: 0 14px 10px; border-bottom: 1px solid var(--line); }
+  #settings-modal .m-tab {
+    flex: 1; text-align: center; padding: 7px 0; font-size: 13px; color: var(--dim);
+    border-radius: 9px; background: var(--bg);
   }
-  .st-sec > .st-head::before { content: "▸"; margin-right: 6px; transition: transform .15s; }
-  .st-sec.open > .st-head::before { transform: rotate(90deg); }
-  .st-sec > .st-body { display: none; }
-  .st-sec.open > .st-body { display: block; }
+  #settings-modal .m-tab.active { background: var(--accent-soft); color: var(--accent-deep); font-weight: 600; }
+  #settings-modal .m-body { overflow-y: auto; padding: 12px 14px calc(16px + env(safe-area-inset-bottom)); }
+  .st-sec { margin-bottom: 10px; }
   .st-card { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
   .st-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
   .st-row:first-child { border-top: none; }
-  .st-row label { flex: none; width: 110px; font-size: 12.5px; color: var(--dim); }
+  .st-row label { flex: none; width: 120px; font-size: 12.5px; color: var(--dim); }
   .st-row input[type="text"], .st-row input[type="number"], .st-row select {
     flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px;
     font: inherit; font-size: 12.5px; outline: none; background: var(--card); min-width: 0;
@@ -366,6 +369,24 @@
   .st-row .st-toggle.on::after { transform: translateX(18px); }
   .st-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   .st-note { font-size: 11px; color: var(--faint); margin-top: 4px; }
+  /* 插件配置子项（缩进） */
+  .st-plugin-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-top: 1px solid var(--line); }
+  .st-plugin-row:first-child { border-top: none; }
+  .st-plugin-row .p-arrow { flex: none; width: 16px; text-align: center; color: var(--faint); cursor: pointer; user-select: none; }
+  .st-plugin-row .p-label { flex: 1; min-width: 0; font-size: 13px; }
+  .st-plugin-row .p-status { flex: none; font-size: 11px; color: var(--faint); }
+  .st-cfg-row { display: flex; align-items: center; gap: 8px; padding: 4px 0 4px 24px; border-top: 1px solid var(--line); }
+  .st-cfg-row:first-child { border-top: none; }
+  .st-cfg-row label { flex: none; width: 110px; font-size: 12px; color: var(--dim); }
+  .st-cfg-row input[type="text"], .st-cfg-row input[type="number"], .st-cfg-row select {
+    flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px;
+    font: inherit; font-size: 12px; outline: none; background: var(--card); min-width: 0;
+  }
+  .st-cfg-row input:focus, .st-cfg-row select:focus { border-color: var(--accent); }
+  .st-cfg-row .st-toggle { width: 34px; height: 19px; }
+  .st-cfg-row .st-toggle::after { width: 15px; height: 15px; }
+  .st-cfg-row .st-toggle.on::after { transform: translateX(15px); }
+  .st-cfg-hint { font-size: 10.5px; color: var(--faint); padding-left: 24px; }
 
   /* toast */
   #toast {
@@ -405,7 +426,6 @@
     <button class="d-tab active" data-tab="sessions">会话</button>
     <button class="d-tab" data-tab="control">控制</button>
     <button class="d-tab" data-tab="info">信息</button>
-    <button class="d-tab" data-tab="settings">设置</button>
   </div>
   <div class="d-body">
     <!-- 会话 -->
@@ -470,13 +490,6 @@
       <details class="acc" data-load="plugins"><summary>插件</summary><div class="a-body"><div class="empty-note">展开加载…</div></div></details>
       <details class="acc" data-load="help"><summary>命令帮助</summary><div class="a-body"><div class="empty-note">展开加载…</div></div></details>
     </div>
-    <!-- 设置 -->
-    <div class="d-pane" id="pane-settings">
-      <div class="d-sec">
-        <div class="s-head">设置<button class="d-refresh" data-act="refresh-settings">刷新</button></div>
-        <div id="settings-body"><div class="empty-note">加载中…</div></div>
-      </div>
-    </div>
   </div>
 </aside>
 <div id="scrim"></div>
@@ -489,6 +502,7 @@
     <div class="chips">
       <button class="chip" id="chip-model" title="切换模型">—</button>
       <button class="chip" id="chip-mode" title="访问模式">—</button>
+      <button class="chip" id="chip-settings" title="设置" style="font-size:15px;padding:3px 8px">⚙</button>
     </div>
   </header>
   <div id="session-bar">
@@ -1137,7 +1151,7 @@ $("chip-model").onclick = () => openDrawer("control");
 $("chip-mode").onclick = () => openDrawer("control");
 desktopMQ.addEventListener("change", mq => { if (mq.matches) document.body.classList.remove("drawer-open"); });
 
-const tabLoaders = { sessions: loadSessions, control: loadControl, info: loadInfo, settings: loadSettings };
+const tabLoaders = { sessions: loadSessions, control: loadControl, info: loadInfo };
 function activateTab(name) {
   document.querySelectorAll(".d-tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
   document.querySelectorAll(".d-pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + name));
@@ -1313,48 +1327,59 @@ async function doUndo(which) {
 /* ---- 信息面板 ---- */
 function loadInfo() { renderPlanCard(); }
 
-/* ---- 设置面板 ---- */
+/* ---- 设置模态弹窗 ---- */
 let settingsData = null;
-async function loadSettings() {
-  const body = $("settings-body");
-  body.innerHTML = "";
-  body.append(el("div", "empty-note", "加载中…"));
-  try {
-    const r = await api("/api/settings");
-    if (!r.ok) { body.innerHTML = ""; body.append(el("div", "empty-note", r.message || "读取失败")); return; }
-    settingsData = r;
-    renderSettings(body, r);
-  } catch (e) {
-    body.innerHTML = ""; body.append(el("div", "empty-note", "网络错误: " + e));
+let settingsTab = 0;
+const SETTINGS_TABS = ["提供商", "模型", "系统", "快捷键", "插件"];
+let pluginExpanded = new Set();
+
+$("chip-settings").onclick = () => openSettingsModal();
+
+function openSettingsModal() {
+  const scrim = el("div", "modal-scrim");
+  const modal = el("div", "modal");
+  modal.id = "settings-modal";
+  const head = el("div", "m-head");
+  head.append(el("span", "t", "设置"));
+  const closeBtn = el("button", "x", "✕");
+  closeBtn.onclick = () => scrim.remove();
+  head.append(closeBtn);
+  const tabs = el("div", "m-tabs");
+  const body = el("div", "m-body");
+  modal.append(head, tabs, body);
+  scrim.append(modal);
+  document.body.append(scrim);
+  scrim.onclick = e => { if (e.target === scrim) scrim.remove(); };
+
+  function renderTabs() {
+    tabs.innerHTML = "";
+    SETTINGS_TABS.forEach((name, i) => {
+      const t = el("button", "m-tab" + (i === settingsTab ? " active" : ""), name);
+      t.onclick = () => { settingsTab = i; renderTabs(); renderBody(); };
+      tabs.append(t);
+    });
   }
+
+  async function renderBody() {
+    body.innerHTML = "";
+    body.append(el("div", "empty-note", "加载中…"));
+    try {
+      const r = await api("/api/settings");
+      if (!r.ok) { body.innerHTML = ""; body.append(el("div", "empty-note", r.message || "读取失败")); return; }
+      settingsData = r;
+      body.innerHTML = "";
+      const builders = [buildProviderTab, buildModelTab, buildSystemTab, buildShortcutsTab, buildPluginsTab];
+      builders[settingsTab](body, r);
+    } catch (e) {
+      body.innerHTML = ""; body.append(el("div", "empty-note", "网络错误: " + e));
+    }
+  }
+
+  renderTabs();
+  renderBody();
 }
 
-function renderSettings(container, data) {
-  container.innerHTML = "";
-  const sections = [
-    { key: "provider", title: "提供商", build: buildProviderSection },
-    { key: "model", title: "模型", build: buildModelSection },
-    { key: "system", title: "系统", build: buildSystemSection },
-    { key: "shortcuts", title: "快捷键", build: buildShortcutsSection },
-    { key: "plugins", title: "插件", build: buildPluginsSection },
-  ];
-  for (const sec of sections) {
-    const div = el("div", "st-sec");
-    const head = el("div", "st-head", sec.title);
-    head.onclick = () => div.classList.toggle("open");
-    div.append(head);
-    const bodyEl = el("div", "st-body");
-    const card = el("div", "st-card");
-    sec.build(card, data[sec.key] || {});
-    bodyEl.append(card);
-    div.append(bodyEl);
-    container.append(div);
-  }
-  // 默认展开第一个
-  const first = container.querySelector(".st-sec");
-  if (first) first.classList.add("open");
-}
-
+/* 设置面板工具函数 */
 function stRow(label, inputEl) {
   const row = el("div", "st-row");
   row.append(el("label", "", label));
@@ -1390,14 +1415,16 @@ function stSaveBtn(section, collectFn) {
     try {
       const r = await api("/api/settings", { section, values });
       toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
-      if (r.ok) loadSettings();
     } catch (e) { toast("网络错误: " + e, true); }
     btn.disabled = false;
   };
   return btn;
 }
 
-function buildProviderSection(card, p) {
+/* 提供商标签页 */
+function buildProviderTab(body, data) {
+  const p = data.provider || {};
+  const card = el("div", "st-card");
   const providers = p.providers || [];
   const pidInput = stInput(p.provider_id);
   const nameInput = stInput(p.provider_name);
@@ -1418,8 +1445,7 @@ function buildProviderSection(card, p) {
     stRow("默认温度", tempInput),
     stRow("默认模型", defModelSel),
   );
-  const note = el("div", "st-note", "修改后点击保存生效；API Key 明文存储于本地配置文件");
-  card.append(note);
+  card.append(el("div", "st-note", "修改后点击保存生效；API Key 明文存储于本地配置文件"));
   const actions = el("div", "st-actions");
   actions.append(stSaveBtn("provider", () => ({
     active_provider_id: activeSel.value,
@@ -1432,9 +1458,13 @@ function buildProviderSection(card, p) {
     default_model_id: defModelSel.value,
   })));
   card.append(actions);
+  body.append(card);
 }
 
-function buildModelSection(card, m) {
+/* 模型标签页 */
+function buildModelTab(body, data) {
+  const m = data.model || {};
+  const card = el("div", "st-card");
   const modelSel = stSelect(m.model_names || [], m.active_model_name);
   const midInput = stInput(m.model_id);
   const modInput = stInput(m.modalities);
@@ -1473,9 +1503,13 @@ function buildModelSection(card, m) {
     task_review: revSel.value,
   })));
   card.append(actions);
+  body.append(card);
 }
 
-function buildSystemSection(card, s) {
+/* 系统标签页 */
+function buildSystemTab(body, data) {
+  const s = data.system || {};
+  const card = el("div", "st-card");
   const themeSel = stSelect(s.themes || ["dark"], s.theme);
   const modeSel = stSelect(["auto", "manual", "full"], s.mode);
   const logoTog = stToggle(s.logo);
@@ -1541,9 +1575,13 @@ function buildSystemSection(card, s) {
     log_level: logSel.value,
   })));
   card.append(actions);
+  body.append(card);
 }
 
-function buildShortcutsSection(card, s) {
+/* 快捷键标签页 */
+function buildShortcutsTab(body, data) {
+  const s = data.shortcuts || {};
+  const card = el("div", "st-card");
   const keys = [
     ["switch_mode", "切换模式"], ["switch_focus", "切换焦点"], ["send", "发送"],
     ["newline", "换行"], ["complete", "命令补全"], ["scroll_up", "滚动上"],
@@ -1556,8 +1594,7 @@ function buildShortcutsSection(card, s) {
     inputs[key] = inp;
     card.append(stRow(label, inp));
   }
-  const note = el("div", "st-note", "快捷键值如 shift+tab / ctrl+enter / f2 等");
-  card.append(note);
+  card.append(el("div", "st-note", "快捷键值如 shift+tab / ctrl+enter / f2 等"));
   const actions = el("div", "st-actions");
   actions.append(stSaveBtn("shortcuts", () => {
     const out = {};
@@ -1565,28 +1602,60 @@ function buildShortcutsSection(card, s) {
     return out;
   }));
   card.append(actions);
+  body.append(card);
 }
 
-function buildPluginsSection(card, plugins) {
-  if (!plugins || !plugins.length) {
-    card.append(el("div", "empty-note", "未发现插件"));
+/* 插件标签页：与 TUI 对齐（启停 + 展开声明式配置） */
+function buildPluginsTab(body, data) {
+  const plugins = data.plugins || [];
+  if (!plugins.length) {
+    body.append(el("div", "empty-note", "未发现插件"));
     return;
   }
+  const card = el("div", "st-card");
   const toggles = {};
   for (const p of plugins) {
-    const loaded = p.status === "loaded";
-    const tog = stToggle(loaded);
-    toggles[p.id] = tog;
-    const row = stRow(p.name + " (" + p.id + ")", tog);
-    if (p.error) {
-      const err = el("div", "st-note", "错误: " + p.error);
-      err.style.color = "var(--red)";
-      row.append(err);
+    // 插件行：箭头 + 名称 + 状态 + 启停开关
+    const row = el("div", "st-plugin-row");
+    const hasConfigs = (p.configs || []).length > 0;
+    const expanded = pluginExpanded.has(p.id);
+    const arrow = el("span", "p-arrow", hasConfigs ? (expanded ? "▾" : "▸") : "·");
+    if (hasConfigs) {
+      arrow.style.cursor = "pointer";
+      arrow.onclick = () => {
+        if (pluginExpanded.has(p.id)) pluginExpanded.delete(p.id);
+        else pluginExpanded.add(p.id);
+        // 重新渲染插件标签页
+        const modal = document.querySelector("#settings-modal");
+        if (modal) {
+          const mbody = modal.querySelector(".m-body");
+          mbody.innerHTML = "";
+          buildPluginsTab(mbody, settingsData);
+        }
+      };
     }
+    row.append(arrow);
+    const label = el("span", "p-label", p.name + " (" + p.id + ")");
+    row.append(label);
+    const statusText = p.status === "loaded" ? "开" : p.status === "disabled" ? "关" : "失败";
+    row.append(el("span", "p-status", statusText));
+    const tog = stToggle(p.status === "loaded");
+    toggles[p.id] = tog;
+    row.append(tog);
     card.append(row);
+    if (p.error) {
+      const err = el("div", "st-cfg-hint", "错误: " + p.error);
+      err.style.color = "var(--red)";
+      card.append(err);
+    }
+    // 展开的配置项
+    if (expanded && hasConfigs) {
+      for (const cfg of p.configs) {
+        card.append(buildPluginConfigRow(p.id, cfg));
+      }
+    }
   }
-  const note = el("div", "st-note", "切换后点击保存生效（自动重载插件）");
-  card.append(note);
+  card.append(el("div", "st-note", "启停切换后点击保存生效（自动重载插件）；配置项修改即时写透"));
   const actions = el("div", "st-actions");
   actions.append(stSaveBtn("plugins", () => {
     const out = {};
@@ -1594,7 +1663,57 @@ function buildPluginsSection(card, plugins) {
     return out;
   }));
   card.append(actions);
+  body.append(card);
 }
+
+/* 单个插件配置项行：按声明类型渲染 */
+function buildPluginConfigRow(pid, cfg) {
+  const wrap = el("div");
+  const row = el("div", "st-cfg-row");
+  row.append(el("label", "", cfg.label || cfg.key));
+  if (cfg.type === "bool") {
+    const cur = cfg.current in (true, "true", "1", 1) || cfg.current === true;
+    const tog = stToggle(cur);
+    tog.onclick = async () => {
+      tog.classList.toggle("on");
+      const val = tog.classList.contains("on");
+      try {
+        const r = await api("/api/settings", { section: "plugin_config", values: { plugin_id: pid, key: cfg.key, value: val } });
+        toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
+      } catch (e) { toast("网络错误: " + e, true); }
+    };
+    row.append(tog);
+  } else if (cfg.type === "list") {
+    const sel = stSelect(cfg.options || [], String(cfg.current ?? cfg.default ?? ""));
+    sel.onchange = async () => {
+      try {
+        const r = await api("/api/settings", { section: "plugin_config", values: { plugin_id: pid, key: cfg.key, value: sel.value } });
+        toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
+      } catch (e) { toast("网络错误: " + e, true); }
+    };
+    row.append(sel);
+  } else {
+    // str / int / float：文本输入 + 失焦保存
+    const inp = stInput(cfg.current ?? cfg.default ?? "", cfg.type === "int" || cfg.type === "float" ? "number" : "text");
+    if (cfg.type === "float") inp.step = "0.1";
+    if (cfg.min !== undefined && cfg.min !== null) inp.min = cfg.min;
+    if (cfg.max !== undefined && cfg.max !== null) inp.max = cfg.max;
+    inp.onblur = async () => {
+      let val = inp.value;
+      if (cfg.type === "int") val = parseInt(val) || 0;
+      else if (cfg.type === "float") val = parseFloat(val) || 0;
+      try {
+        const r = await api("/api/settings", { section: "plugin_config", values: { plugin_id: pid, key: cfg.key, value: val } });
+        toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
+      } catch (e) { toast("网络错误: " + e, true); }
+    };
+    row.append(inp);
+  }
+  wrap.append(row);
+  if (cfg.hint) wrap.append(el("div", "st-cfg-hint", cfg.hint));
+  return wrap;
+}
+
 
 function renderPlanCard() {
   const card = $("plan-card");
@@ -1690,7 +1809,6 @@ document.querySelector(".d-body").addEventListener("click", async e => {
     else if (act === "refresh-models") loadModels();
     else if (act === "refresh-workflows") loadWorkflows();
     else if (act === "refresh-undo") loadUndo();
-    else if (act === "refresh-settings") loadSettings();
     else if (act === "session-new") twoTap(btn, async () => {
       const r = await api("/api/session/new", {});
       toast(r.ok ? "新会话已开启" : (r.message || "失败"), !r.ok);

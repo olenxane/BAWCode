@@ -377,19 +377,24 @@ class _PtReader:
             log.info("pt 输入后端启动: %s", type(self._input).__name__)
             _flog("started reader=%s" % type(self._input).__name__)
         except Exception as exc:
+            self.dead.set()
+            if self._raw is not None:
+                self._raw.__exit__(None, None, None)
             log.error("pt 输入后端启动失败: %r", exc)
             _flog("start failed: %r" % (exc,))
 
     def _pump(self) -> None:
-        # POSIX 传小超时保证暂停协议与帧泵响应；Windows read_keys(self) 阻塞读不收超时参数
-        timeout = None if _WINDOWS else 0.05
+        # 两个平台的 read_keys 都不接收超时参数
         try:
             while True:
                 if self._pause_req.is_set():
                     self._parked.set()
                     time.sleep(0.02)
                     continue
-                presses = self._input.read_keys() if _WINDOWS else self._input.read_keys(timeout)
+                if self._input.closed:
+                    self.dead.set()
+                    return
+                presses = self._input.read_keys()
                 if presses:
                     self._q.put(presses)
                 else:

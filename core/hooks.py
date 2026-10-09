@@ -20,6 +20,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from core.log import get_logger
@@ -49,7 +50,8 @@ EVENTS: Dict[str, dict] = {
     "rag_query": {"kind": "call", "desc": "RAG 查询旁路"},
     "computer_use": {"kind": "call", "desc": "computer-use 外部执行接口"},
     "llm_request": {"kind": "call", "desc": "整段接管/转发 LLM 请求（返回 chat 响应结构生效）"},
-    "tool_confirm": {"kind": "call", "desc": "工具确认代答（返回 {action: allow_once|allow_always|deny} 生效；None 交回 UI 面板）"},
+    "tool_confirm": {"kind": "call", "desc": "工具确认代答，首个有效应答生效；None 交回 UI 面板"},
+    "tool_confirm_closed": {"kind": "collect", "desc": "工具确认已应答，按 request_id 关闭其他通道请求"},
     "ui_request": {"kind": "call", "desc": "交互弹窗代答 confirm/choose/line/ask（返回与键盘输入同语义的应答值生效；None 交回 UI 面板）"},
     # ---- 生命周期事件 ----
     "session_start": {"kind": "collect", "desc": "会话初始化完成（collect）"},
@@ -199,6 +201,8 @@ def call_hook(event: str, payload: Optional[dict] = None, default: Any = None) -
     """
     data = dict(payload) if payload is not None else {}
     data.setdefault("_event", event)
+    if event == "tool_confirm":
+        return confirm_hook(data, default)
     result = None
     merged: Dict[str, Any] = {}
     for entry in _ordered(event):
@@ -212,6 +216,33 @@ def call_hook(event: str, payload: Optional[dict] = None, default: Any = None) -
     if result is None:
         return default
     return merged if isinstance(result, dict) else result
+
+
+def confirm_hook(data: dict, default: Any = None) -> Any:
+    """工具确认采用首个有效应答，并通知其余通道关闭请求。"""
+    entries = _ordered("tool_confirm")
+    data = dict(data)
+    cancelled = data.pop("cancelled", None)
+    data.setdefault("request_id", uuid.uuid4().hex)
+    for winner in entries:
+        if callable(cancelled) and cancelled():
+            collect_hook("tool_confirm_closed", dict(data, phase="closed", action="deny"))
+            return {"action": "deny"}
+        out = _invoke(winner, dict(data))
+        if callable(cancelled) and cancelled():
+            collect_hook("tool_confirm_closed", dict(data, phase="closed", action="deny"))
+            return {"action": "deny"}
+        if not isinstance(out, dict):
+            continue
+        action = str(out.get("action") or "").lower()
+        if action in ("denied", "reject"):
+            action = "deny"
+        if action not in ("allow_once", "allow_always", "deny"):
+            continue
+        result = dict(out, action=action)
+        collect_hook("tool_confirm_closed", dict(data, phase="closed", action=result["action"]))
+        return result
+    return default
 
 
 def collect_hook(event: str, payload: Optional[dict] = None) -> List[Any]:

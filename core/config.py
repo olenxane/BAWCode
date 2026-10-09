@@ -3,6 +3,8 @@ import copy
 import json
 import os
 import re
+import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -15,6 +17,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 log = get_logger("config")
 DEFAULT_CONFIG_PATH = _ROOT / "data" / "config.json"
 THEME_DIR = _ROOT / "data" / "theme"
+SAVE_LOCK = threading.Lock()
 
 
 def default_config() -> dict:
@@ -732,16 +735,11 @@ class Config:
         for row in rows:
             if row["model_name"] == text:
                 return row
-        pid, mid = parse_model_name(text)
-        hits = [r for r in rows if r["model_id"] == (mid or text) or r["model_name"] == text]
+        hits = [r for r in rows if r["model_id"] == text]
         if len(hits) == 1:
             return hits[0]
-        for row in rows:
-            if row["model_id"] == text:
-                return row
-        for row in rows:
-            if row["provider_id"] == pid and row["model_id"] == mid:
-                return row
+        if len(hits) > 1:
+            log.warn("模型 ID 有歧义，请使用完整 model_name: %s", text)
         return None
 
     def switch_model(self, name: str) -> Optional[dict]:
@@ -824,13 +822,20 @@ class Config:
 
     def save(self) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        # 原子写：防进程中断留下半截配置（与 session_store/memory 同款）
-        tmp = self.config_path.with_name(self.config_path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(self.data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self.config_path)
+        # 同目录独占临时文件，避免并发保存互相替换临时内容
+        with SAVE_LOCK:
+            tmp = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=self.config_path.parent,
+                    prefix=self.config_path.name + ".", suffix=".tmp", delete=False,
+                ) as handle:
+                    tmp = Path(handle.name)
+                    handle.write(json.dumps(self.data, ensure_ascii=False, indent=2))
+                os.replace(tmp, self.config_path)
+            finally:
+                if tmp is not None:
+                    tmp.unlink(missing_ok=True)
         log.debug("配置已保存: %s", self.config_path)
 
     def list_themes(self) -> List[str]:

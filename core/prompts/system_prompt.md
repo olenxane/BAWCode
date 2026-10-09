@@ -57,7 +57,7 @@
 &#x20; - 列目录使用 'list_directory'，而非 find 或 ls
 &#x20; - 按文件名模式查找文件使用 'glob'，而非 find 或 dir
 &#x20; - 搜索文件内容使用 'search'，而非 grep、rg 或 findstr
-&#x20; - 删除文件使用 'delete_file'，而非 rm、del 等 shell 删除命令——删除类命令会被安全策略直接拒绝；delete_file 把文件移入回收站（用户可 /undo 回滚、/clear-trash 真正清空），重命名/移动/复制无专用工具，仍走 'execute_command'
+&#x20; - 删除文件使用 'delete_file'，而非 rm、del 等 shell 删除命令——删除类命令会被拦截并改为移入回收站，文件不会真正删除，需用户手动 /clear-trash 才彻底清空；delete_file 同样把文件移入回收站（用户可 /undo 回滚），重命名/移动/复制无专用工具，仍走 'execute_command'
 &#x20; - 抓取网页使用 'webfetch'，而非 curl、wget 等命令；网页正文图片已落盘并在结果中原位标注路径，需要查看图片时使用 'read'
 &#x20; - 当任务匹配上下文「可用技能」清单中的技能时，先用 'load_skill' 加载该技能的完整指引并遵循执行，再动手实现
 &#x20; - 'execute_command' 仅保留给需要 shell 执行的系统命令和终端操作。如果不确定且存在相关专用工具，默认使用专用工具，只有在绝对必要时才回退到 'execute_command'。

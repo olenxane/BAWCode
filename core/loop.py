@@ -174,7 +174,9 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             ):
                 # 手动重试等待态：Ctrl+Y 重发同一请求（不计轮次、不写消息），放弃则走错误路径
                 io.phase("")  # 停掉思考中转轮，状态行交给等待态提示
-                if io.wait_llm_retry(str(response["error"])):
+                retry_requested = io.wait_llm_retry(str(response["error"]))
+                check_cancel(turn)
+                if retry_requested:
                     io.status(f"重试 · 第{round_no + 1}轮")
                     continue
             break
@@ -209,82 +211,56 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 call["description"] = str(args.pop("description") or "")
 
         io.phase("工具调用中")
-        pending = []
-        allowed_results = []
-        registered = []
-        calls_logged = False
+        for call in tool_calls:
+            call["id"] = call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+        thinking_extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
+        session.add_message(
+            "assistant",
+            response.get("content") or "",
+            type="tool_call",
+            tool_calls=[
+                {
+                    "id": c["id"],
+                    "name": c.get("name"),
+                    "arguments": c.get("arguments") or {},
+                    "type": c.get("type") or "function",
+                }
+                for c in tool_calls
+            ],
+            **thinking_extra,
+        )
+        registered = 0
+        round_results = []
         log.debug("第%d轮返回 %d 个工具调用", round_no + 1, len(tool_calls))
         try:
             for call in tool_calls:
+                check_cancel(turn)
                 action, reason = llm.evaluate_tool(call.get("name"), call.get("arguments") or {})
+                check_cancel(turn)
                 if action == policy.ALLOW:
-                    # 逐工具阶段提示：树底转轮行带上当前执行的工具名
                     io.phase(f"工具调用中 · {call.get('name')}")
-                    allowed_results.append((call, llm.execute_approved_tool(call)))
+                    check_cancel(turn)
+                    result = llm.execute_approved_tool(call)
                 elif action == policy.CONFIRM:
-                    pending.append(call)
+                    io.phase(f"待确认 · {call.get('name')}")
+                    check_cancel(turn)
+                    if io.tool_confirm is None:
+                        result = {"content": policy.default_reject_message("无确认通道")}
+                    else:
+                        # 确认桥负责确认后的取消门禁与执行，返回工具结果
+                        result = io.tool_confirm(call)
                 else:
-                    allowed_results.append(
-                        (
-                            call,
-                            {
-                                "role": "tool",
-                                "tool_call_id": call.get("id"),
-                                "tool_name": call.get("name"),
-                                "content": policy.default_reject_message(reason),
-                                "type": "tool",
-                            },
-                        )
-                    )
-
-            # DeepSeek Tool Calls：保留 assistant 工具轮（含 content + tool_calls）；
-            # thinking 与正文并存时以 thinking 字段留档（出站时并回 content）
-            thinking_extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
-            session.add_message(
-                "assistant",
-                response.get("content") or "",
-                type="tool_call",
-                tool_calls=[
-                    {
-                        "id": c.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                        "name": c.get("name"),
-                        "arguments": c.get("arguments") or {},
-                        "type": c.get("type") or "function",
-                    }
-                    for c in tool_calls
-                ],
-                **thinking_extra,
-            )
-            calls_logged = True
-
-            round_results = []
-            for call, item in allowed_results:
-                msg = session.add_tool_result(call, item["content"], item.get("images"))
-                registered.append(call)
-                if msg:
-                    round_results.append(msg)
-            io.status(f"工具 {len(allowed_results)} 完成 · 待确认 {len(pending)}")
-
-            for call in pending:
-                # 确认面板等待期同样有阶段文案（带工具名，与执行中区分）
-                io.phase(f"待确认 · {call.get('name')}")
-                if io.tool_confirm is None:
-                    result = {"content": policy.default_reject_message("无确认通道")}
-                else:
-                    result = io.tool_confirm(call)
+                    result = {"content": policy.default_reject_message(reason)}
                 msg = session.add_tool_result(call, result["content"], result.get("images"))
-                registered.append(call)
+                registered += 1
                 if msg:
                     round_results.append(msg)
                 check_cancel(turn)
-                io.status(f"确认完成 · {call.get('name')}")
+                io.status(f"工具 {registered}/{len(tool_calls)} 完成 · {call.get('name')}")
         finally:
-            # 配对不变式：assistant.tool_calls 落库后每个 id 必须有配对 tool 结果；
-            # 取消/异常留下的孤儿调用会让后续每次请求被 API 以配对不全拒绝（只能 /clear）
-            if calls_logged:
-                for call in tool_calls:
-                    if call not in registered:
-                        session.add_tool_result(call, "[回合中断，该调用未获得结果]")
+            # 中断或异常时补齐尚未返回的调用，保持协议配对
+            for call in tool_calls[registered:]:
+                session.add_tool_result(call, "[回合中断，该调用未获得结果]")
 
         # 空转计数：本轮结果喂入计数器（重复才计，整轮全新清零）
         spin.feed(round_results)

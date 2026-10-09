@@ -442,6 +442,14 @@ def setup(ctx):
     # ---- 工具确认远程代答（tool_confirm 变换链：返回 dict 生效，None 交回终端面板）----
 
     def _on_tool_confirm(payload):
+        if payload.get("phase") == "closed":
+            with st.lock:
+                pending = [c for c in st.confirms if c["request_id"] == payload.get("request_id")]
+                for item in pending:
+                    item["event"].set()
+            for item in pending:
+                _broadcast({"t": "confirm_done", "id": item["id"], "action": "closed"})
+            return None
         if not remote_confirm:
             return None
         with st.lock:
@@ -451,7 +459,8 @@ def setup(ctx):
         name = str(payload.get("name") or "")
         arguments = payload.get("arguments") or {}
         item = {
-            "id": uuid.uuid4().hex[:8],
+            "id": uuid.uuid4().hex,
+            "request_id": payload.get("request_id"),
             "name": name,
             "arguments": arguments,
             "event": threading.Event(),
@@ -480,6 +489,7 @@ def setup(ctx):
         return None
 
     ctx.register_hook("tool_confirm", _on_tool_confirm, priority=50)
+    ctx.register_hook("tool_confirm_closed", _on_tool_confirm)
 
     # ---- 宿主运行时访问（缺载体/缺属性时降级为 None，端点各自兜底）----
 
@@ -650,6 +660,13 @@ def setup(ctx):
             return {"ok": False, "message": "回合进行中：请先停止，或发送新消息按设置中断/排队后再操作"}
         return None
 
+    def _idle_operation(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            return ctx.run_when_idle(lambda: fn(*args, **kwargs))
+        return wrapped
+
+    @_idle_operation
     def _op_session_new() -> dict:
         err = _session_op_guard()
         if err:
@@ -667,6 +684,7 @@ def setup(ctx):
         _broadcast({"t": "reset"})
         return {"ok": True, "result": "新会话已开启"}
 
+    @_idle_operation
     def _op_session_clear() -> dict:
         err = _session_op_guard()
         if err:
@@ -683,6 +701,7 @@ def setup(ctx):
         _broadcast({"t": "reset"})
         return {"ok": True, "result": "会话已清空"}
 
+    @_idle_operation
     def _op_session_rename(title: str) -> dict:
         session, err = _require_session()
         if err:
@@ -696,6 +715,7 @@ def setup(ctx):
         _broadcast({"t": "reset"})
         return {"ok": True, "result": f"已重命名: {name}", "title": name}
 
+    @_idle_operation
     def _op_session_switch(sid: str) -> dict:
         err = _session_op_guard()
         if err:
@@ -724,6 +744,7 @@ def setup(ctx):
         _broadcast({"t": "reset"})
         return {"ok": True, "result": f"已切换: {session.session_title or session.session_id}"}
 
+    @_idle_operation
     def _op_session_delete(sid: str) -> dict:
         session, err = _require_session()
         if err:
@@ -843,6 +864,7 @@ def setup(ctx):
         trash = snapshot_mod.trash_count(ctx.config, session.project_id)
         return {"ok": True, "turns": turns, "trash": trash}
 
+    @_idle_operation
     def _op_undo(which) -> dict:
         err = _session_op_guard()
         if err:
@@ -965,7 +987,33 @@ def setup(ctx):
         themes = ["dark"] + [t for t in cfg.list_themes() if t != "dark"]
         workflows = workflow_mod.list_workflows(cfg) if workflow_mod else []
         wf_active = workflow_mod.active_name(cfg) if workflow_mod else ""
-        plugins_list = plugins_mod.statuses() if plugins_mod else []
+        # 插件列表 + 声明式配置（与 TUI 设置页"插件"标签对齐）
+        plugins_list = []
+        if plugins_mod:
+            for row in plugins_mod.statuses():
+                pid = row["id"]
+                decls = plugins_mod.declared_configs(pid)
+                configs = []
+                for d in decls:
+                    configs.append({
+                        "key": d["key"],
+                        "label": d.get("label") or d["key"],
+                        "type": d["type"],
+                        "hint": d.get("hint") or "",
+                        "default": d.get("default"),
+                        "options": d.get("options"),
+                        "min": d.get("min"),
+                        "max": d.get("max"),
+                        "current": plugins_mod.get_setting(pid, d["key"], d.get("default"), cfg),
+                    })
+                plugins_list.append({
+                    "id": pid,
+                    "name": row.get("name") or pid,
+                    "description": row.get("description") or "",
+                    "status": row["status"],
+                    "error": row.get("error") or "",
+                    "configs": configs,
+                })
         return {
             "ok": True,
             "provider": {
@@ -1158,6 +1206,21 @@ def setup(ctx):
                     return {"ok": False, "message": f"插件 {pid} 状态写入失败"}
             plugins_mod.reload(cfg)
 
+        elif section == "plugin_config":
+            # 单个插件配置项写透：{plugin_id, key, value}
+            if plugins_mod is None:
+                return {"ok": False, "message": "宿主缺少 plugins 模块"}
+            pid = str(values.get("plugin_id") or "")
+            key = str(values.get("key") or "")
+            value = values.get("value")
+            if not pid or not key:
+                return {"ok": False, "message": "缺少 plugin_id 或 key"}
+            try:
+                val = plugins_mod.set_setting(pid, key, value, cfg)
+            except ValueError as e:
+                return {"ok": False, "message": str(e)}
+            return {"ok": True, "result": f"{pid}.{key} = {val}"}
+
         else:
             return {"ok": False, "message": f"未知设置分区: {section}"}
 
@@ -1186,6 +1249,12 @@ def setup(ctx):
             return {"ok": False, "message": "工作流编辑器是桌面 GUI，远程不可用"}
         if head in _CMD_BUSY_BLOCKED and _busy():
             return {"ok": False, "message": "回合进行中：请先停止，或发送新消息按设置中断/排队后再操作"}
+        if head in _CMD_BUSY_BLOCKED:
+            return ctx.run_when_idle(lambda: _execute_command(line))
+        return _execute_command(line)
+
+    def _execute_command(line: str) -> dict:
+        head = line.split()[0].lower()
         session, err = _require_session()
         if err:
             return err
@@ -1386,17 +1455,17 @@ def setup(ctx):
                         self._json(200, {"ok": False, "message": "当前无等待重试的错误"})
                 elif path == "/api/confirm":
                     cid = str(data.get("id") or "")
-                    with st.lock:
-                        item = next((c for c in st.confirms if c["id"] == cid), None)
-                    if item is None:
-                        self._json(200, {"ok": False, "message": "确认请求不存在或已处理"})
-                        return
                     action = str(data.get("action") or "").lower()
                     if action not in ("allow_once", "allow_always", "deny", "reject"):
                         self._json(400, {"ok": False, "message": "action 须为 allow_once/allow_always/deny"})
                         return
-                    item["response"] = {"action": action, "reason": str(data.get("reason") or "")}
-                    item["event"].set()
+                    with st.lock:
+                        item = next((c for c in st.confirms if c["id"] == cid), None)
+                        if item is None or item["event"].is_set():
+                            self._json(200, {"ok": False, "message": "确认请求不存在或已处理"})
+                            return
+                        item["response"] = {"action": action, "reason": str(data.get("reason") or "")}
+                        item["event"].set()
                     _broadcast({"t": "confirm_done", "id": cid, "action": action})
                     self._json(200, {"ok": True})
                 elif path == "/api/session/new":

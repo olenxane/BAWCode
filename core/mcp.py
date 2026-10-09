@@ -93,12 +93,13 @@ def normalize_name(server: str, tool: str) -> str:
     """注册名规范化（qwen-code 同款）：≤63 字符且 ^[A-Za-z][A-Za-z0-9_-]*$ 原样保留，
     否则非法字符替换 _、字母开头补齐、截断后追加 _<fnv 哈希>；注册名与原始名分离"""
     raw = f"mcp__{server}__{tool}"
-    if len(raw) <= 63 and _NAME_RE.match(raw):
+    pair = json.dumps([server, tool], ensure_ascii=False, separators=(",", ":"))
+    if "__" not in server and "__" not in tool and len(raw) <= 63 and _NAME_RE.match(raw):
         return raw
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", raw)
     if not re.match(r"^[A-Za-z]", cleaned):
         cleaned = "tool_" + cleaned
-    suffix = _fnv1a36(raw)
+    suffix = _fnv1a36(pair)
     return cleaned[: 63 - len(suffix) - 1] + "_" + suffix
 
 
@@ -278,6 +279,9 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
 
     handle = _RUNTIME["handles"].setdefault(name, {})
     stack = contextlib.AsyncExitStack()
+    registered: List[str] = []
+    wrappers: Dict[str, Any] = {}
+    previous: Dict[str, Any] = {}
     try:
         transport = _transport_of(entry)
         if transport == "stdio":
@@ -315,7 +319,6 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
 
         include = [str(x) for x in (entry.get("include_tools") or [])]
         exclude = [str(x) for x in (entry.get("exclude_tools") or [])]
-        registered: List[str] = []
         server_tool: Dict[str, str] = {}
         call_timeout = _int(entry.get("timeout"), 0) or cfg["call_timeout"]
         for tool in (listing.tools or []):
@@ -325,13 +328,21 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
             if include and original not in include:
                 continue
             reg_name = normalize_name(name, original)
+            existing = register.get_tool(reg_name)
+            if existing is not None and existing.get("owner") != f"mcp:{name}":
+                raise ValueError(f"MCP 工具注册名已被其他来源占用: {reg_name}")
+            if reg_name in server_tool and server_tool[reg_name] != original:
+                raise ValueError(f"MCP 工具注册名冲突: {reg_name}")
             schema = _normalize_schema(_attr(tool, "input_schema", "inputSchema"))
             wrapper = _make_wrapper(name, handle, original, schema, call_timeout, cfg)
+            previous.setdefault(reg_name, existing)
+            wrappers[reg_name] = wrapper
             register.register(
                 name=reg_name,
                 description=f"[mcp:{name}] {getattr(tool, 'description', '') or original}".strip(),
                 usage=original,
                 schema=schema,
+                owner=f"mcp:{name}",
             )(wrapper)
             registered.append(reg_name)
             server_tool[reg_name] = original
@@ -339,7 +350,9 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
         # 重连场景：旧连接注册、新连接已不存在的工具予以撤销
         for stale in (_STATE.get(name) or {}).get("tools") or []:
             if stale not in server_tool:
-                register.unregister(stale)
+                meta = register.get_tool(stale)
+                if meta is not None and meta.get("owner") == f"mcp:{name}":
+                    register.unregister(stale)
         handle["stack"] = stack
         handle["session"] = session
         handle["entry"] = entry
@@ -352,6 +365,16 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
         }
         log.info("MCP 已连接: %s（%s，%d 个工具）", name, transport, len(registered))
     except BaseException as exc:
+        for reg_name in registered:
+            meta = register.get_tool(reg_name)
+            if meta is None or meta.get("owner") != f"mcp:{name}" or meta.get("func") is not wrappers[reg_name]:
+                continue
+            old = previous[reg_name]
+            if old is None:
+                register.unregister(reg_name)
+            else:
+                register.register(name=reg_name, description=old["description"], usage=old["usage"],
+                                  schema=old["schema"], owner=old["owner"])(old["func"])
         # 未成形的 stack 自行收尾；已成形的留给 disconnect 流程
         try:
             if handle.get("stack") is not stack:
@@ -390,6 +413,7 @@ def _connect_once(name: str, entry: dict, cfg: dict) -> None:
     inflight 互斥由调用方负责（_connect_attempt 或 reconnect 的前置闸）"""
     state = _init_state(name, entry)
     state["status"] = CONNECTING
+    _RUNTIME["handles"].setdefault(name, {})["entry"] = copy.deepcopy(entry)
     try:
         _submit(_connect_coro(name, entry, cfg), timeout=cfg.get("discovery_timeout_stdio", 30) + 30)
     except BaseException as exc:

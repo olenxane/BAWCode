@@ -1,5 +1,6 @@
 # Agent 核心：LLM 调用、工具策略、token/余额
 import json
+import http.client
 import threading
 import time
 import traceback
@@ -44,8 +45,29 @@ def _is_retryable_error(e: BaseException) -> bool:
         return status in _RETRYABLE_STATUS or 500 <= status <= 599
     if type(e).__name__ in ("APITimeoutError", "APIConnectionError"):
         return True
-    # 无状态码的网络层异常（URLError/DNS/连接拒绝/超时）
-    return isinstance(e, (urllib.error.URLError, ConnectionError, TimeoutError))
+    if type(e).__module__.split(".")[0] in {"httpx", "httpcore"}:
+        if type(e).__name__ in {"ReadError", "ReadTimeout", "RemoteProtocolError", "WriteError", "WriteTimeout", "ConnectError", "ConnectTimeout", "PoolTimeout"}:
+            return True
+    # 无状态码的网络层异常
+    return isinstance(e, (urllib.error.URLError, ConnectionError, TimeoutError, http.client.IncompleteRead))
+
+
+def _stream_unsupported(e: BaseException) -> bool:
+    """只允许明确拒绝流式参数的 HTTP 错误降级"""
+    status = e.code if isinstance(e, urllib.error.HTTPError) else getattr(e, "status_code", None)
+    if status not in {400, 422, 501}:
+        return False
+    text = str(e) + " " + str(getattr(e, "body", "") or "")
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            text += " " + e.read(8192).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    text = text.lower()
+    return ("stream" in text and any(marker in text for marker in (
+        "not supported", "unsupported", "does not support", "unknown parameter",
+        "unrecognized", "unexpected keyword", "not allowed", "不支持",
+    )))
 
 
 # 思考文本字段名各厂商不同，按序取首个非空
@@ -79,8 +101,9 @@ class _StreamAggregate:
         self.tool_buckets: dict = {}
         self.tool_order: list = []
         self.usage = None
-        self.error = None      # midway 错误：已产出内容后传输中断（不重试，partial 定格）
-        self.produced = 0      # 已回调 delta 数（reasoning/content），>0 即"已上屏"
+        self.error = None
+        self.finished = False
+        self.produced = 0      # 已回调增量数
 
     def _emit(self, kind: str, piece: str) -> None:
         if not piece:
@@ -114,7 +137,7 @@ class _StreamAggregate:
             bucket["id"] = call_delta["id"]
         fn = call_delta.get("function") or {}
         if fn.get("name"):
-            bucket["name"] = fn["name"]
+            bucket["name"] += fn["name"]
         if fn.get("arguments"):
             bucket["arguments"] += fn["arguments"]
 
@@ -234,6 +257,11 @@ class LLM:
         """
         cfg = self.config
         name = model or getattr(cfg, "model_name", None) or cfg.active_model_name()
+        rows = cfg.list_models()
+        if not any(r.get("model_name") == name for r in rows):
+            hits = [r for r in rows if r.get("model_id") == name]
+            if len(hits) > 1:
+                return {"ok": False, "model_name": name, "error": f"模型 ID 有歧义，请使用完整 model_name: {name}"}
         row = cfg.resolve_model_row(name)
         if row is None:
             row = cfg.find_model(name)
@@ -298,6 +326,8 @@ class LLM:
         if not choices:
             return  # usage 终块 choices 为空
         head = choices[0] or {}
+        if head.get("finish_reason") is not None:
+            agg.finished = True
         delta = head.get("delta") or head.get("message") or {}
         agg.add_reasoning(_reasoning_of(delta))
         agg.add_content(delta.get("content") or "")
@@ -307,14 +337,16 @@ class LLM:
                 agg.add_tool_delta(tc.get("index") if tc.get("index") is not None else i, tc)
 
     def _finish_stream(self, agg: "_StreamAggregate", exc: Optional[Exception]) -> Optional["_StreamAggregate"]:
-        """流循环异常的统一收口：取消→None；已产出→midway 定格；未产出→抛给 chat 回落/重试"""
-        if exc is not None and self._cancel.is_set():
+        """保存原始异常，由 chat 统一分类和重试"""
+        if self._cancel.is_set():
             return None
+        if exc is None and not agg.finished:
+            exc = ConnectionError("流式响应意外结束，未收到完成标记")
         if exc is None:
             return agg
         if agg.produced_any:
-            agg.error = f"流式传输中断: {exc}"
-            log.warn("流式传输中断（已产出 %d 片，不重试）: %s", agg.produced, exc)
+            agg.error = exc
+            log.warn("流式传输中断，已产出 %d 片: %s", agg.produced, exc)
             return agg
         raise exc
 
@@ -356,6 +388,7 @@ class LLM:
             if "text/event-stream" not in content_type:
                 # 服务端不支持流式（回了整段 JSON）：同一聚合器优雅降级
                 self._feed_chunk(agg, json.loads(resp.read().decode("utf-8")))
+                agg.finished = True
                 return self._finish_stream(agg, None)
             for raw_line in resp:
                 if self._cancel.is_set():
@@ -365,6 +398,7 @@ class LLM:
                     continue
                 data_text = line[5:].strip()
                 if data_text == "[DONE]":
+                    agg.finished = True
                     break
                 try:
                     data = json.loads(data_text)
@@ -501,14 +535,16 @@ class LLM:
     ) -> dict:
         """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型。
 
-        on_delta(kind, piece) 提供（kind ∈ reasoning/content）且 config.llm.stream
-        开启时走 SSE 流式：增量经回调上屏，聚合结果与非流式逐字段等价。
-        首个 chunk 前失败自动回落非流式；已产出后失败 midway 定格不重试。
+        on_delta 接收 reasoning/content 增量和 reset 清空事件。
+        config.llm.stream 开启时走 SSE 流式，网络中断按配置重试。
+        失败尝试不计成功用量，不返回未完成工具调用。
         """
         if self._cancel.is_set():
             return {"content": "", "tool_calls": [], "error": CANCELLED}
         self.meter.measure_context(messages)
         req = self.resolve_request(model)
+        if req.get("error"):
+            return {"content": "", "tool_calls": [], "error": req["error"]}
         model_id = req.get("model_id") or req.get("model_name") or ""
         payload = {
             "model": model_id,
@@ -564,21 +600,22 @@ class LLM:
                     except Exception as stream_err:
                         if self._cancel.is_set():
                             return {"content": "", "tool_calls": [], "error": CANCELLED}
-                        # 首个 chunk 前失败：回落非流式（本次尝试内完成；回落自身异常交外层重试）
-                        log.warn("流式请求失败，回落非流式: %s", stream_err)
+                        if not _stream_unsupported(stream_err):
+                            raise
+                        log.warn("服务端拒绝流式参数，降级非流式: %s", stream_err)
+                        streaming = False
                         data = self._native_chat(payload, req)
                     else:
-                        if agg is None:
+                        if agg is None or self._cancel.is_set():
                             return {"content": "", "tool_calls": [], "error": CANCELLED}
                         if agg.error:
-                            # midway：partial 已上屏，不自动重试（重试交由手动重试等待态），
-                            # 错误随结果返回
-                            result = self._normalize(agg.to_response(), keep_reasoning=bool(tools))
-                            self.meter.record_api_usage(result.get("raw", {}).get("usage"))
-                            self._account_completion(result)
-                            result["error"] = agg.error
-                            result["retryable"] = True
-                            return result
+                            # 清空失败尝试，避免直播拼接和半成品工具执行
+                            if on_delta is not None:
+                                try:
+                                    on_delta("reset", "")
+                                except Exception as callback_err:
+                                    log.warn("流式重置回调异常: %s", callback_err)
+                            raise agg.error
                         data = agg.to_response()
                 else:
                     data = self._native_chat(payload, req)
@@ -608,8 +645,10 @@ class LLM:
                     break
                 if attempt > max(retry_times, 0):
                     break
-                if retry_delay > 0:
-                    time.sleep(retry_delay * attempt)
+                if retry_delay > 0 and self._cancel.wait(retry_delay * attempt):
+                    return {"content": "", "tool_calls": [], "error": CANCELLED}
+                if self._cancel.is_set():
+                    return {"content": "", "tool_calls": [], "error": CANCELLED}
                 self._build_client(
                     provider_id=req.get("provider_id"),
                     api_key=req.get("api_key"),
@@ -764,8 +803,8 @@ class LLM:
         )
         return result.get("content") or prompt
 
-    def generate_plan(self, prompt: str, model: Optional[str] = None) -> dict:
-        external = hooks.call_hook("plan_generate", {"prompt": prompt}, default=None)
+    def generate_plan(self, prompt: str, model: Optional[str] = None, messages: Optional[List[dict]] = None) -> dict:
+        external = hooks.call_hook("plan_generate", {"prompt": prompt, "messages": messages or []}, default=None)
         if isinstance(external, dict) and external.get("content"):
             log.info("计划生成（外部接口）: %s", external.get("title", "任务计划"))
             return {
@@ -781,13 +820,12 @@ class LLM:
         except Exception as e:
             log.warn("加载 plan.md 失败: %s", e)
             system = "输出 markdown 计划：目标、步骤、风险、验收。不要执行任务。"
-        result = self.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-            model=plan_model,
-        )
+        context = list(messages) if messages is not None else [{"role": "user", "content": prompt}]
+        system_parts = [str(m.get("content") or "") for m in context if m.get("role") == "system"]
+        system_parts.append(system)
+        payload = [{"role": "system", "content": "\n\n".join(p for p in system_parts if p)}]
+        payload.extend(m for m in context if m.get("role") != "system")
+        result = self.chat(payload, model=plan_model)
         log.info("计划生成: %d字（model=%s）", len(result.get("content") or ""), plan_model or self.config.model)
         # error 透出给工作流判断计划是否生成成功，供重试与中断
         return {

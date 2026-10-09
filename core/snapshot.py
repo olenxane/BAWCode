@@ -9,12 +9,14 @@
 #  的参数里没有旧内容；还原前校验当前磁盘 md5 == 回合末 md5，用户事后改过的文件跳过；
 #  还原后 ledger_reset() 强制模型重新 read（台账"安全优先"哲学）
 #- 回收站：delete_file 把文件移入项目回收站（data/trash/{project_id}/，可配置），
-#  /clear-trash 真正不可逆删除；shell 删除命令在 policy 层直接拒绝（硬安全栏，full 模式也不例外）
+#  /clear-trash 真正不可逆删除；shell 删除命令由 execute_command 工具拦截，
+#  目标静默移入项目回收站而非真正删除
 #- 不覆盖：execute_command 副作用（仅清单对账提示）、MCP 工具写文件、redo
 import hashlib
 import json
 import os
 import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -207,6 +209,7 @@ def end_turn() -> Optional[dict]:
             "blob": "",
             "md5_after": "",
             "size_after": 0,
+            "existed_after": path.exists(),
         }
         if rec["bytes"] is not None:
             entry["blob"] = f"{i:03d}.bin"
@@ -239,6 +242,14 @@ def end_turn() -> Optional[dict]:
                 if len(external) >= _EXTERNAL_LIST_CAP:
                     external.append("…（其余略）")
                     break
+            # 已消失的文件也属于外部改动
+            for key in turn["inventory"].keys() - current.keys():
+                if len(external) >= _EXTERNAL_LIST_CAP:
+                    if external[-1] != "…（其余略）":
+                        external.append("…（其余略）")
+                    break
+                if key not in captured and not key.startswith((snap_prefix, trash_prefix)):
+                    external.append(key)
 
     if not entries and not external:
         return None  # 空回合不产生任何文件
@@ -270,9 +281,15 @@ def _next_seq_dir(cfg: dict, project_id: str, session_id: str) -> Path:
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+            tmp = Path(stream.name)
+            stream.write(data)
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def _prune_old_turns(cfg: dict, project_id: str, session_id: str, keep: int) -> None:
@@ -387,8 +404,10 @@ def _restore_entries(turn_dir: Path, index: dict) -> Tuple[List[str], List[str],
         except OSError as e:
             skipped.append((entry["path"], f"留底读取失败: {e}"))
             continue
-        if path.exists() and _file_md5(path) != entry.get("md5_after"):
-            skipped.append((entry["path"], "事后已修改，未还原"))
+        # 旧索引以回合末哈希判断文件是否存在
+        existed_after = entry.get("existed_after", bool(entry.get("md5_after")))
+        if path.exists() != existed_after or path.exists() and _file_md5(path) != entry.get("md5_after"):
+            skipped.append((entry["path"], "事后已修改或删除，未还原"))
             continue
         try:
             _atomic_write_bytes(path, original)
@@ -458,8 +477,13 @@ def _bound_trash_base() -> Path:
     return _trash_base(cfg, str(_BOUND.get("project_id") or ""))
 
 
+def trash_base() -> Path:
+    """当前绑定上下文对应的项目回收站目录"""
+    return _bound_trash_base()
+
+
 def move_to_trash(path: Path) -> Path:
-    """delete_file 专用：文件移入项目回收站（带时间戳前缀防撞名），返回落点"""
+    """文件或目录移入项目回收站（带时间戳前缀防撞名），返回落点"""
     base = _bound_trash_base()
     base.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")

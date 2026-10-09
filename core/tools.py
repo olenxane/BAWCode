@@ -1,6 +1,7 @@
 #工具的具体实现：文件读写与编辑、终端命令与程序调用、内容搜索、网页抓取、计划与步骤、关键词记忆、技能加载、computer-use 外部接口
 import base64
 import difflib
+import glob as glob_lib
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from typing import List, Optional, Union
 
 from core import hooks
 from core import memory as memory_mod
+from core import policy
 from core import register
 from core import snapshot
 from core import toolstore
@@ -70,6 +72,91 @@ def _session():
     return memory_mod.get_session()
 
 
+def _covers_trash(path: Path, trash: Path) -> bool:
+    """目标包含回收站目录时不可搬移，否则会自我嵌套"""
+    try:
+        path, trash = path.resolve(), trash.resolve()
+    except OSError:
+        pass
+    if path == trash:
+        return True
+    try:
+        trash.relative_to(path)
+        return True
+    except ValueError:
+        return False
+
+
+def _trash_result_text(moved, missing, skipped, failed, trash) -> str:
+    """删除命令拦截结果：告知模型文件未真正删除，需用户 /clear-trash"""
+    lines = [
+        "删除命令已被安全策略拦截，文件没有真正删除，已移入项目回收站；"
+        "用户需手动执行 /clear-trash 才会彻底删除。原命令未执行。",
+        f"项目回收站: {trash}",
+    ]
+    for src, dest in moved:
+        lines.append(f"- 已移入回收站: {src} -> {dest}")
+    for path in missing:
+        lines.append(f"- 未找到，跳过: {path}")
+    for path in skipped:
+        lines.append(f"- 跳过，该目标包含回收站目录: {path}")
+    for path, err in failed:
+        lines.append(f"- 移入回收站失败: {path}: {err}")
+    if not moved and not skipped and not failed:
+        lines.append("- 未解析出可删除的目标")
+    lines.append("后续删除文件请使用 delete_file 工具，不要再用 rm/del 等命令。")
+    return "\n".join(lines)
+
+
+def _join_argv(parts: List[str]) -> str:
+    """按 shell 习惯拼接参数：含空白的参数加引号，保住删除目标边界"""
+    return " ".join(f'"{p}"' if any(c.isspace() for c in p) else p for p in parts)
+
+
+def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute_command") -> Optional[str]:
+    """删除类命令改为移入回收站：返回替代结果文本；非删除类命令返回 None"""
+    targets = policy.delete_targets(command)
+    if targets is None:
+        return None
+    log.info("删除命令被拦截，改为移入回收站: %s", command)
+    base = Path(cwd) if cwd else Path.cwd()
+    trash = snapshot.trash_base()
+    moved, missing, skipped, failed = [], [], [], []
+    seen = set()
+    for raw in targets:
+        pattern = str(raw).strip()
+        if not pattern:
+            continue
+        literal = base / pattern
+        matches = glob_lib.glob(str(literal))
+        if not matches and not any(ch in pattern for ch in "*?["):
+            matches = [str(literal)]
+        for item in matches:
+            try:
+                path = Path(item).resolve()
+            except OSError:
+                continue
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not path.exists():
+                missing.append(path)
+                continue
+            if _covers_trash(path, trash):
+                skipped.append(path)
+                continue
+            snapshot.capture_before(path, tool=tool)
+            try:
+                dest = snapshot.move_to_trash(path)
+            except (OSError, shutil.Error) as e:
+                log.error("删除命令移入回收站失败 %s: %s", path, e)
+                failed.append((path, e))
+                continue
+            moved.append((path, dest))
+    return _trash_result_text(moved, missing, skipped, failed, trash)
+
+
 @register.register(
     name="execute_command",
     description=(
@@ -114,6 +201,9 @@ def execute_command(
     mode: str = "foreground",
 ) -> str:
     """终端命令调用：前台阻塞收输出，后台落盘+完成通知"""
+    trash_result = _trash_delete_command(command, cwd)
+    if trash_result is not None:
+        return trash_result
     timeout = _clamp_timeout(timeout)
     if str(mode or "").strip().lower() == "background":
         return _execute_command_background(command, cwd)
@@ -787,8 +877,8 @@ def _match_spots(content: str, needle: str) -> list:
         "Delete a single file safely: the file is moved to the project trash "
         "rather than destroyed, recoverable via /undo, truly emptied via "
         "/clear-trash. Files only, no directories. Shell delete commands like "
-        "rm/del are rejected by the safety policy — always delete files with "
-        "this tool"
+        "rm/del are intercepted and their targets moved to the project trash "
+        "instead of being executed — always delete files with this tool"
     ),
     usage="delete_file <file_path>",
     schema={
@@ -836,7 +926,7 @@ _TOOL_FAILURE_PATTERNS = (
     "拒绝编辑",
     "old_str 不能为空",
     "old_str 与 new_str 相同",
-    "命令被安全策略拒绝",
+    "删除命令已被安全策略拦截",
     "已拒绝",
     "拒绝写入",
     # MCP 工具的 isError 结果与调用失败统一前缀
@@ -1452,6 +1542,9 @@ def run_program(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
     """程序调用：独立进程启动并收集输出"""
+    trash_result = _trash_delete_command(_join_argv([str(program)] + [str(a) for a in (args or [])]), cwd, tool="run_program")
+    if trash_result is not None:
+        return trash_result
     timeout = _clamp_timeout(timeout)
     cmd = [program] + list(args or [])
     log.info("运行程序: %s（cwd=%s timeout=%ds）", " ".join(cmd), cwd or "-", timeout)

@@ -54,7 +54,7 @@ PROMPT_TYPES = {"understand", "analyze", "execute", "review", "llm"}
 BOOL, INT, STR, LIST, CHOICE = "bool", "int", "str", "list", "choice"
 FIELD_SCHEMAS = {
     "system_prompt": [("files", "系统提示词文件（逗号分隔）", LIST, None)],
-    "skill": [("list", "技能白名单（逗号分隔，空=全部）", LIST, None)],
+    "skill": [("list", "技能白名单（逗号分隔，空=不注入）", LIST, None)],
     "understand": [
         ("max_rounds", "理解循环轮数（ask_user 澄清）", INT, (1, 100)),
         ("capture", "捕获输出为变量名（可空）", STR, None),
@@ -570,6 +570,12 @@ class EditorWindow(QtWidgets.QMainWindow):
             return
         node = item.node
         ntype = str(node.get("type") or "")
+        defaults = {
+            "enabled": True, "confirm": True, "steps": True, "retry_times": 2,
+            "default_level": "low",
+            "max_rounds": {"understand": 8, "execute": 12, "review": 8}.get(ntype, 0),
+            "model_role": {"plan": "plan", "execute": "code", "review": "review"}.get(ntype, ""),
+        }
         label, _ = TYPE_LABELS.get(ntype, (ntype, "#555555"))
         holder = QtWidgets.QWidget()
         holder.setStyleSheet("background: #FAF9F5;")  # 默认控件底色偏灰，与 dock 米白统一
@@ -613,7 +619,7 @@ class EditorWindow(QtWidgets.QMainWindow):
 
         def add_bool(key: str, title: str) -> None:
             box = QtWidgets.QCheckBox()
-            box.setChecked(bool(node.get(key, key == "enabled")))
+            box.setChecked(bool(node.get(key, defaults.get(key, False))))
 
             def _write(state: int) -> None:
                 node[key] = state == QtCore.Qt.CheckState.Checked.value
@@ -626,9 +632,9 @@ class EditorWindow(QtWidgets.QMainWindow):
             spin = QtWidgets.QSpinBox()
             spin.setRange(lo, hi)
             try:
-                spin.setValue(int(node.get(key) or lo))
+                spin.setValue(int(node.get(key, defaults.get(key, lo))))
             except (TypeError, ValueError):
-                spin.setValue(lo)
+                spin.setValue(defaults.get(key, lo))
 
             def _write(value: int) -> None:
                 node[key] = int(value)
@@ -642,7 +648,7 @@ class EditorWindow(QtWidgets.QMainWindow):
             combo.addItem("（默认）", "")
             for opt in options:
                 combo.addItem(opt, opt)
-            cur = str(node.get(key) or "")
+            cur = str(node.get(key, defaults.get(key, "")) or "")
             idx = combo.findData(cur)
             if cur and idx < 0:
                 combo.addItem(cur, cur)
@@ -745,11 +751,15 @@ class EditorWindow(QtWidgets.QMainWindow):
             index += 1
         return f"{base}{index}"
 
-    def add_node(self, ntype: str, pos: QtCore.QPointF | None = None) -> NodeItem:
+    def add_node(self, ntype: str, pos: QtCore.QPointF | None = None, node_data: dict | None = None) -> NodeItem:
         if ntype not in TYPE_LABELS:
             return None
-        node = {"id": self._unique_id(ntype), "type": ntype, "enabled": True}
-        node.update(json.loads(json.dumps(NODE_DEFAULTS.get(ntype, {}))))  # 深拷贝默认字段
+        if node_data is None:
+            node = {"id": self._unique_id(ntype), "type": ntype, "enabled": True}
+            node.update(json.loads(json.dumps(NODE_DEFAULTS.get(ntype, {}))))
+        else:
+            # 加载保留缺省字段，面板按运行时默认展示
+            node = json.loads(json.dumps(node_data))
         item = NodeItem(node, self)
         if pos is None:
             pos = QtCore.QPointF(80 + 220 * (len(self._nodes) % 8), 60 + 140 * (len(self._nodes) // 8))
@@ -925,8 +935,7 @@ class EditorWindow(QtWidgets.QMainWindow):
         self.new_workflow(keep_name=data.get("name") or path.stem)
         for node in data["nodes"]:
             prev = self._nodes[-1] if self._nodes else None
-            item = self.add_node(node["type"])
-            item.node.update(node)
+            item = self.add_node(node["type"], node_data=node)
             if prev is not None:
                 edge = EdgeItem(prev, item)
                 self.scene.addItem(edge)

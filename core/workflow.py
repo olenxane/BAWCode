@@ -379,7 +379,11 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
     plan: dict = {}
     reason = ""
     for attempt in range(retry_times + 1):
-        plan = llm.generate_plan(turn.user_text, model=plan_model)
+        check_cancel(turn)
+        plan = llm.generate_plan(
+            turn.user_text, model=plan_model,
+            messages=session.build_messages(extra_system=turn.system_prompt_text or None),
+        )
         check_cancel(turn)
         reason = _plan_error(plan)
         if not reason:

@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -428,11 +429,17 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
 def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancelled=None) -> dict:
     """工具确认：先经 tool_confirm 扩展点（插件/外部接口可代答），无处理时
     经 UI 请求桥在主线程弹面板（↑↓ 选择）；取消时按默认拒绝回注"""
-    hooked = hooks.call_hook(
-        "tool_confirm",
-        {"name": call.get("name"), "arguments": call.get("arguments") or {}},
-        default=None,
-    )
+    def rejected():
+        return {"role": "tool", "tool_call_id": call.get("id"), "tool_name": call.get("name"),
+                "content": policy.default_reject_message(""), "type": "tool"}
+
+    if callable(cancelled) and cancelled():
+        return rejected()
+    confirm_payload = {"name": call.get("name"), "arguments": call.get("arguments") or {},
+                       "request_id": uuid.uuid4().hex, "cancelled": cancelled}
+    hooked = hooks.call_hook("tool_confirm", confirm_payload, default=None)
+    if callable(cancelled) and cancelled():
+        return rejected()
     if isinstance(hooked, dict):
         action = str(hooked.get("action") or "").lower()
         if action in ("allow_once", "allow_always"):
@@ -457,6 +464,10 @@ def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancel
         result = app.wait_ui(req, cancelled)
     finally:
         app.pending_tool = None
+        closed_payload = {key: value for key, value in confirm_payload.items() if key != "cancelled"}
+        hooks.collect_hook("tool_confirm_closed", dict(closed_payload, phase="closed"))
+    if callable(cancelled) and cancelled():
+        return rejected()
     if result == CANCELLED or not isinstance(result, dict):
         return {
             "role": "tool",
@@ -628,6 +639,12 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     def _on_delta(kind: str, piece: str) -> None:
         # 流式回调（agent 线程）：只改 UI 状态不渲染——流式对象挂在 app.streaming_msg，
         # 不进 session.messages（半成品不落盘/不进 API），帧循环每帧读它画树尾直播
+        if kind == "reset":
+            app.streaming_msg = None
+            hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
+            return
+        if kind not in {"reasoning", "content"}:
+            return
         msg = getattr(app, "streaming_msg", None)
         if msg is None:
             msg = {"role": "assistant", "content": "", "thinking": "", "type": "streaming"}
@@ -649,10 +666,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         app.token_meter.begin_turn()  # 复位本轮本地分词累计（提示行实时 token）
     # 粘贴附图（输入框占位符=图片路径，提交时入队）：与正文一并落为多模态数组；
     # 非视觉模型不编码图片块（路径作为普通文本保留在正文里）
-    pending = None
-    pending_q = getattr(app, "pending_images", None)
-    if pending_q:
-        pending = pending_q.pop(0)
+    pending = getattr(runner, "turn_images", None) if runner is not None else None
     if pending and getattr(llm.config, "supports_vision", True):
         parts, notes = memory_mod.build_image_parts(pending)
         content: list = [{"type": "text", "text": user_text}]
@@ -743,6 +757,13 @@ class _AgentRunner:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
 
+    def run_when_idle(self, callback):
+        """与提交仲裁共用锁，空闲时执行会话修改。"""
+        with self._lock:
+            if self.busy:
+                return False, None
+            return True, callback()
+
     def _set_busy(self, value: bool) -> None:
         """busy 双写：runner 自身判定 + app.busy 镜像（UI 键位如树回退据此拒绝，跨线程只读）"""
         self.busy = value
@@ -760,12 +781,13 @@ class _AgentRunner:
         self.llm.cancel()
         return True
 
-    def start(self, text: str) -> bool:
+    def start(self, text: str, images=None) -> bool:
         with self._lock:
             if self.busy:
                 return False
             self._set_busy(True)
-        t = threading.Thread(target=self._run, args=(text,), daemon=True, name="bawcode-agent")
+        item = {"text": text, "images": list(images or [])}
+        t = threading.Thread(target=self._run, args=(item,), daemon=True, name="bawcode-agent")
         self._thread = t
         t.start()
         return True
@@ -785,22 +807,32 @@ class _AgentRunner:
     def inject_turn(self, text: str) -> str:
         """回合中插话（普通 Enter）：并入当前回合，由回合循环取走作为 user 消息"""
         take = getattr(self.app, "take_injections", None)
-        if take is None or not self.busy:
-            return self.queue_turn(text)
-        with self.app.inject_lock:
-            self.app.inject_queue.append(text)
-        return "[插话已并入当前回合]"
-
-    def queue_turn(self, text: str) -> str:
-        """Ctrl+Q 排队：当前回合结束后作为新回合发送"""
         with self._lock:
-            self._queue.append(text)
+            if take is not None and self.busy:
+                with self.app.inject_lock:
+                    self.app.inject_queue.append(text)
+                return "[插话已并入当前回合]"
+        return self.queue_turn(text)
+
+    def queue_turn(self, text: str, images=None) -> str:
+        """排队消息与附件一起进入调度器。"""
+        self.notify_message(text, images)
+        with self._lock:
             n = len(self._queue)
         return f"[已排队 {n} 条 · 当前回合结束后作为新回合发送]"
 
-    def submit(self, text: str) -> str:
-        """busy 期间的外部提交（插件 submit_turn 等）：排队为新回合"""
-        return self.queue_turn(text)
+    def submit(self, text: str, images=None) -> str:
+        """外部提交在空闲时启动，忙碌时排队。"""
+        if self.start(text, images):
+            return "[已提交，新回合开始]"
+        self.notify_message(text, images)
+        return "[已排队 · 当前回合结束后作为新回合发送]"
+
+    def notify_message(self, text: str, images=None) -> None:
+        """以通知入口原子接力，避免回合退忙时留下孤立队列。"""
+        self.notify({"text": text, "images": list(images or [])})
+
+    submit_message = submit
 
     def pop_queue(self):
         with self._lock:
@@ -823,7 +855,9 @@ class _AgentRunner:
                         self._set_busy(False)
                         return
             try:
-                text = _before_turn(text)
+                item = text if isinstance(text, dict) else {"text": text, "images": []}
+                self.turn_images = list(item.get("images") or [])
+                text = _before_turn(item["text"])
                 self.llm.reset_cancel()
                 _agent_turn(self.llm, self.session, text, self.app, runner=self)
             except Exception as exc:
@@ -1061,6 +1095,7 @@ def main() -> None:
             raw = app.read_line(config=config)
             queued = app.consume_queued_submit()  # Ctrl+Q 排队标记
             has_images = app.consume_submit_images()  # 含图片的提交不插话
+            images = app.take_submit_images()
             app.token_meter = llm.meter
             text = (raw or "").strip()
             if not text:
@@ -1093,15 +1128,15 @@ def main() -> None:
             if runner.busy:
                 # 普通发送=插话并入当前回合；Ctrl+Q 或含图片=排队为当前回合结束后的新回合
                 if queued or has_images:
-                    note = runner.queue_turn(text)
+                    note = runner.submit(text, images)
                 else:
                     note = runner.inject_turn(text)
                 session.add_message("system", note, type="help")
                 _sync(app, session)
                 continue
-            if not runner.start(text):
+            if not runner.start(text, images):
                 # busy 检查与 start 之间后台通知可能已置忙：排队接力，不丢输入
-                note = runner.queue_turn(text)
+                note = runner.submit(text, images)
                 session.add_message("system", note, type="help")
                 _sync(app, session)
     except KeyboardInterrupt:

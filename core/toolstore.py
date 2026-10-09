@@ -1,8 +1,11 @@
-#该脚本负责工具调用结果的外置存储：超限/被剥离的工具输出以调用id为文件名落盘，
+#该脚本负责工具调用结果的外置存储：超限/被剥离的工具输出以调用id哈希为文件名落盘，
 #供模型后续用 read 工具分批回读；提供 token 计量切片、原子写入与会话清理。
-#文件布局：data/toolcalls/{project_id}/{session_id}/{call_id}.txt，与 sessions/ 同范式
+#文件布局：data/toolcalls/{project_id}/{session_id}/call-{sha256}.txt
+import hashlib
 import json
 import os
+import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -62,13 +65,21 @@ def persist(
     description: str,
     content: str,
 ) -> Optional[Path]:
-    """以 call_id 为文件名原子写入完整输出；文件已存在则幂等跳过，返回路径"""
+    """以 call_id 的稳定哈希原子写入完整输出，兼容安全的旧文件名"""
     if not call_id:
         return None
     directory = store_dir(config, project_id, session_id)
-    path = directory / f"{call_id}.txt"
+    digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()
+    path = directory / f"call-{digest}.txt"
     if path.exists():
-        return path
+        if path.is_file() and path.resolve().parent == directory.resolve():
+            return path
+        return None
+    # 旧记录直接定位，不遍历会话目录
+    if re.fullmatch(r'[^\\/:*?"<>|\x00-\x1f]{1,200}', call_id) and call_id not in (".", ".."):
+        legacy = directory / f"{call_id}.txt"
+        if legacy.is_file() and legacy.resolve().parent == directory.resolve():
+            return legacy
     content = content or ""
     header_lines = [
         _HEADER_TITLE,
@@ -82,18 +93,22 @@ def persist(
         "",
         "--- content ---",
     ]
-    directory.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = None
     try:
-        tmp.write_text("\n".join(header_lines) + "\n" + content, encoding="utf-8")
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+            tmp = Path(stream.name)
+            stream.write("\n".join(header_lines) + "\n" + content)
         os.replace(tmp, path)
     except OSError as e:
         log.error("工具输出外置失败 %s: %s", path, e)
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
         return None
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
     log.debug("工具输出已外置: %s (%d字)", path, len(content))
     return path
 

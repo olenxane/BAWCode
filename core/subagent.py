@@ -210,6 +210,14 @@ def _current_mode(rt: dict) -> str:
     return str(mode or policy.MODE_AUTO)
 
 
+def _requested_permission(record: dict) -> str:
+    if "permission_requested" in record:
+        requested = str(record.get("permission_requested") or "").strip().lower()
+        return requested if requested in _PERMISSION_ORDER else ""
+    requested = str(record.get("permission") or "").strip().lower()
+    return requested if requested in _PERMISSION_ORDER else "manual"
+
+
 # ---------------------------------------------------------------------------
 # 记录存储：data/subagents/{project_id}/{session_id}/{id}.json
 
@@ -440,6 +448,7 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
     重复/近似重复输出才开始计数，整轮全新结果清零，计满 spin_kill_count 终止）；
     续期总量受 config.workflow.max_total_rounds 兜底保险丝约束（默认 100）"""
     llm, io = rt["llm"], rt["io"]
+    record.setdefault("permission_requested", _requested_permission(record))
     wf_cfg = (getattr(rt.get("config"), "data", None) or {}).get("workflow") or {}
     try:
         fuse_cfg = int(wf_cfg.get("max_total_rounds") or 0)
@@ -463,11 +472,20 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
         if io.cancelled() or llm.cancelled():
             return ("interrupted", "")
         _live_phase(rt, f"推理 · 第{rounds}轮")
+
+        def on_delta(kind, piece):
+            if kind == "reset":
+                live = _live(rt)
+                if live is not None:
+                    live["text"] = ""
+            elif kind == "content":
+                _live_text_delta(rt, piece)
+
         response = llm.chat(
             messages,
             tools=tool_defs,
             model=str(record.get("model") or "") or None,
-            on_delta=lambda kind, piece, _rt=rt: _live_text_delta(_rt, piece) if kind == "content" else None,
+            on_delta=on_delta,
         )
         if response.get("error") == CANCELLED or io.cancelled():
             return ("interrupted", "")
@@ -494,12 +512,16 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
         processed = []
         try:
             for call in norm_calls:
-                item = _execute_one(rt, call, str(record.get("permission") or "auto"))
+                permission = effective_permission(
+                    _requested_permission(record), inherited_permission(_current_mode(rt))
+                )
+                record["permission"] = permission
+                item = _execute_one(rt, call, permission)
                 messages.append(item)
                 round_results.append(item)
                 processed.append(call)
                 record["tools_used"] = _int(record.get("tools_used"), 0) + 1
-                failed = "❌" if _failure_hint(item.get("content")) else "✅"
+                failed = "×" if _failure_hint(item.get("content")) else "✓"
                 _live_tool(rt, f"⚙ {call.get('name')} {failed}")
                 if io.cancelled() or llm.cancelled():
                     return ("interrupted", "")
@@ -560,7 +582,14 @@ def _tool_task(
         return f"角色不存在: {role}。可用角色:\n{roles_listing()}"
 
     directory = _records_dir(config, session)
-    permission_eff = effective_permission(permission, inherited_permission(_current_mode(rt)))
+    permission_requested = str(permission or "").strip().lower()
+    if permission_requested not in _PERMISSION_ORDER:
+        permission_requested = ""
+    if resume_id:
+        original_requested = _requested_permission(source)
+        if original_requested:
+            permission_requested = effective_permission(permission_requested, original_requested)
+    permission_eff = effective_permission(permission_requested, inherited_permission(_current_mode(rt)))
     now = time.strftime("%Y-%m-%d %H:%M:%S")
 
     if resume_key:
@@ -585,6 +614,7 @@ def _tool_task(
             "task": task_text,
             "origin_task": origin_task,
             "permission": permission_eff,
+            "permission_requested": permission_requested,
             "model": source.get("model") or spec.get("model") or "",
             "status": "running",
             "rounds": 0,
@@ -607,6 +637,7 @@ def _tool_task(
             "task": task_text,
             "origin_task": "",
             "permission": permission_eff,
+            "permission_requested": permission_requested,
             "model": str(spec.get("model") or ""),
             "status": "running",
             "rounds": 0,

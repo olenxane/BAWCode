@@ -2,6 +2,9 @@
 #文件布局：data/sessions/{project_id}/{YYYYMMDD-HHMMSS-hexx}.json（与长期记忆 Projects/ 同范式）
 import json
 import os
+import re
+import tempfile
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +17,7 @@ log = get_logger("session_store")
 _ROOT = Path(__file__).resolve().parent.parent
 
 SESSION_VERSION = 1
+save_lock = threading.Lock()
 
 
 def new_session_id() -> str:
@@ -30,13 +34,38 @@ def sessions_dir(config, project_id: str) -> Path:
     return base / (project_id or "_default")
 
 
+def session_path(directory: Path, session_id: str) -> Optional[Path]:
+    """解析目录内的会话文件路径。
+
+    会话标识只接受文件名字符，不接受路径。
+    """
+    if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
+        return None
+    path = directory / f"{session_id}.json"
+    if path.resolve().parent != directory.resolve():
+        return None
+    return path
+
+
 def save_session_data(directory: Path, data: dict) -> Path:
-    """原子写入会话文件（.tmp + os.replace，防 Ctrl+C 写一半损坏），返回最终路径"""
+    """使用独占临时文件原子保存会话。
+
+    返回最终会话文件路径。
+    """
+    path = session_path(directory, data.get("id"))
+    if path is None:
+        raise ValueError("会话标识非法")
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{data.get('id')}.json"
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    with save_lock:
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=directory)
+        tmp = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
     return path
 
 
@@ -119,7 +148,10 @@ def heal_orphan_tool_calls(messages: list) -> int:
 
 def load_session_data(directory: Path, session_id: str) -> Optional[dict]:
     """按 id 加载完整会话数据（messages/plan/steps 原样，孤儿 tool_calls 顺带修复）"""
-    path = directory / f"{session_id}.json"
+    path = session_path(directory, session_id)
+    if path is None:
+        log.warn("会话标识非法")
+        return None
     if not path.exists():
         log.warn("会话文件不存在: %s", path)
         return None
@@ -137,7 +169,10 @@ def load_session_data(directory: Path, session_id: str) -> Optional[dict]:
 
 def delete_session_data(directory: Path, session_id: str) -> bool:
     """删除会话文件；文件不存在返回 False"""
-    path = directory / f"{session_id}.json"
+    path = session_path(directory, session_id)
+    if path is None:
+        log.warn("会话标识非法")
+        return False
     try:
         path.unlink()
         log.info("会话已删除: %s", path)

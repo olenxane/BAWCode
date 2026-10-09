@@ -405,22 +405,37 @@ class PluginContext:
 
     # ---- 类用户操作 ----
 
-    def submit_turn(self, text: str) -> str:
-        """以用户语义提交一条消息开启回合（等价主输入框发送）。
+    def submit_turn(self, text: str, images: Optional[List[str]] = None) -> str:
+        """以用户语义提交消息及附件。
 
-        idle 直接开新回合；busy 排队为当前回合结束后的新回合
-        （_AgentRunner.start/queue_turn 语义；插件外部消息不并入当前回合）。
-        返回给用户看的状态说明；调度器未注入（启动早期）返回提示且不提交。"""
+        空闲时开启回合，忙碌时整条消息排队。
+        """
         text = (text or "").strip()
         if not text:
             return "[空消息，未提交]"
         runner = _runtime.get("runner")
         if runner is None:
-            self.log.warn("submit_turn 失败：runner 未注入（启动早期/测试环境不可用）")
+            self.log.warn("submit_turn 失败：runner 未注入")
             return "[回合调度器未就绪，消息未提交]"
+        submit = getattr(runner, "submit_message", None)
+        if callable(submit):
+            return submit(text, images)
+        if images:
+            return "[调度器不支持图片附件，消息未提交]"
         if runner.start(text):
             return "[已提交，新回合开始]"
         return runner.submit(text)
+
+    def run_when_idle(self, callback: Callable) -> Any:
+        """在调度器空闲锁内执行会话结构操作。"""
+        runner = _runtime.get("runner")
+        run = getattr(runner, "run_when_idle", None)
+        if not callable(run):
+            return {"ok": False, "message": "调度器不支持原子会话操作"}
+        ok, result = run(callback)
+        if not ok:
+            return {"ok": False, "message": "回合进行中：请先停止后再操作"}
+        return result
 
     def notify(self, text: str) -> None:
         """用户可见通知：写入会话系统消息（对话树可见，同命令反馈 _echo 的呈现），

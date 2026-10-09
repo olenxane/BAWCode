@@ -4,7 +4,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from core import register
 from core.log import get_logger
@@ -60,15 +60,13 @@ SAFE_TOOLS = {
     "delete_memory",
 }
 
-# 只读动词表：SAFE 判定要求整条命令无管道/链式/重定向（复合命令一律不走 SAFE），
-# 且首词（取文件名部分）在此表内——关键词子串匹配会让 "dir | powershell ..." 误判安全
-SAFE_VERBS = {
-    "ls", "dir", "pwd", "cd", "echo", "cat", "head", "tail", "tree",
-    "where", "which", "env", "set", "ver", "version", "type",
-}
-# 两段式只读命令（首词 + 子命令/标志）
-SAFE_VERB_PAIRS = {
-    "git status", "git log", "git branch", "pip show", "python -v", "python3 -v",
+# 仅放行明确的只读参数，未识别的选项交由用户确认
+SAFE_OPTIONS = {
+    "ls": {"-a", "-l", "-h", "-al", "-la", "-lh", "-lah", "-R", "--all", "--long"},
+    "dir": {"/a", "/b", "/s", "/w", "/p", "/o", "/n"},
+    "cat": {"-n", "-b", "-s", "--number"},
+    "type": set(), "where": {"/r", "/q", "/f", "/t"},
+    "which": {"-a", "--all"}, "tree": {"/f", "/a", "-a", "-d"},
 }
 
 
@@ -84,14 +82,61 @@ def has_shell_operator(cmd: str) -> bool:
 
 
 def readonly_simple_cmd(cmd: str) -> bool:
-    """单条无操作符命令，首词属于只读动词表（含两段式组合）"""
-    tokens = cmd.strip().split()
+    """按完整参数白名单判定只读命令，未知选项不自动放行"""
+    if any(ch in cmd for ch in "'`$%!^\r") or cmd.count('"') % 2:
+        return False
+    tokens = re.findall(r'"[^"\n]*"|[^\s"]+', cmd.strip())
     if not tokens:
         return False
-    first = tokens[0].lower().replace("\\", "/").rsplit("/", 1)[-1]
-    if first in SAFE_VERBS:
+    first = tokens[0].lower()
+    args = [t[1:-1] if t.startswith('"') else t for t in tokens[1:]]
+    if first in ("python", "python3"):
+        return args in (["-V"], ["--version"])
+    if first in ("pwd", "ver", "version", "env", "set"):
+        return not args
+    if first == "cd":
+        return not args or len(args) == 1 and not args[0].startswith(("-", "/"))
+    if first == "echo":
+        return not any(arg.startswith("-") for arg in args)
+    if first == "pip":
+        return len(args) > 1 and args[0] == "show" and all(re.fullmatch(r"[\w.-]+", a) and not a.startswith("-") for a in args[1:])
+    if first == "git":
+        if not args:
+            return False
+        command, rest = args[0], args[1:]
+        if command == "branch":
+            return all(a in {"--list", "-l", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--no-color"} for a in rest)
+        if command == "status":
+            return all(a in {"--short", "-s", "--branch", "-b", "--porcelain", "--porcelain=v1", "--porcelain=v2", "--untracked-files", "--untracked-files=all", "--untracked-files=no", "--untracked-files=normal"} for a in rest)
+        if command == "log":
+            index = 0
+            while index < len(rest):
+                arg = rest[index]
+                if arg in ("-n", "--max-count"):
+                    index += 1
+                    if index >= len(rest) or not rest[index].isdigit():
+                        return False
+                elif arg not in {"--oneline", "--graph", "--all", "--decorate", "--no-decorate", "--stat", "--name-only", "--name-status", "--no-color"} and not re.fullmatch(r"-\d+|-n\d+|--max-count=\d+", arg):
+                    return False
+                index += 1
+            return True
+        return False
+    if first in ("head", "tail"):
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg in ("-n", "-c"):
+                index += 1
+                if index >= len(args) or not args[index].isdigit():
+                    return False
+            elif arg.startswith("-") and not re.fullmatch(r"-\d+", arg):
+                return False
+            index += 1
         return True
-    return " ".join([first] + [t.lower() for t in tokens[1:2]]) in SAFE_VERB_PAIRS
+    if first in SAFE_OPTIONS:
+        options = SAFE_OPTIONS[first]
+        return all(not a.startswith("-") and not (sys.platform == "win32" and a.startswith("/")) or a in options for a in args)
+    return False
 
 
 def readonly_compound_cmd(cmd: str) -> bool:
@@ -136,18 +181,125 @@ _DANGEROUS_CMD_RE = re.compile(
     """
 )
 
-# 删除类命令硬拒绝（完全访问模式也不例外）：shell 直删不可恢复，文件删除一律走
-# delete_file 工具（移入项目回收站，可 /undo 回滚、/clear-trash 真正清空）。
+# 删除类命令改为"移入回收站"执行：不再直接拒绝，命令放行到 execute_command，
+# 由工具层把目标静默移入项目回收站，真正删除只由用户 /clear-trash 触发。
 # 只匹配命令首词或分隔符（|;& 与换行，shell 下换行即命令分隔）之后的删除词，
 # 避免 "python app.py del" 这类参数误伤
+_DELETE_WORDS = ("rmdir", "rimraf", "deltree", "remove-item", "erase", "rm", "rd", "del")
 _DELETE_CMD_RE = re.compile(
-    r"(?ix)(?:^|[|;&\r\n])\s*(?:[a-z]:\S+\s+)?(?:rm|rmdir|rd|del|erase|deltree|rimraf)(?:\s|$)|"
-    r"(?:^|[|;&\r\n])\s*remove-item(?:\s|$)"
+    r"(?ix)(?:^|[|;&\r\n])\s*(?:[a-z]:\S+\s+)?(?:" + "|".join(_DELETE_WORDS) + r")(?:\s|$)"
 )
-_DELETE_DENY_REASON = (
-    "删除类命令被拦截（不可恢复）：请改用 delete_file 工具"
-    "（文件移入回收站，可 /undo 回滚、/clear-trash 真正清空）"
-)
+_DELETE_TRASH_REASON = "删除类命令改为移入项目回收站执行"
+
+
+def is_delete_command(cmd: str) -> bool:
+    """命令是否命中删除类命令"""
+    return bool(_DELETE_CMD_RE.search(str(cmd or "")))
+
+
+def _strip_exe(token: str) -> str:
+    """取命令词的可执行名：去路径前缀与 .exe，转小写"""
+    name = token.strip().strip('"').replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def _split_command_segments(cmd: str) -> List[str]:
+    """引号外按 |;& 与换行切分复合命令"""
+    segs: List[str] = []
+    cur: List[str] = []
+    in_dq = False
+    for ch in cmd:
+        if ch == '"':
+            in_dq = not in_dq
+            cur.append(ch)
+        elif in_dq:
+            cur.append(ch)
+        elif ch in "|;&\r\n":
+            segs.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    segs.append("".join(cur))
+    return [s for s in segs if s.strip()]
+
+
+def _tokenize(seg: str) -> List[str]:
+    """按空白切分并剥离成对引号"""
+    out = []
+    for tok in re.findall(r'"[^"]*"|\'[^\']*\'|[^\s"\']+', seg):
+        if len(tok) >= 2 and tok[0] in "'\"" and tok[-1] == tok[0]:
+            tok = tok[1:-1]
+        out.append(tok)
+    return out
+
+
+def _cd_dir(toks: List[str]) -> Optional[str]:
+    """识别 cd 段的目录参数，非 cd 段返回 None"""
+    if not toks or _strip_exe(toks[0]) not in ("cd", "chdir"):
+        return None
+    args = [t for t in toks[1:] if not t.startswith("-") and not re.fullmatch(r"/[A-Za-z]", t)]
+    return args[0] if len(args) == 1 else None
+
+
+def _with_cwd(parts: List[str], target: str) -> str:
+    """并入命令内 cd 累积的目录前缀；绝对路径不受影响"""
+    if not parts:
+        return target
+    return str(Path(*parts) / target)
+
+
+def delete_targets(cmd: str) -> Optional[List[str]]:
+    """解析删除类命令的目标路径；非删除类命令返回 None，命中但目标不可靠时返回空表"""
+    text = str(cmd or "")
+    if not is_delete_command(text):
+        return None
+    # 重定向会混入与删除无关的 token，目标不可靠时返回空表交由调用方拒绝执行
+    in_dq = False
+    for ch in text:
+        if ch == '"':
+            in_dq = not in_dq
+        elif not in_dq and ch in "<>":
+            return []
+    targets: List[str] = []
+    cwd_parts: List[str] = []
+    for seg in _split_command_segments(text):
+        toks = _tokenize(seg)
+        if not toks:
+            continue
+        cd_dir = _cd_dir(toks)
+        if cd_dir is not None:
+            cwd_parts.append(cd_dir)
+            continue
+        index, word = 0, _strip_exe(toks[0])
+        if word not in _DELETE_WORDS:
+            # 允许盘符路径前缀，如 C:\Tools\rm.exe
+            if len(toks) < 2 or _strip_exe(toks[1]) not in _DELETE_WORDS:
+                continue
+            index, word = 1, _strip_exe(toks[1])
+        rest = toks[index + 1:]
+        i = 0
+        literal = False
+        while i < len(rest):
+            arg = rest[i]
+            if not literal and arg == "--":
+                literal = True
+                i += 1
+                continue
+            if not literal and word == "remove-item" and arg.lower() in ("-path", "-literalpath"):
+                i += 1
+                if i < len(rest):
+                    targets.append(_with_cwd(cwd_parts, rest[i]))
+                i += 1
+                continue
+            if not literal and arg.startswith("-"):
+                i += 1
+                continue
+            if not literal and sys.platform == "win32" and word in ("del", "erase", "rd", "rmdir") and re.fullmatch(r"/[A-Za-z]{1,3}", arg):
+                i += 1
+                continue
+            targets.append(_with_cwd(cwd_parts, arg))
+            i += 1
+    return targets
 
 
 def project_root() -> Path:
@@ -284,9 +436,9 @@ def evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pat
 
 def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Path] = None) -> Tuple[str, str]:
     root = root or project_root()
-    # 删除类命令硬安全栏：先于一切模式判定（full 也不例外）
-    if tool_name == "execute_command" and _DELETE_CMD_RE.search(str((args or {}).get("command") or "")):
-        return DENY, _DELETE_DENY_REASON
+    # 删除类命令不再拒绝：放行到工具层静默移入项目回收站，execute_command 与 run_program 同口径
+    if tool_name in ("execute_command", "run_program") and is_delete_command(_command_text(tool_name, args or {})):
+        return ALLOW, _DELETE_TRASH_REASON
     if mode == MODE_FULL:
         return ALLOW, "full"
     if not mode:

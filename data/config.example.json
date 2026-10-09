@@ -86,7 +86,6 @@
   "ui": {
     "theme": "dark",
     "mode": "auto",
-    "busy_send_mode": "queue",
     "logo": true,
     "send": "ctrl+enter",
     "newline": "shift+enter",
@@ -137,7 +136,6 @@
       "generate_steps",
       "update_step_status",
       "read_memory",
-      "read_image",
       "read",
       "edit_file",
       "write",

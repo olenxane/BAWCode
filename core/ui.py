@@ -140,6 +140,9 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         # _paste_async：后台图片落盘单槽（后台线程单写、帧尾 _tick_paste_async 取回清空）
         self._paste_async = None
         self._paste_async_busy = False
+        self._paste_window = 0
+        self._paste_key_down = False
+        self._paste_image_time = 0.0
         # LLM 错误手动重试闸（agent 线程等待、主线程按键/插件放行；None=非等待态）
         self._llm_retry_gate: Optional[_LlmRetryGate] = None
         self.scroll = 0
@@ -338,6 +341,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         sys.stdout.write("\033[2J\033[H\033[?25l" + ("\033[?2004h" if _paste_on else "") + _mouse_seq)
         sys.stdout.flush()
         self._entered = True
+        self._paste_window, self._paste_key_down = pasteboard.clipboard_paste_key_state()
 
     def leave(self) -> None:
         """退出 TUI：停 Live、关粘贴协议、清屏恢复。
@@ -515,11 +519,13 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self._input_prompt = prompt or "> "
         self.render()
         frame_deadline = time.time()
-        pending_events: List[Tuple[str, Any]] = []
+        pending_events = getattr(self, "pending_key_events", [])
+        self.pending_key_events = pending_events
         while True:
+            self._poll_clipboard_paste()
             self._refresh_candidates(config=config)
             if not pending_events:
-                pending_events = _read_events(0.0)
+                pending_events.extend(_read_events(0.0))
             # 每帧分发本批全部事件：滚轮/按键高速到达（>20/秒）时若每帧只
             # 消费一个，积压线性增长，表现为滚动/删字明显滞后于手。
             while pending_events:
@@ -533,9 +539,10 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
 
             # 帧尾：UI 请求桥 + 后台图片落盘结果 + 选区边缘自动滚动 + 无条件渲染 + 补足帧周期
             self._serve_ui_request()
-            if self._dialog_active and _pump_dead():
-                # 读键泵崩溃：对话框永远等不到键，按空行收场防回合永久挂起
-                return ""
+            if _pump_dead():
+                if self._dialog_active:
+                    return ""
+                raise KeyboardInterrupt("终端输入不可用")
             self._tick_paste_async()
             self._tick_restore_input()
             self._selection_tick()
@@ -562,7 +569,19 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         if inserted:
             self._buf_insert(inserted)
 
-    def _handle_clipboard_paste(self) -> None:
+    def _poll_clipboard_paste(self) -> None:
+        window, down = pasteboard.clipboard_paste_key_state()
+        rising = down and not self._paste_key_down
+        self._paste_key_down = down
+        if not rising or not self._paste_window or window != self._paste_window:
+            return
+        if self._ui_context() != Context.INPUT or self.confirm_mode or self.ask_mode or self._dialog_active or self.sessions_mode:
+            return
+        data = pasteboard.read_clipboard()
+        if data.get("kind") == "image":
+            self._handle_clipboard_paste(data)
+
+    def _handle_clipboard_paste(self, data=None) -> None:
         """应用侧读剪贴板（Ctrl+V 热键）：文件列表/文本同步插入；纯图片后台落盘
         （PowerShell 0.5~1s，不阻帧循环），完成结果经 _paste_async 单槽由帧尾取回；
         非视觉模型纯图片分支不落盘不插入（状态行提示）"""
@@ -570,8 +589,13 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         if self._paste_async_busy:
             self.status = "剪贴板图片正在处理…"
             return
-        data = pasteboard.read_clipboard()
+        if data is None:
+            data = pasteboard.read_clipboard()
         if (data or {}).get("kind") == "image" and supports:
+            now = time.monotonic()
+            if now - self._paste_image_time < 0.3:
+                return
+            self._paste_image_time = now
             self._paste_async_busy = True
             self.status = "正在读取剪贴板图片…"
 
@@ -644,6 +668,12 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self._submit_has_images = False
         return has
 
+    def take_submit_images(self) -> list:
+        """取走本次输入框提交的附件。"""
+        images = getattr(self, "submit_images", [])
+        self.submit_images = []
+        return images
+
     def _submit_line(self) -> str:
         """提交输入框内容：展开粘贴占位、记录历史、清空缓冲，返回提交行"""
         line = self._buf_text()
@@ -653,8 +683,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self.paste.reset()
         else:
             line, images = self.paste.expand(line)
-            if images:
-                self.pending_images.append(images)
+        self.submit_images = list(images or [])
         self._submit_has_images = bool(images)
         if line.strip():
             self.input_history.append(line)

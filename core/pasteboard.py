@@ -52,7 +52,23 @@ def _win_clipboard_payload() -> dict:
     图片字节经 PowerShell 落盘（剪贴板关闭后调用，GetImage 自行开剪贴板）。"""
     import ctypes
 
+    from ctypes import wintypes
+
     user32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    shell32 = ctypes.windll.shell32
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+    k32.GlobalLock.argtypes = [wintypes.HANDLE]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+    k32.GlobalUnlock.restype = wintypes.BOOL
+    shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    shell32.DragQueryFileW.restype = wintypes.UINT
     opened = False
     for _ in range(3):
         if user32.OpenClipboard(0):
@@ -64,7 +80,8 @@ def _win_clipboard_payload() -> dict:
         return {"kind": "none"}
     has_hd = bool(user32.IsClipboardFormatAvailable(15))   # CF_HDROP
     has_txt = bool(user32.IsClipboardFormatAvailable(13))  # CF_UNICODETEXT
-    has_img = bool(user32.IsClipboardFormatAvailable(8) or user32.IsClipboardFormatAvailable(2))
+    png_format = user32.RegisterClipboardFormatW("PNG")
+    has_img = any(user32.IsClipboardFormatAvailable(fmt) for fmt in (8, 2, 17, png_format) if fmt)
     paths, text = [], None
     try:
         if has_hd:
@@ -95,6 +112,21 @@ def _win_clipboard_payload() -> dict:
     if has_img:
         return {"kind": "image"}
     return {"kind": "none"}
+
+
+def clipboard_paste_key_state() -> Tuple[int, bool]:
+    if sys.platform != "win32":
+        return 0, False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    window = user32.GetForegroundWindow()
+    pressed = bool(user32.GetAsyncKeyState(0x11) & 0x8000 and user32.GetAsyncKeyState(0x56) & 0x8000)
+    return int(window or 0), pressed
 
 
 def paste_temp_dir() -> Path:

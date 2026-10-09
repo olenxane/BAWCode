@@ -57,14 +57,35 @@ log = get_logger("render")
 from core.llm import CANCELLED as CANCEL_RESULT
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+@functools.lru_cache(maxsize=128)
+def cached_safe_text(text: str) -> str:
+    return _CONTROL_RE.sub("", text.replace("\r\n", "\n"))
+
+
+def safe_text(text: str) -> str:
+    """清理正文控制字符，长正文不留缓存副本。"""
+    text = str(text or "")
+    if len(text) > 4096:
+        return _CONTROL_RE.sub("", text.replace("\r\n", "\n"))
+    return cached_safe_text(text)
 
 # 会话树收起渲染：消息类节点最多显示的视觉行数，超出部分折叠并附「… (+N 行)」指示行
 _TREE_INLINE_CAP = 3
+
+# 非指定工具（读取类等）展开时的输出行数上限，超出部分截断并附「… (+N 行)」
+_TREE_TOOL_CAP = 5
 
 # 参与 3 行折叠的消息类节点；assistant/stream_* 全文显示，plan/help 走子节点机制
 _TREE_FOLD_KINDS = {"user", "tool", "system", "system_prompt"}
 
 _STATUS_ICON = {"pending": "○", "running": "◐", "done": "●", "failed": "✗"}
+
+# 工具状态图标：普通字符存进 label，渲染期着色（label 经 safe_text 会剥离 ANSI）
+_GLYPH_OK = "✓"
+_GLYPH_FAIL = "×"
 
 # 树底阶段提示转轮：盲文方点阵帧序（cli-spinners "dots" 同款，80ms/帧）
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -310,7 +331,7 @@ def _clip(text: str, width: int) -> str:
     if width <= 0:
         return ""
     out, used = [], 0
-    for ch in _ANSI_RE.sub("", text or ""):
+    for ch in safe_text(_ANSI_RE.sub("", text or "")):
         w = _char_width(ch)
         if used + w > width:
             out.append("…")
@@ -405,6 +426,7 @@ def _kw_lines_lexer(lexer, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ..
     """已定词法：代码 → 每行仅关键词着色的字符串；其余字符不着色，由外层主题色决定。"""
     if not code:
         return ()
+    code = safe_text(code)
     want = code.splitlines() or [""]
     if lexer is None:
         return tuple(want)
@@ -565,6 +587,8 @@ _MD_TASK_RE = re.compile(r"^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$")
 _MD_UL_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 _MD_OL_RE = re.compile(r"^(\s*)(\d{1,3})[.)]\s+(.*)$")
 _MD_HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+# 表格分隔行：| --- | :--: | ---: |（至少一个连字符，段间以 | 分隔）
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$")
 
 # 内联样式：行内代码 / 粗体 / 删除线 / 链接 / 斜体（顺序即优先级）
 _MD_INLINE_RE = re.compile(
@@ -688,11 +712,87 @@ def _md_code_block(code_lines: List[str], lang: str, pal: dict, width: int) -> L
             rows.append(pal["dim"] + "│ " + pal["code"] + piece + pal["base"])
     return rows
 
+def _md_split_row(line: str) -> List[str]:
+    """表格行按 | 切分单元格，去掉首尾空管"""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _md_table_align(cell: str) -> str:
+    """分隔单元格 :---: → left/center/right"""
+    t = cell.strip()
+    if t.startswith(":") and t.endswith(":"):
+        return "center"
+    if t.endswith(":"):
+        return "right"
+    return "left"
+
+
+def _md_pad_cell(cell_ansi: str, col_w: int, align: str) -> str:
+    """ANSI 单元格按对齐补空格到 col_w（超宽先裁剪）"""
+    clipped = _clip_keep_ansi(cell_ansi, col_w)
+    pad = max(0, col_w - _display_width(clipped))
+    if align == "right":
+        return " " * pad + clipped
+    if align == "center":
+        left = pad // 2
+        return " " * left + clipped + " " * (pad - left)
+    return clipped + " " * pad
+
+
+def _md_table(header: List[str], aligns: List[str], rows: List[List[str]], pal: dict, width: int) -> List[str]:
+    """GFM 表格 → 带框线逐行；列宽按内容自适应，超出宽度按最宽列收缩"""
+    ncol = len(header)
+    if ncol <= 0:
+        return []
+
+    def _norm(cells: List[str]) -> List[str]:
+        return (cells + [""] * ncol)[:ncol]
+
+    header = _norm(header)
+    rows = [_norm(r) for r in rows]
+    aligns = (list(aligns) + ["left"] * ncol)[:ncol]
+    # 列宽：表头与各正文单元格的显示宽（_md_inline 已含 ANSI，_display_width 去掉计宽）
+    cols: List[int] = []
+    for c in range(ncol):
+        w = _display_width(_md_inline(header[c], pal, plain=pal["bold"]))
+        for r in rows:
+            w = max(w, _display_width(_md_inline(r[c], pal)))
+        cols.append(max(1, w))
+
+    def _total() -> int:
+        return sum(cols) + 3 * ncol + 1
+
+    while _total() > width and max(cols) > 1:
+        cols[cols.index(max(cols))] -= 1
+
+    dim, base = pal["dim"], pal["base"]
+
+    def _border(left: str, mid: str, right: str) -> str:
+        return dim + left + mid.join("─" * (w + 2) for w in cols) + right + base
+
+    def _line(cells: List[str], is_header: bool) -> str:
+        seg = []
+        for c in range(ncol):
+            cell = _md_inline(cells[c], pal, plain=pal["bold"]) if is_header else _md_inline(cells[c], pal)
+            seg.append(" " + _md_pad_cell(cell, cols[c], aligns[c]) + " ")
+        return dim + "│" + base + (dim + "│" + base).join(seg) + dim + "│" + base
+
+    out = [_border("┌", "┬", "┐"), _line(header, True), _border("├", "┼", "┤")]
+    out.extend(_line(r, False) for r in rows)
+    out.append(_border("└", "┴", "┘"))
+    return out
+
+
 def _md_render(text: str, pal: dict, width: int) -> List[str]:
     """对话正文 → 逐行 Markdown 渲染（块级 + 内联）并折行；返回可直拼的 ANSI 行"""
     width = max(1, width)
     base = pal["base"]
-    src = (text or "").replace("\r", "").split("\n")
+    src = safe_text(text or "").split("\n")
     rows: List[str] = []
     i, n = 0, len(src)
     while i < n:
@@ -715,6 +815,17 @@ def _md_render(text: str, pal: dict, width: int) -> List[str]:
         if _MD_HR_RE.match(line):
             rows.append(pal["dim"] + "─" * width + base)
             i += 1
+            continue
+        # 表格：表头行含 | 且下一行为分隔行 | --- | --- |（分隔行须含 | 以免误吞 HR）
+        if "|" in line and i + 1 < n and "|" in src[i + 1] and _MD_TABLE_SEP_RE.match(src[i + 1]):
+            header = _md_split_row(line)
+            aligns = [_md_table_align(c) for c in _md_split_row(src[i + 1])]
+            i += 2
+            body: List[List[str]] = []
+            while i < n and "|" in src[i] and src[i].strip():
+                body.append(_md_split_row(src[i]))
+                i += 1
+            rows.extend(_md_table(header, aligns, body, pal, width))
             continue
         heading = _MD_HEADING_RE.match(line)
         if heading:
@@ -933,12 +1044,12 @@ class TreeNode:
 
     def __init__(self, id, label, kind="text", children=None, default_expanded=True, summary="", detail="", meta=None):
         self.id = id
-        self.label = label
+        self.label = safe_text(label)
         self.kind = kind
         self.children = children or []
         self.default_expanded = default_expanded
-        self.summary = summary
-        self.detail = detail
+        self.summary = safe_text(summary)
+        self.detail = safe_text(detail)
         self.meta = meta
 
 
@@ -1132,13 +1243,17 @@ class RenderMixin:
                 if head:
                     cmd_heads[cid] = head
 
-        for index, item in enumerate(self.messages[-200:]):
+        window = self.messages[-200:]
+        # 最新一轮起点：最后一条用户消息之后的消息属于「本轮」，工具节点据此自动展开
+        turn_start = max((i for i, m in enumerate(window) if m.get("role") == "user"), default=-1)
+        for index, item in enumerate(window):
             role = item.get("role")
             content = memory_mod.content_text(item.get("content"))
             n_imgs = memory_mod.count_image_parts(item.get("content"))
             image_note = f" 🖼×{n_imgs}" if n_imgs else ""
             msg_type = item.get("type") or ""
             tool_name = item.get("tool_name") or ""
+            is_latest = index > turn_start
             pending_extra: List[TreeNode] = []  # type=plan 快照等附加节点（排在 node 之后）
             if role == "user":
                 # 正文写入节点 label 折行展示；超 3 行默认收起，树内手动展开
@@ -1162,7 +1277,7 @@ class RenderMixin:
                         rendered_steps = True
                 else:
                     failed = tool_failure_hint(content)
-                    icon = "❌" if failed else "✅"
+                    icon = _GLYPH_FAIL if failed else _GLYPH_OK
                     cid = str(item.get("tool_call_id") or "")
                     info = call_info.get(cid)
                     # 命令/写入/编辑类：附元数据，展开时按类型渲染（命令+输出 / 高亮全文 / 高亮 diff）
@@ -1174,7 +1289,8 @@ class RenderMixin:
                     if meta is not None:
                         base = tool_name or str((info or {}).get("name") or "") or "tool"
                         if meta.get("tool_kind") == "cmd":
-                            label = f"⚙ {cmd_heads.get(cid) or base} {icon}"
+                            # 类型在前、状态图标居中、命令头附后：▾ ⚙ 执行命令 ✓ · npm run
+                            label = f"⚙ 执行命令 {icon} · {cmd_heads.get(cid) or base}"
                         else:
                             path = str(meta.get("path") or "")
                             label = f"⚙ {base} {path} {icon}" if path else f"⚙ {base} {icon}"
@@ -1182,12 +1298,12 @@ class RenderMixin:
                             f"msg:{index}",
                             label,
                             "tool",
-                            default_expanded=True,
+                            default_expanded=is_latest,
                             detail="",
                             meta=meta,
                         )
                     else:
-                        # 读取类等：保持概要显示（标题 + 结果正文，默认折叠可展开）
+                        # 读取类等：保持概要显示（标题 + 结果正文，本轮展开、历史折叠）
                         result_text = content.strip()
                         display = cmd_heads.get(cid) or tool_name or "tool"
                         label = f"⚙ {display} {icon}{image_note}"
@@ -1197,7 +1313,7 @@ class RenderMixin:
                             f"msg:{index}",
                             label,
                             "tool",
-                            default_expanded=False,
+                            default_expanded=is_latest,
                             detail="",
                         )
             elif msg_type == "system_prompt":
@@ -1296,7 +1412,7 @@ class RenderMixin:
                             default_expanded=False,
                         )
                     elif t_role == "tool" or tm.get("type") == "tool":
-                        icon = "❌" if tool_failure_hint(t_content) else "✅"
+                        icon = _GLYPH_FAIL if tool_failure_hint(t_content) else _GLYPH_OK
                         label = f"⚙ {tm.get('tool_name') or 'tool'} {icon}"
                         if t_text:
                             label = f"{label} · {t_text}"
@@ -1377,8 +1493,9 @@ class RenderMixin:
             thinking = str(streaming.get("thinking") or "")
             content = str(streaming.get("content") or "")
             if thinking:
+                # 默认折叠=尾部滚动窗随流滚动；手动展开显示完整思考
                 _parent().children.append(
-                    TreeNode("stream:thinking", thinking, "stream_thinking", default_expanded=True, detail="")
+                    TreeNode("stream:thinking", thinking, "stream_thinking", default_expanded=False, detail="")
                 )
             if content:
                 _parent().children.append(
@@ -1606,6 +1723,23 @@ class RenderMixin:
                 self.tree_cursor = i
                 break
 
+    def _title_with_status(self, title: str, base_c: str) -> str:
+        """工具标题内 ✓/× 着色：其余片段保持 base_c，返回 ANSI（配 _clip_keep_ansi 用）"""
+        out: List[str] = []
+        buf: List[str] = []
+        for ch in title:
+            if ch == _GLYPH_OK or ch == _GLYPH_FAIL:
+                if buf:
+                    out.append(base_c + "".join(buf))
+                    buf = []
+                col = self.c("ok") if ch == _GLYPH_OK else self.c("err")
+                out.append(col + ch + self.RESET)
+            else:
+                buf.append(ch)
+        if buf:
+            out.append(base_c + "".join(buf))
+        return "".join(out)
+
     def _tree_rows(self, width: int) -> List[str]:
         # 树行缓存：按键路径（partial 重绘）不重建行字符串，只做窗口切片。
         # key 必须用「当前实时签名」——不能用 self._tree_sig（它只在
@@ -1687,13 +1821,19 @@ class RenderMixin:
                     if abs_i == self.tree_cursor and tree_focus:
                         rows.append(self.C_HL + _pad(f"{indent}{title_part}", width) + self.RESET)
                     else:
-                        rows.append(gseg + self.c("tool_title") + _clip(title_part, max(1, width - gw)) + self.RESET)
+                        rows.append(
+                            gseg
+                            + _clip_keep_ansi(
+                                self._title_with_status(title_part, self.c("tool_title")),
+                                max(1, width - gw),
+                            )
+                        )
                     if expanded:
                         rows.extend(self._tool_detail_rows(meta, gseg, width, gw))
                     spans.append((span_start, len(rows) - span_start))
                     continue
                 # 工具调用（含工具轮）：标题青色（14babc）+ 内容纯白，同一物理行双色。
-                # 折叠仅显示标题行（✅/❌ 状态在标题内），完整输出展开后查看
+                # 折叠仅显示标题行（✓/× 状态在标题内），完整输出展开后查看
                 title, sep, content_text = label.partition(" · ")
                 probe_title = f"{indent}· {title}"
                 budget = max(8, width - _display_width(probe_title) - _display_width(" · "))
@@ -1703,10 +1843,13 @@ class RenderMixin:
                     has = True  # 折叠时 marker 提示有可展开内容
                 title_part = f"{_marker(has, expanded)} {title}"
                 title_w = gw + _display_width(title_part)
+                title_ansi = self._title_with_status(title_part, self.c("tool_title"))
                 if has_output and expanded:
-                    first = wrapped[0] if wrapped else ""
-                    rest = wrapped[1:]
-                    row = (gseg + self.c("tool_title") + _clip(title_part, max(1, width - gw)) + self.RESET
+                    # 非指定工具输出截断：最多 _TREE_TOOL_CAP 行，其余折为「… (+N 行)」
+                    shown = wrapped[:_TREE_TOOL_CAP]
+                    first = shown[0] if shown else ""
+                    rest = shown[1:]
+                    row = (gseg + _clip_keep_ansi(title_ansi, max(1, width - gw))
                            + self.c("tool_content") + _clip(" · " + first, max(8, width - title_w - 3)) + self.RESET)
                     if abs_i == self.tree_cursor and tree_focus:
                         rows.append(self.C_HL + _pad(f"{indent}{title_part} · {first}", width) + self.RESET)
@@ -1714,17 +1857,28 @@ class RenderMixin:
                         rows.append(row)
                     for wline in rest:
                         rows.append(gseg + self.c("tool_content") + _clip("  " + wline, max(1, width - gw)) + self.RESET)
+                    hidden = len(wrapped) - len(shown)
+                    if hidden > 0:
+                        rows.append(
+                            gseg + self.c("dim")
+                            + _clip(f"  … (+{hidden} 行)", max(1, width - gw)) + self.RESET
+                        )
                 else:
                     if abs_i == self.tree_cursor and tree_focus:
                         rows.append(self.C_HL + _pad(f"{indent}{title_part}", width) + self.RESET)
                     else:
-                        rows.append(gseg + self.c("tool_title") + _clip(title_part, max(1, width - gw)) + self.RESET)
+                        rows.append(gseg + _clip_keep_ansi(title_ansi, max(1, width - gw)))
                 spans.append((span_start, len(rows) - span_start))
                 continue
             if node.kind == "stream_thinking":
-                # 思考过程（流式进行中）：滚动显示尾部 N 行动态窗口（随追加上滚）
+                # 思考过程（流式进行中）：独立节点，头部 + 折叠时尾部滚动窗 / 展开时全文
+                head_text = f"{_marker(True, expanded)} 💭 思考"
+                if abs_i == self.tree_cursor and tree_focus:
+                    rows.append(self.C_HL + _pad(_clip(f"{indent}{head_text}", width), width) + self.RESET)
+                else:
+                    rows.append(gseg + color + _clip(head_text, max(1, width - gw)) + self.RESET)
                 win = _wrap(label, max(8, width - gw - 2))
-                for wline in win[-_STREAM_THINKING_LINES:]:
+                for wline in (win if expanded else win[-_STREAM_THINKING_LINES:]):
                     rows.append(gseg + color + _clip("  " + wline, max(1, width - gw)) + self.RESET)
                 spans.append((span_start, len(rows) - span_start))
                 continue
@@ -1893,6 +2047,33 @@ class RenderMixin:
             f" · ↑ {_fmt_tokens(self._turn_tokens())} tokens · esc to cancel/enter to send)"
         )
 
+    def _compose_todo(self, w: int) -> List[str]:
+        """todo 清单：本轮进行中且未全部完成时固定在输入框上方显示，逐行状态着色"""
+        steps = self.steps or []
+        if not getattr(self, "busy", False) or not steps:
+            return []
+        if all(str(s.get("status") or "") == "done" for s in steps):
+            return []
+        status_c = {
+            "done": self.c("ok"),
+            "running": self.c("warn"),
+            "failed": self.c("err"),
+            "pending": self.c("dim"),
+        }
+        done = sum(1 for s in steps if str(s.get("status") or "") == "done")
+        out = [self.c("warn") + _pad(_clip(f" 待办 {done}/{len(steps)}", w), w) + self.RESET]
+        cap = 8
+        for s in steps[:cap]:
+            st = str(s.get("status") or "pending")
+            icon = _STATUS_ICON.get(st, "○")
+            col = status_c.get(st, self.c("dim"))
+            line = f" {icon} {s.get('id')}. {s.get('title') or ''}"
+            out.append(col + _pad(_clip(line, w), w) + self.RESET)
+        extra = len(steps) - cap
+        if extra > 0:
+            out.append(self.c("dim") + _pad(_clip(f" … 还有 {extra} 步", w), w) + self.RESET)
+        return out
+
     def _compose_plain(self, width: int, height: int) -> List[str]:
         w = max(40, width)
         h = max(20, height)
@@ -1925,7 +2106,9 @@ class RenderMixin:
             input_zone_h = len(confirm_panel)
 
         bottom_fixed = 1 + 2 + 1 + 1  # rule + info/mode+tip + rule + status
-        phase_fixed = 1               # 树底阶段提示行：思考中/工具调用中/完成空行占位
+        # todo 清单：本轮进行中且未全部完成时固定在输入框上方；对话框/确认面板期间隐藏
+        todo_lines = self._compose_todo(w) if (confirm_panel is None and not self._dialog_active) else []
+        phase_fixed = 1 + len(todo_lines)  # 树底阶段提示行 + todo 清单
         top_fixed = 1 + 1
         tree_h = max(4, h - top_fixed - bottom_fixed - input_zone_h - phase_fixed)
         self._row_meta["tree_h"] = tree_h
@@ -1980,18 +2163,31 @@ class RenderMixin:
         # 各阶段共用转轮+轮换机制，仅文案池不同（base 匹配 _PHASE_POOLS，后缀保留）；
         # 确认面板/对话框（confirm/ask/choose/line）期间隐藏，空行占位
         hint = (self.phase_hint or "").strip()
-        if hint and not self.confirm_mode and not self._dialog_active:
-            frame = _SPINNER_FRAMES[int(time.time() * 12) % len(_SPINNER_FRAMES)]
-            base, sep, detail = hint.partition(" · ")
-            pool = _PHASE_POOLS.get(base)
-            if pool:
-                slot = int(time.time() // _HINT_ROTATE_SECONDS) % len(pool)
-                text = pool[slot] + (f" · {detail}" if sep and detail else "")
+        suffix = self._turn_status_suffix()
+        if (hint or suffix) and not self.confirm_mode and not self._dialog_active:
+            body = ""
+            if hint:
+                frame = _SPINNER_FRAMES[int(time.time() * 12) % len(_SPINNER_FRAMES)]
+                base, sep, detail = hint.partition(" · ")
+                pool = _PHASE_POOLS.get(base)
+                if pool:
+                    slot = int(time.time() // _HINT_ROTATE_SECONDS) % len(pool)
+                    text = pool[slot] + (f" · {detail}" if sep and detail else "")
+                else:
+                    text = hint
+                body = f" {frame} {text}"
+            # 用时/token 附加文案接在轮换文案之后（同一行），不再落到输入框下方
+            if suffix:
+                seg = (
+                    self.c("warn") + _clip(body, max(0, w - _display_width(suffix)))
+                    + self.c("dim") + _clip(suffix, max(0, w - _display_width(body) - 1))
+                )
             else:
-                text = hint
-            lines.append(self.c("warn") + _pad(_clip(f" {frame} {text}", w), w) + self.RESET)
+                seg = self.c("warn") + _clip(body, w)
+            lines.append(_pad(_clip_keep_ansi(seg, w), w) + self.RESET)
         else:
             lines.append("")
+        lines.extend(todo_lines)
         lines.append(self._rule(w))
 
         # 输入区
@@ -2064,13 +2260,8 @@ class RenderMixin:
             + mode_c + mode_label + self.RESET
         )
         lines.append(_clip_keep_ansi(info, w))
-        tip_suffix = self._turn_status_suffix()
-        if tip_suffix:
-            # 后缀优先占位，轮换文案按剩余宽度裁剪，保证用时/token 始终可见
-            tip_text = _clip(self._rotating_tip(), max(0, w - _display_width(tip_suffix))) + tip_suffix
-        else:
-            tip_text = self._rotating_tip()
-        lines.append(self.c("dim") + _clip(tip_text, w) + self.RESET)
+        # 用时/token 后缀已上移到阶段提示行（输入框上方），此处只留轮换小贴士
+        lines.append(self.c("dim") + _clip(self._rotating_tip(), w) + self.RESET)
         lines.append(self._rule(w))
 
         # 状态栏：token / 余额

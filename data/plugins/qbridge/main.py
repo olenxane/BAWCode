@@ -73,6 +73,7 @@ class _State:
         self.pending = None         # 待应答交互槽（同刻最多一个）：{kind, event, response, ...}
         self.pending_submits = []   # 防回声：经 QQ 提交的文本（message_added 比对后移除）
         self.bound = ""             # 生效的同步目标 "private/<qq>" / "group/<gid>"
+        self.bound_user = ""
         self.self_id = ""           # 机器人 QQ 号（事件帧 / get_login_info 自动获取）
         self.last_error = ""
 
@@ -120,7 +121,7 @@ def setup(ctx):
     def _online() -> bool:
         """桥可用（已启用+WS 在线+已绑定目标）——交互代答与发送的前提"""
         with st.lock:
-            return _enabled() and _running() and bool(st.bound)
+            return _enabled() and _running() and bool(st.bound) and _target_allowed(st.bound)
 
     def _runner():
         return plugins_mod.runtime().get("runner") if plugins_mod else None
@@ -130,8 +131,15 @@ def setup(ctx):
 
     # ---- 发送（hook 线程入队，WS 线程消费）----
 
+    def _target_allowed(target: str) -> bool:
+        configured = str(_cfg("target") or "").strip()
+        with st.lock:
+            if configured == target:
+                return True
+            return bool(st.bound_user and st.bound_user in _allowlist() and st.bound == target)
+
     def _send(target: str, segments: list) -> None:
-        if not target or not segments:
+        if not target or not segments or not _target_allowed(target):
             return
         try:
             tx.put_nowait({"target": target, "segments": segments})
@@ -292,13 +300,14 @@ def setup(ctx):
                 return None
         return item.get("response")
 
-    def _take_pending(kind: str):
+    def _take_pending(kind: str, request_id=None):
         with st.lock:
             if st.pending is not None or not _online():
                 return None
             runner = _runner()
             qbase = len(getattr(runner, "_queue", None) or []) if runner is not None else 0
-            item = {"kind": kind, "event": threading.Event(), "response": None, "qbase": qbase}
+            item = {"kind": kind, "event": threading.Event(), "response": None, "qbase": qbase,
+                    "request_id": request_id}
             st.pending = item
             return item
 
@@ -314,7 +323,7 @@ def setup(ctx):
             return None
         name = str(payload.get("name") or "")
         arguments = payload.get("arguments") or {}
-        item = _take_pending("confirm")
+        item = _take_pending("confirm", payload.get("request_id"))
         if item is None:
             return None
         try:
@@ -341,7 +350,18 @@ def setup(ctx):
                 return {"action": "deny", "reason": str(resp.get("reason") or "")}
         return None
 
+    def _on_tool_confirm_closed(payload):
+        request_id = payload.get("request_id")
+        with st.lock:
+            item = st.pending
+            if not request_id or item is None or item.get("kind") != "confirm" or item.get("request_id") != request_id:
+                return
+            st.pending = None
+            item["response"] = None
+            item["event"].set()
+
     ctx.register_hook("tool_confirm", _on_tool_confirm, priority=50)
+    ctx.register_hook("tool_confirm_closed", _on_tool_confirm_closed)
 
     # ---- 选择框/行输入/询问面板代答（ui_request 变换链）----
 
@@ -496,11 +516,7 @@ def setup(ctx):
             st.pending_submits.append(text)
             if len(st.pending_submits) > 50:  # 回合被丢弃时条目无处比对，防无限累积
                 del st.pending_submits[:len(st.pending_submits) - 50]
-        if image_paths:
-            app = _app()
-            if app is not None and hasattr(app, "pending_images"):
-                app.pending_images.append(image_paths)  # 条目=路径列表，与粘贴附图同形状
-        result = ctx.submit_turn(text)
+        result = ctx.submit_turn(text, images=image_paths)
         if "未提交" in result or "未就绪" in result:
             with st.lock:
                 try:
@@ -515,6 +531,8 @@ def setup(ctx):
         uid = str(ev.get("user_id") or "")
         if not uid or uid == _self_id():
             return  # 机器人自身（含其他端）消息回声
+        if uid not in _allowlist():
+            return
         if ev.get("message_type") == "group":
             key = f"group/{ev.get('group_id')}"
         else:
@@ -529,6 +547,7 @@ def setup(ctx):
                 matched = key == st.bound
             else:
                 st.bound = key
+                st.bound_user = uid
                 matched = True
                 auto_bound = True
         if auto_bound:
@@ -566,6 +585,8 @@ def setup(ctx):
             except queue.Empty:
                 return
             target = job["target"]
+            if not _target_allowed(target):
+                continue
             kind, _, val = target.partition("/")
             ident = int(val) if val.isdigit() else val
             if kind == "group":
