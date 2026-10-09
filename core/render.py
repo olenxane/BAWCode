@@ -25,6 +25,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
+from pygments.lexers import get_lexer_by_name as _pyg_lexer_by_name
 from pygments.lexers import get_lexer_for_filename as _pyg_lexer_for_filename
 from pygments.token import Token
 from pygments.util import ClassNotFound as _PygClassNotFound
@@ -131,6 +132,18 @@ DEFAULT_COLORS = {
     "mcp": (106, 204, 132),          # 6acc84 MCP 状态行（外接服务器，冷绿示连通）
     "tree_guide": (58, 85, 120),     # 3a5578 会话树引导线（│）
     "selection_bg": (42, 82, 134),   # 2a5286 自绘选区背景（比光标高亮略深一档）
+    # Markdown 内联/块级样式与关键信息高亮：仅作用于对话消息正文
+    "md_bold": (255, 255, 255),      # ffffff 粗体加亮
+    "md_italic": (111, 207, 151),    # 6fcf97 斜体绿
+    "md_code": (230, 192, 123),      # e6c07b 行内代码
+    "md_heading": (127, 212, 255),   # 7fd4ff 标题
+    "md_list": (255, 209, 102),      # ffd166 列表符号
+    "md_quote": (138, 155, 176),     # 8a9bb0 引用
+    "md_strike": (127, 146, 173),    # 7f92ad 删除线
+    "path": (97, 175, 239),          # 61afef 文件路径
+    "func": (199, 146, 234),         # c792ea 函数/方法名
+    "cmd": (152, 195, 121),          # 98c379 命令
+    "url": (86, 182, 194),           # 56b6c2 URL
 }
 
 TIPS = [
@@ -355,15 +368,22 @@ def _lexer_for(filename: str):
     except Exception:
         return None
 
-@functools.lru_cache(maxsize=128)
-def _kw_lines(filename: str, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ...]:
-    """代码 → 每行仅关键词着色的字符串；其余字符不着色，由外层主题色决定。
+def _lexer_by_name(lang: str):
+    """按围栏语言名取 pygments 词法；无 pygments 或未知语言返回 None（降级纯文本）"""
+    if not HAS_PYGMENTS or not lang:
+        return None
+    try:
+        return _pyg_lexer_by_name(lang)
+    except _PygClassNotFound:
+        return None
+    except Exception:
+        return None
 
-    关键词取 pygments 的 Token.Keyword，着色后立即恢复 base_fg；行数与 splitlines 对齐。"""
+def _kw_lines_lexer(lexer, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ...]:
+    """已定词法：代码 → 每行仅关键词着色的字符串；其余字符不着色，由外层主题色决定。"""
     if not code:
         return ()
     want = code.splitlines() or [""]
-    lexer = _lexer_for(filename)
     if lexer is None:
         return tuple(want)
     try:
@@ -383,6 +403,18 @@ def _kw_lines(filename: str, code: str, kw_fg: str, base_fg: str) -> Tuple[str, 
     if len(lines) != len(want):
         return tuple(want)  # 行数错位：宁可不带高亮也不串行
     return tuple(lines)
+
+@functools.lru_cache(maxsize=128)
+def _kw_lines(filename: str, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ...]:
+    """代码 → 每行仅关键词着色的字符串；其余字符不着色，由外层主题色决定。
+
+    关键词取 pygments 的 Token.Keyword，着色后立即恢复 base_fg；行数与 splitlines 对齐。"""
+    return _kw_lines_lexer(_lexer_for(filename), code, kw_fg, base_fg)
+
+@functools.lru_cache(maxsize=128)
+def _kw_lines_lang(lang: str, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ...]:
+    """围栏代码块按语言名高亮；未知语言降级纯文本"""
+    return _kw_lines_lexer(_lexer_by_name(lang), code, kw_fg, base_fg)
 
 @functools.lru_cache(maxsize=64)
 def _hl_rows_wrapped(filename: str, code: str, width: int, kw_fg: str, base_fg: str, dim_fg: str) -> Tuple[str, ...]:
@@ -498,6 +530,201 @@ def _wrap_line(text: str, width: int) -> List[str]:
             used += w
     lines.append(cur)
     return lines or [""]
+
+# ----- Markdown 渲染：仅对话消息正文（user / assistant / 流式正文）-----
+
+_MD_KINDS = {"user", "assistant", "stream_content"}
+
+# 围栏代码块起始/结束（含可选语言名）
+_MD_FENCE_RE = re.compile(r"^\s*(?:```|~~~)\s*([\w+#.-]*)\s*$")
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_MD_QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
+_MD_TASK_RE = re.compile(r"^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$")
+_MD_UL_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_MD_OL_RE = re.compile(r"^(\s*)(\d{1,3})[.)]\s+(.*)$")
+_MD_HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+
+# 内联样式：行内代码 / 粗体 / 删除线 / 链接 / 斜体（顺序即优先级）
+_MD_INLINE_RE = re.compile(
+    r"(?P<code>`[^`\n]+`)"
+    r"|(?P<bold>\*\*[^*\n]+\*\*|__[^_\n]+__)"
+    r"|(?P<strike>~~[^~\n]+~~)"
+    r"|(?P<link>\[[^\]\n]+\]\([^)\n]+\))"
+    r"|(?P<italic>\*[^*\n]+\*|(?<![\w])_[^_\n]+_(?![\w]))"
+)
+
+# 关键信息：可识别扩展名 / 常见命令动词
+_MD_EXT = (
+    "py|pyi|js|mjs|cjs|ts|tsx|jsx|json|jsonc|md|markdown|txt|toml|ya?ml|cfg|ini|conf|"
+    "go|rs|java|kt|kts|c|h|cpp|hpp|cc|cs|rb|php|css|scss|less|sass|html?|xml|svg|sh|bash|"
+    "zsh|ps1|bat|cmd|log|csv|tsv|sql|env|lock|gitignore|dockerfile"
+)
+# 命令识别分两档：强动词（非英文常用词）后接参数即认定；弱动词（易与英文常用词混淆）
+# 要求邻近出现 flag/路径特征参数，避免误伤普通英文；代码区域内一律宽松识别
+_MD_CMD_STRONG = (
+    "npm|pnpm|yarn|npx|pip|pip3|python|python3|node|deno|bun|cargo|rustc|javac|java|"
+    "docker|docker-compose|kubectl|cmake|gradle|mvn|pytest|ruff|black|mypy|flake8|"
+    "tsc|eslint|prettier|webpack|vite|rsync|chmod|chown|systemctl|apt|apt-get|yum|dnf|"
+    "winget|choco|rmdir|git"
+)
+_MD_CMD_WEAK = (
+    "go|make|ninja|curl|wget|ssh|scp|grep|rg|find|sed|awk|cat|head|tail|ls|dir|cd|mkdir|"
+    "rm|cp|mv|touch|tar|zip|unzip|brew"
+)
+_MD_CMD_ALL = _MD_CMD_STRONG + "|" + _MD_CMD_WEAK
+# 命令参数限 ASCII：避免把后续中文词一并吞入命令着色
+_MD_CMD_ARGS = r"(?:\s+(?:-{1,2}[A-Za-z0-9_-]+|[A-Za-z0-9./=:@_-]+)){1,6}"
+_MD_CMD_STRICT = (
+    r"\b(?:" + _MD_CMD_STRONG + r")\b" + _MD_CMD_ARGS
+    + r"|\b(?:" + _MD_CMD_WEAK + r")\b"
+    r"(?=\s+(?:[A-Za-z0-9./=:@_-]+\s+){0,2}(?:-{1,2}[A-Za-z0-9_-]+|[A-Za-z0-9_-]*[./=:@][A-Za-z0-9./=:@_-]*))"
+    + _MD_CMD_ARGS
+)
+_MD_CMD_LOOSE = r"\b(?:" + _MD_CMD_ALL + r")\b" + _MD_CMD_ARGS
+
+# 关键信息分组 → 调色板键：Windows 路径与裸文件名统一用 path 色
+_MD_GROUP_ALIAS = {"winpath": "path", "file": "path"}
+
+def _build_keyinfo_re(cmd_pat: str):
+    return re.compile(
+        r"(?P<url>https?://[^\s<>()\[\]{}\"'`]+|www\.[^\s<>()\[\]{}\"'`]+)"
+        r"|(?P<winpath>[A-Za-z]:\\[^\s\"'`|<>]+)"
+        r"|(?P<path>(?<![\w/])(?:[\w.@%+-]+/){2,}[\w.@%+-]+"
+        r"|(?<![\w/])[\w.@%+-]+/[\w.@%+-]*\.[A-Za-z]\w*)"
+        r"|(?P<file>\b[\w.-]+\.(?:" + _MD_EXT + r")\b)"
+        r"|(?P<func>\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\(\))"
+        r"|(?P<cmd>" + cmd_pat + r")"
+    )
+
+_MD_KEYINFO_STRICT_RE = _build_keyinfo_re(_MD_CMD_STRICT)
+_MD_KEYINFO_LOOSE_RE = _build_keyinfo_re(_MD_CMD_LOOSE)
+
+def _md_keyinfo(text: str, pal: dict, plain: str, strict: bool = True) -> str:
+    """纯文本段关键信息着色：URL/路径/文件名/函数/命令；plain 为未命中段的底色"""
+    if not text:
+        return ""
+    rx = _MD_KEYINFO_STRICT_RE if strict else _MD_KEYINFO_LOOSE_RE
+    out: List[str] = []
+    pos = 0
+    for m in rx.finditer(text):
+        if m.start() > pos:
+            out.append(plain + text[pos:m.start()])
+        key = _MD_GROUP_ALIAS.get(m.lastgroup, m.lastgroup)
+        color = pal.get(key) or plain
+        out.append(color + m.group(0) + plain)
+        pos = m.end()
+    if pos < len(text):
+        out.append(plain + text[pos:])
+    return "".join(out)
+
+def _md_inline(text: str, pal: dict, strict: bool = True, plain: Optional[str] = None) -> str:
+    """单行内联 Markdown → ANSI 字符串；plain 为普通文本底色（默认角色正文色）"""
+    if not text:
+        return ""
+    base = plain or pal["base"]
+    out: List[str] = []
+    pos = 0
+    for m in _MD_INLINE_RE.finditer(text):
+        if m.start() > pos:
+            out.append(_md_keyinfo(text[pos:m.start()], pal, base, strict))
+        kind = m.lastgroup
+        raw = m.group(0)
+        if kind == "code":
+            out.append(_md_keyinfo(raw[1:-1], pal, pal["code"], strict=False) + base)
+        elif kind == "bold":
+            out.append(_md_keyinfo(raw[2:-2], pal, pal["bold"], strict) + base)
+        elif kind == "italic":
+            out.append(_md_keyinfo(raw[1:-1], pal, pal["italic"], strict) + base)
+        elif kind == "strike":
+            out.append("\033[9m" + pal["strike"] + raw[2:-2] + "\033[29m" + base)
+        elif kind == "link":
+            label, _, url = raw[1:-1].partition("](")
+            out.append(pal["url"] + label + base + pal["dim"] + f" ({url})" + base)
+        pos = m.end()
+    if pos < len(text):
+        out.append(_md_keyinfo(text[pos:], pal, base, strict))
+    return "".join(out)
+
+def _md_prefixed(prefix: str, prefix_c: str, content: str, width: int) -> List[str]:
+    """列表/任务项：前缀着 list 色，正文按剩余宽度折行，续行悬挂对齐"""
+    pw = _display_width(prefix)
+    pieces = _wrap_keep_ansi(content, max(1, width - pw))
+    out: List[str] = []
+    for k, piece in enumerate(pieces):
+        out.append((prefix_c + prefix if k == 0 else " " * pw) + piece)
+    return out
+
+def _md_code_block(code_lines: List[str], lang: str, pal: dict, width: int) -> List[str]:
+    """围栏代码块：语言可识别则关键词高亮，逐行折行；前缀竖线标示代码区"""
+    code = "\n".join(code_lines)
+    hl = list(_kw_lines_lang(lang, code, pal["accent"], pal["code"])) if code else []
+    if len(hl) != len(code_lines):
+        hl = list(code_lines)
+    rows: List[str] = []
+    for line in hl:
+        for piece in _wrap_keep_ansi(line, max(1, width - 2)):
+            rows.append(pal["dim"] + "│ " + pal["code"] + piece + pal["base"])
+    return rows
+
+def _md_render(text: str, pal: dict, width: int) -> List[str]:
+    """对话正文 → 逐行 Markdown 渲染（块级 + 内联）并折行；返回可直拼的 ANSI 行"""
+    width = max(1, width)
+    base = pal["base"]
+    src = (text or "").replace("\r", "").split("\n")
+    rows: List[str] = []
+    i, n = 0, len(src)
+    while i < n:
+        line = src[i]
+        fence = _MD_FENCE_RE.match(line)
+        if fence:
+            lang = (fence.group(1) or "").strip()
+            code_lines: List[str] = []
+            i += 1
+            while i < n and not _MD_FENCE_RE.match(src[i]):
+                code_lines.append(src[i])
+                i += 1
+            i += 1  # 越过结束围栏（缺失时到末尾）
+            rows.extend(_md_code_block(code_lines, lang, pal, width))
+            continue
+        if not line.strip():
+            rows.append("")
+            i += 1
+            continue
+        if _MD_HR_RE.match(line):
+            rows.append(pal["dim"] + "─" * width + base)
+            i += 1
+            continue
+        heading = _MD_HEADING_RE.match(line)
+        if heading:
+            body = _md_inline(heading.group(2).strip(), pal, plain=pal["heading"])
+            rows.extend(_wrap_keep_ansi(body + base, width))
+            i += 1
+            continue
+        quote = _MD_QUOTE_RE.match(line)
+        if quote:
+            body = _md_inline(quote.group(1), pal, plain=pal["quote"])
+            rows.extend(_wrap_keep_ansi(pal["quote"] + "│ " + body + base, width))
+            i += 1
+            continue
+        task = _MD_TASK_RE.match(line)
+        if task:
+            box = "☑ " if task.group(2).lower() == "x" else "☐ "
+            rows.extend(_md_prefixed(task.group(1) + box, pal["list"], _md_inline(task.group(3), pal), width))
+            i += 1
+            continue
+        ul = _MD_UL_RE.match(line)
+        if ul:
+            rows.extend(_md_prefixed(ul.group(1) + "• ", pal["list"], _md_inline(ul.group(2), pal), width))
+            i += 1
+            continue
+        ol = _MD_OL_RE.match(line)
+        if ol:
+            rows.extend(_md_prefixed(f"{ol.group(1)}{ol.group(2)}. ", pal["list"], _md_inline(ol.group(3), pal), width))
+            i += 1
+            continue
+        rows.extend(_wrap_keep_ansi(_md_inline(line, pal), width))
+        i += 1
+    return rows or [""]
 
 class Layout:
     """多行输入布局：按逻辑行缓存 visual 行，编辑只重折脏行（宽度来自 wcwidth）。"""
@@ -713,6 +940,25 @@ class RenderMixin:
         self._tree_rows_key = None
         self._tree_sig = None
         self.keys["tip_interval"] = self.theme.get("tips_rotate_seconds", 5)
+
+    def _md_palette(self, base: str) -> dict:
+        """Markdown 渲染调色板；base 为角色正文色"""
+        return {
+            "base": base,
+            "accent": self.c("accent"),
+            "dim": self.c("dim"),
+            "bold": "\033[1m" + self.c("md_bold"),
+            "italic": self.c("md_italic"),
+            "code": self.c("md_code"),
+            "heading": "\033[1m" + self.c("md_heading"),
+            "list": self.c("md_list"),
+            "quote": self.c("md_quote"),
+            "strike": self.c("md_strike"),
+            "path": self.c("path"),
+            "func": self.c("func"),
+            "cmd": self.c("cmd"),
+            "url": self.c("url"),
+        }
 
     def _clamp_tree_scroll(self, total: int, tree_h: int) -> int:
         """按 follow_tail / tree_cursor 计算并夹紧会话树 scroll"""
@@ -1492,7 +1738,11 @@ class RenderMixin:
             content_c = content_of.get(node.kind, color)
             badge_plain = f"{badge} · " if badge else ""
             budget = max(8, width - gw - 2 - _display_width(badge_plain))
-            vis = _wrap(body_text, budget)
+            is_md = node.kind in _MD_KINDS
+            if is_md:
+                vis = _md_render(body_text, self._md_palette(content_c), budget)
+            else:
+                vis = _wrap(body_text, budget)
             total_rows = len(vis)
             truncated = foldable and not expanded and total_rows > _TREE_INLINE_CAP
             if foldable and total_rows > _TREE_INLINE_CAP:
@@ -1510,7 +1760,7 @@ class RenderMixin:
                     seg = gseg + color + marker + " " + self.RESET
                     if badge:
                         seg += "\033[1m" + color + badge + self.RESET + sep_c + " · " + self.RESET
-                    seg += content_c + _clip(wline, budget) + self.RESET
+                    seg += _clip_keep_ansi(wline, budget) if is_md else content_c + _clip(wline, budget) + self.RESET
                     if not expanded and node.summary:
                         seg += sep_c + _clip(
                             f" · {node.summary}",
@@ -1518,7 +1768,10 @@ class RenderMixin:
                         ) + self.RESET
                     rows.append(seg)
                 else:
-                    rows.append(gseg + content_c + _clip("  " + wline, max(1, width - gw)) + self.RESET)
+                    if is_md:
+                        rows.append(gseg + _clip_keep_ansi("  " + wline, max(1, width - gw)) + self.RESET)
+                    else:
+                        rows.append(gseg + content_c + _clip("  " + wline, max(1, width - gw)) + self.RESET)
                 piece_no += 1
             if truncated:
                 hint = f"… (+{total_rows - _TREE_INLINE_CAP} 行)"

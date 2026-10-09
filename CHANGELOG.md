@@ -1,5 +1,106 @@
 # Changelog
 
+## 2026-10-09 — 会话消息正文 Markdown 渲染与关键信息高亮
+
+- **动机**：系统提示词要求模型输出 GitHub 风格 Markdown，但会话树此前按纯文本原样显示，
+  `**粗体**`、`# 标题`、列表、围栏代码等都带着标记符暴露给用户。
+- **范围**：仅对话消息正文——`user` / `assistant` / 流式 `stream_content` 三类节点；
+  工具输出、思考、系统提示词、任务根摘要仍走原纯文本渲染。
+- **实现**（core/render.py）：
+  - 块级：围栏代码块（``` / ~~~，按语言用 pygments 关键词高亮）、`#` 标题、`>` 引用、
+    `-/*/+` 与 `1.` 列表、`- [ ]/[x]` 任务项、`---` 分隔线。
+  - 内联：`` `code` ``、`**粗体**`（加亮）、`*斜体*`（绿）、`~~删除线~~`、`[文本](url)`。
+  - 关键信息：URL、文件路径（Windows/Unix/相对/裸文件名）、函数/方法调用 `foo()`、命令；
+    命令识别分强/弱动词两档，弱动词要求邻近 flag/路径参数，避免误伤普通英文。
+  - 新增 `_md_render` / `_md_inline` / `_md_keyinfo` 等模块级函数与 `_md_palette` 调色板；
+    渲染行改走 `_wrap_keep_ansi` / `_clip_keep_ansi` 以保留 ANSI。
+- **主题**：`DEFAULT_COLORS` 与 `data/theme/dark.json`、`ocean.json` 新增 11 个色键：
+  `md_bold` `md_italic` `md_code` `md_heading` `md_list` `md_quote` `md_strike`
+  `path` `func` `cmd` `url`；切主题即时生效（行缓存随 `load_theme` 失效）。
+- **取舍**：全文正则识别有误报风险，已用扩展名/多级斜杠、函数带括号、命令白名单等约束收敛；
+  终端不支持斜体时仍以绿色区分，粗体同时用 ANSI `1m` 与加亮色兼容。
+- **验证**：独立脚本断言标记剥离、行宽不超预算、各片段着色正确、普通英文不误判命令；
+  `_tree_rows` 集成校验确认消息正文渲染与色键命中；`python -m py_compile` 通过。
+
+## 2026-10-09 — LLM 读取侧思考字段名兼容：reasoning_content 之外补 reasoning
+
+- **定位**：真机探针直连 SenseNova 发现其流式思考字段是 `delta.reasoning`，而读取侧只认
+  `reasoning_content`，思考被整段丢弃，UI 因此不出现思考节点；同次请求 `reasoning_effort`
+  已被接受，HTTP 200，故请求侧无误。
+- **修复**（core/llm.py）：新增 `_reasoning_of`，按 `reasoning_content` → `reasoning` →
+  `thinking_content` → `thinking` 取首个非空；流式 `_feed_chunk` 与非流式 `_normalize`
+  共用，不按 provider 分支。
+- **测试**：`develop/test_llm_thinking_payload.py` 增加 F1–F6，断言多字段名读取、流式聚合
+  与非流式归一化。探针脚本 `develop/_probe_sensenova.py` 用完即删。
+
+## 2026-10-09 — LLM 出站 payload 补齐思考参数 reasoning_effort
+
+- **问题**：模型级 `thinking_effort` 取值 none/low/medium/high，此前只在配置与设置页可取，
+  `resolve_request` 也把它取了出来，但 `chat()` 组装出站 `payload` 时从未写入，两条传输
+  路径 openai SDK 与 urllib 降级都收不到——"思考强度"设置对请求是空操作。
+- **修复**（core/llm.py）：`chat()` 组装 payload 后按档位写入 `reasoning_effort`；
+  `none` 或未知档位不写该字段，避免 OpenAI 兼容厂商因未知参数报错。流式与非流式共用同一
+  份 payload，故两条路径及 urllib 降级同时生效；流式开关仍由流式函数内部补，未受影响。
+  各家 OpenAI 兼容厂商思考字段形态不同，DeepSeek/Kimi/MiniMax 等按厂商分派的扩展点
+  预留在同一处，后续适配不散落。
+- **测试**：新增 `develop/test_llm_thinking_payload.py`，12 项，真实 HTTP 打 mock LLM：
+  非流式、流式、urllib 降级三条路径都带 `reasoning_effort` 且值与档位一致，流式开关未被
+  破坏；`none` 与未配置都不带该字段。既有 test_e2e_mock_llm / test_plugins_e2e 等未配置
+  thinking_effort，出站 payload 不变。
+
+## 2026-10-09 — 插件依赖自动补齐：装载时读插件目录 requirements.txt 静默 pip
+
+- **动机**：插件的第三方依赖此前随主程序 `requirements.txt` 一起安装（或需用户手工装），
+  新增插件的依赖无从表达。改为**由宿主在首次装载插件时补齐**：插件自带
+  `requirements.txt`，主程序自动检查并安装缺失项。
+- **机制**（`core/plugins.py`）：`_load_one` 在启用判定通过后、`import` 入口前调用
+  `_ensure_requirements`——
+  - 无 `requirements.txt` → 零开销跳过（`deps.status=none`）；
+  - 有文件则 `_missing_requirements` 按 PEP 508 逐条检查（`importlib.metadata` 查发行名 +
+    `packaging` 校验版本约束；带环境标记且不适用者跳过；pip 选项/URL 等非标准行不参与检查）；
+  - 有缺失才 `sys.executable -m pip install -r <插件>/requirements.txt`（`--disable-pip-version-check
+    --no-input`，`_PIP_TIMEOUT=900s` 整体超时），装完 `importlib.invalidate_caches()` 复核；
+  - **全程静默**：不打印任何提示，过程只写 `data/log`（命名空间 `plugins`）。
+- **失败不阻断**：pip 失败/超时/装后仍不满足 → `deps.status=failed`（原因入诊断），插件仍
+  照常 `import+setup`，可自行 `try/except ImportError` 降级；无 pip 环境等同处理。
+- **配置**：`config.plugins.auto_install_deps`（缺省 true）关闭后仅检查不安装（`deps.status=manual`），
+  缺依赖标注在 `/plugin` 列表（`依赖已补装(N)` / `依赖安装失败: …` / `依赖缺N项(未自动装)`）。
+  `statuses()` 新增 `deps` 字段（`{status, missing, error}`）。
+- **范围**：仅改宿主装载机制与文档，**不动**现有内置插件（rag/qbridge/computer-use）与主
+  `requirements.txt`——新机制面向此后自带 `requirements.txt` 的第三方插件。
+- **文档**：`docs/plugin-development.md` 新增 §2.3「插件依赖（requirements.txt）」，补目录
+  结构、§9.2 配置段与 §12 生命周期图、§14 分发自述。
+- **测试**：新增 `develop/test_plugin_requirements.py`（24 项，全程不触网，pip 调用用桩替换）
+  覆盖解析/名称约束/环境标记/缺失判定与 none·ok·installed·manual·failed 五态及 load 集成
+  （依赖齐备零开销、pip 失败不阻断、诊断标注）；`develop/test_plugins_e2e.py` 全绿；
+  `py_compile` 通过。
+
+## 2026-10-08 — 设置面板：中文输入的根因修复 + 抽取 core/settings.py
+
+- **根因**：设置页文本项（提供商 ID/名称/Key/URL、插件 ptext、添加 provider/model）
+  借道内建 `input()`（`keyinput.paused()` 救济）。新输入栈 raw_mode 关闭了控制台行缓冲/
+  回显，且后台泵线程持续抽干输入；退出 raw 虽恢复行缓冲，但中文 IME 无法在该路径上屏
+  ——与主输入框（走 `core.keyinput` 的 pt 事件管线，中文正常）不同管线。
+- **修复**：新增设置页**行内编辑器**，直接消费 `core.keyinput` 的逐键事件（`char` 事件
+  含 CJK/IME 上屏），与主输入框同一管线。Enter 进入编辑、Enter 提交、Esc 取消，支持
+  Backspace/Delete/Ctrl+U/←→/Home/End 与粘贴压平；**也可在选中的文本项上直接键入即进入
+  编辑**（与字段尾部 ▌ 输入提示一致），编辑内容**就地显示在字段行内**（`标签  值▌`），
+  底部另有一行 `标签 [值▌] Enter 提交 · Esc 取消` 提示。删除 `ui._paused_input` 与
+  `settings_mode` 的 False/True 反复切换（消除漏恢复界面态的隐患）；空串提交仍视为
+  「未修改」，语义与旧版一致。
+- **取证**：ConPTY 注入 UTF-8 中文 → `core.keyinput` 稳定产出 4 个 `char` 事件（管线无
+  问题）；沙盒 `TuiApp.show_settings_form` 直接键入中文 → `settings_scratch.provider_id`
+  正确写入。`develop/ime_probe.py`（新增）供在真实终端自检 IME 是否投递 `char` 事件。
+- **抽取**：设置面板全部代码（Compose、字段构建、表单循环、交互/保存/插件、应用落盘）
+  移入 `core/settings.py` 的 `SettingsPanelMixin`，`ui.TuiApp` 改为继承之；纯显示函数在
+  运行期惰性从 `core.ui` 取用，避免循环导入。`class TuiApp:` 声明、`__init__` 状态块与
+  模块级 `settings()` 入口保持不变，`ui.settings(config)` 对外契约不变。
+- **测试**：`develop/test_plugin_settings.py` D7–D10 改为驱动行内编辑器（Ctrl+U 清空 +
+  逐字 `char` + Enter 提交），新增 D7a 编辑态断言；D9 以中文 `改好的名字` 覆盖 IME 路径。
+  渲染冒烟、插件设置 33 项、context_injection、mouse_wheel、paint_throttle、key_binding、
+  input_layout、ask_ui、phase_hint 全绿；`import main` 正常。（mouse_wheel 的 2 项
+  `mouse_down` 前缀断言为既有失败，与本次无关。）
+
 ## 2026-10-05 — 编辑工具加固：容差匹配/原子写/BOM/read 上限/write 编码保持（对照 qwen-code 调研落地）
 
 - **P1 容差匹配分级**（edit_file/multi_edit 共用 `_apply_replacement` 核心）：精确 0 命中时

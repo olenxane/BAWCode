@@ -307,21 +307,6 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.logo_enabled = bool(ui_cfg.get("logo", True))
 
     def enter(self) -> None:
-        """进入 TUI：rich Live 接管渲染（TMP app.py:1584 同构）+ 终端模式初始化。
-
-        - Live(screen=False, auto_refresh=False)：主屏 + 应用驱动刷新，
-          与 music player 的 Live 用法完全一致——每帧 live.update(refresh=True)，
-          rich 负责光标回卷与整帧输出（LiveRender 无 diff，每帧真实写字节），
-          应用不再手拼 ANSI/diff/节流。
-        - 不开 ?2004h bracketed-paste：conhost 上开启后 TSF IME 的删除序列
-          （孤立 \x00 握手字节之后的 \x1e\x08）会被扣押到下一次按键才放行，
-          表现为"退格删不掉已上屏的中文，再打中文才一起刷新"
-          （minimal_repro 二分：四个开 2004 的模式全卡，唯一不卡的 tmplayer
-          模式无 2004；参照项目 TMP 也不开——这是两进程间唯一的控制台状态差）。
-          粘贴改走 keyinput 的 conhost 启发式（批次中部回车/Tab → paste 事件）。
-          调试可设 BAW_BRACKETED_PASTE=1 强制开启，=0 全平台强制关闭。
-        - 隐藏光标由 enter 直写 \033[?25l（原 rich Live 代管，现为行级 diff 直写）。
-        """
         _enable_windows_ansi()
         if self._entered:
             return

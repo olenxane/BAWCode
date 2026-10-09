@@ -18,7 +18,18 @@
     "tool_content": "#FFFFFF",
     "subagent": "#F0A868",
     "tree_guide": "#2E5A6E",
-    "selection_bg": "#0B5878"
+    "selection_bg": "#0B5878",
+    "md_bold": "#FFFFFF",
+    "md_italic": "#5FD38A",
+    "md_code": "#FFD479",
+    "md_heading": "#7FDBFF",
+    "md_list": "#FFDC00",
+    "md_quote": "#7C93A6",
+    "md_strike": "#667788",
+    "path": "#56A6E8",
+    "func": "#B48CE0",
+    "cmd": "#8FD46A",
+    "url": "#48C9D6"
   },
   "tips_rotate_seconds": 6
 }
