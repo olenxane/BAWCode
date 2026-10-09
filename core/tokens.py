@@ -89,6 +89,22 @@ class TokenMeter:
         self.balance_source: str = ""
         self.source = "none"  # api | tokenizer | none
         self.last_error = ""
+        # 本轮输出累计（本地分词，不依赖提供商 usage）：各轮生成 completion
+        self.turn_output_tokens = 0
+
+    def begin_turn(self) -> None:
+        """回合开始：复位本轮输出 token 累计"""
+        self.turn_output_tokens = 0
+
+    def count_text(self, text: str) -> int:
+        """本地分词计数；tiktoken 不可用返回 0"""
+        try:
+            return count_tokens(text or "", self.model)
+        except Exception:
+            return 0
+
+    def add_turn_output(self, n: int) -> None:
+        self.turn_output_tokens += max(0, int(n or 0))
 
     def set_model(self, model: str, context_window: int = 0) -> None:
         self.model = model or self.model

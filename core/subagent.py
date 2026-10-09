@@ -389,7 +389,7 @@ def extract_artifacts(messages: List[dict]) -> List[str]:
             name = str(c.get("name") or "")
             args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
             label = ""
-            if name in ("write", "edit_file", "multi_edit"):
+            if name in ("write", "edit_file"):
                 label = f"修改 {args.get('file_path', '')}"
             elif name == "execute_command":
                 cmd = str(args.get("command") or "").strip()

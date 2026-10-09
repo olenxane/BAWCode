@@ -532,13 +532,21 @@ def _after_turn(session, user_text: str) -> None:
 def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
     """回合入口：无论正常结束/出错/中断，回合末执行上下文维护（剥离+预算外置），
     并清掉流式树尾消息（partial 丢弃，与在途回合丢弃语义一致）与子代理运行时/直播槽"""
+    snap = None
     try:
         _agent_turn_impl(llm, session, user_text, app, runner=runner)
     finally:
         try:
-            snapshot_mod.end_turn()  # 回合快照落盘（中断/异常路径同样收尾；空回合无副作用）
+            snap = snapshot_mod.end_turn()  # 回合快照落盘（中断/异常路径同样收尾；空回合无副作用）
         except Exception as exc:
             log.error("回合快照收尾失败: %r", exc)
+        # Esc 打断：回合收尾后按回合起点回滚会话与文件，并把用户输入回填输入框
+        if runner is not None and getattr(runner, "_esc_rollback", False):
+            runner._esc_rollback = False
+            try:
+                _rollback_interrupted_turn(session, app, runner, snap)
+            except Exception as exc:
+                log.error("回合打断回滚失败: %r", exc)
         try:
             session.finalize_turn()
         except Exception as exc:
@@ -547,6 +555,51 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
         app.streaming_msg = None
         app.subagent_stream = None
         app.phase_hint = ""
+        app.turn_start_time = 0.0
+
+
+def _rollback_interrupted_turn(session, app, runner, snap=None) -> None:
+    """Esc 打断收尾：会话回滚到回合起点、本回合文件还原、用户输入回填输入框。"""
+    start = int(getattr(runner, "turn_start_index", -1))
+    removed_msgs = []
+    removed = 0
+    if 0 <= start <= len(session.messages):
+        removed_msgs = list(session.messages[start:])
+        removed = len(removed_msgs)
+        del session.messages[start:]
+    # 文件：仅当本回合确实落了快照才还原，避免误伤上一回合的快照
+    file_note = ""
+    if isinstance(snap, dict) and snap.get("seq"):
+        try:
+            res = snapshot_mod.undo(session.config, session.project_id, session.session_id, snap["seq"])
+            if res:
+                file_note = f" · 文件还原{len(res['restored'])} 删除{len(res['deleted'])} 跳过{len(res['skipped'])}"
+        except Exception as exc:
+            log.warn("打断回滚文件失败: %r", exc)
+    # 回填：本轮的用户消息（含回合中插话）逐条取回；多模态取首个 text 片段
+    texts: List[str] = []
+    for m in removed_msgs:
+        if str(m.get("role")) != "user":
+            continue
+        content = m.get("content")
+        if isinstance(content, str) and content.strip():
+            texts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text" and str(part.get("text") or "").strip():
+                    texts.append(str(part["text"]))
+                    break
+    if not texts:
+        fallback = str(getattr(app, "turn_user_text", "") or "")
+        if fallback:
+            texts = [fallback]
+    if texts:
+        app.restore_input = "\n".join(texts)
+    try:
+        _sync(app, session, status=f"已打断并回滚到回合前（移除 {removed} 条消息{file_note}）", render=False)
+    except Exception:
+        pass
+    log.info("Esc 打断回滚：移除消息 %d 条%s", removed, file_note)
 
 
 def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
@@ -586,6 +639,14 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
 
     log.info("任务开始: %s", user_text)
+    # 回合起点：消息序号供 Esc 打断回滚切割；时间与 token 基线供提示行显示用时/本轮消耗
+    if runner is not None:
+        runner.turn_start_index = len(session.messages)
+        runner._esc_rollback = False  # 清掉上一回合竞态残留的打断标记，避免误回滚本轮
+    app.turn_start_time = time.monotonic()
+    app.turn_user_text = user_text
+    if app.token_meter is not None:
+        app.token_meter.begin_turn()  # 复位本轮本地分词累计（提示行实时 token）
     # 粘贴附图（输入框占位符=图片路径，提交时入队）：与正文一并落为多模态数组；
     # 非视觉模型不编码图片块（路径作为普通文本保留在正文里）
     pending = None
@@ -663,9 +724,9 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
 class _AgentRunner:
     """后台线程执行 agent 回合：等待响应期间 TUI 保持可交互。
 
-    busy 期间用户消息按 ui.busy_send_mode 处理（设置页可改）：
-      queue     — 入队，本轮结束后按顺序接力执行（默认）
-      interrupt — 取消在途请求并丢弃本轮，强行以新消息开启新一轮
+    busy 期间用户消息分两条路径：
+      普通 Enter — 插话：并入当前回合（回合循环取走作为 user 消息，不新开回合）
+      Ctrl+Q     — 排队：当前回合结束后作为新回合发送
     """
 
     def __init__(self, llm: LLM, session, app: "ui.TuiApp", config: Config):
@@ -675,14 +736,12 @@ class _AgentRunner:
         self.config = config
         self.busy = False
         self.last_error = None  # 最近回合的异常文本（无头 --json 消费；交互模式仅诊断用）
+        # Esc 打断回滚：标记本轮需回滚到回合前（agent 线程收尾时执行）+ 回合起点消息序号
+        self._esc_rollback = False
+        self.turn_start_index = 0
         self._queue: list = []
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
-
-    def mode(self) -> str:
-        ui_cfg = (self.config.data or {}).get("ui") or {}
-        m = str(ui_cfg.get("busy_send_mode") or "queue").strip().lower()
-        return m if m in ("queue", "interrupt") else "queue"
 
     def _set_busy(self, value: bool) -> None:
         """busy 双写：runner 自身判定 + app.busy 镜像（UI 键位如树回退据此拒绝，跨线程只读）"""
@@ -691,6 +750,15 @@ class _AgentRunner:
             self.app.busy = value
         except Exception:
             pass
+
+    def interrupt_for_rollback(self) -> bool:
+        """Esc 打断当前回合：取消在途请求并标记本轮回滚。
+        会话/文件回滚与输入回填由 agent 线程收尾执行（session 写入单写者）。"""
+        if not self.busy:
+            return False
+        self._esc_rollback = True
+        self.llm.cancel()
+        return True
 
     def start(self, text: str) -> bool:
         with self._lock:
@@ -704,7 +772,7 @@ class _AgentRunner:
 
     def notify(self, text: str) -> None:
         """后台事件通知入口（tools.set_background_notifier 注册）：
-        idle 直接开新回合，busy 入队接力——不打断在途回合（区别于 submit 的 interrupt 语义）"""
+        idle 直接开新回合，busy 入队接力——不打断在途回合"""
         with self._lock:
             self._queue.append(text)
             if self.busy:
@@ -714,16 +782,25 @@ class _AgentRunner:
         self._thread = t
         t.start()
 
-    def submit(self, text: str) -> str:
-        """busy 期间的发送语义；返回给用户看的状态说明"""
-        if self.mode() == "interrupt":
-            self.llm.cancel()  # 置标记 + 关闭在途连接，agent 回合在检查点丢弃
-            with self._lock:
-                self._queue = [text]  # 强行插入：清空队列仅保留新消息
-            return "[已中断当前请求，新消息将立即开始]"
+    def inject_turn(self, text: str) -> str:
+        """回合中插话（普通 Enter）：并入当前回合，由回合循环取走作为 user 消息"""
+        take = getattr(self.app, "take_injections", None)
+        if take is None or not self.busy:
+            return self.queue_turn(text)
+        with self.app.inject_lock:
+            self.app.inject_queue.append(text)
+        return "[插话已并入当前回合]"
+
+    def queue_turn(self, text: str) -> str:
+        """Ctrl+Q 排队：当前回合结束后作为新回合发送"""
         with self._lock:
             self._queue.append(text)
-        return f"[已排队 {len(self._queue)} 条 · 本轮结束后自动发送]"
+            n = len(self._queue)
+        return f"[已排队 {n} 条 · 当前回合结束后作为新回合发送]"
+
+    def submit(self, text: str) -> str:
+        """busy 期间的外部提交（插件 submit_turn 等）：排队为新回合"""
+        return self.queue_turn(text)
 
     def pop_queue(self):
         with self._lock:
@@ -736,6 +813,11 @@ class _AgentRunner:
         while True:
             if text is None:
                 with self._lock:
+                    # 插话残余兜底：回合结束后才到达的插话，作为新回合接力（极窄竞态）
+                    take = getattr(self.app, "take_injections", None)
+                    leftover = take() if callable(take) else []
+                    if leftover:
+                        self._queue.extend(leftover)
                     text = self._queue.pop(0) if self._queue else None
                     if text is None:
                         self._set_busy(False)
@@ -782,6 +864,13 @@ class _HeadlessApp:
         self.phase_hint = ""
         self.token_meter = None
         self.busy = False
+        self.turn_start_time = 0.0
+        self.turn_user_text = ""
+        self.restore_input = None
+        self.interrupt_turn_handler = None
+        self.inject_queue = []
+        self.inject_lock = threading.Lock()
+        self._submit_queued = False
         self.pending_tool = None
         self.streaming_msg = None
         self.subagent_stream = None
@@ -795,6 +884,14 @@ class _HeadlessApp:
 
     def refresh_from_session(self, session, task=None, render=True) -> None:
         pass
+
+    def take_injections(self) -> list:
+        with self.inject_lock:
+            if not self.inject_queue:
+                return []
+            pending = list(self.inject_queue)
+            self.inject_queue.clear()
+            return pending
 
     def show_sessions_form(self, *args, **kwargs):
         return None  # 无头模式无会话选择面板
@@ -956,11 +1053,14 @@ def main() -> None:
         runner = _AgentRunner(llm, session, app, config)
         tools_mod.set_background_notifier(runner.notify)  # 后台命令完成 → runner.notify 自动开新回合
         plugins_mod.bind_runtime(app=app, runner=runner)  # 插件类用户操作 API（submit_turn/notify/ctx.ui）载体
+        app.interrupt_turn_handler = runner.interrupt_for_rollback  # Esc 打断当前回合并回滚
         llm.query_balance()
         app.token_meter = llm.meter
         _sync(app, session, status="就绪")
         while True:
             raw = app.read_line(config=config)
+            queued = app.consume_queued_submit()  # Ctrl+Q 排队标记
+            has_images = app.consume_submit_images()  # 含图片的提交不插话
             app.token_meter = llm.meter
             text = (raw or "").strip()
             if not text:
@@ -970,7 +1070,7 @@ def main() -> None:
                 if runner.busy and head in ("/clear", "/new", "/resume", "/undo", "/clear-trash"):
                     session.add_message(
                         "system",
-                        "本轮对话进行中：等待完成，或直接发送新消息（按设置中断/排队）后再操作会话",
+                        "本轮对话进行中：等待完成，或直接发送新消息（普通发送=插话并入本轮 · Ctrl+Q=排队新回合）后再操作会话",
                         type="help",
                     )
                     _sync(app, session)
@@ -991,13 +1091,17 @@ def main() -> None:
                     session.save_session()
                 continue
             if runner.busy:
-                note = runner.submit(text)
+                # 普通发送=插话并入当前回合；Ctrl+Q 或含图片=排队为当前回合结束后的新回合
+                if queued or has_images:
+                    note = runner.queue_turn(text)
+                else:
+                    note = runner.inject_turn(text)
                 session.add_message("system", note, type="help")
                 _sync(app, session)
                 continue
             if not runner.start(text):
-                # busy 检查与 start 之间后台通知可能已置忙：入队接力，不丢输入
-                note = runner.submit(text)
+                # busy 检查与 start 之间后台通知可能已置忙：排队接力，不丢输入
+                note = runner.queue_turn(text)
                 session.add_message("system", note, type="help")
                 _sync(app, session)
     except KeyboardInterrupt:

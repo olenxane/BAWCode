@@ -523,7 +523,6 @@ class SettingsPanelMixin:
             fields = [
                 {"key": "theme", "label": "主题", "type": "choice", "options": themes, "current": config.theme, "hint": "←→ 切换主题"},
                 {"key": "mode", "label": "访问模式", "type": "choice", "options": list(policy.MODES), "current": config.mode, "hint": "auto/manual/full"},
-                {"key": "busy_send_mode", "label": "等待时新消息", "type": "choice", "options": ["queue", "interrupt"], "current": str(ui_cfg.get("busy_send_mode") or "queue"), "hint": "queue=排队等本轮结束 · interrupt=中断插入"},
                 {"key": "logo", "label": "会话区Logo", "type": "bool", "current": bool(ui_cfg.get("logo", True)), "hint": "←→ 开/关"},
                 {"key": "font_size", "label": "字体大小", "type": "text", "current": getattr(config, "font_size", 16)},
                 {"key": "tip_interval", "label": "提示间隔秒", "type": "text", "current": ui_cfg.get("tip_interval", 5)},
@@ -1124,8 +1123,6 @@ class SettingsPanelMixin:
             ui_cfg["theme"] = str(s["theme"])
         if "mode" in s:
             ui_cfg["mode"] = str(s["mode"])
-        if "busy_send_mode" in s and str(s["busy_send_mode"]) in ("queue", "interrupt"):
-            ui_cfg["busy_send_mode"] = str(s["busy_send_mode"])
         if "logo" in s:
             ui_cfg["logo"] = bool(s["logo"] in (True, "true", "1", 1) if isinstance(s["logo"], str) else bool(s["logo"]))
         for key, cast in (

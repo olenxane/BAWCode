@@ -575,6 +575,7 @@ class LLM:
                             # 错误随结果返回
                             result = self._normalize(agg.to_response(), keep_reasoning=bool(tools))
                             self.meter.record_api_usage(result.get("raw", {}).get("usage"))
+                            self._account_completion(result)
                             result["error"] = agg.error
                             result["retryable"] = True
                             return result
@@ -584,6 +585,7 @@ class LLM:
                 result = self._normalize(data, keep_reasoning=bool(tools))
                 usage = result.get("raw", {}).get("usage") if isinstance(result.get("raw"), dict) else None
                 self.meter.record_api_usage(usage)
+                self._account_completion(result)
                 log.info(
                     "LLM 响应 model=%s content=%d字 tool_calls=%d 用时=%.2fs（第%d次尝试）",
                     model_id,
@@ -670,6 +672,11 @@ class LLM:
             reasoning = ""
         # 思考与正文并存时 reasoning 单独返回，由调用方以 thinking 字段随消息留档
         return {"content": content, "reasoning": reasoning, "tool_calls": tool_calls, "raw": data}
+
+    def _account_completion(self, result: dict) -> None:
+        """本地分词累计本轮输出 token（正文+思考），供提示行实时显示"""
+        text = str(result.get("content") or "") + str(result.get("reasoning") or "")
+        self.meter.add_turn_output(self.meter.count_text(text))
 
     def evaluate_tool(self, tool_name: str, args: dict) -> tuple:
         action, reason = policy.evaluate(tool_name, args, getattr(self.config, "mode", policy.MODE_AUTO))

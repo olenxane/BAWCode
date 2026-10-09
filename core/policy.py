@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from core import register
 from core.log import get_logger
 
 log = get_logger("policy")
@@ -38,8 +39,6 @@ SAFE_TOOLS = {
     "glob",
     "list_directory",
     "webfetch",
-    # 只读图片文件回注多模态消息，无写入副作用
-    "read_image",
     # RAG：检索/重建只读（索引仅存内存与插件数据目录）；set_rag 只写插件
     # 项目状态文件（.bawcode/plugin-data/rag/state.json），无文件系统副作用
     "rag_search",
@@ -295,6 +294,9 @@ def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pa
         return CONFIRM, "unknown_mode"
     if not tool_name:
         return CONFIRM, "unknown_tool"
+    if not register.has_tool(tool_name):
+        # 未注册工具（拼写错误、旧会话历史里的已删工具、已下线 MCP）：直接答复，不进确认面板
+        return DENY, f"工具不存在: {tool_name}"
 
     # 项目始终允许规则（路径类工具的通配命中需通过项目边界校验）
     rules = load_allowlist(root).get("rules") or []

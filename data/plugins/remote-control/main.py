@@ -96,7 +96,7 @@ _HL_STYLE = "monokai"          # pygments 高亮风格，与 TUI 的 _HL_STYLE �
 _HL_CLASS = "hl"               # 词法样式作用域类名
 _TOOL_CMD = {"execute_command", "run_program"}
 _TOOL_WRITE = {"write"}
-_TOOL_EDIT = {"edit_file", "multi_edit"}
+_TOOL_EDIT = {"edit_file"}
 _PLAN_TOOLS = {"write_plan", "update_plan", "generate_steps", "update_step_status"}
 _WRITE_MAX_LINES = 500         # 写入高亮行数上限，防大文件拖垮网页
 _DIFF_MAX_LINES = 600          # 单处 diff 行数上限
@@ -219,15 +219,7 @@ def _tool_render(name: str, args: dict, content: str, failed: bool) -> Optional[
             "truncated": len(lines) > _WRITE_MAX_LINES,
         }
     if name in _TOOL_EDIT and not failed:
-        raw: List[Tuple[str, str]] = []
-        if name == "multi_edit":
-            for e in args.get("edits") or []:
-                if isinstance(e, dict):
-                    raw.append((str(e.get("old_str") or ""), str(e.get("new_str") or "")))
-        else:
-            raw.append((str(args.get("old_str") or ""), str(args.get("new_str") or "")))
-        if not raw:
-            return None
+        raw: List[Tuple[str, str]] = [(str(args.get("old_str") or ""), str(args.get("new_str") or ""))]
         path = str(args.get("file_path") or "")
         items = []
         for old, new in raw:
@@ -275,6 +267,13 @@ def _plan_render(tool_name: str, content: str) -> Optional[dict]:
     return None
 
 
+class _Server(ThreadingHTTPServer):
+    """监听全部网卡的服务端：SO_REUSEADDR 便于重启，daemon 线程便于 SSE 长连接下卸载"""
+
+    allow_reuse_address = True  # 需在 server_bind 前生效，故写在类属性上
+    daemon_threads = True
+
+
 class _State:
     """单个插件实例的运行态（reload 后随新模块重建，线程经 teardown 停止）"""
 
@@ -298,7 +297,7 @@ def setup(ctx):
 
     # ---- 配置 ----
     port = int(ctx.settings.get("port") or 8399)
-    bind = str(ctx.settings.get("bind") or "0.0.0.0:0")
+    bind = str(ctx.settings.get("bind") or "0.0.0.0")
     remote_confirm = bool(ctx.settings.get("remote_confirm", True))
     confirm_timeout = float(ctx.settings.get("confirm_timeout") or 90)
     max_history = int(ctx.settings.get("max_history") or 80)
@@ -944,6 +943,235 @@ def setup(ctx):
     # 回合进行中拒绝的会话结构操作（与主循环口径一致）
     _CMD_BUSY_BLOCKED = {"/clear", "/new", "/resume", "/undo", "/clear-trash"}
 
+    # ---- 设置面板：读取 / 保存（与 TUI /settings 同源，经 config 对象读写）----
+
+    def _settings_get() -> dict:
+        """汇总当前配置，按标签页组织返回给网页端"""
+        cfg = ctx.config
+        d = cfg.data or {}
+        ui = d.get("ui") or {}
+        mem = d.get("memory") or {}
+        llm = d.get("llm") or {}
+        ctx_cfg = d.get("context") or {}
+        wf = d.get("workflow") or {}
+        tools = d.get("tools") or {}
+        log_cfg = d.get("log") or {}
+        providers = cfg.providers() or []
+        active_pid = d.get("active_provider_id", "")
+        provider = cfg.find_provider(active_pid) or (providers[0] if providers else {})
+        models = provider.get("models") or []
+        active_mid = d.get("active_model_id", "")
+        model_row = next((m for m in models if m.get("model_id") == active_mid), models[0] if models else {})
+        themes = ["dark"] + [t for t in cfg.list_themes() if t != "dark"]
+        workflows = workflow_mod.list_workflows(cfg) if workflow_mod else []
+        wf_active = workflow_mod.active_name(cfg) if workflow_mod else ""
+        plugins_list = plugins_mod.statuses() if plugins_mod else []
+        return {
+            "ok": True,
+            "provider": {
+                "providers": [{"provider_id": p.get("provider_id"), "name": p.get("name")} for p in providers],
+                "active_provider_id": active_pid,
+                "provider_id": provider.get("provider_id", ""),
+                "provider_name": provider.get("name", ""),
+                "api_key": provider.get("api_key", ""),
+                "base_url": provider.get("base_url", ""),
+                "balance_url": provider.get("balance_url", ""),
+                "temperature": provider.get("temperature", 1.0),
+                "default_model_id": provider.get("default_model_id", ""),
+                "models": [m.get("model_id") for m in models],
+            },
+            "model": {
+                "active_model_name": cfg.model_name,
+                "model_id": model_row.get("model_id", ""),
+                "modalities": ",".join(model_row.get("modalities") or ["text"]),
+                "context_window": model_row.get("context_window", 0),
+                "max_tokens": model_row.get("max_tokens", 0),
+                "temperature": model_row.get("temperature", 1.0),
+                "thinking_effort": model_row.get("thinking_effort", "none"),
+                "task_plan": (cfg.task_models() or {}).get("plan", ""),
+                "task_code": (cfg.task_models() or {}).get("code", ""),
+                "task_review": (cfg.task_models() or {}).get("review", ""),
+                "model_names": cfg.list_model_names() or [],
+            },
+            "system": {
+                "theme": getattr(cfg, "theme", ui.get("theme", "dark")),
+                "themes": themes,
+                "mode": getattr(cfg, "mode", ui.get("mode", "auto")),
+                "logo": bool(ui.get("logo", True)),
+                "font_size": getattr(cfg, "font_size", 16),
+                "tip_interval": ui.get("tip_interval", 5),
+                "retry_times": llm.get("retry_times", 3),
+                "retry_delay": llm.get("retry_delay", 1.0),
+                "auto_compress": bool(mem.get("auto_compress", True)),
+                "compress_threshold": mem.get("compress_threshold", 0.8),
+                "compress_keep_recent_tokens": mem.get("compress_keep_recent_tokens", 16384),
+                "compress_summary_max_tokens": mem.get("compress_summary_max_tokens", 1024),
+                "tool_whitelist": ", ".join(str(x) for x in (ctx_cfg.get("tool_whitelist") or [])),
+                "max_tool_rounds": wf.get("max_rounds", 0),
+                "spin_kill_count": wf.get("spin_kill_count", 12),
+                "max_tool_timeout": tools.get("max_timeout", 600),
+                "ask_user_timeout": bool(tools.get("ask_user_timeout", True)),
+                "workflow_enabled": bool(wf.get("enabled", False)),
+                "workflow_active": wf_active,
+                "workflows": workflows,
+                "log_level": log_cfg.get("level", "info"),
+            },
+            "shortcuts": {
+                "switch_mode": ui.get("switch_mode", "shift+tab"),
+                "switch_focus": ui.get("switch_focus", "tab"),
+                "send": ui.get("send", "ctrl+enter"),
+                "newline": ui.get("newline", "shift+enter"),
+                "complete": ui.get("complete", "tab"),
+                "scroll_up": ui.get("scroll_up", "pageup"),
+                "scroll_down": ui.get("scroll_down", "pagedown"),
+                "expand": ui.get("expand", "right"),
+                "collapse": ui.get("collapse", "left"),
+                "rollback": ui.get("rollback", "ctrl+z"),
+            },
+            "plugins": plugins_list,
+        }
+
+    def _settings_save(data: dict) -> dict:
+        """网页端提交设置：写入 config.data 并 save + apply_active"""
+        cfg = ctx.config
+        d = cfg.data or {}
+        section = str(data.get("section") or "")
+        values = data.get("values") or {}
+        if not isinstance(values, dict):
+            return {"ok": False, "message": "values 须为对象"}
+
+        if section == "provider":
+            pid = str(values.get("provider_id") or "").strip()
+            if not pid:
+                return {"ok": False, "message": "provider_id 不能为空"}
+            provider = {
+                "provider_id": pid,
+                "name": str(values.get("provider_name") or pid),
+                "api_key": str(values.get("api_key") or ""),
+                "base_url": str(values.get("base_url") or ""),
+                "balance_url": str(values.get("balance_url") or ""),
+                "temperature": float(values.get("temperature", 1.0)),
+                "default_model_id": str(values.get("default_model_id") or ""),
+            }
+            existing = cfg.find_provider(pid)
+            if existing:
+                provider["models"] = existing.get("models") or []
+            cfg.add_or_update_provider(provider)
+            active = str(values.get("active_provider_id") or pid)
+            if cfg.find_provider(active):
+                d["active_provider_id"] = active
+            cfg.apply_active()
+
+        elif section == "model":
+            select_model = str(values.get("select_model") or "").strip()
+            row = cfg.find_model(select_model) if select_model else None
+            if row:
+                updates = {}
+                if "model_id" in values:
+                    updates["model_id"] = str(values["model_id"])
+                if "modalities" in values:
+                    updates["modalities"] = [x.strip() for x in str(values["modalities"]).split(",") if x.strip()]
+                if "context_window" in values:
+                    updates["context_window"] = int(float(values["context_window"]))
+                if "max_tokens" in values:
+                    updates["max_tokens"] = int(float(values["max_tokens"]))
+                if "temperature" in values:
+                    updates["temperature"] = float(values["temperature"])
+                if "thinking_effort" in values:
+                    updates["thinking_effort"] = str(values["thinking_effort"])
+                cfg.update_model(row["provider_id"], row["model_id"], updates)
+                d["active_provider_id"] = row["provider_id"]
+                d["active_model_id"] = updates.get("model_id", row["model_id"])
+            for task_key in ("task_plan", "task_code", "task_review"):
+                v = str(values.get(task_key) or "").strip()
+                if v:
+                    cfg.set_task_model(task_key.replace("task_", ""), v)
+            active_model = str(values.get("active_model_name") or "").strip()
+            if active_model:
+                cfg.switch_model(active_model)
+            cfg.apply_active()
+
+        elif section == "system":
+            ui_cfg = d.setdefault("ui", {})
+            if "theme" in values:
+                ui_cfg["theme"] = str(values["theme"])
+            if "mode" in values:
+                mode = str(values["mode"])
+                if mode in ("auto", "manual", "full"):
+                    ui_cfg["mode"] = mode
+                    cfg.mode = mode
+            if "logo" in values:
+                ui_cfg["logo"] = bool(values["logo"])
+            if "font_size" in values:
+                ui_cfg["font_size"] = int(float(values["font_size"]))
+                d.setdefault("system", {})["font_size"] = ui_cfg["font_size"]
+            if "tip_interval" in values:
+                ui_cfg["tip_interval"] = float(values["tip_interval"])
+            llm_cfg = d.setdefault("llm", {})
+            if "retry_times" in values:
+                llm_cfg["retry_times"] = int(float(values["retry_times"]))
+            if "retry_delay" in values:
+                llm_cfg["retry_delay"] = float(values["retry_delay"])
+            mem_cfg = d.setdefault("memory", {})
+            if "auto_compress" in values:
+                mem_cfg["auto_compress"] = bool(values["auto_compress"])
+            if "compress_threshold" in values:
+                mem_cfg["compress_threshold"] = float(values["compress_threshold"])
+            if "compress_keep_recent_tokens" in values:
+                mem_cfg["compress_keep_recent_tokens"] = max(0, int(float(values["compress_keep_recent_tokens"])))
+            if "compress_summary_max_tokens" in values:
+                mem_cfg["compress_summary_max_tokens"] = max(100, int(float(values["compress_summary_max_tokens"])))
+            if "tool_whitelist" in values:
+                ctx_cfg = d.setdefault("context", {})
+                ctx_cfg["tool_whitelist"] = [p.strip() for p in str(values["tool_whitelist"]).split(",") if p.strip()]
+            wf_cfg = d.setdefault("workflow", {})
+            if "workflow_enabled" in values:
+                wf_cfg["enabled"] = bool(values["workflow_enabled"])
+            if "workflow_active" in values and workflow_mod:
+                workflow_mod.set_active(cfg, str(values["workflow_active"]))
+            if "max_tool_rounds" in values:
+                wf_cfg["max_rounds"] = max(0, int(float(values["max_tool_rounds"])))
+            if "spin_kill_count" in values:
+                wf_cfg["spin_kill_count"] = max(1, int(float(values["spin_kill_count"])))
+            if "max_tool_timeout" in values:
+                d.setdefault("tools", {})["max_timeout"] = max(1, int(float(values["max_tool_timeout"])))
+            if "ask_user_timeout" in values:
+                d.setdefault("tools", {})["ask_user_timeout"] = bool(values["ask_user_timeout"])
+            if "log_level" in values:
+                level = str(values["log_level"]).strip().lower()
+                if level in ("debug", "info", "warn", "error", "off"):
+                    d.setdefault("log", {})["level"] = level
+
+        elif section == "shortcuts":
+            ui_cfg = d.setdefault("ui", {})
+            for key in ("switch_mode", "switch_focus", "send", "newline", "complete",
+                        "scroll_up", "scroll_down", "expand", "collapse", "rollback"):
+                if key in values:
+                    ui_cfg[key] = str(values[key]).lower()
+
+        elif section == "plugins":
+            # 插件启停：{plugin_id: true/false}
+            if plugins_mod is None:
+                return {"ok": False, "message": "宿主缺少 plugins 模块"}
+            for pid, enabled in values.items():
+                if not plugins_mod.set_enabled(pid, bool(enabled), cfg):
+                    return {"ok": False, "message": f"插件 {pid} 状态写入失败"}
+            plugins_mod.reload(cfg)
+
+        else:
+            return {"ok": False, "message": f"未知设置分区: {section}"}
+
+        cfg.save()
+        # 同步 LLM 与 UI
+        llm = _llm()
+        if llm is not None and hasattr(llm, "refresh_from_config"):
+            llm.refresh_from_config(cfg)
+        app = _app()
+        if app is not None and hasattr(app, "bind_config"):
+            app.bind_config(cfg)
+        _broadcast({"t": "reset"})
+        return {"ok": True, "result": f"设置已保存（{section}）"}
+
     def _op_command(line: str) -> dict:
         if commands_mod is None:
             return {"ok": False, "message": "宿主缺少 commands 模块"}
@@ -1074,6 +1302,8 @@ def setup(ctx):
                     self._json(200, _undo_listing())
                 elif path == "/api/commands":
                     self._json(200, _commands_listing())
+                elif path == "/api/settings":
+                    self._json(200, _settings_get())
                 else:
                     self._json(404, {"ok": False, "message": "not found"})
 
@@ -1192,6 +1422,8 @@ def setup(ctx):
                     self._json(200, _op_undo(which))
                 elif path == "/api/command":
                     self._json(200, _op_command(str(data.get("line") or "")))
+                elif path == "/api/settings":
+                    self._json(200, _settings_save(data))
                 else:
                     self._json(404, {"ok": False, "message": "not found"})
 
@@ -1201,7 +1433,7 @@ def setup(ctx):
         if st.httpd is not None:
             return "远程控制服务已在运行"
         try:
-            st.httpd = ThreadingHTTPServer((bind, port), _make_handler())
+            st.httpd = _Server((bind, port), _make_handler())
         except OSError as e:
             st.httpd = None
             ctx.log.warn("HTTP 服务启动失败: %s", e)

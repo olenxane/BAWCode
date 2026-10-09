@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from core import hooks
 from core import memory as memory_mod
@@ -327,10 +327,12 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
 @register.register(
     name="read",
     description=(
-        "Read a text file with line-number prefixes; use the numbers to anchor "
-        "edit_file. Long files are paged via offset/limit, and each read "
-        "registers the file baseline required before edit_file or positional "
-        "write — read a file before editing it"
+        "Read a file. Text files come back with line-number prefixes; use the "
+        "numbers to anchor edit_file. Long files are paged via offset/limit, and "
+        "each read registers the file baseline required before edit_file or "
+        "positional write — read a file before editing it. Image files "
+        "(png/jpg/jpeg/gif/webp/bmp) are returned as pictures you can see "
+        "(requires a vision-capable model)"
     ),
     usage="read <file_path> [offset] [limit]",
     schema={
@@ -338,23 +340,25 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Path of the file to read",
+                "description": "Path of the file to read (image paths return the picture itself)",
             },
             "offset": {
                 "type": "integer",
-                "description": "1-based start line; omit to read from the beginning",
+                "description": "1-based start line; omit to read from the beginning (text files only)",
             },
             "limit": {
                 "type": "integer",
-                "description": "Max number of lines to return; omit to read to the end",
+                "description": "Max number of lines to return; omit to read to the end (text files only)",
             },
         },
         "required": ["file_path"],
     },
 )
-def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
-    """读取指定文件内容，带行号前缀供 edit_file 锚定；offset/limit 可选按行分页"""
+def read(file_path: str, offset: int = 0, limit: int = 0) -> Union[str, dict]:
+    """读取文件内容，带行号前缀供 edit_file 锚定；offset/limit 可选按行分页；图片按后缀分派回注多模态"""
     path = Path(file_path)
+    if path.suffix.lower() in memory_mod.IMAGE_SUFFIXES:
+        return _read_image(path)
     log.debug("读取文件: %s offset=%s limit=%s", path, offset or "-", limit or "-")
     try:
         raw = path.read_bytes()
@@ -402,40 +406,19 @@ def read(file_path: str, offset: int = 0, limit: int = 0) -> str:
     return page
 
 
-@register.register(
-    name="read_image",
-    description=(
-        "Read a local image file so you can see it (multimodal). Use for screenshots, "
-        "UI captures, webfetch-saved page images, diagrams and photos."
-    ),
-    usage="read_image <file_path>",
-    schema={
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "Image file path (png/jpg/jpeg/gif/webp/bmp, max 4MB per image)",
-            },
-        },
-        "required": ["file_path"],
-    },
-)
-def read_image(file_path: str) -> dict:
-    """读取本地图片回注多模态消息：返回 {"content", "images"}，执行层摘出 images 落为 API 数组形态 content"""
+def _read_image(path: Path) -> Union[str, dict]:
+    """read 的图片分支：返回 {"content", "images"}，执行层摘出 images 落为 API 数组形态 content"""
     sess = _session()
     cfg = getattr(sess, "config", None) if sess is not None else None
     if cfg is not None and not cfg.supports_vision:
         return "当前模型不支持视觉输入，图片内容无法查看；请用文本方式获取该文件的相关信息"
-    path = Path(file_path)
-    suffix = path.suffix.lower()
-    if suffix not in memory_mod.IMAGE_SUFFIXES:
-        return f"不支持的图片格式: {suffix or '(无后缀)'}（支持 png/jpg/jpeg/gif/webp/bmp）"
     if not path.is_file():
         return f"图片不存在: {path}"
     size = path.stat().st_size
     if size > memory_mod._IMAGE_MAX_BYTES:
         return f"图片超过 {memory_mod._IMAGE_MAX_BYTES // (1024 * 1024)}MB 上限（当前 {size // 1024}KB）：请压缩后重试"
     kb = max(size // 1024, 1)
+    log.info("读取图片: %s（%dKB）", path, kb)
     return {"content": f"已加载图片: {path}（{kb}KB），图片内容已随本结果提供", "images": [str(path)]}
 
 
@@ -553,7 +536,11 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
         "If no exact match exists, a line-anchored match tolerant of trailing "
         "whitespace is attempted automatically (leading indentation is never "
         "relaxed) and the success message says so; full-width punctuation "
-        "variants are only hinted at on failure, never auto-replaced."
+        "variants are only hinted at on failure, never auto-replaced. "
+        "For several changes to one file, issue one edit_file call per change in the "
+        "same message — calls run in order and each one sees the previous result, so "
+        "write every old_str against the state left by the earlier edits. Each call "
+        "is atomic on its own and an earlier failure does not roll back the rest"
     ),
     usage="edit_file <file_path> <old_str> <new_str> [replace_all]",
     schema={
@@ -714,7 +701,7 @@ _REPLACE_TOL_MULTI = "tol_multi"  # 容差多处命中且未开 replace_all
 
 
 def _apply_replacement(content: str, old_str: str, new_str: str, replace_all: bool) -> tuple:
-    """edit_file/multi_edit 共用的单项替换核心；只在内存文本上替换，落盘由调用方负责。
+    """edit_file 的单项替换核心；只在内存文本上替换，落盘由调用方负责。
 
     返回 (kind, 新内容或 None, info)，OK 类 info=替换处数，MULTI 类 info=(处数, 起始行号列表)。
     容差命中取磁盘原文行并保留其原行尾空白，行首缩进绝不放宽。"""
@@ -795,110 +782,6 @@ def _match_spots(content: str, needle: str) -> list:
 
 
 @register.register(
-    name="multi_edit",
-    description=(
-        "Apply multiple find-and-replace edits to one file atomically: "
-        "all edits are validated and applied in order, file is written once at the end; "
-        "any failure leaves the file untouched"
-    ),
-    usage="multi_edit <file_path> <edits>",
-    schema={
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "Path of the file to edit",
-            },
-            "edits": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "old_str": {"type": "string", "description": "Exact string to replace"},
-                        "new_str": {"type": "string", "description": "Replacement string"},
-                        "replace_all": {"type": "boolean", "description": "Replace all occurrences of this item, default false"},
-                    },
-                    "required": ["old_str", "new_str"],
-                },
-                "description": "Ordered edit list, applied in array order",
-            },
-        },
-        "required": ["file_path", "edits"],
-    },
-)
-def multi_edit(file_path: str, edits: List[dict]) -> str:
-    """批量编辑：按数组顺序校验并应用，全部通过后一次性原子写回，失败不留任何修改"""
-    path = Path(file_path)
-    log.info("批量编辑: %s（%d 项）", path, len(edits or []))
-    if not path.exists():
-        log.warn("编辑失败，文件不存在: %s", path)
-        return "找不到文件"
-    if not edits or not isinstance(edits, list):
-        return "edits 不能为空"
-    items = []
-    for idx, e in enumerate(edits, 1):
-        if not isinstance(e, dict):
-            return f"第 {idx} 项须为对象（含 old_str/new_str）"
-        old, new = e.get("old_str"), e.get("new_str")
-        if not isinstance(old, str) or not isinstance(new, str):
-            return f"第 {idx} 项 old_str/new_str 须为字符串"
-        if not old:
-            return f"第 {idx} 项 old_str 不能为空"
-        if old == new:
-            return f"第 {idx} 项 old_str 与 new_str 相同"
-        items.append((old, new, bool(e.get("replace_all", False))))
-    refusal = toolstore.ledger_check(path)
-    if refusal:
-        log.warn("批量编辑门禁拦截: %s", path)
-        return refusal
-    try:
-        content, is_crlf, enc, err, bom = _load_editable(path)
-    except OSError as e:
-        return f"读取失败，发生错误: {e}"
-    if err:
-        log.warn("编辑中止: %s（%s）", path, err)
-        return err
-    original = content
-    total = 0
-    tol_items = 0
-    for idx, (old, new, replace_all) in enumerate(items, 1):
-        kind, new_content, info = _apply_replacement(content, old, new, replace_all)
-        if kind == _REPLACE_MISS:
-            return f"第 {idx} 项编辑失败，未做任何修改:\n{_edit_miss_feedback(old, content)}"
-        if kind == _REPLACE_MULTI:
-            count, spots = info
-            return (
-                f"第 {idx} 项匹配到 {count} 处（行号: {'、'.join(str(n) for n in spots)}），"
-                "未做任何修改；请为该项 old_str 扩展上下文，或设置其 replace_all=true"
-            )
-        if kind == _REPLACE_TOL_MULTI:
-            count, spots = info
-            return (
-                f"第 {idx} 项精确匹配 0 处，按行尾空白容差匹配到 {count} 处"
-                f"（行号: {'、'.join(str(n) for n in spots)}），"
-                "未做任何修改；请为该项 old_str 扩展上下文，或设置其 replace_all=true"
-            )
-        content = new_content
-        total += info
-        if kind == _REPLACE_TOL:
-            tol_items += 1
-    note = _changed_note(original, content)
-    snapshot.capture_before(path, tool="multi_edit")
-    _written, serr = _save_editable_msg(path, content, is_crlf, enc, bom)
-    if serr:
-        return serr
-    toolstore.ledger_register(path, content, source="multi_edit")
-    log.debug("批量编辑完成: %d 项替换 %d 处，写入 %d 字节", len(items), total, _written)
-    parts = []
-    if tol_items:
-        parts.append(f"{tol_items} 项经行尾空白容差匹配")
-    if enc != "utf-8":
-        parts.append(f"原编码 {enc} 已保留")
-    suffix = f"（{'，'.join(parts)}）" if parts else ""
-    return f"multi_edit 成功：{len(items)} 项编辑，共替换 {total} 处{suffix}\n{note}"
-
-
-@register.register(
     name="delete_file",
     description=(
         "Delete a single file safely: the file is moved to the project trash "
@@ -976,12 +859,17 @@ def tool_failure_hint(content: str) -> bool:
     return False
 
 
+# 变更类工具的成功回显彼此高度同构（批量重构实测相邻相似度 0.85-0.92），只按整串精确
+# 判重：模糊判重会把同一轮里的连续编辑误判为空转，在编辑已落盘后终止回合
+_EXACT_DEDUP_TOOLS = {"write", "edit_file", "delete_file"}
+
+
 class SpinGuard:
     """空转计数器：结果重复出现才开始计数，计满才终止回合，主循环与子代理循环共用。
 
-    结果键取工具名+目标，read 以 file_path 为目标，其余工具取去空白内容并辅以
-    ≥0.9 前缀相似度判重，覆盖读变化中文件、结果仅数字微变这类空转；
-    本轮含重复则计数累加，全部为新结果则清零；达到 kill_count 即 spun_out() 为真。
+    结果键取工具名+目标，read 以 file_path 为目标，变更类工具取整串内容精确判重，
+    其余工具取去空白内容并辅以 ≥0.9 前缀相似度判重，覆盖读变化中文件、结果仅数字微变
+    这类空转；本轮含重复则计数累加，全部为新结果则清零；达到 kill_count 即 spun_out() 为真。
     """
 
     FUZZ_RATIO = 0.9
@@ -1008,16 +896,21 @@ class SpinGuard:
             else:
                 body = re.sub(r"\s+", "", memory_mod.content_text(m.get("content")))
                 key = f"{tool}|{body}"
-                probe = body[: self.FUZZ_PREFIX]
-                recent = self.recent.setdefault(tool, [])
-                dup = key in self.seen or any(
-                    difflib.SequenceMatcher(None, probe, old).ratio() >= self.FUZZ_RATIO
-                    for old in recent
-                )
-                if not dup:
-                    self.seen.add(key)
-                    recent.append(probe)
-                    del recent[: -self.RECENT_CAP]
+                if tool in _EXACT_DEDUP_TOOLS:
+                    dup = key in self.seen
+                    if not dup:
+                        self.seen.add(key)
+                else:
+                    probe = body[: self.FUZZ_PREFIX]
+                    recent = self.recent.setdefault(tool, [])
+                    dup = key in self.seen or any(
+                        difflib.SequenceMatcher(None, probe, old).ratio() >= self.FUZZ_RATIO
+                        for old in recent
+                    )
+                    if not dup:
+                        self.seen.add(key)
+                        recent.append(probe)
+                        del recent[: -self.RECENT_CAP]
             if dup:
                 dups += 1
         self.count = self.count + dups if dups else 0
@@ -1831,7 +1724,7 @@ def _webfetch_download_images(targets: list) -> dict:
 
     with ThreadPoolExecutor(max_workers=_WEBFETCH_IMG_WORKERS) as pool:
         results = dict(pool.map(fetch_one, targets))
-    return {key: f"[图: {alt} | {results[key]} | read_image 可查看]" if alt else f"[图 | {results[key]} | read_image 可查看]"
+    return {key: f"[图: {alt} | {results[key]} | read 可查看]" if alt else f"[图 | {results[key]} | read 可查看]"
             for _, key, alt, _raw in targets}
 
 
@@ -1944,7 +1837,7 @@ def _webfetch_render(soup, page_url: str) -> tuple:
     description=(
         "Fetch a web page with real-browser headers and return the cleaned main "
         "text as markdown (scripts/nav/ads stripped). Content images are saved "
-        "to disk and annotated in place with their paths — use read_image to "
+        "to disk and annotated in place with their paths — use read to "
         "view them. Use this instead of curl/wget in execute_command"
     ),
     usage="webfetch <url> [timeout]",
@@ -2216,7 +2109,7 @@ def update_step_status(step_id: int, status: str, detail: str = "", external_han
 )
 def computer_use(action: str, params: Optional[dict] = None, external_handler=None) -> str:
     """computer-use 能力，必须经外部 API 接入；处理器返回 dict 可携带 images 本地图片路径列表，
-    执行层摘出随工具结果回注，多模态约定同 read_image"""
+    执行层摘出随工具结果回注，多模态约定同 read 的图片分支"""
     log.info("computer_use: %s params=%s", action, sorted((params or {}).keys()))
     result = hooks.call_user_participating(
         "computer_use",

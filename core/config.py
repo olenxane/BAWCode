@@ -66,7 +66,6 @@ def default_config() -> dict:
         "ui": {
             "theme": "dark",
             "mode": "auto",
-            "busy_send_mode": "queue",
             "logo": True,
             "send": "ctrl+enter",
             "newline": "shift+enter",
@@ -121,7 +120,6 @@ def default_config() -> dict:
                 "read_memory",
                 "rag_search",
                 "read",
-                "read_image",
                 "edit_file",
                 "write",
                 "task",
@@ -212,7 +210,7 @@ def default_config() -> dict:
             "call_timeout": 600,
             "auto_reconnect": True,
         },
-        # 回合快照与回收站（core/snapshot.py）：write/edit_file/multi_edit/delete_file
+        # 回合快照与回收站（core/snapshot.py）：write/edit_file/delete_file
         # 改动前留底原始字节，回合末落盘 data/snapshots/{project}/{session}/{序号}/，
         # /undo 校验 md5 后字节级还原（用户事后改过的文件跳过）；回合开始轻量清单
         # （不含内容）回合末对账，execute_command 等绕过写入工具的改动仅列出无法还原。

@@ -408,9 +408,9 @@ class PluginContext:
     def submit_turn(self, text: str) -> str:
         """以用户语义提交一条消息开启回合（等价主输入框发送）。
 
-        idle 直接开新回合；busy 按设置 busy_send_mode 排队或中断在途回合
-        （_AgentRunner.start/submit 原语义）。返回给用户看的状态说明；
-        调度器未注入（启动早期）返回提示且不提交。"""
+        idle 直接开新回合；busy 排队为当前回合结束后的新回合
+        （_AgentRunner.start/queue_turn 语义；插件外部消息不并入当前回合）。
+        返回给用户看的状态说明；调度器未注入（启动早期）返回提示且不提交。"""
         text = (text or "").strip()
         if not text:
             return "[空消息，未提交]"

@@ -335,6 +335,38 @@
   .cmd-row .c-name { font-family: var(--mono); font-size: 13px; color: var(--accent-deep); flex: none; }
   .cmd-row .c-hint { font-size: 12px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* 设置面板 */
+  .st-sec { margin-bottom: 14px; }
+  .st-sec > .st-head {
+    font-size: 12px; color: var(--faint); margin: 0 2px 6px; display: flex; align-items: center;
+    cursor: pointer; user-select: none;
+  }
+  .st-sec > .st-head::before { content: "▸"; margin-right: 6px; transition: transform .15s; }
+  .st-sec.open > .st-head::before { transform: rotate(90deg); }
+  .st-sec > .st-body { display: none; }
+  .st-sec.open > .st-body { display: block; }
+  .st-card { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+  .st-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
+  .st-row:first-child { border-top: none; }
+  .st-row label { flex: none; width: 110px; font-size: 12.5px; color: var(--dim); }
+  .st-row input[type="text"], .st-row input[type="number"], .st-row select {
+    flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px;
+    font: inherit; font-size: 12.5px; outline: none; background: var(--card); min-width: 0;
+  }
+  .st-row input:focus, .st-row select:focus { border-color: var(--accent); }
+  .st-row .st-toggle {
+    flex: none; width: 40px; height: 22px; border-radius: 999px; background: var(--line);
+    position: relative; cursor: pointer; transition: background .2s;
+  }
+  .st-row .st-toggle.on { background: var(--accent); }
+  .st-row .st-toggle::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: #fff; transition: transform .2s; box-shadow: 0 1px 2px rgba(0,0,0,.15);
+  }
+  .st-row .st-toggle.on::after { transform: translateX(18px); }
+  .st-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .st-note { font-size: 11px; color: var(--faint); margin-top: 4px; }
+
   /* toast */
   #toast {
     position: fixed; left: 50%; bottom: calc(84px + env(safe-area-inset-bottom)); transform: translateX(-50%) translateY(8px);
@@ -373,6 +405,7 @@
     <button class="d-tab active" data-tab="sessions">会话</button>
     <button class="d-tab" data-tab="control">控制</button>
     <button class="d-tab" data-tab="info">信息</button>
+    <button class="d-tab" data-tab="settings">设置</button>
   </div>
   <div class="d-body">
     <!-- 会话 -->
@@ -436,6 +469,13 @@
       <details class="acc" data-load="mcp"><summary>MCP 服务器</summary><div class="a-body"><div class="empty-note">展开加载…</div></div></details>
       <details class="acc" data-load="plugins"><summary>插件</summary><div class="a-body"><div class="empty-note">展开加载…</div></div></details>
       <details class="acc" data-load="help"><summary>命令帮助</summary><div class="a-body"><div class="empty-note">展开加载…</div></div></details>
+    </div>
+    <!-- 设置 -->
+    <div class="d-pane" id="pane-settings">
+      <div class="d-sec">
+        <div class="s-head">设置<button class="d-refresh" data-act="refresh-settings">刷新</button></div>
+        <div id="settings-body"><div class="empty-note">加载中…</div></div>
+      </div>
     </div>
   </div>
 </aside>
@@ -1097,7 +1137,7 @@ $("chip-model").onclick = () => openDrawer("control");
 $("chip-mode").onclick = () => openDrawer("control");
 desktopMQ.addEventListener("change", mq => { if (mq.matches) document.body.classList.remove("drawer-open"); });
 
-const tabLoaders = { sessions: loadSessions, control: loadControl, info: loadInfo };
+const tabLoaders = { sessions: loadSessions, control: loadControl, info: loadInfo, settings: loadSettings };
 function activateTab(name) {
   document.querySelectorAll(".d-tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
   document.querySelectorAll(".d-pane").forEach(p => p.classList.toggle("active", p.id === "pane-" + name));
@@ -1272,6 +1312,290 @@ async function doUndo(which) {
 
 /* ---- 信息面板 ---- */
 function loadInfo() { renderPlanCard(); }
+
+/* ---- 设置面板 ---- */
+let settingsData = null;
+async function loadSettings() {
+  const body = $("settings-body");
+  body.innerHTML = "";
+  body.append(el("div", "empty-note", "加载中…"));
+  try {
+    const r = await api("/api/settings");
+    if (!r.ok) { body.innerHTML = ""; body.append(el("div", "empty-note", r.message || "读取失败")); return; }
+    settingsData = r;
+    renderSettings(body, r);
+  } catch (e) {
+    body.innerHTML = ""; body.append(el("div", "empty-note", "网络错误: " + e));
+  }
+}
+
+function renderSettings(container, data) {
+  container.innerHTML = "";
+  const sections = [
+    { key: "provider", title: "提供商", build: buildProviderSection },
+    { key: "model", title: "模型", build: buildModelSection },
+    { key: "system", title: "系统", build: buildSystemSection },
+    { key: "shortcuts", title: "快捷键", build: buildShortcutsSection },
+    { key: "plugins", title: "插件", build: buildPluginsSection },
+  ];
+  for (const sec of sections) {
+    const div = el("div", "st-sec");
+    const head = el("div", "st-head", sec.title);
+    head.onclick = () => div.classList.toggle("open");
+    div.append(head);
+    const bodyEl = el("div", "st-body");
+    const card = el("div", "st-card");
+    sec.build(card, data[sec.key] || {});
+    bodyEl.append(card);
+    div.append(bodyEl);
+    container.append(div);
+  }
+  // 默认展开第一个
+  const first = container.querySelector(".st-sec");
+  if (first) first.classList.add("open");
+}
+
+function stRow(label, inputEl) {
+  const row = el("div", "st-row");
+  row.append(el("label", "", label));
+  row.append(inputEl);
+  return row;
+}
+function stInput(value, type) {
+  const inp = el("input");
+  inp.type = type || "text";
+  inp.value = value ?? "";
+  return inp;
+}
+function stSelect(options, current) {
+  const sel = el("select");
+  for (const opt of options) {
+    const o = el("option", "", opt);
+    o.value = opt;
+    if (opt === current) o.selected = true;
+    sel.append(o);
+  }
+  return sel;
+}
+function stToggle(on) {
+  const t = el("div", "st-toggle" + (on ? " on" : ""));
+  t.onclick = () => t.classList.toggle("on");
+  return t;
+}
+function stSaveBtn(section, collectFn) {
+  const btn = el("button", "btn small primary", "保存");
+  btn.onclick = async () => {
+    const values = collectFn();
+    btn.disabled = true;
+    try {
+      const r = await api("/api/settings", { section, values });
+      toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
+      if (r.ok) loadSettings();
+    } catch (e) { toast("网络错误: " + e, true); }
+    btn.disabled = false;
+  };
+  return btn;
+}
+
+function buildProviderSection(card, p) {
+  const providers = p.providers || [];
+  const pidInput = stInput(p.provider_id);
+  const nameInput = stInput(p.provider_name);
+  const keyInput = stInput(p.api_key);
+  const urlInput = stInput(p.base_url);
+  const balInput = stInput(p.balance_url);
+  const tempInput = stInput(p.temperature, "number");
+  tempInput.step = "0.1";
+  const defModelSel = stSelect(p.models || [], p.default_model_id);
+  const activeSel = stSelect(providers.map(x => x.provider_id), p.active_provider_id);
+  card.append(
+    stRow("激活提供商", activeSel),
+    stRow("提供商ID", pidInput),
+    stRow("显示名称", nameInput),
+    stRow("API Key", keyInput),
+    stRow("Base URL", urlInput),
+    stRow("余额URL", balInput),
+    stRow("默认温度", tempInput),
+    stRow("默认模型", defModelSel),
+  );
+  const note = el("div", "st-note", "修改后点击保存生效；API Key 明文存储于本地配置文件");
+  card.append(note);
+  const actions = el("div", "st-actions");
+  actions.append(stSaveBtn("provider", () => ({
+    active_provider_id: activeSel.value,
+    provider_id: pidInput.value,
+    provider_name: nameInput.value,
+    api_key: keyInput.value,
+    base_url: urlInput.value,
+    balance_url: balInput.value,
+    temperature: parseFloat(tempInput.value) || 1.0,
+    default_model_id: defModelSel.value,
+  })));
+  card.append(actions);
+}
+
+function buildModelSection(card, m) {
+  const modelSel = stSelect(m.model_names || [], m.active_model_name);
+  const midInput = stInput(m.model_id);
+  const modInput = stInput(m.modalities);
+  const ctxInput = stInput(m.context_window, "number");
+  const maxInput = stInput(m.max_tokens, "number");
+  const tempInput = stInput(m.temperature, "number");
+  tempInput.step = "0.1";
+  const thinkSel = stSelect(["none", "low", "medium", "high"], m.thinking_effort);
+  const planSel = stSelect(m.model_names || [], m.task_plan);
+  const codeSel = stSelect(m.model_names || [], m.task_code);
+  const revSel = stSelect(m.model_names || [], m.task_review);
+  card.append(
+    stRow("当前模型", modelSel),
+    stRow("模型ID", midInput),
+    stRow("支持模态", modInput),
+    stRow("最大上下文", ctxInput),
+    stRow("最大输出token", maxInput),
+    stRow("温度", tempInput),
+    stRow("思考强度", thinkSel),
+    stRow("规划模型", planSel),
+    stRow("编写模型", codeSel),
+    stRow("审查模型", revSel),
+  );
+  const actions = el("div", "st-actions");
+  actions.append(stSaveBtn("model", () => ({
+    select_model: modelSel.value,
+    active_model_name: modelSel.value,
+    model_id: midInput.value,
+    modalities: modInput.value,
+    context_window: parseInt(ctxInput.value) || 0,
+    max_tokens: parseInt(maxInput.value) || 0,
+    temperature: parseFloat(tempInput.value) || 1.0,
+    thinking_effort: thinkSel.value,
+    task_plan: planSel.value,
+    task_code: codeSel.value,
+    task_review: revSel.value,
+  })));
+  card.append(actions);
+}
+
+function buildSystemSection(card, s) {
+  const themeSel = stSelect(s.themes || ["dark"], s.theme);
+  const modeSel = stSelect(["auto", "manual", "full"], s.mode);
+  const logoTog = stToggle(s.logo);
+  const fontInput = stInput(s.font_size, "number");
+  const tipInput = stInput(s.tip_interval, "number");
+  const retryInput = stInput(s.retry_times, "number");
+  const delayInput = stInput(s.retry_delay, "number");
+  delayInput.step = "0.1";
+  const compressTog = stToggle(s.auto_compress);
+  const threshInput = stInput(s.compress_threshold, "number");
+  threshInput.step = "0.05";
+  const keepInput = stInput(s.compress_keep_recent_tokens, "number");
+  const sumInput = stInput(s.compress_summary_max_tokens, "number");
+  const wlInput = stInput(s.tool_whitelist);
+  const roundsInput = stInput(s.max_tool_rounds, "number");
+  const spinInput = stInput(s.spin_kill_count, "number");
+  const timeoutInput = stInput(s.max_tool_timeout, "number");
+  const askTog = stToggle(s.ask_user_timeout);
+  const wfTog = stToggle(s.workflow_enabled);
+  const wfSel = stSelect(s.workflows || [], s.workflow_active);
+  const logSel = stSelect(["debug", "info", "warn", "error", "off"], s.log_level);
+  card.append(
+    stRow("主题", themeSel),
+    stRow("访问模式", modeSel),
+    stRow("会话区Logo", logoTog),
+    stRow("字体大小", fontInput),
+    stRow("提示间隔秒", tipInput),
+    stRow("LLM重试次数", retryInput),
+    stRow("LLM重试延迟", delayInput),
+    stRow("自动压缩上下文", compressTog),
+    stRow("压缩阈值", threshInput),
+    stRow("压缩保留尾段token", keepInput),
+    stRow("摘要上限token", sumInput),
+    stRow("工具白名单", wlInput),
+    stRow("最大工具轮数", roundsInput),
+    stRow("空转计数上限", spinInput),
+    stRow("命令超时上限秒", timeoutInput),
+    stRow("询问自动超时", askTog),
+    stRow("启用工作流", wfTog),
+    stRow("工作流", wfSel),
+    stRow("日志等级", logSel),
+  );
+  const actions = el("div", "st-actions");
+  actions.append(stSaveBtn("system", () => ({
+    theme: themeSel.value,
+    mode: modeSel.value,
+    logo: logoTog.classList.contains("on"),
+    font_size: parseInt(fontInput.value) || 16,
+    tip_interval: parseFloat(tipInput.value) || 5,
+    retry_times: parseInt(retryInput.value) || 3,
+    retry_delay: parseFloat(delayInput.value) || 1.0,
+    auto_compress: compressTog.classList.contains("on"),
+    compress_threshold: parseFloat(threshInput.value) || 0.8,
+    compress_keep_recent_tokens: parseInt(keepInput.value) || 16384,
+    compress_summary_max_tokens: parseInt(sumInput.value) || 1024,
+    tool_whitelist: wlInput.value,
+    max_tool_rounds: parseInt(roundsInput.value) || 0,
+    spin_kill_count: parseInt(spinInput.value) || 12,
+    max_tool_timeout: parseInt(timeoutInput.value) || 600,
+    ask_user_timeout: askTog.classList.contains("on"),
+    workflow_enabled: wfTog.classList.contains("on"),
+    workflow_active: wfSel.value,
+    log_level: logSel.value,
+  })));
+  card.append(actions);
+}
+
+function buildShortcutsSection(card, s) {
+  const keys = [
+    ["switch_mode", "切换模式"], ["switch_focus", "切换焦点"], ["send", "发送"],
+    ["newline", "换行"], ["complete", "命令补全"], ["scroll_up", "滚动上"],
+    ["scroll_down", "滚动下"], ["expand", "树展开"], ["collapse", "树折叠"],
+    ["rollback", "树回退"],
+  ];
+  const inputs = {};
+  for (const [key, label] of keys) {
+    const inp = stInput(s[key] || "");
+    inputs[key] = inp;
+    card.append(stRow(label, inp));
+  }
+  const note = el("div", "st-note", "快捷键值如 shift+tab / ctrl+enter / f2 等");
+  card.append(note);
+  const actions = el("div", "st-actions");
+  actions.append(stSaveBtn("shortcuts", () => {
+    const out = {};
+    for (const [key] of keys) out[key] = inputs[key].value;
+    return out;
+  }));
+  card.append(actions);
+}
+
+function buildPluginsSection(card, plugins) {
+  if (!plugins || !plugins.length) {
+    card.append(el("div", "empty-note", "未发现插件"));
+    return;
+  }
+  const toggles = {};
+  for (const p of plugins) {
+    const loaded = p.status === "loaded";
+    const tog = stToggle(loaded);
+    toggles[p.id] = tog;
+    const row = stRow(p.name + " (" + p.id + ")", tog);
+    if (p.error) {
+      const err = el("div", "st-note", "错误: " + p.error);
+      err.style.color = "var(--red)";
+      row.append(err);
+    }
+    card.append(row);
+  }
+  const note = el("div", "st-note", "切换后点击保存生效（自动重载插件）");
+  card.append(note);
+  const actions = el("div", "st-actions");
+  actions.append(stSaveBtn("plugins", () => {
+    const out = {};
+    for (const [pid, tog] of Object.entries(toggles)) out[pid] = tog.classList.contains("on");
+    return out;
+  }));
+  card.append(actions);
+}
+
 function renderPlanCard() {
   const card = $("plan-card");
   card.innerHTML = "";
@@ -1366,6 +1690,7 @@ document.querySelector(".d-body").addEventListener("click", async e => {
     else if (act === "refresh-models") loadModels();
     else if (act === "refresh-workflows") loadWorkflows();
     else if (act === "refresh-undo") loadUndo();
+    else if (act === "refresh-settings") loadSettings();
     else if (act === "session-new") twoTap(btn, async () => {
       const r = await api("/api/session/new", {});
       toast(r.ok ? "新会话已开启" : (r.message || "失败"), !r.ok);

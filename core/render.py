@@ -76,6 +76,9 @@ _THINKING_PHRASES = (
 
 _HINT_ROTATE_SECONDS = 4.0
 
+# 提示行「本轮 token」流式增量的本地分词刷新间隔（秒）：已完成轮次即时累加，流式部分按此节流
+_TURN_TOKENS_REFRESH = 2.0
+
 # 树底阶段文案池：key=「 · 」前的阶段基名，值=按时间槽轮换的文案元组（帧循环无状态、线程安全）；
 # 带后缀的阶段（如「工具调用中 · read」）轮换基名文案、保留后缀；未登记的阶段按原样显示
 _PHASE_POOLS = {
@@ -92,7 +95,7 @@ _TOOL_CMD = {"execute_command", "run_program"}
 
 _TOOL_WRITE = {"write"}
 
-_TOOL_EDIT = {"edit_file", "multi_edit"}
+_TOOL_EDIT = {"edit_file"}
 
 _TOOL_CMD_OUTPUT_LINES = 3  # 命令类展开时显示的输出行数（超出折叠为「还有 N 行」）
 
@@ -148,6 +151,7 @@ DEFAULT_COLORS = {
 
 TIPS = [
     "界面输入框：Enter 提交 · Shift+Enter 换行 · Tab 补全/切焦点",
+    "回合中 Enter 插话并入本轮 · Ctrl+Q 排队为新回合 · Esc 打断回滚",
     "Shift+Tab 或 /mode 切换访问模式",
     "/model 切换模型 · /settings 打开设置",
     "树模式 Ctrl+Z 回退到选中节点 · 再按取消",
@@ -156,6 +160,24 @@ TIPS = [
     "中文输入时绘制合并刷新，候选上屏后自动更新",
     "/theme 列出并载入主题",
 ]
+
+def _fmt_elapsed(seconds: float) -> str:
+    """耗时人类可读：2m 25s / 45s / 1h 3m 7s"""
+    total = max(0, int(seconds or 0))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+def _fmt_tokens(n: int) -> str:
+    """token 数紧凑显示：999 / 1.2k / 16k"""
+    n = max(0, int(n or 0))
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000.0:.1f}".rstrip("0").rstrip(".") + "k"
 
 def _enable_windows_ansi() -> None:
     """Windows：仅开启输出 VT（0x0004）
@@ -1455,15 +1477,7 @@ class RenderMixin:
                 "content": body if isinstance(body, str) else str(body or ""),
             }
         if name in _TOOL_EDIT and not failed:
-            items: List[Tuple[str, str]] = []
-            if name == "multi_edit":
-                for e in args.get("edits") or []:
-                    if isinstance(e, dict):
-                        items.append((str(e.get("old_str") or ""), str(e.get("new_str") or "")))
-            else:
-                items.append((str(args.get("old_str") or ""), str(args.get("new_str") or "")))
-            if not items:
-                return None
+            items: List[Tuple[str, str]] = [(str(args.get("old_str") or ""), str(args.get("new_str") or ""))]
             return {
                 "tool_kind": "edit",
                 "path": str(args.get("file_path") or ""),
@@ -1849,6 +1863,36 @@ class RenderMixin:
         interval = float(self.keys.get("tip_interval") or 5)
         return TIPS[int(time.time() // interval) % len(TIPS)]
 
+    def _turn_tokens(self) -> int:
+        """本轮输出 token（本地分词累计）：已完成轮次即时累加，流式增量按 2 秒节流刷新"""
+        meter = getattr(self, "token_meter", None)
+        total = int(getattr(meter, "turn_output_tokens", 0) or 0) if meter is not None else 0
+        msg = getattr(self, "streaming_msg", None)
+        if not isinstance(msg, dict):
+            self._turn_tok_cache = None
+            return total
+        now = time.monotonic()
+        cache = getattr(self, "_turn_tok_cache", None)
+        if cache is not None and now - cache[0] < _TURN_TOKENS_REFRESH:
+            return total + cache[1]
+        text = str(msg.get("content") or "") + str(msg.get("thinking") or "")
+        counter = getattr(meter, "count_text", None)
+        streamed = counter(text) if (callable(counter) and text) else 0
+        self._turn_tok_cache = (now, streamed)
+        return total + streamed
+
+    def _turn_status_suffix(self) -> str:
+        """回合进行中的提示后缀：用时 · 本轮 token · 按键提示；空闲返回空串"""
+        if not getattr(self, "busy", False):
+            return ""
+        start = float(getattr(self, "turn_start_time", 0.0) or 0.0)
+        if start <= 0:
+            return ""
+        return (
+            f" ({_fmt_elapsed(time.monotonic() - start)}"
+            f" · ↑ {_fmt_tokens(self._turn_tokens())} tokens · esc to cancel/enter to send)"
+        )
+
     def _compose_plain(self, width: int, height: int) -> List[str]:
         w = max(40, width)
         h = max(20, height)
@@ -2020,7 +2064,13 @@ class RenderMixin:
             + mode_c + mode_label + self.RESET
         )
         lines.append(_clip_keep_ansi(info, w))
-        lines.append(self.c("dim") + _clip(self._rotating_tip(), w) + self.RESET)
+        tip_suffix = self._turn_status_suffix()
+        if tip_suffix:
+            # 后缀优先占位，轮换文案按剩余宽度裁剪，保证用时/token 始终可见
+            tip_text = _clip(self._rotating_tip(), max(0, w - _display_width(tip_suffix))) + tip_suffix
+        else:
+            tip_text = self._rotating_tip()
+        lines.append(self.c("dim") + _clip(tip_text, w) + self.RESET)
         lines.append(self._rule(w))
 
         # 状态栏：token / 余额

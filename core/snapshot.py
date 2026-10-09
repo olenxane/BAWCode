@@ -2,7 +2,7 @@
 #快照管线行为：
 #- 回合开始做轻量清单（路径+mtime+size，不含内容），回合末对账——execute_command 等
 #  绕过写入工具的改动至少能在 /undo 里明确列出"无法自动还原"，不装作没发生
-#- 四个文件写入工具（write 全量/位置、edit_file、multi_edit）+ delete_file 在改动前
+#- 两个文件写入工具（write 全量/位置、edit_file）+ delete_file 在改动前
 #  capture_before 留底原始字节（字节级还原保编码/CRLF 保真），tool 名记入索引——
 #  这就是"成功的文件修改工具调用历史"（上下文回合末剥离会丢参数，必须在捕获时落索引）
 #- 回退由程序确定性执行（不走模型）：逆操作重放对 edit 顺序/多处匹配敏感，write 覆盖

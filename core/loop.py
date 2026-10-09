@@ -81,6 +81,23 @@ def check_cancel(turn: TurnContext) -> None:
         raise TurnInterrupt()
 
 
+def drain_injections(turn: TurnContext) -> int:
+    """把回合进行中到达的插话并入当前会话（作为 user 消息），返回并入条数。
+
+    插话由主线程入队（app.inject_queue），回合循环在每轮取走——下一轮
+    build_messages 即包含它，模型在当前回合内看到并回应；回合收尾前再取一次，
+    有插话则多跑一轮，避免插话落在末尾被丢弃。"""
+    app = turn.app
+    take = getattr(app, "take_injections", None)
+    pending = take() if callable(take) else []
+    for text in pending:
+        turn.session.add_message("user", text, type="task")
+    if pending:
+        turn.io.status(f"插话 {len(pending)} 条 · 并入当前回合")
+        log.info("插话并入当前回合: %d 条", len(pending))
+    return len(pending)
+
+
 def ensure_system_prompt(turn: TurnContext, files=None) -> None:
     """注入系统提示词：写入 turn.system_prompt_text，会话无 system_prompt 记录时补一条"""
     # get_system_prompt 内部已带兜底回落，不会向外抛错
@@ -141,6 +158,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         io.status(f"推理 · 第{round_no + 1}轮")
         while True:
             io.phase("思考中")
+            drain_injections(turn)  # 回合中插话：并入本回合，下一轮模型即看到
             payload = session.build_messages(extra_system=extra_system)
             llm.meter.measure_context(payload)
             response = llm.chat(payload, tools=register.get_tool_defs(), model=model, on_delta=io.on_delta)
@@ -172,6 +190,10 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             session.add_message("assistant", response["content"], **extra)
         tool_calls = response.get("tool_calls") or []
         if not tool_calls:
+            if drain_injections(turn):
+                # 回合收尾前有插话：不结束，再跑一轮回应插话（仍属当前回合）
+                io.status("插话并入 · 继续")
+                continue
             io.phase("")  # 回合完成：状态行空行占位
             log.info("任务完成（共%d轮推理）", round_no + 1)
             if not io.cancelled():

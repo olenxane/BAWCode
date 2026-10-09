@@ -171,6 +171,22 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.phase_hint = ""  # 树底阶段提示：思考中/工具调用中/空（完成）
         # 回合进行中标志（main._AgentRunner 镜像写入，跨线程只读）：树回退等操作据此拒绝
         self.busy = False
+        # 回合计时与本轮 token 基线：agent 线程回合起始写入，帧循环只读
+        self.turn_start_time = 0.0
+        self.turn_user_text = ""
+        # 流式 token 本地分词的 2 秒节流缓存：(时间戳, token 数)
+        self._turn_tok_cache = None
+        # Esc 打断回滚后的输入回填单槽：agent 线程写、帧尾取回
+        self.restore_input: Optional[str] = None
+        # 主循环注册的 Esc 打断回调，返回是否已触发；None=未注册
+        self.interrupt_turn_handler = None
+        # 回合中插话队列（普通 Enter 提交）：主线程入队、回合循环取走并入当前回合
+        self.inject_queue: List[str] = []
+        self.inject_lock = threading.Lock()
+        # Ctrl+Q 排队提交标记：read_line 返回后由主循环取回（排队=当前回合结束后新回合）
+        self._submit_queued = False
+        # 本次提交是否含图片：含图片的提交不插话，排队为新回合（图片按回合起始消费）
+        self._submit_has_images = False
         # 树回退（Ctrl+Z）的取消暂存：{"cut","messages","session_id"}；末条 _rollback_note 标记配合校验
         self._conv_stash: Optional[dict] = None
         self.logo_enabled = True
@@ -521,6 +537,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 # 读键泵崩溃：对话框永远等不到键，按空行收场防回合永久挂起
                 return ""
             self._tick_paste_async()
+            self._tick_restore_input()
             self._selection_tick()
             self.render()
             frame_deadline += self._frame_time
@@ -593,6 +610,62 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self.status = "剪贴板图片保存失败（详见日志）"
         self.render()
 
+    def _tick_restore_input(self) -> None:
+        """帧尾取回 Esc 打断回填的单槽；输入框非空则不覆盖用户新输入"""
+        text = self.restore_input
+        if text is None:
+            return
+        self.restore_input = None
+        if self._buf_text().strip():
+            self.status = "已回滚到回合前（输入框已有内容，未回填原消息）"
+            return
+        self._buf_set(text, len(text))
+        self.status = "已回滚到回合前，原消息已回到输入框"
+        self.render()
+
+    def take_injections(self) -> List[str]:
+        """取走并清空回合中插话队列（线程安全）：回合循环与主循环收尾共用"""
+        with self.inject_lock:
+            if not self.inject_queue:
+                return []
+            pending = list(self.inject_queue)
+            self.inject_queue.clear()
+            return pending
+
+    def consume_queued_submit(self) -> bool:
+        """取回并复位 Ctrl+Q 排队提交标记（主循环用）"""
+        queued = self._submit_queued
+        self._submit_queued = False
+        return queued
+
+    def consume_submit_images(self) -> bool:
+        """取回并复位「本次提交含图片」标记（主循环用）：含图片的提交不插话，排队为新回合"""
+        has = self._submit_has_images
+        self._submit_has_images = False
+        return has
+
+    def _submit_line(self) -> str:
+        """提交输入框内容：展开粘贴占位、记录历史、清空缓冲，返回提交行"""
+        line = self._buf_text()
+        images = None
+        if line.startswith("/"):
+            # 命令行不展开粘贴占位（占位机制只服务对话消息）
+            self.paste.reset()
+        else:
+            line, images = self.paste.expand(line)
+            if images:
+                self.pending_images.append(images)
+        self._submit_has_images = bool(images)
+        if line.strip():
+            self.input_history.append(line)
+            if self._llm_retry_gate is not None:
+                # 等待重试时提交新消息：自动放弃当前错误
+                self._llm_retry_gate.give_up.set()
+        self.hist_index = len(self.input_history)
+        self._buf_clear()
+        self.candidates = []
+        return line
+
     def _dispatch_key(self, kind: str, value: Any, config=None) -> Optional[str]:
         """返回 None 表示继续循环；返回 str 为提交行。"""
         # 鼠标事件不走键表（也不必重编译键位表：拖拽中 move 事件高频）
@@ -621,6 +694,23 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         if kind == "hotkey" and str(value) == "ctrl+v" and self.focus == "input":
             self._handle_clipboard_paste()
             return None
+
+        # Ctrl+Q：排队提交（当前回合结束后作为新回合发送）；空闲时等同普通提交
+        # 弹窗（含嵌套 line 输入）期间不拦截，避免污染主循环的排队标记
+        if kind == "hotkey" and str(value) == "ctrl+q" and self.focus == "input" and not self._dialog_active:
+            if self._buf_text().strip():
+                self._submit_queued = True
+                return self._submit_line()
+            return None
+
+        # Esc：回合进行中=打断并回滚到回合前（含文件与输入回填）；空闲保持原清空语义
+        # 弹窗（含嵌套 line 输入）期间 _dialog_active 为真，Esc 语义交给弹窗自身
+        if kind == "escape" and self.busy and not self._dialog_active:
+            handler = self.interrupt_turn_handler
+            if callable(handler) and handler():
+                self.status = "正在打断回合…"
+                self.render()
+                return None
 
         # LLM 错误重试闸激活时：Ctrl+Y 放行重试、Esc 放弃；其余按键照常分发
         gate = self._llm_retry_gate
@@ -655,23 +745,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 self.render()
                 return None
             # SEND 在树上也提交
-            line = self._buf_text()
-            if line.startswith("/"):
-                # 命令行不展开粘贴占位（占位机制只服务对话消息）
-                self.paste.reset()
-            else:
-                line, images = self.paste.expand(line)
-                if images:
-                    self.pending_images.append(images)
-            if line.strip():
-                self.input_history.append(line)
-                if self._llm_retry_gate is not None:
-                    # 等待重试时提交新消息：自动放弃当前错误，消息经 busy 队列接力
-                    self._llm_retry_gate.give_up.set()
-            self.hist_index = len(self.input_history)
-            self._buf_clear()
-            self.candidates = []
-            return line
+            return self._submit_line()
 
         if act == Action.INSERT:
             s = value if isinstance(value, str) else ""

@@ -686,6 +686,8 @@ class Memory:
             file_path = str((args or {}).get("file_path") or "")
             if file_path:
                 extra["file_path"] = file_path  # 随消息留档，供回合末剥离记录附新鲜度状态
+                if image_parts:
+                    extra["image_read"] = True  # 图片读取不进台账，剥离时不附编辑新鲜度提示
         message = self.add_message("tool", message_content, **extra)
         if persist_path is not None:
             message["persisted"] = True
@@ -753,7 +755,7 @@ class Memory:
             parts.append(f"call_id={message['tool_call_id']}")
         if message.get("persist_path"):
             parts.append(f"完整输出: {message['persist_path']}")
-        if message.get("tool_name") == "read" and message.get("file_path"):
+        if message.get("tool_name") == "read" and message.get("file_path") and not message.get("image_read"):
             # 剥离后的 read 记录升级为状态路标：模型据此判断可否直接 edit_file，免一次试探
             parts.append(f"[{toolstore.ledger_fresh_hint(Path(message['file_path']))}]")
         message["content"] = " ".join(parts)
