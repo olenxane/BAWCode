@@ -21,7 +21,7 @@ from core import policy
 from core import prompt_loader
 from core import register
 from core import tokens as tokenmod
-from core.config import normalize_base_url
+from core.config import THINKING_OPTIONS, normalize_base_url
 from core.log import get_logger
 
 log = get_logger("llm")
@@ -48,23 +48,24 @@ def _is_retryable_error(e: BaseException) -> bool:
     return isinstance(e, (urllib.error.URLError, ConnectionError, TimeoutError))
 
 
-def _fallback_system_prompt() -> str:
-    return (
-        "你是 BAWCode 编码 Agent。根据用户任务与记忆/计划/步骤工作。"
-        "复杂任务先 write_plan / generate_steps；执行中 update_step_status。"
-        "工具调用可能被安全策略拦截，收到用户拒绝 error 时说明原因并调整。"
-        "回复使用简洁中文。"
-    )
+# 思考文本字段名各厂商不同，按序取首个非空
+_REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking_content", "thinking")
+
+
+def _reasoning_of(mapping) -> str:
+    """从响应 message 或流式 delta 取思考文本，取不到返回空串"""
+    if not isinstance(mapping, dict):
+        return ""
+    for key in _REASONING_FIELDS:
+        value = mapping.get(key)
+        if value:
+            return value if isinstance(value, str) else str(value)
+    return ""
 
 
 def get_system_prompt(config=None, files: Optional[List[str]] = None, **kwargs) -> str:
     """从 core/prompts 加载系统提示词（占位符替换）；files 覆盖默认文件组"""
-    try:
-        return prompt_loader.get_system_prompt(config=config, files=files, **kwargs)
-    except Exception as e:
-        log.warn("加载系统提示词失败，使用兜底: %s", e)
-        return _fallback_system_prompt()
-
+    return prompt_loader.get_system_prompt(config=config, files=files, **kwargs)
 
 class _StreamAggregate:
     """流式 chunk 聚合器：content/reasoning_content/tool_calls 增量累积，
@@ -298,7 +299,7 @@ class LLM:
             return  # usage 终块 choices 为空
         head = choices[0] or {}
         delta = head.get("delta") or head.get("message") or {}
-        agg.add_reasoning(delta.get("reasoning_content") or "")
+        agg.add_reasoning(_reasoning_of(delta))
         agg.add_content(delta.get("content") or "")
         for i, tc in enumerate(delta.get("tool_calls") or []):
             if isinstance(tc, dict):
@@ -515,6 +516,11 @@ class LLM:
             "temperature": req.get("temperature", 1.0) if temperature is None else temperature,
             "max_tokens": int(req.get("max_tokens") or 2048),
         }
+        # 思考强度 → reasoning_effort；none 不发，避免厂商因未知参数报错
+        # 各厂商思考字段形态不同，后续在此处按 provider 分派，勿散落到调用点
+        effort = str(req.get("thinking_effort") or "none").lower()
+        if effort != "none" and effort in THINKING_OPTIONS:
+            payload["reasoning_effort"] = effort
         if tools:
             payload["tools"] = tools
             # DeepSeek 思考模式不支持 required/指定 function，固定 auto
@@ -656,7 +662,7 @@ class LLM:
                 }
             )
         content = message.get("content") or ""
-        reasoning = message.get("reasoning_content") or ""
+        reasoning = _reasoning_of(message)
         if reasoning and not content and not keep_reasoning:
             # 无工具的内部文本调用（计划/压缩/判定/refine）：仅思考时顶替 content，保住下游取得到文本；
             # agent 工具轮（keep_reasoning=True）不顶替——思考进 thinking 字段，回合末可整体剥离

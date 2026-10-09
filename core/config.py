@@ -148,11 +148,14 @@ def default_config() -> dict:
         # （项目级 {workspace}/.bawcode/plugins 同名覆盖全局）。插件可注册 hooks/
         # commands/tools/skills/上下文补充；enabled=false 全局关闭；disable 按 id
         # 禁用单个插件（/plugin disable 写入）。plugins_config.<id> 为插件私有配置
-        # （插件经 ctx.settings 读取，宿主不解释其内容）。
+        # （插件经 ctx.settings 读取，宿主不解释其内容）。插件目录可带
+        # requirements.txt 声明独有依赖：装载时缺失项经 pip 静默补齐；
+        # auto_install_deps=false 时只检查不安装，缺依赖记入 /plugin 诊断。
         "plugins": {
             "enabled": True,
             "dir": "data/plugins",
             "disable": [],
+            "auto_install_deps": True,
         },
         "plugins_config": {},
         # 外置工作流（core/workflow.py）：enabled=false（默认）时用户直接与 LLM 对话

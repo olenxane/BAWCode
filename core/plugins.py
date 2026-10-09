@@ -7,10 +7,10 @@
 #   plugin.json   清单（id 必填；entry 缺省 main.py；enabled 缺省 true）
 #   main.py       入口模块，定义 setup(ctx)；ctx 提供 hooks/commands/tools/补充注册 API
 #   skills/<n>/SKILL.md   可选，自动并入技能系统（项目级技能仍最高优先）
-#   requirements.txt      可选，插件独有依赖；装载时缺失项经 pip 自动补齐（不随主程序安装）
+#   requirements.txt      可选，插件独有依赖；装载时缺失项经 pip 自动补齐，不随主程序安装
 #
 # 生命周期：启动 discover→逐个装载（错误隔离，失败不影响其他插件）；启用的插件
-# 先按 requirements.txt 补齐依赖（config.plugins.auto_install_deps 可关），再 import+setup；
+# 先按 requirements.txt 补齐依赖，再 import+setup；auto_install_deps 可关；
 # /plugin reload 卸载重载（按 owner 注销 hooks/commands/tools）；
 # 禁用持久化到 config.plugins.disable。
 #
@@ -470,22 +470,22 @@ class PluginContext:
 
 
 # ---------------------------------------------------------------------------
-# 插件依赖（requirements.txt）：首次装载时检查缺失项并经 pip 静默补齐
+# 插件依赖：首次装载时读 requirements.txt，缺失项经 pip 静默补齐
 
 
 _REQ_FILE = "requirements.txt"
-_PIP_TIMEOUT = 900  # pip 安装整体超时（秒）：大型包（GUI/语言包）留足下载时间
+_PIP_TIMEOUT = 900  # pip 安装整体超时秒数，大型包留足下载时间
 _NO_DEPS: Dict[str, Any] = {"status": "none", "missing": [], "error": ""}
 
 
 def _auto_install_enabled(config) -> bool:
-    """config.plugins.auto_install_deps（缺省 true）：是否允许自动安装插件依赖"""
+    """config.plugins.auto_install_deps，缺省 true；是否允许自动安装插件依赖"""
     cfg = (getattr(config, "data", None) or {}).get("plugins") or {}
     return bool(cfg.get("auto_install_deps", True))
 
 
 def _read_requirements(dir_path: Path) -> List[str]:
-    """读取插件 requirements.txt 的有效依赖行（跳过空行/注释）；无文件返回 []"""
+    """读取 requirements.txt 的有效依赖行；跳过空行与注释，无文件返回 []"""
     req_file = dir_path / _REQ_FILE
     if not req_file.is_file():
         return []
@@ -498,7 +498,7 @@ def _read_requirements(dir_path: Path) -> List[str]:
 
 
 def _split_requirement(line: str) -> tuple:
-    """解析依赖行为 (发行名, SpecifierSet|None)；非 PEP 508 行（pip 选项/URL/可编辑）返回 (None, None)"""
+    """解析依赖行为 发行名与版本约束；非 PEP 508 行返回 None"""
     if _Requirement is not None:
         try:
             req = _Requirement(line)
@@ -507,7 +507,7 @@ def _split_requirement(line: str) -> tuple:
         if req.marker is not None:
             try:
                 if not req.marker.evaluate():
-                    return None, None  # 环境标记不适用（如 python_version<"3.8"）
+                    return None, None  # 环境标记不适用，如 python_version<"3.8"
             except Exception:
                 return None, None
         return req.name, req.specifier
@@ -516,7 +516,7 @@ def _split_requirement(line: str) -> tuple:
 
 
 def _missing_requirements(reqs: List[str]) -> List[str]:
-    """返回当前环境未满足（未安装或版本不符）的依赖行"""
+    """返回当前环境未满足的依赖行，含未安装与版本不符"""
     missing: List[str] = []
     for line in reqs:
         name, spec = _split_requirement(line)
@@ -536,7 +536,7 @@ def _missing_requirements(reqs: List[str]) -> List[str]:
 
 
 def _pip_install(pid: str, req_file: Path) -> tuple:
-    """调用当前解释器的 pip 安装插件依赖文件；返回 (ok, 输出尾部摘要)"""
+    """经当前解释器的 pip 安装插件依赖文件；返回成功标志与输出尾部摘要"""
     cmd = [
         sys.executable, "-m", "pip", "install", "-r", str(req_file),
         "--disable-pip-version-check", "--no-input",
@@ -560,10 +560,10 @@ def _pip_install(pid: str, req_file: Path) -> tuple:
 def _ensure_requirements(pid: str, dir_path: Path, config) -> dict:
     """检查并静默补齐插件目录 requirements.txt 声明的依赖。
 
-    只在缺失时调用一次 pip（已满足则零开销跳过）。返回记录：
+    已满足则零开销跳过，只在缺失时调用一次 pip。返回记录：
       {"status": "none"|"ok"|"installed"|"manual"|"failed", "missing": [...], "error": str}
       none=无 requirements.txt；ok=依赖齐备；installed=已补装成功；
-      manual=缺依赖但已关闭自动安装；failed=补装失败（不阻断装载，插件自行降级）
+      manual=缺依赖但已关闭自动安装；failed=补装失败，不阻断装载，插件自行降级
     """
     none = {"status": "none", "missing": [], "error": ""}
     if not (dir_path / _REQ_FILE).is_file():
@@ -659,7 +659,7 @@ def _load_one(item: dict, config, workspace: Path) -> None:
         }
         log.debug("插件跳过（%s）: %s", reason, pid)
         return
-    # 依赖先于 import：requirements.txt 的缺失项在此静默补齐（失败不阻断，插件可自行降级）
+    # 依赖先于 import：requirements.txt 缺失项在此静默补齐，失败不阻断，插件可自行降级
     deps = _ensure_requirements(pid, item["dir"], config)
     ctx = PluginContext(pid, item["dir"], manifest, item["source"], config, workspace)
     record = {
@@ -793,7 +793,7 @@ def summary() -> dict:
 
 
 def _deps_note(deps: Optional[dict]) -> str:
-    """依赖状态在 /plugin 行内的简短标注（none/ok 不标注，避免噪声）"""
+    """依赖状态在 /plugin 行内的简短标注；none 与 ok 不标注"""
     deps = deps or {}
     st = deps.get("status")
     missing = deps.get("missing") or []

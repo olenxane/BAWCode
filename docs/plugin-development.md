@@ -92,6 +92,7 @@ def setup(ctx):
 my-plugin/
 ├── plugin.json        # 清单（推荐但非必需，见 §3）
 ├── main.py            # 入口：定义 setup(ctx)（entry 可指定其他文件名）
+├── requirements.txt   # 可选：插件独有依赖，装载时缺失项自动补齐（见 §2.3）
 ├── skills/            # 可选：插件自带技能，自动并入技能系统（见 §8）
 │   └── my-usage/
 │       └── SKILL.md
@@ -101,6 +102,32 @@ my-plugin/
 
 最小要求：目录里有 `main.py` 即可装载（此时清单字段全部取缺省值，`id` 取目录名）。
 **没有 `main.py` 且没有 `plugin.json` 的目录会装载失败**（状态 `[失败]`，不影响其他插件）。
+
+### 2.3 插件依赖（requirements.txt）
+
+插件的第三方依赖**不随主程序安装**——请在插件目录放一份 `requirements.txt`（标准 PEP 508
+格式，每行一个依赖，支持版本约束与 `#` 注释），宿主会在**首次装载该插件时**检查并按需
+静默 `pip install -r requirements.txt` 补齐缺失项：
+
+```
+# requirements.txt 示例
+websockets>=13
+Pillow>=10
+```
+
+规则与注意：
+
+- **只检查、只安装缺失项**：依赖已满足时零开销跳过（不调用 pip）；版本不满足（如已装
+  `websockets 12` 而要求 `>=13`）也视为缺失并补装
+- 安装用**当前运行 BAWCode 的解释器**（`sys.executable -m pip`），装进同一环境；完成后
+  复核，个别仍不满足的记入 `/plugin` 诊断
+- **失败不阻断装载**：pip 失败（断网/无 pip）只写日志（`data/log`，命名空间 `plugins`），
+  插件照常 `import + setup`——依赖可选的插件应自行 `try/except ImportError` 降级
+  （如自带工具缺依赖时不注册、命令给出缺失提示）
+- 关闭自动安装：`config.plugins.auto_install_deps = false`（此时仅检查，缺依赖状态显示在
+  `/plugin` 的"未自动装"标注里，需用户自行安装）
+- 插件依赖请在 `requirements.txt` 声明，**不要**写进主程序根目录的 `requirements.txt`
+- 安装可能耗时（下载大型包），且发生在启动/装载阶段——首次装载会短暂阻塞，属预期
 
 ---
 
@@ -543,7 +570,8 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
   "plugins": {
     "enabled": true,          // false = 全局关闭，所有插件不装载
     "dir": "data/plugins",    // 全局插件目录（相对路径相对 BAWCode 根）
-    "disable": ["some-id"]    // 禁用的插件 id 列表（/plugin enable/disable 维护）
+    "disable": ["some-id"],   // 禁用的插件 id 列表（/plugin enable/disable 维护）
+    "auto_install_deps": true // 装载时按插件 requirements.txt 静默补装缺失依赖（见 §2.3）
   },
 
   // 插件私有配置：键 = 插件 id；声明过的键由设置面板"插件"页维护，
@@ -624,7 +652,8 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
  ├─ Config 加载
  ├─ plugins.load()            ← 插件装载（先于会话，可收 session_start）
  │   ├─ discover()            双层目录扫描 + 覆盖解析
- │   ├─ _load_one() × N       逐个：import 入口 → setup(ctx) → 登记注册量
+ │   ├─ _load_one() × N       逐个：按 requirements.txt 静默补齐依赖（见 §2.3）
+ │   │                        → import 入口 → setup(ctx) → 登记注册量
  │   │                        （单插件失败：回滚其注册，继续下一个）
  │   └─ _sync_plugin_skills() 插件 skills/ 并入技能系统
  ├─ init_session()            ← session_start 事件触发
@@ -699,7 +728,8 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 **Q：如何分发？**
 把插件目录打成 zip 即可。接收方解压到 `data/plugins/`（全局）或
 `.bawcode/plugins/`（项目）。发布前在 `plugin.json` 写明 `version` 与 `description`，
-并提供 `config.plugins_config` 的建议配置示例。
+并提供 `config.plugins_config` 的建议配置示例。若插件有第三方依赖，附上
+`requirements.txt`（见 §2.3），宿主会在首次装载时自动补齐，接收方无需手工安装。
 
 ---
 

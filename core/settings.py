@@ -19,26 +19,26 @@ from core.textbuf import TextBuffer
 log = get_logger("settings")
 
 
-# ----- ui 层纯函数（模块级，运行期惰性导入避免循环依赖）-----
+# ----- 渲染层纯函数：运行期惰性导入，避免循环依赖 -----
 
 def _clip(text: str, width: int) -> str:
-    from core import ui
-    return ui._clip(text, width)
+    from core import render
+    return render._clip(text, width)
 
 
 def _clip_keep_ansi(text: str, width: int) -> str:
-    from core import ui
-    return ui._clip_keep_ansi(text, width)
+    from core import render
+    return render._clip_keep_ansi(text, width)
 
 
 def _pad(text: str, width: int) -> str:
-    from core import ui
-    return ui._pad(text, width)
+    from core import render
+    return render._pad(text, width)
 
 
 def _display_width(text: str) -> int:
-    from core import ui
-    return ui._display_width(text)
+    from core import render
+    return render._display_width(text)
 
 
 def _read_key():

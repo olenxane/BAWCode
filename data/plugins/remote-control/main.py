@@ -28,7 +28,10 @@
   hooks 事件 stream_delta / turn_status（collect）；
   plugins.runtime() 只读运行时载体；ctx.register_teardown 卸载回调。
 """
+import difflib
+import functools
 import hmac
+import html
 import json
 import queue
 import secrets
@@ -38,6 +41,7 @@ import uuid
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -46,6 +50,11 @@ try:
 except ImportError:  # 插件目录被单独导入（类型检查等场景）时的防御
     memory_mod = None
     plugins_mod = None
+
+try:
+    from core.tools import tool_failure_hint
+except ImportError:
+    tool_failure_hint = None
 
 try:  # 远程命令/信息面板依赖的宿主模块（缺失时对应端点降级提示）
     from core import commands as commands_mod
@@ -68,8 +77,202 @@ except ImportError:
     subagent_mod = None
     workflow_mod = None
 
+try:  # 语法高亮 / diff：与 TUI（core/render.py）同源 pygments，缺失时降级为纯文本
+    from pygments import highlight as _pyg_highlight
+    from pygments.formatters import HtmlFormatter as _PygHtmlFormatter
+    from pygments.lexers import get_lexer_for_filename as _pyg_lexer_for_filename
+    from pygments.util import ClassNotFound as _PygClassNotFound
+
+    HAS_PYGMENTS = True
+except ImportError:
+    HAS_PYGMENTS = False
+
 KEY_VALID_DAYS = 7
 SSE_HEARTBEAT = 10  # 秒；顺带用于探测死连接与退出检查
+
+# ---- 渲染辅助：与 TUI core/render.py 对齐的工具分类 / pygments 高亮 / diff ----
+# 分类口径与 TUI 的 _tool_display_meta 保持一致；插件不依赖宿主内部实现，逻辑在此独立实现
+_HL_STYLE = "monokai"          # pygments 高亮风格，与 TUI 的 _HL_STYLE 一致
+_HL_CLASS = "hl"               # 词法样式作用域类名
+_TOOL_CMD = {"execute_command", "run_program"}
+_TOOL_WRITE = {"write"}
+_TOOL_EDIT = {"edit_file", "multi_edit"}
+_PLAN_TOOLS = {"write_plan", "update_plan", "generate_steps", "update_step_status"}
+_WRITE_MAX_LINES = 500         # 写入高亮行数上限，防大文件拖垮网页
+_DIFF_MAX_LINES = 600          # 单处 diff 行数上限
+
+def _as_text(value) -> str:
+    """工具参数取值转文本：数组形态 content 优先取文本部分"""
+    if memory_mod is not None:
+        try:
+            return memory_mod.content_text(value)
+        except Exception:
+            pass
+    if isinstance(value, str):
+        return value
+    return "" if value is None else str(value)
+
+def _esc(text) -> str:
+    return html.escape(str(text or ""), quote=False)
+
+def _lexer_for(filename: str):
+    if not HAS_PYGMENTS or not filename:
+        return None
+    try:
+        return _pyg_lexer_for_filename(filename)
+    except _PygClassNotFound:
+        return None
+    except Exception:
+        return None
+
+@functools.lru_cache(maxsize=32)
+def _hl_lines(filename: str, code: str) -> Tuple[str, ...]:
+    """代码 → 逐行 HTML（monokai 词法着色）；无 pygments 或行数错位时降级为转义纯文本"""
+    want = (code or "").splitlines() or [""]
+    lexer = _lexer_for(filename)
+    if lexer is None:
+        return tuple(_esc(line) for line in want)
+    try:
+        text = _pyg_highlight(code, lexer, _PygHtmlFormatter(nowrap=True, style=_HL_STYLE))
+    except Exception:
+        return tuple(_esc(line) for line in want)
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if len(lines) != len(want):
+        return tuple(_esc(line) for line in want)
+    return tuple(lines)
+
+@functools.lru_cache(maxsize=1)
+def _hl_css() -> str:
+    """monokai 词法样式表，限定在 .hl 作用域；随 /api/hlcss 下发一次"""
+    base = (
+        f".{_HL_CLASS}{{background:#272822;color:#f8f8f2}}"
+        f".{_HL_CLASS} .hll{{background:#49483e}}"
+    )
+    if not HAS_PYGMENTS:
+        return base
+    try:
+        raw = _PygHtmlFormatter(style=_HL_STYLE).get_style_defs(f".{_HL_CLASS}")
+    except Exception:
+        return base
+    # 只保留 .hl 作用域内的规则；丢弃 pygments 顺带产出的全局 pre/linenos 规则，避免污染现有样式
+    sel = f".{_HL_CLASS}"
+    defs = "\n".join(line for line in raw.splitlines() if sel in line)
+    return base + defs
+
+@functools.lru_cache(maxsize=16)
+def _diff_items(filename: str, old: str, new: str) -> List[dict]:
+    """old→new 差分 → [{t, html}]；t 为 ' ' / '-' / '+'，与 TUI _diff_wrapped 同算法"""
+    old_l = old.splitlines() if old else []
+    new_l = new.splitlines() if new else []
+    old_hl = list(_hl_lines(filename, old)) if old else []
+    new_hl = list(_hl_lines(filename, new)) if new else []
+    if len(old_hl) != len(old_l):
+        old_hl = [_esc(x) for x in old_l]
+    if len(new_hl) != len(new_l):
+        new_hl = [_esc(x) for x in new_l]
+    out: List[dict] = []
+
+    def emit(t: str, hl: List[str], idx: int) -> None:
+        out.append({"t": t, "html": hl[idx] if 0 <= idx < len(hl) else ""})
+
+    sm = difflib.SequenceMatcher(a=old_l, b=new_l, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i1, i2):
+                emit(" ", new_hl, j1 + (k - i1))
+        elif tag == "delete":
+            for k in range(i1, i2):
+                emit("-", old_hl, k)
+        elif tag == "insert":
+            for k in range(j1, j2):
+                emit("+", new_hl, k)
+        elif tag == "replace":
+            for k in range(i1, i2):
+                emit("-", old_hl, k)
+            for k in range(j1, j2):
+                emit("+", new_hl, k)
+    return out
+
+def _tool_render(name: str, args: dict, content: str, failed: bool) -> Optional[dict]:
+    """命令/写入/编辑类工具 → 网页渲染载荷；读取类或不适用返回 None（保持通用卡片）"""
+    args = args if isinstance(args, dict) else {}
+    if name in _TOOL_CMD:
+        if name == "execute_command":
+            command = _as_text(args.get("command"))
+        else:  # run_program
+            prog = str(args.get("program") or "")
+            extra = " ".join(str(a) for a in (args.get("args") or []))
+            command = (prog + " " + extra).strip()
+        return {"kind": "cmd", "command": command, "output": str(content or "")}
+    if name in _TOOL_WRITE and not failed:
+        body = args.get("content")
+        body = body if isinstance(body, str) else _as_text(body)
+        path = str(args.get("file_path") or "")
+        lines = body.splitlines()
+        head = "\n".join(lines[:_WRITE_MAX_LINES])
+        return {
+            "kind": "write",
+            "path": path,
+            "html": "\n".join(_hl_lines(path, head)),
+            "truncated": len(lines) > _WRITE_MAX_LINES,
+        }
+    if name in _TOOL_EDIT and not failed:
+        raw: List[Tuple[str, str]] = []
+        if name == "multi_edit":
+            for e in args.get("edits") or []:
+                if isinstance(e, dict):
+                    raw.append((str(e.get("old_str") or ""), str(e.get("new_str") or "")))
+        else:
+            raw.append((str(args.get("old_str") or ""), str(args.get("new_str") or "")))
+        if not raw:
+            return None
+        path = str(args.get("file_path") or "")
+        items = []
+        for old, new in raw:
+            lines = _diff_items(path, old, new)
+            items.append({"lines": lines[:_DIFF_MAX_LINES], "truncated": len(lines) > _DIFF_MAX_LINES})
+        return {"kind": "edit", "path": path, "items": items}
+    return None
+
+def _plan_render(tool_name: str, content: str) -> Optional[dict]:
+    """计划四件套工具结果（JSON 快照）→ 时间线渲染载荷；解析失败返回 None"""
+    if tool_name not in _PLAN_TOOLS:
+        return None
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if tool_name in ("write_plan", "update_plan") and isinstance(data, dict):
+        return {
+            "kind": "plan",
+            "status": str(data.get("status") or ""),
+            "title": str(data.get("title") or ""),
+            "content": str(data.get("content") or ""),
+        }
+    if tool_name == "generate_steps" and isinstance(data, list) and all(isinstance(s, dict) for s in data):
+        return {
+            "kind": "steps",
+            "steps": [
+                {
+                    "id": s.get("id"),
+                    "title": str(s.get("title") or ""),
+                    "status": str(s.get("status") or "pending"),
+                    "detail": str(s.get("detail") or ""),
+                }
+                for s in data
+            ],
+        }
+    if tool_name == "update_step_status" and isinstance(data, dict):
+        return {
+            "kind": "step_update",
+            "id": data.get("id"),
+            "status": str(data.get("status") or ""),
+            "detail": str(data.get("detail") or ""),
+            "title": str(data.get("title") or ""),
+        }
+    return None
 
 
 class _State:
@@ -95,8 +298,7 @@ def setup(ctx):
 
     # ---- 配置 ----
     port = int(ctx.settings.get("port") or 8399)
-    # 缺省只绑本机回环（公网隧道/SSH 转发均可用）；需局域网访问在插件设置里显式配 bind=0.0.0.0
-    bind = str(ctx.settings.get("bind") or "127.0.0.1")
+    bind = str(ctx.settings.get("bind") or "0.0.0.0:0")
     remote_confirm = bool(ctx.settings.get("remote_confirm", True))
     confirm_timeout = float(ctx.settings.get("confirm_timeout") or 90)
     max_history = int(ctx.settings.get("max_history") or 80)
@@ -201,10 +403,17 @@ def setup(ctx):
                     "arguments": _trunc_args(payload.get("args"))})
 
     def _on_after_tool(payload):
-        _broadcast({"t": "tool_after", "name": payload.get("name"),
-                    "arguments": _trunc_args(payload.get("args")),
-                    "output": str(payload.get("output") or "")[:2000],
-                    "elapsed": payload.get("elapsed")})
+        name = str(payload.get("name") or "")
+        args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+        output = str(payload.get("output") or "")
+        failed = bool(tool_failure_hint(output)) if tool_failure_hint else False
+        render = _plan_render(name, output) or _tool_render(name, args, output, failed)
+        evt = {"t": "tool_after", "name": payload.get("name"),
+               "arguments": _trunc_args(payload.get("args")),
+               "output": output[:2000], "elapsed": payload.get("elapsed"), "failed": failed}
+        if render:
+            evt["render"] = render
+        _broadcast(evt)
 
     def _on_step_update(payload):
         step = payload.get("step") or {}
@@ -321,24 +530,57 @@ def setup(ctx):
     def _snapshot() -> dict:
         messages = []
         session = _session()
-        if session is not None:
-            for m in list(session.messages)[-max_history:]:
-                # 数组形态 content 取文本部分（防 base64 图片块灌进网页）；附图片计数
-                text = memory_mod.content_text(m.get("content")) if memory_mod else str(m.get("content") or "")
-                n_imgs = memory_mod.count_image_parts(m.get("content")) if memory_mod else 0
-                entry = {"role": m.get("role"), "content": text[:2000]}
-                if n_imgs:
-                    entry["images"] = n_imgs
-                if m.get("tool_name"):
-                    entry["tool_name"] = str(m.get("tool_name"))
-                if m.get("type"):
-                    entry["type"] = str(m.get("type"))
-                if m.get("description"):
-                    entry["description"] = str(m.get("description"))[:200]
-                thinking = m.get("thinking")
-                if thinking and not m.get("thinking_stripped"):
-                    entry["thinking"] = str(thinking)[:2000]
-                messages.append(entry)
+        raw = list(session.messages)[-max_history:] if session is not None else []
+        # 工具调用索引：结果消息不带参数，按 tool_call_id 关联到 tool_call 信封（与 TUI 同法）
+        call_info: dict = {}
+        for m in raw:
+            if m.get("type") != "tool_call":
+                continue
+            for c in m.get("tool_calls") or []:
+                if isinstance(c, dict) and c.get("id"):
+                    call_info[str(c["id"])] = {
+                        "name": str(c.get("name") or ""),
+                        "args": c.get("arguments") if isinstance(c.get("arguments"), dict) else {},
+                    }
+        for m in raw:
+            # 数组形态 content 取文本部分（防 base64 图片块灌进网页）；附图片计数
+            text = memory_mod.content_text(m.get("content")) if memory_mod else str(m.get("content") or "")
+            n_imgs = memory_mod.count_image_parts(m.get("content")) if memory_mod else 0
+            entry = {"role": m.get("role"), "content": text[:2000]}
+            if n_imgs:
+                entry["images"] = n_imgs
+            if m.get("tool_name"):
+                entry["tool_name"] = str(m.get("tool_name"))
+            if m.get("type"):
+                entry["type"] = str(m.get("type"))
+            if m.get("description"):
+                entry["description"] = str(m.get("description"))[:200]
+            thinking = m.get("thinking")
+            if thinking and not m.get("thinking_stripped"):
+                entry["thinking"] = str(thinking)[:2000]
+            # 工具结果：附与 TUI 对齐的分类渲染载荷（命令/写入/编辑/计划四件套）
+            if m.get("role") == "tool" or m.get("type") == "tool":
+                info = call_info.get(str(m.get("tool_call_id") or ""))
+                name = str((info or {}).get("name") or m.get("tool_name") or "")
+                args = (info or {}).get("args") or {}
+                failed = bool(tool_failure_hint(text)) if tool_failure_hint else False
+                entry["failed"] = failed
+                render = _plan_render(name, text) or _tool_render(name, args, text, failed)
+                if render:
+                    entry["render"] = render
+            # 工具调用信封：附被调用的工具名（TUI 显示「⚙ a,b」节点）
+            if m.get("type") == "tool_call":
+                names = [str(c.get("name") or "") for c in (m.get("tool_calls") or []) if isinstance(c, dict)]
+                if names:
+                    entry["calls"] = names
+            # 子代理：附角色/状态，前端渲染为独立节点
+            if m.get("type") == "subagent":
+                entry["subagent"] = {
+                    "id": m.get("subagent_id"),
+                    "role": m.get("subagent_role"),
+                    "status": str(m.get("status") or ""),
+                }
+            messages.append(entry)
         runner = _runner()
         app = _app()
         streaming = None
@@ -802,6 +1044,14 @@ def setup(ctx):
                     return
                 if path == "/api/state":
                     self._json(200, _snapshot())
+                elif path == "/api/hlcss":
+                    body = _hl_css().encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/css; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
                 elif path == "/api/events":
                     self._do_events()
                 elif path == "/api/sessions":

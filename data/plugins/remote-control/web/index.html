@@ -146,6 +146,36 @@
   .tool .label { font-size: 11px; color: var(--faint); margin: 6px 0 2px; }
   .tool .tbody pre { background: var(--bg); border-radius: 8px; padding: 8px 10px; max-height: 300px; overflow: auto; }
 
+  /* ============ 工具正文 / 计划 / 子代理（与 TUI 对齐） ============ */
+  .tool .tbody pre.cmdline { background: var(--bg); color: var(--dim); }
+  /* 写入/编辑：monokai 词法底色（.hl 作用域，样式表由 /api/hlcss 下发） */
+  pre.hl { border-radius: 8px; padding: 8px 10px; overflow: auto; max-height: 340px; font-size: 12.5px; line-height: 1.55; }
+  .hl.diff { border-radius: 8px; padding: 6px 0; overflow: auto; max-height: 340px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; }
+  .hl.diff .dl { display: flex; white-space: pre-wrap; word-break: break-word; }
+  .hl.diff .dl .mk { flex: none; width: 1.4em; text-align: center; color: #8b8b8b; user-select: none; }
+  .hl.diff .dl .dc { flex: 1; min-width: 0; }
+  .hl.diff .dl.add { background: #1a3622; }
+  .hl.diff .dl.del { background: #3a1a1e; }
+  .hl.diff .dl.ctx .dc { color: #cfcfc2; }
+  /* 计划 / 步骤时间线节点 */
+  .msg.planblock, .msg.stepsblock, .msg.stepupdate { max-width: 860px; margin: 10px auto; }
+  .planblock { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; box-shadow: var(--shadow); }
+  .planblock .pb-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--amber); }
+  .planblock .pb-title { color: var(--ink); }
+  .planblock .pb-status { color: var(--faint); font-weight: 400; font-size: 12px; }
+  .planblock .pb-body { margin-top: 6px; color: var(--dim); }
+  .stepsblock { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 8px 12px; box-shadow: var(--shadow); }
+  .stepsblock .sb-head { font-size: 12px; font-weight: 600; color: var(--amber); margin-bottom: 2px; }
+  .msg.stepupdate { font-size: 12.5px; color: var(--dim); font-family: var(--mono); padding: 2px 4px; }
+  /* 子代理节点（暖橙，与主对话区分） */
+  .msg.subagent .sa-pill {
+    display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+    background: #fdf1e6; border: 1px solid #f3d9bd; color: #8a5a2b;
+    border-radius: 10px; padding: 6px 12px; font-size: 12.5px; white-space: pre-wrap; word-break: break-word;
+  }
+  /* 工具调用名行 */
+  .bubble .calls { margin-top: 6px; font-size: 11.5px; color: var(--faint); font-family: var(--mono); }
+
   /* 直播气泡 */
   .msg.live .bubble { border-color: var(--accent); }
   .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent); border-radius: 2px; vertical-align: text-bottom; animation: blink 1s steps(1) infinite; }
@@ -491,6 +521,18 @@ function showBanner(text) {
   setConn("err");
 }
 
+/* 语法高亮样式：monokai 词法配色，作用域 .hl，启动时一次性注入 */
+async function loadHlCss() {
+  try {
+    const res = await fetch("/api/hlcss" + qs());
+    if (!res.ok) return;
+    const css = await res.text();
+    const st = el("style");
+    st.textContent = css;
+    document.head.append(st);
+  } catch (e) { /* 样式拉取失败：写入/编辑内容降级为纯文本展示 */ }
+}
+
 /* ================= 基础 UI 工具 ================= */
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -549,15 +591,55 @@ logEl.addEventListener("scroll", () => {
 });
 function stick() { if (pinned) logEl.scrollTop = logEl.scrollHeight; }
 
-function buildToolCard(o) {
-  const d = el("details", "tool");
-  const s = el("summary");
-  s.append(el("span", "ticon", "🔧"));
-  s.append(el("span", "tname", o.name || "tool"));
-  if (o.desc) s.append(el("span", "tdesc", o.desc));
-  if (o.elapsed !== undefined && o.elapsed !== null) s.append(el("span", "telapsed", o.elapsed + "s"));
-  d.append(s);
+const STEP_ICON = { done: "●", running: "◐", failed: "✗", pending: "○" };
+const TOOL_CMD_LINES = 3;  // 命令类输出预览行数，超出折叠（与 TUI 一致）
+
+/* 工具详细正文：按后端下发的渲染载荷分类（命令/写入/编辑），与 TUI core/render.py 对齐 */
+function toolBody(o) {
+  const r = o.render;
   const b = el("div", "tbody");
+  if (r && r.kind === "cmd") {
+    b.append(el("div", "label", "命令"));
+    b.append(el("pre", "cmdline", "$ " + (r.command || "")));
+    const out = (r.output || "").replace(/\n+$/, "");
+    const lines = out ? out.split("\n") : [];
+    if (lines.length) {
+      b.append(el("div", "label", "输出"));
+      b.append(el("pre", "", lines.slice(0, TOOL_CMD_LINES).join("\n")));
+      if (lines.length > TOOL_CMD_LINES) {
+        b.append(el("div", "label", `… 还有 ${lines.length - TOOL_CMD_LINES} 行输出`));
+      }
+    }
+    return b;
+  }
+  if (r && r.kind === "write") {
+    b.append(el("div", "label", "写入 " + (r.path || "")));
+    const pre = el("pre", "hl");
+    pre.innerHTML = r.html || "";
+    b.append(pre);
+    if (r.truncated) b.append(el("div", "label", "（仅显示前若干行）"));
+    return b;
+  }
+  if (r && r.kind === "edit") {
+    const items = r.items || [];
+    const multi = items.length > 1;
+    items.forEach((it, i) => {
+      b.append(el("div", "label", (multi ? `—— 第 ${i + 1} 处 —— ` : "编辑 ") + (r.path || "")));
+      if (it.truncated) b.append(el("div", "label", "（仅显示前若干行）"));
+      const box = el("div", "hl diff");
+      for (const ln of (it.lines || [])) {
+        const cls = ln.t === "+" ? " add" : ln.t === "-" ? " del" : " ctx";
+        const row = el("div", "dl" + cls);
+        row.append(el("span", "mk", ln.t === " " ? " " : ln.t));
+        const c = el("span", "dc");
+        c.innerHTML = ln.html || "";
+        row.append(c);
+        box.append(row);
+      }
+      b.append(box);
+    });
+    return b;
+  }
   if (o.args && Object.keys(o.args).length) {
     b.append(el("div", "label", "参数"));
     b.append(el("pre", "", JSON.stringify(o.args, null, 2)));
@@ -566,21 +648,97 @@ function buildToolCard(o) {
     b.append(el("div", "label", "输出（截断）"));
     b.append(el("pre", "", o.output));
   }
-  d.append(b);
+  return b;
+}
+
+function toolTitle(o) {
+  const r = o.render;
+  if (r && r.kind === "cmd" && r.command) return r.command.trim().split(/\s+/).slice(0, 2).join(" ");
+  if (r && (r.kind === "write" || r.kind === "edit") && r.path) return `${o.name || "tool"} ${r.path}`;
+  return o.name || "tool";
+}
+
+function buildToolCard(o) {
+  const d = el("details", "tool");
+  const s = el("summary");
+  s.append(el("span", "ticon", o.failed ? "❌" : "🔧"));
+  s.append(el("span", "tname", toolTitle(o)));
+  if (o.desc) s.append(el("span", "tdesc", o.desc));
+  if (o.elapsed !== undefined && o.elapsed !== null) s.append(el("span", "telapsed", o.elapsed + "s"));
+  d.append(s);
+  d.append(toolBody(o));
+  if (o.render) d.open = true;  // 命令/写入/编辑类默认展开，与 TUI 一致
   return d;
 }
 
+/* 计划 / 步骤 / 步骤更新：时间线节点（TUI 由工具结果 JSON 快照解析而来） */
+function planBlock(r) {
+  const d = el("div", "msg planblock");
+  const head = el("div", "pb-head");
+  head.append(el("span", "pb-badge", "计划"));
+  head.append(el("span", "pb-title", r.title || "（未命名计划）"));
+  head.append(el("span", "pb-status", `[${r.status || "empty"}]`));
+  d.append(head);
+  if (r.content) d.append(el("pre", "pb-body", r.content));
+  return d;
+}
+
+function stepsBlock(steps) {
+  const d = el("div", "msg stepsblock");
+  const done = steps.filter(s => s.status === "done").length;
+  d.append(el("div", "sb-head", `步骤 ${done}/${steps.length}`));
+  for (const st of steps) {
+    const row = el("div", "step-row");
+    row.append(el("span", "step-ico " + (st.status || "pending"), STEP_ICON[st.status] || "○"));
+    const main = el("div");
+    main.append(el("div", "", `${st.id}. ${st.title}`));
+    if (st.detail) main.append(el("div", "s-detail", st.detail));
+    row.append(main);
+    d.append(row);
+  }
+  return d;
+}
+
+function stepUpdateLine(r) {
+  const d = el("div", "msg stepupdate");
+  let text = `${STEP_ICON[r.status] || "○"} 步骤 ${r.id} → ${r.status || "?"}`;
+  const note = r.detail || r.title;
+  if (note) text += ` · ${note}`;
+  d.textContent = text;
+  return d;
+}
+
+function subagentBlock(m) {
+  const d = el("div", "msg subagent");
+  const pill = el("div", "sa-pill");
+  pill.append(el("span", "sa-ico", "🤖"));
+  pill.append(el("span", "sa-text", m.content || "子代理"));
+  d.append(pill);
+  return d;
+}
+
+/* 统一出口：计划/步骤渲染为时间线块，其余工具走可折叠卡片 */
+function appendToolResult(o) {
+  const r = o.render;
+  if (r && r.kind === "plan") { logEl.append(planBlock(r)); return; }
+  if (r && r.kind === "steps") { logEl.append(stepsBlock(r.steps || [])); return; }
+  if (r && r.kind === "step_update") { logEl.append(stepUpdateLine(r)); return; }
+  logEl.append(buildToolCard(o));
+}
+
 function thinkDetails(text) {
+  const first = (text || "").split("\n").find(l => l.trim()) || "";
   const d = el("details", "think");
-  d.append(el("summary", "", "思考过程"));
+  d.append(el("summary", "", "💭 思考 · " + first.slice(0, 80)));
   d.append(el("pre", "", text));
   return d;
 }
 
 function renderMessage(m) {
+  if (m.type === "subagent") { logEl.append(subagentBlock(m)); return; }
   const role = m.role;
   if (role === "tool" || m.type === "tool") {
-    logEl.append(buildToolCard({ name: m.tool_name, desc: m.description, output: m.content }));
+    appendToolResult({ name: m.tool_name, desc: m.description, output: m.content, failed: m.failed, render: m.render });
   } else if (role === "user") {
     const d = el("div", "msg user");
     d.append(el("span", "who", "你"));
@@ -589,7 +747,8 @@ function renderMessage(m) {
     d.append(b);
     logEl.append(d);
   } else if (role === "assistant") {
-    if (!m.content && !m.thinking) return;
+    const calls = m.calls || [];
+    if (!m.content && !m.thinking && !calls.length) return;
     const d = el("div", "msg assistant");
     d.append(el("span", "who", "BAWCode"));
     const b = el("div", "bubble");
@@ -598,6 +757,7 @@ function renderMessage(m) {
       span.innerHTML = mdLite(m.content);
       b.append(span);
     }
+    if (calls.length) b.append(el("div", "calls", "🔧 调用 " + calls.join("、")));
     if (m.thinking) b.append(thinkDetails(m.thinking));
     d.append(b);
     logEl.append(d);
@@ -885,7 +1045,7 @@ function connect() {
         break;
       case "tool_after":
         liveSeal();
-        logEl.append(buildToolCard({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed }));
+        appendToolResult({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render });
         stick();
         break;
       case "step":
@@ -1293,6 +1453,7 @@ $("cmd-btn").onclick = openPalette;
 document.addEventListener("visibilitychange", () => { if (!document.hidden) fetchState(); });
 setInterval(() => { if (!document.hidden && !state.busy) fetchState(); }, 25000);
 if (KEY) {
+  loadHlCss();
   fetchState(true).then(connect);
   if (desktopMQ.matches) loadSessions();
 } else {
