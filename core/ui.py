@@ -315,8 +315,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         _bp = os.environ.get("BAW_BRACKETED_PASTE", "")
         _paste_on = _bp == "1" or (_bp == "" and sys.platform != "win32")
         # 鼠标：1000h 普通 + 1002h 按钮事件 + 1006h SGR 编码。
-        # WT/ConPTY 实测（2026-09-25 探针）：仅 1000h+1006h 时终端不转发滚轮
-        # （滚轮被 WT 自己消费），加 1002h 后以 MOUSE_EVENT 记录到达。
+        # WT/ConPTY 实测：仅 1000h+1006h 时终端不转发滚轮加 1002h 后以 MOUSE_EVENT 记录到达。
         # 开启鼠标捕获后，终端内文本选择需 Shift+拖拽。关闭用 BAW_MOUSE=0
         _mouse_on = os.environ.get("BAW_MOUSE", "1") != "0"
         _mouse_seq = "\033[?1000h\033[?1002h\033[?1006h" if _mouse_on else ""

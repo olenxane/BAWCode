@@ -60,7 +60,7 @@ FIELD_SCHEMAS = {
         ("capture", "捕获输出为变量名（可空）", STR, None),
     ],
     "analyze": [("default_level", "判定失败/不可解析时默认", CHOICE, ["low", "high"])],
-    "plan": [("confirm", "计划生成后需用户确认", BOOL, None), ("steps", "执行前强制拆解步骤（主 LLM 经 generate_steps 工具）", BOOL, None)],
+    "plan": [("confirm", "计划生成后需用户确认", BOOL, None), ("steps", "执行前强制拆解步骤（主 LLM 经 generate_steps 工具）", BOOL, None), ("retry_times", "计划生成失败重试次数", INT, (0, 10))],
     "execute": [
         ("max_rounds", "工具循环轮数", INT, (1, 200)),
         ("capture", "捕获输出为变量名（可空）", STR, None),
@@ -82,7 +82,7 @@ NODE_DEFAULTS = {
     "skill": {"list": []},
     "understand": {"prompt_files": ["understand.md"], "capture": "understanding", "max_rounds": 8, "model_role": ""},
     "analyze": {"default_level": "low", "prompt_files": [], "prompt": "", "model_role": "plan"},
-    "plan": {"confirm": True, "steps": True},
+    "plan": {"confirm": True, "steps": True, "retry_times": 2},
     "execute": {"max_rounds": 12, "model_role": "code", "prompt_files": [], "capture": ""},
     "review": {"prompt_files": ["review.md"], "capture": "review_result", "max_rounds": 8, "model_role": "review"},
     "llm": {"prompt_files": [], "capture": "", "model_role": "plan", "max_rounds": 0},

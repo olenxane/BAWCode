@@ -11,14 +11,6 @@
       ]
     },
     {
-      "id": "plan",
-      "type": "plan",
-      "enabled": true,
-      "confirm": true,
-      "steps": false,
-      "model_role": "plan"
-    },
-    {
       "id": "execute",
       "type": "execute",
       "enabled": true,

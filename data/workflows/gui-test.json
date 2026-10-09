@@ -1,6 +1,6 @@
 {
   "name": "gui-test",
-  "description": "GUI 编辑器另存产物（skills 节点 gate=high）",
+  "description": "GUI 编辑器另存产物",
   "nodes": [
     {
       "id": "system_prompt",
@@ -9,12 +9,6 @@
       "files": [
         "system_prompt.md"
       ]
-    },
-    {
-      "id": "skills",
-      "type": "skill",
-      "enabled": true,
-      "list": []
     },
     {
       "id": "plan",

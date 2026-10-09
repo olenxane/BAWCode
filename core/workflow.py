@@ -10,10 +10,11 @@
 
 节点类型（内置执行器）：
   system_prompt — 指定初始化注入哪些系统提示词文件（缺省走 config.prompt.system_files）
-  skill         — 是否注入技能清单 / 白名单过滤（经 core/skills.set_injection）
+  skill         — 只注入 list 指定的技能，list 为空则不注入任何技能（经 core/skills.set_injection）
   understand    — 任务理解：带工具循环解析意图，缺失信息经 ask_user 询问用户
   analyze       — 复杂度判定：独立一次 LLM 请求输出 high/low，写入 ^{complexity}^
-  plan          — 生成计划（plan.md）；confirm 需用户确认；steps 确认后生成步骤
+  plan          — 生成计划（plan.md）；confirm 需用户确认；steps 确认后生成步骤；
+                  存在 analyze 节点且判定 low 时跳过（复杂度路由）
   execute       — 主工具调用循环（编码执行）
   review        — 审查节点：审查本回合改动并反思修正（带工具循环）
   llm           — 通用 LLM 阶段：prompt_files 渲染为补充系统提示词，max_rounds>0 时
@@ -277,12 +278,11 @@ def _exec_system_prompt(node: dict, turn: TurnContext) -> None:
 
 
 def _exec_skill(node: dict, turn: TurnContext) -> None:
+    """技能注入：只注入 list 指定的技能，list 为空则不注入任何技能"""
     from core import skills as skills_mod
 
-    skills_mod.set_injection(
-        enabled=bool(node.get("enabled", True)),
-        allow=[str(n) for n in (node.get("list") or [])] or None,
-    )
+    names = [str(n).strip() for n in (node.get("list") or []) if str(n).strip()]
+    skills_mod.set_injection(enabled=bool(names), allow=names or None)
 
 
 def _plan_confirm_loop(turn: TurnContext) -> None:
@@ -346,15 +346,51 @@ def _plan_confirm_loop(turn: TurnContext) -> None:
         raise TurnStop()
 
 
+def _plan_error(plan: dict) -> str:
+    """计划结果是否失败：返回失败原因，空串表示有效计划"""
+    if not isinstance(plan, dict):
+        return "计划结果无效"
+    error = str(plan.get("error") or "").strip()
+    if error:
+        return error
+    content = str(plan.get("content") or "").strip()
+    if not content or content == "暂无计划":
+        return "计划内容为空"
+    return ""
+
+
 def _exec_plan(node: dict, turn: TurnContext) -> None:
     io, session, llm = turn.io, turn.session, turn.llm
+    if str(turn.captured.get("complexity") or "").strip().lower() == "low":
+        # 复杂度路由：判定为 low 时跳过计划，直接进入后续节点
+        log.info("复杂度 low，跳过计划节点")
+        io.status("复杂度 low · 跳过计划")
+        session.add_message("system", "复杂度判定为 low，跳过计划生成。", type="help")
+        return
     log.info("进入计划流程")
     io.status("生成计划")
     plan_model = _node_model(turn.config, node)
     if plan_model is None:
         plan_model = _role_model(turn.config, node.get("model_role") or "plan")
-    plan = llm.generate_plan(turn.user_text, model=plan_model)
-    check_cancel(turn)
+    try:
+        retry_times = max(0, int(node.get("retry_times", 2)))
+    except (TypeError, ValueError):
+        retry_times = 2
+    plan: dict = {}
+    reason = ""
+    for attempt in range(retry_times + 1):
+        plan = llm.generate_plan(turn.user_text, model=plan_model)
+        check_cancel(turn)
+        reason = _plan_error(plan)
+        if not reason:
+            break
+        log.warn("计划生成失败(第%d/%d次): %s", attempt + 1, retry_times + 1, reason)
+        if attempt < retry_times:
+            io.status(f"计划生成失败 · 重试 {attempt + 2}/{retry_times + 1}")
+    if reason:
+        session.add_message("assistant", f"计划生成失败（{reason}），任务中止。")
+        io.status("计划生成失败")
+        raise TurnStop()
     session.set_plan(
         plan.get("title", "任务计划"),
         plan.get("content", ""),

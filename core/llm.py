@@ -782,7 +782,13 @@ class LLM:
             model=plan_model,
         )
         log.info("计划生成: %d字（model=%s）", len(result.get("content") or ""), plan_model or self.config.model)
-        return {"title": "任务计划", "content": result.get("content") or "暂无计划", "complexity": "high"}
+        # error 透出给工作流判断计划是否生成成功，供重试与中断
+        return {
+            "title": "任务计划",
+            "content": result.get("content") or "暂无计划",
+            "complexity": "high",
+            "error": result.get("error") or "",
+        }
 
     def confirm_plan(self, plan: dict, action: str, feedback: str = "") -> dict:
         external = hooks.call_hook("plan_confirm", {"plan": plan, "action": action, "feedback": feedback}, default=None)
