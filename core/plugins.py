@@ -7,18 +7,27 @@
 #   plugin.json   清单（id 必填；entry 缺省 main.py；enabled 缺省 true）
 #   main.py       入口模块，定义 setup(ctx)；ctx 提供 hooks/commands/tools/补充注册 API
 #   skills/<n>/SKILL.md   可选，自动并入技能系统（项目级技能仍最高优先）
+#   requirements.txt      可选，插件独有依赖；装载时缺失项经 pip 自动补齐（不随主程序安装）
 #
-# 生命周期：启动 discover→逐个装载（错误隔离，失败不影响其他插件）；
+# 生命周期：启动 discover→逐个装载（错误隔离，失败不影响其他插件）；启用的插件
+# 先按 requirements.txt 补齐依赖（config.plugins.auto_install_deps 可关），再 import+setup；
 # /plugin reload 卸载重载（按 owner 注销 hooks/commands/tools）；
 # 禁用持久化到 config.plugins.disable。
 #
 # 信任模型：插件在本进程内以完整权限运行 Python 代码，只安装可信来源的插件。
+import importlib.metadata
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+try:  # packaging 随 pip 生态普遍存在；缺失时依赖检查退化为仅按发行名判断有无
+    from packaging.requirements import Requirement as _Requirement
+except Exception:  # pragma: no cover
+    _Requirement = None  # type: ignore[assignment]
 
 from core import commands
 from core import hooks
@@ -461,6 +470,129 @@ class PluginContext:
 
 
 # ---------------------------------------------------------------------------
+# 插件依赖（requirements.txt）：首次装载时检查缺失项并经 pip 静默补齐
+
+
+_REQ_FILE = "requirements.txt"
+_PIP_TIMEOUT = 900  # pip 安装整体超时（秒）：大型包（GUI/语言包）留足下载时间
+_NO_DEPS: Dict[str, Any] = {"status": "none", "missing": [], "error": ""}
+
+
+def _auto_install_enabled(config) -> bool:
+    """config.plugins.auto_install_deps（缺省 true）：是否允许自动安装插件依赖"""
+    cfg = (getattr(config, "data", None) or {}).get("plugins") or {}
+    return bool(cfg.get("auto_install_deps", True))
+
+
+def _read_requirements(dir_path: Path) -> List[str]:
+    """读取插件 requirements.txt 的有效依赖行（跳过空行/注释）；无文件返回 []"""
+    req_file = dir_path / _REQ_FILE
+    if not req_file.is_file():
+        return []
+    try:
+        text = req_file.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        log.warn("插件依赖文件读取失败 %s: %s", req_file, e)
+        return []
+    return [line for line in (raw.strip() for raw in text.splitlines()) if line and not line.startswith("#")]
+
+
+def _split_requirement(line: str) -> tuple:
+    """解析依赖行为 (发行名, SpecifierSet|None)；非 PEP 508 行（pip 选项/URL/可编辑）返回 (None, None)"""
+    if _Requirement is not None:
+        try:
+            req = _Requirement(line)
+        except Exception:
+            return None, None
+        if req.marker is not None:
+            try:
+                if not req.marker.evaluate():
+                    return None, None  # 环境标记不适用（如 python_version<"3.8"）
+            except Exception:
+                return None, None
+        return req.name, req.specifier
+    m = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)", line)  # 退化：仅取名字，不做版本判断
+    return (m.group(1), None) if m else (None, None)
+
+
+def _missing_requirements(reqs: List[str]) -> List[str]:
+    """返回当前环境未满足（未安装或版本不符）的依赖行"""
+    missing: List[str] = []
+    for line in reqs:
+        name, spec = _split_requirement(line)
+        if not name:
+            continue  # 非标准依赖行不参与检查，交由 pip 安装时处理
+        try:
+            dist = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            missing.append(line)
+            continue
+        except Exception:
+            missing.append(line)
+            continue
+        if spec is not None and not spec.contains(dist.version, prereleases=True):
+            missing.append(line)
+    return missing
+
+
+def _pip_install(pid: str, req_file: Path) -> tuple:
+    """调用当前解释器的 pip 安装插件依赖文件；返回 (ok, 输出尾部摘要)"""
+    cmd = [
+        sys.executable, "-m", "pip", "install", "-r", str(req_file),
+        "--disable-pip-version-check", "--no-input",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=_PIP_TIMEOUT)
+    except FileNotFoundError as e:
+        return False, f"无法启动 pip: {e}"
+    except subprocess.TimeoutExpired:
+        return False, f"pip 安装超时（>{_PIP_TIMEOUT}s）"
+    except OSError as e:
+        return False, f"pip 执行失败: {e}"
+    out = "\n".join(x for x in ((proc.stdout or "") + (proc.stderr or "")).splitlines() if x.strip())
+    log.debug("插件 %s pip 输出:\n%s", pid, out or "(空)")
+    tail = "\n".join(out.splitlines()[-15:])
+    if proc.returncode == 0:
+        return True, tail
+    return False, tail or f"pip 退出码 {proc.returncode}"
+
+
+def _ensure_requirements(pid: str, dir_path: Path, config) -> dict:
+    """检查并静默补齐插件目录 requirements.txt 声明的依赖。
+
+    只在缺失时调用一次 pip（已满足则零开销跳过）。返回记录：
+      {"status": "none"|"ok"|"installed"|"manual"|"failed", "missing": [...], "error": str}
+      none=无 requirements.txt；ok=依赖齐备；installed=已补装成功；
+      manual=缺依赖但已关闭自动安装；failed=补装失败（不阻断装载，插件自行降级）
+    """
+    none = {"status": "none", "missing": [], "error": ""}
+    if not (dir_path / _REQ_FILE).is_file():
+        return none
+    reqs = _read_requirements(dir_path)
+    if not reqs:
+        return {"status": "ok", "missing": [], "error": ""}
+    missing = _missing_requirements(reqs)
+    if not missing:
+        log.debug("插件 %s 依赖已满足（%d 项）", pid, len(reqs))
+        return {"status": "ok", "missing": [], "error": ""}
+    if not _auto_install_enabled(config):
+        log.info("插件 %s 缺依赖 %d 项（已关闭自动安装）: %s", pid, len(missing), ", ".join(missing))
+        return {"status": "manual", "missing": missing, "error": ""}
+    log.info("插件 %s 缺依赖 %d 项，静默安装: %s", pid, len(missing), ", ".join(missing))
+    ok, detail = _pip_install(pid, dir_path / _REQ_FILE)
+    if not ok:
+        log.warn("插件 %s 依赖安装失败: %s", pid, detail or "未知错误")
+        return {"status": "failed", "missing": missing, "error": detail}
+    importlib.invalidate_caches()  # 让本轮新装的发行版可见，复核是否真的补齐
+    still = _missing_requirements(reqs)
+    if still:
+        log.warn("插件 %s 依赖安装后仍未满足: %s", pid, ", ".join(still))
+        return {"status": "failed", "missing": still, "error": f"安装后仍未满足: {', '.join(still)}"}
+    log.info("插件 %s 依赖已补齐（%d 项）", pid, len(missing))
+    return {"status": "installed", "missing": missing, "error": ""}
+
+
+# ---------------------------------------------------------------------------
 # 装载 / 卸载
 
 
@@ -508,6 +640,7 @@ def _load_one(item: dict, config, workspace: Path) -> None:
             "context": None,
             "module": None,
             "config_decls": decls,
+            "deps": dict(_NO_DEPS),
         }
         log.warn("插件清单异常 %s: %s", pid, item["error"])
         return
@@ -522,9 +655,12 @@ def _load_one(item: dict, config, workspace: Path) -> None:
             "context": None,
             "module": None,
             "config_decls": decls,
+            "deps": dict(_NO_DEPS),
         }
         log.debug("插件跳过（%s）: %s", reason, pid)
         return
+    # 依赖先于 import：requirements.txt 的缺失项在此静默补齐（失败不阻断，插件可自行降级）
+    deps = _ensure_requirements(pid, item["dir"], config)
     ctx = PluginContext(pid, item["dir"], manifest, item["source"], config, workspace)
     record = {
         "manifest": manifest,
@@ -534,6 +670,7 @@ def _load_one(item: dict, config, workspace: Path) -> None:
         "error": "",
         "context": ctx,
         "module": None,
+        "deps": deps,
     }
     _loaded[pid] = record
     try:
@@ -655,8 +792,22 @@ def summary() -> dict:
     return counts
 
 
+def _deps_note(deps: Optional[dict]) -> str:
+    """依赖状态在 /plugin 行内的简短标注（none/ok 不标注，避免噪声）"""
+    deps = deps or {}
+    st = deps.get("status")
+    missing = deps.get("missing") or []
+    if st == "installed":
+        return f" · 依赖已补装({len(missing)})"
+    if st == "failed":
+        return f" · 依赖安装失败: {', '.join(missing)}"
+    if st == "manual":
+        return f" · 依赖缺{len(missing)}项(未自动装)"
+    return ""
+
+
 def statuses() -> List[dict]:
-    """诊断视图：id/名称/版本/来源/状态/错误/注册量"""
+    """诊断视图：id/名称/版本/来源/状态/错误/注册量/依赖"""
     rows = []
     for pid in sorted(_loaded.keys()):
         rec = _loaded[pid]
@@ -674,6 +825,7 @@ def statuses() -> List[dict]:
                 "tools": rec.get("tools", 0),
                 "commands": rec.get("commands", 0),
                 "configs": rec.get("configs", 0),
+                "deps": rec.get("deps") or dict(_NO_DEPS),
             }
         )
     return rows
@@ -690,11 +842,16 @@ def status_listing() -> str:
         line = f"  {r['id']:20} v{r['version'] or '-':8} [{label.get(r['status'], r['status'])}] {r['source']}"
         if r["status"] == "loaded":
             line += f" · hooks={r['hooks']} tools={r['tools']} commands={r['commands']}"
+            line += _deps_note(r.get("deps"))
         if r["description"]:
             line += f" · {r['description'][:40]}"
         lines.append(line)
         if r["error"]:
             lines.append(f"    └ {r['error']}")
+        deps = r.get("deps") or {}
+        if deps.get("status") == "failed" and deps.get("error"):
+            last = (deps["error"] or "").splitlines()[-1]
+            lines.append(f"    └ 依赖安装失败: {last}")
     hooks_view = hooks.list_hooks()
     hook_lines = [f"{ev}: {len(entries)}" for ev, entries in sorted(hooks_view.items()) if entries]
     if hook_lines:

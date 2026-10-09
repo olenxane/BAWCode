@@ -1,4 +1,6 @@
 #此文件为ui的渲染交互脚本：无边框分区、主题、确认流程、token状态
+import difflib
+import functools
 import json
 import os
 import re
@@ -18,6 +20,11 @@ try:
 except ImportError:
     HAS_RICH = False
 
+from pygments import highlight as _pyg_highlight
+from pygments.formatters import TerminalTrueColorFormatter as _PygTrueColorFormatter
+from pygments.lexers import get_lexer_for_filename as _pyg_lexer_for_filename
+from pygments.util import ClassNotFound as _PygClassNotFound
+HAS_PYGMENTS = True
 from core import commands as cmdsys
 from core import hooks as hooks_mod
 from core import keymap as keymap_mod
@@ -43,7 +50,6 @@ from core.settings import SettingsPanelMixin
 
 log = get_logger("ui")
 
-# UI 请求桥的取消哨兵：复用 llm 的常量，桥等待被取消时回填给 agent 线程
 from core.llm import CANCELLED as CANCEL_RESULT
 
 _CONSOLE = Console(soft_wrap=True, force_terminal=True) if HAS_RICH else None
@@ -58,8 +64,7 @@ _STATUS_ICON = {"pending": "○", "running": "◐", "done": "●", "failed": "�
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 # 「思考中」文案池：树底提示每 4s 轮换一句（按时间槽取值，帧循环无状态、线程安全）
 _THINKING_PHRASES = (
-    "思考中", "推敲中", "琢磨中", "构思中", "盘算中", "酝酿中", "权衡方案",
-    "梳理思路", "整理上下文", "排查疑点", "串联线索", "打腹稿", "翻找思路", "灵感加载中",
+    "脑子加载中...", "整理上下文", "翻找思路...", "灵感加载中...",
 )
 _HINT_ROTATE_SECONDS = 4.0
 # 树底阶段文案池：key=「 · 」前的阶段基名，值=按时间槽轮换的文案元组（帧循环无状态、线程安全）；
@@ -69,8 +74,19 @@ _PHASE_POOLS = {
     "工具调用中": ("调用工具中", "等待工具返回", "处理工具输出"),
     "待确认": ("等待确认", "等待你的决定"),
 }
-# 控制台鼠标 y → compose 行号偏移（rich Live 主屏模式 1:1；真机如有固定偏差在此校准）
+# 控制台鼠标 y → compose 行号偏移
 _MOUSE_Y_OFFSET = 0
+# 工具显示分类：读取类保持概要；命令类显示输入命令 + 折叠输出；写入/编辑类显示高亮全文/diff
+_TOOL_CMD = {"execute_command", "run_program"}
+_TOOL_WRITE = {"write"}
+_TOOL_EDIT = {"edit_file", "multi_edit"}
+_TOOL_CMD_OUTPUT_LINES = 3  # 命令类展开时显示的输出行数（超出折叠为「还有 N 行」）
+_HL_STYLE = "monokai"       # pygments 高亮风格（暗色终端）
+# diff 行底色（叠在语法高亮前景之上）：红删 / 绿增
+_DIFF_DEL_BG = (58, 26, 30)
+_DIFF_ADD_BG = (26, 54, 34)
+# 流式思考滚动窗口行数；完成后落库思考固定折叠为一行
+_STREAM_THINKING_LINES = 5
 
 def _command_head(command: str, limit: int = 24) -> str:
     """命令头提取：取前两个 token，clip 到 limit 显示宽——供树节点显示简洁命令"""
@@ -287,6 +303,123 @@ def _clip_keep_ansi(text: str, width: int) -> str:
         i += 1
     out.append("\033[0m")
     return "".join(out)
+
+
+def _wrap_keep_ansi(text: str, width: int) -> List[str]:
+    """按显示宽度折行并保留 ANSI（续行重放当前 SGR 前景色）；供语法高亮/diff 行折行使用"""
+    if width <= 0:
+        return [""]
+    src = (text or "").replace("\r", "").replace("\n", " ")
+    rows: List[str] = []
+    cur: List[str] = []
+    used = 0
+    active = ""  # 当前前景色 SGR
+    i = 0
+    while i < len(src):
+        if src[i] == "\x1b":
+            m = _ANSI_RE.match(src, i)
+            if m:
+                code = m.group(0)
+                cur.append(code)
+                if code.endswith("m"):
+                    if code in ("\x1b[0m", "\x1b[m", "\x1b[39m", "\x1b[49m"):
+                        active = ""
+                    else:
+                        active = code
+                i = m.end()
+                continue
+        ch = src[i]
+        w = _char_width(ch)
+        if used + w > width and cur:
+            cur.append("\033[0m")
+            rows.append("".join(cur))
+            cur = [active] if active else []
+            used = 0
+        cur.append(ch)
+        used += w
+        i += 1
+    cur.append("\033[0m")
+    rows.append("".join(cur))
+    return rows or [""]
+
+
+def _lexer_for(filename: str):
+    """按文件名/扩展名取 pygments 词法；无 pygments 或未知类型返回 None（降级纯文本）"""
+    if not HAS_PYGMENTS or not filename:
+        return None
+    try:
+        return _pyg_lexer_for_filename(filename)
+    except _PygClassNotFound:
+        return None
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=128)
+def _pyg_lines(filename: str, code: str) -> Tuple[str, ...]:
+    """整段代码 → 每行一个带 ANSI 的字符串；行数与 splitlines 对齐，异常时降级纯文本"""
+    if not code:
+        return ()
+    want = code.splitlines() or [""]
+    lexer = _lexer_for(filename)
+    if lexer is None:
+        return tuple(want)
+    try:
+        text = _pyg_highlight(code, lexer, _PygTrueColorFormatter(style=_HL_STYLE))
+    except Exception:
+        return tuple(want)
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if len(lines) != len(want):
+        return tuple(want)  # 行数错位：宁可不带高亮也不串行
+    return tuple(lines)
+
+
+@functools.lru_cache(maxsize=64)
+def _hl_rows_wrapped(filename: str, code: str, width: int) -> Tuple[str, ...]:
+    """代码 → 高亮并按宽度折行后的行列表（写入工具正文）"""
+    rows: List[str] = []
+    for line in _pyg_lines(filename, code):
+        rows.extend(_wrap_keep_ansi(line, width))
+    return tuple(rows)
+
+
+@functools.lru_cache(maxsize=64)
+def _diff_wrapped(filename: str, old: str, new: str, width: int) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+    """old→new 统一 diff → ((标记, 折行后的行元组), ...)，标记为 ' ' / '-' / '+'；代码逐行高亮"""
+    old_l = old.splitlines() if old else []
+    new_l = new.splitlines() if new else []
+    old_hl = list(_pyg_lines(filename, old)) if old else []
+    new_hl = list(_pyg_lines(filename, new)) if new else []
+    if len(old_hl) != len(old_l):
+        old_hl = old_l
+    if len(new_hl) != len(new_l):
+        new_hl = new_l
+    line_w = max(1, width - 4)  # 预留 2 列缩进 + 标记 + 空格
+    items: List[Tuple[str, Tuple[str, ...]]] = []
+
+    def _emit(marker: str, hl: List[str], idx: int) -> None:
+        text = hl[idx] if 0 <= idx < len(hl) else ""
+        items.append((marker, tuple(_wrap_keep_ansi(text, line_w))))
+
+    sm = difflib.SequenceMatcher(a=old_l, b=new_l, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i1, i2):
+                _emit(" ", new_hl, j1 + (k - i1))
+        elif tag == "delete":
+            for k in range(i1, i2):
+                _emit("-", old_hl, k)
+        elif tag == "insert":
+            for k in range(j1, j2):
+                _emit("+", new_hl, k)
+        elif tag == "replace":
+            for k in range(i1, i2):
+                _emit("-", old_hl, k)
+            for k in range(j1, j2):
+                _emit("+", new_hl, k)
+    return tuple(items)
 
 
 def _scrollbar_geometry(total: int, tree_h: int, scroll: int) -> Tuple[int, int]:
@@ -537,9 +670,9 @@ def _logo_frames() -> List[List[str]]:
 
 
 class TreeNode:
-    __slots__ = ("id", "label", "kind", "children", "default_expanded", "summary", "detail")
+    __slots__ = ("id", "label", "kind", "children", "default_expanded", "summary", "detail", "meta")
 
-    def __init__(self, id, label, kind="text", children=None, default_expanded=True, summary="", detail=""):
+    def __init__(self, id, label, kind="text", children=None, default_expanded=True, summary="", detail="", meta=None):
         self.id = id
         self.label = label
         self.kind = kind
@@ -547,6 +680,7 @@ class TreeNode:
         self.default_expanded = default_expanded
         self.summary = summary
         self.detail = detail
+        self.meta = meta
 
 
 class _LlmRetryGate:
@@ -969,24 +1103,32 @@ class TuiApp(SettingsPanelMixin):
         def _parent() -> TreeNode:
             return current_turn if current_turn is not None else task_node
 
-        # 命令头索引：从 tool_call 信封提取 execute_command/run_program 的简洁命令
-        #（结果消息不带参数，按 tool_call_id 关联到调用），供结果单行节点与信封节点显示
+        # 工具调用索引：结果消息不带参数，按 tool_call_id 关联到 tool_call 信封。
+        # cmd_heads：execute_command/run_program 的简洁命令头（结果/信封节点显示）；
+        # call_info：完整参数（命令/写入内容/编辑 old-new），供命令/写入/编辑类渲染正文
         cmd_heads: Dict[str, str] = {}
+        call_info: Dict[str, dict] = {}
         for item in self.messages[-200:]:
             if item.get("type") != "tool_call":
                 continue
             for c in item.get("tool_calls") or []:
                 if not isinstance(c, dict):
                     continue
+                cid = str(c.get("id") or "")
+                if not cid:
+                    continue
+                name = str(c.get("name") or "")
                 args = c.get("arguments") or {}
+                if not isinstance(args, dict):
+                    args = {}
+                call_info[cid] = {"name": name, "args": args}
                 head = ""
-                if c.get("name") == "execute_command":
+                if name == "execute_command":
                     head = _command_head(memory_mod.content_text(args.get("command")))
-                elif c.get("name") == "run_program":
+                elif name == "run_program":
                     rest = " ".join(str(a) for a in (args.get("args") or [])[:2])
                     head = _command_head((str(args.get("program") or "") + " " + rest).strip())
-                cid = str(c.get("id") or "")
-                if cid and head:
+                if head:
                     cmd_heads[cid] = head
 
         for index, item in enumerate(self.messages[-200:]):
@@ -1020,20 +1162,43 @@ class TuiApp(SettingsPanelMixin):
                 else:
                     failed = tool_failure_hint(content)
                     icon = "❌" if failed else "✅"
-                    # 结果正文 trim 后再拼（纯空白结果不挂悬空「 · 」）；内部换行保留供展开查看
-                    result_text = content.strip()
-                    # execute_command/run_program 显示提取的命令头（无索引回落工具名）
-                    display = cmd_heads.get(str(item.get("tool_call_id") or "")) or tool_name or "tool"
-                    label = f"⚙ {display} {icon}{image_note}"
-                    if result_text:
-                        label = f"{label} · {result_text}"
-                    node = TreeNode(
-                        f"msg:{index}",
-                        label,
-                        "tool",
-                        default_expanded=False,
-                        detail="",
-                    )
+                    cid = str(item.get("tool_call_id") or "")
+                    info = call_info.get(cid)
+                    # 命令/写入/编辑类：附元数据，展开时按类型渲染（命令+输出 / 高亮全文 / 高亮 diff）
+                    meta = None
+                    if info is not None:
+                        meta = self._tool_display_meta(
+                            str(info.get("name") or tool_name), info.get("args") or {}, content, failed
+                        )
+                    if meta is not None:
+                        base = tool_name or str((info or {}).get("name") or "") or "tool"
+                        if meta.get("tool_kind") == "cmd":
+                            label = f"⚙ {cmd_heads.get(cid) or base} {icon}"
+                        else:
+                            path = str(meta.get("path") or "")
+                            label = f"⚙ {base} {path} {icon}" if path else f"⚙ {base} {icon}"
+                        node = TreeNode(
+                            f"msg:{index}",
+                            label,
+                            "tool",
+                            default_expanded=True,
+                            detail="",
+                            meta=meta,
+                        )
+                    else:
+                        # 读取类等：保持概要显示（标题 + 结果正文，默认折叠可展开）
+                        result_text = content.strip()
+                        display = cmd_heads.get(cid) or tool_name or "tool"
+                        label = f"⚙ {display} {icon}{image_note}"
+                        if result_text:
+                            label = f"{label} · {result_text}"
+                        node = TreeNode(
+                            f"msg:{index}",
+                            label,
+                            "tool",
+                            default_expanded=False,
+                            detail="",
+                        )
             elif msg_type == "system_prompt":
                 files = item.get("files") or []
                 label = "注入系统提示词"
@@ -1062,6 +1227,10 @@ class TuiApp(SettingsPanelMixin):
                     detail="",
                 )
             elif msg_type == "tool_call":
+                # 已完成思考：落库 thinking 字段固定折叠为一行，排在本轮正文/工具节点之前
+                think = self._thinking_node(index, item)
+                if think is not None:
+                    _parent().children.append(think)
                 names = []
                 for c in item.get("tool_calls") or []:
                     if isinstance(c, dict):
@@ -1145,6 +1314,10 @@ class TuiApp(SettingsPanelMixin):
                         )
                     node.children.append(child)
             elif role == "assistant":
+                # 已完成思考（无工具调用的最终回复）：固定一行摘要，排在回复节点之前
+                think = self._thinking_node(index, item)
+                if think is not None:
+                    _parent().children.append(think)
                 # 完整回复写入 label，由 _tree_rows 折行；LLM 输出不限行数、无折叠指示
                 # 不建子节点、不开独立详情区
                 node = TreeNode(
@@ -1268,6 +1441,56 @@ class TuiApp(SettingsPanelMixin):
                 child.children.append(TreeNode(f"{id_base}:s{step.get('id')}:d", _oneline(detail, 50), "step_detail"))
             node.children.append(child)
         return node
+
+    def _thinking_node(self, index: int, item: dict) -> Optional[TreeNode]:
+        """已完成思考 → 固定一行摘要节点（不可展开）：取首行非空文本，无则略过"""
+        thinking = str(item.get("thinking") or "").strip()
+        if not thinking:
+            return None
+        summary = next((ln.strip() for ln in thinking.splitlines() if ln.strip()), thinking)
+        return TreeNode(
+            f"think:{index}",
+            f"💭 思考 · {_oneline(summary, 60)}",
+            "thinking",
+            default_expanded=True,
+            detail="",
+        )
+
+    def _tool_display_meta(self, name: str, args: dict, content: str, failed: bool) -> Optional[dict]:
+        """命令/写入/编辑类工具 → 展开正文元数据；读取类或结构缺失返回 None（保持概要）
+
+        写入/编辑失败时返回 None，回落显示结果正文（避免展示未生效的内容/diff）。"""
+        if name in _TOOL_CMD:
+            if name == "execute_command":
+                command = memory_mod.content_text(args.get("command"))
+            else:  # run_program
+                prog = str(args.get("program") or "")
+                extra = " ".join(str(a) for a in (args.get("args") or []))
+                command = (prog + " " + extra).strip()
+            return {"tool_kind": "cmd", "command": command, "output": content}
+        if name in _TOOL_WRITE and not failed:
+            body = args.get("content")
+            return {
+                "tool_kind": "write",
+                "path": str(args.get("file_path") or ""),
+                "content": body if isinstance(body, str) else str(body or ""),
+            }
+        if name in _TOOL_EDIT and not failed:
+            items: List[Tuple[str, str]] = []
+            if name == "multi_edit":
+                for e in args.get("edits") or []:
+                    if isinstance(e, dict):
+                        items.append((str(e.get("old_str") or ""), str(e.get("new_str") or "")))
+            else:
+                items.append((str(args.get("old_str") or ""), str(args.get("new_str") or "")))
+            if not items:
+                return None
+            return {
+                "tool_kind": "edit",
+                "path": str(args.get("file_path") or ""),
+                "items": items,
+            }
+        return None
 
     def _plan_step_node(self, index: int, tool_name: str, content: str) -> Optional[TreeNode]:
         """计划四件套工具结果 → 时间线节点（JSON 快照冻结渲染）。
@@ -1426,6 +1649,7 @@ class TuiApp(SettingsPanelMixin):
             "system": self.c("dim"),
             "system_prompt": self.c("tool"),
             "text": self.c("dim"),
+            "thinking": self.c("thinking"),
             "stream_thinking": self.c("thinking"),
             "stream_content": agent_text,
             "subagent": "\033[1m" + self.c("subagent"),
@@ -1463,6 +1687,18 @@ class TuiApp(SettingsPanelMixin):
             indent = guide
             cont_prefix = guide + "  "
             if node.kind == "tool":
+                meta = node.meta
+                if meta and meta.get("tool_kind") in ("cmd", "write", "edit"):
+                    # 命令/写入/编辑类：标题行 + 展开正文（命令+折叠输出 / 高亮全文 / 高亮 diff）
+                    title_part = f"{_marker(True, expanded)} {label}"
+                    if abs_i == self.tree_cursor and tree_focus:
+                        rows.append(self.C_HL + _pad(f"{indent}{title_part}", width) + self.RESET)
+                    else:
+                        rows.append(gseg + self.c("tool_title") + _clip(title_part, max(1, width - gw)) + self.RESET)
+                    if expanded:
+                        rows.extend(self._tool_detail_rows(meta, gseg, width, gw))
+                    spans.append((span_start, len(rows) - span_start))
+                    continue
                 # 工具调用（含工具轮）：标题青色（14babc）+ 内容纯白，同一物理行双色。
                 # 折叠仅显示标题行（✅/❌ 状态在标题内），完整输出展开后查看
                 title, sep, content_text = label.partition(" · ")
@@ -1493,10 +1729,18 @@ class TuiApp(SettingsPanelMixin):
                 spans.append((span_start, len(rows) - span_start))
                 continue
             if node.kind == "stream_thinking":
-                # 思考过程：过长折叠为尾部 3 行动态窗口（随流式追加滚动）
+                # 思考过程（流式进行中）：滚动显示尾部 N 行动态窗口（随追加上滚）
                 win = _wrap(label, max(8, width - gw - 2))
-                for wline in win[-3:]:
+                for wline in win[-_STREAM_THINKING_LINES:]:
                     rows.append(gseg + color + _clip("  " + wline, max(1, width - gw)) + self.RESET)
+                spans.append((span_start, len(rows) - span_start))
+                continue
+            if node.kind == "thinking":
+                # 已完成思考：固定一行摘要（不可展开），首行文本 clip 到行宽
+                if abs_i == self.tree_cursor and tree_focus:
+                    rows.append(self.C_HL + _pad(_clip(f"{indent}· {label}", width), width) + self.RESET)
+                else:
+                    rows.append(gseg + color + _clip("· " + label, max(1, width - gw)) + self.RESET)
                 spans.append((span_start, len(rows) - span_start))
                 continue
             # 消息类正文：全文折行；可折叠节点收起时最多 3 行，超出以指示行提示手动展开
@@ -1550,6 +1794,52 @@ class TuiApp(SettingsPanelMixin):
         self._tree_rows_key = key
         self._tree_rows_cache = rows
         return rows
+
+    def _tool_detail_rows(self, meta: dict, gseg: str, width: int, gw: int) -> List[str]:
+        """工具节点展开正文：命令（命令 + 折叠输出）/ 写入（高亮全文）/ 编辑（高亮 diff）
+
+        gseg 为树引导线前缀，gw 为其显示宽度；正文再缩进 2 列。"""
+        kind = meta.get("tool_kind")
+        body_w = max(1, width - gw)
+        ind = "  "
+        out: List[str] = []
+        if kind == "cmd":
+            command = str(meta.get("command") or "")
+            for k, ln in enumerate(_wrap(command, max(1, body_w - 2)) or [""]):
+                prefix = "$ " if k == 0 else "  "
+                out.append(gseg + self.c("dim") + _clip(ind + prefix + ln, body_w) + self.RESET)
+            out_lines = str(meta.get("output") or "").strip().splitlines()
+            for ln in out_lines[:_TOOL_CMD_OUTPUT_LINES]:
+                out.append(gseg + self.c("tool_content") + _clip(ind + ln, body_w) + self.RESET)
+            extra = len(out_lines) - _TOOL_CMD_OUTPUT_LINES
+            if extra > 0:
+                out.append(gseg + self.c("dim") + _clip(ind + f"… 还有 {extra} 行输出", body_w) + self.RESET)
+        elif kind == "write":
+            path = str(meta.get("path") or "")
+            code = str(meta.get("content") or "")
+            rows = _hl_rows_wrapped(path, code, max(1, body_w - 2))
+            if not rows:
+                out.append(gseg + self.c("dim") + _clip(ind + "（空内容）", body_w) + self.RESET)
+            for row in rows:
+                out.append(gseg + ind + row + self.RESET)
+        elif kind == "edit":
+            path = str(meta.get("path") or "")
+            items = meta.get("items") or []
+            multi = len(items) > 1
+            for gi, (old, new) in enumerate(items):
+                if multi:
+                    out.append(gseg + self.c("dim") + _clip(ind + f"—— 第 {gi + 1} 处 ——", body_w) + self.RESET)
+                for marker, pieces in _diff_wrapped(path, str(old), str(new), body_w):
+                    if marker == "+":
+                        mcol, bg = self.c("ok"), _bg(_DIFF_ADD_BG)
+                    elif marker == "-":
+                        mcol, bg = self.c("err"), _bg(_DIFF_DEL_BG)
+                    else:
+                        mcol, bg = self.c("dim"), ""
+                    for k, piece in enumerate(pieces):
+                        lead = f"{ind}{mcol}{marker}{self.RESET} " if k == 0 else f"{ind}  "
+                        out.append(gseg + lead + bg + piece + self.RESET)
+        return out
 
     def _rotating_tip(self) -> str:
         interval = float(self.keys.get("tip_interval") or 5)
