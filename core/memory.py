@@ -1,4 +1,6 @@
 #该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.工具调用记录管理（白名单保留/回合末剥离/结果外置磁盘）3.长期记忆写入配置4.在agent对话时提供记忆补充内容
+import hashlib
+import html
 import json
 import os
 import re
@@ -204,6 +206,7 @@ class Memory:
         self.compress_keep_recent_tokens = int(memory_cfg.get("compress_keep_recent_tokens", 16384))
         self.compress_summary_max_tokens = int(memory_cfg.get("compress_summary_max_tokens", 1024))
         self._compress_fail_streak = 0
+        self._compress_noop_fingerprint = ""
         # 上下文管理（core/toolstore.py）：白名单/预算/行内限额/回合末剥离保护
         ctx_cfg = config.data.get("context", {})
         self.tool_whitelist = set(ctx_cfg.get("tool_whitelist") or [])
@@ -366,10 +369,12 @@ class Memory:
         # message_added 观察链：外部同步/转发方消费（content 可能为多模态数组）；
         # 处理函数异常已在 hooks 内隔离，处理函数内不得再写会话消息（会递归）
         hooks.collect_hook("message_added", {"role": role, "content": content, **extra})
-        if role == "user" and self._compress_fail_streak:
-            # 新用户回合复位压缩熔断：上轮的 API 故障可能已恢复，重试频率限制为每回合一轮
-            self._compress_fail_streak = 0
-            log.debug("新用户回合，压缩熔断计数复位")
+        if role == "user":
+            self._compress_noop_fingerprint = ""
+            if self._compress_fail_streak:
+                # 新用户回合复位压缩熔断：上轮的 API 故障可能已恢复，重试频率限制为每回合一轮
+                self._compress_fail_streak = 0
+                log.debug("新用户回合，压缩熔断计数复位")
         log.debug(
             "消息追加: role=%s type=%s call_id=%s 当前%d条",
             role,
@@ -819,13 +824,23 @@ class Memory:
             if m.get("role") == "user" and self._api_visible(m)
         ]
 
+    def _atomic_blocks(self) -> List[tuple]:
+        """按消息协议切原子块，assistant tool_calls 与其 tool 结果不可拆分"""
+        blocks = []
+        index = 0
+        while index < len(self.messages):
+            start, end = conv_block_bounds(self.messages, index)
+            blocks.append((start, end))
+            index = end + 1
+        return blocks
+
     def _tail_start_index(self, budget_tokens: int) -> int:
-        """定位尾段起点：从最新轮次向前累积，预算内保留尽量多的轮次（至少保留最后一轮）"""
+        """定位未超预算轮次的尾段起点；超大最后一轮由 _compression_segments 处理"""
         boundaries = self._round_boundaries()
         if not boundaries:
             return len(self.messages)
         tail_start = boundaries[-1]
-        accumulated = self._count_tokens(self.messages[boundaries[-1]:])
+        accumulated = self._count_tokens(self.messages[tail_start:])
         for i in range(len(boundaries) - 2, -1, -1):
             start = boundaries[i]
             end = boundaries[i + 1]
@@ -835,6 +850,65 @@ class Memory:
             accumulated += round_tokens
             tail_start = start
         return tail_start
+
+    def _compression_segments(self, budget_tokens: int) -> tuple:
+        """返回 (旧段, 尾段)，超大最后一轮按原子块保留当前请求与最近块"""
+        boundaries = self._round_boundaries()
+        if not boundaries:
+            return list(self.messages), []
+        latest_start = boundaries[-1]
+        latest_tokens = self._count_tokens(self.messages[latest_start:])
+        if latest_tokens <= budget_tokens:
+            tail_start = self._tail_start_index(budget_tokens)
+            return self.messages[:tail_start], self.messages[tail_start:]
+
+        blocks = [block for block in self._atomic_blocks() if block[0] >= latest_start]
+        if not blocks:
+            return self.messages[:latest_start], self.messages[latest_start:]
+        user_block = blocks[0]
+        kept = {i for i in range(user_block[0], user_block[1] + 1)}
+        accumulated = self._count_tokens(self.messages[user_block[0]:user_block[1] + 1])
+        kept_blocks = 0
+        for start, end in reversed(blocks[1:]):
+            block_tokens = self._count_tokens(self.messages[start:end + 1])
+            if kept_blocks and accumulated + block_tokens > budget_tokens:
+                break
+            kept.update(range(start, end + 1))
+            accumulated += block_tokens
+            kept_blocks += 1
+        tail = [message for i, message in enumerate(self.messages) if i in kept]
+        old_segment = [message for i, message in enumerate(self.messages) if i not in kept]
+        log.debug(
+            "最后一轮超尾段预算，按原子块切尾: 轮次%d token -> 尾段%d token，保留块%d个",
+            latest_tokens, self._count_tokens(tail), kept_blocks,
+        )
+        return old_segment, tail
+
+    def _message_fingerprint(self) -> str:
+        """为同一条未变化历史生成稳定指纹，避免无效压缩重复调用模型"""
+        raw = json.dumps(self.messages, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _has_real_history(messages: List[dict]) -> bool:
+        """判断旧段是否含真实对话，避免只压缩 system/help/summary"""
+        return any(
+            m.get("role") in ("user", "assistant", "tool") and m.get("type") != "summary"
+            for m in messages
+        )
+
+    @staticmethod
+    def _summary_is_self_referential(summary_text: str, history_text: str) -> bool:
+        """拒绝把压缩器指令本身伪装成历史摘要"""
+        summary = html.unescape(summary_text or "").lower()
+        history = html.unescape(history_text or "").lower()
+        markers = (
+            "你是 bawcode 的上下文压缩器",
+            "严格按照 xml 结构输出",
+            "xml 之外不要输出任何内容",
+            "用户原话是最高优先级信号",
+        )
+        return any(marker in summary and marker not in history for marker in markers)
 
     def _compress_fail(self, reason: str) -> str:
         """压缩失败统一出口：计数熔断，历史保持不变"""
@@ -891,13 +965,21 @@ class Memory:
         """
         if not self.messages:
             return ""
-        tail_start = self._tail_start_index(self.compress_keep_recent_tokens)
-        old_segment = self.messages[:tail_start]
-        tail = self.messages[tail_start:]
+        fingerprint = self._message_fingerprint()
+        if fingerprint == self._compress_noop_fingerprint:
+            log.debug("压缩跳过: 当前历史与上次无效压缩相同")
+            return ""
+        old_segment, tail = self._compression_segments(self.compress_keep_recent_tokens)
         if not old_segment:
+            self._compress_noop_fingerprint = fingerprint
             log.debug("压缩跳过: 旧段为空（最近轮次已覆盖全部历史）")
             return ""
+        if not self._has_real_history(old_segment):
+            self._compress_noop_fingerprint = fingerprint
+            log.debug("压缩跳过: 旧段没有可摘要的真实对话")
+            return ""
         old_tokens = self._count_tokens(old_segment)
+        before_tokens = self._count_tokens(self.messages)
 
         # content 取纯文本部分：数组形态（图片块）直接内插会把 base64 整段拼进提示词
         history_text = "\n".join(
@@ -947,6 +1029,9 @@ class Memory:
         summary_text = structured["xml"] if structured is not None else summary.strip()
         if len(summary_text.strip()) < 50:
             return self._compress_fail("摘要为空或过短")
+        if structured is not None and self._summary_is_self_referential(summary_text, history_text):
+            self._compress_noop_fingerprint = fingerprint
+            return self._compress_fail("摘要疑似复述压缩器指令，历史保持不变")
         from core import tokens as tokenmod
 
         model = getattr(self.config, "model_name", "") or ""
@@ -955,16 +1040,14 @@ class Memory:
         except Exception:
             summary_tokens = max(1, len(summary_text) // 2)
         if summary_tokens > self.compress_summary_max_tokens:
+            self._compress_noop_fingerprint = fingerprint
             return self._compress_fail(
                 f"摘要 {summary_tokens} token 超过上限 {self.compress_summary_max_tokens}"
             )
 
-        self._compress_fail_streak = 0
-        archive_path = self._archive_old_segment(old_segment)
-        pointer = f"\n\n[完整历史已归档: {archive_path}]" if archive_path else ""
         summary_msg = {
             "role": "system",
-            "content": f"[上下文压缩摘要]\n{summary_text}{pointer}",
+            "content": f"[上下文压缩摘要]\n{summary_text}",
             "type": "summary",
             "metadata": {
                 "compressed_at": datetime.now().isoformat(timespec="seconds"),
@@ -975,6 +1058,17 @@ class Memory:
         }
         if structured is not None:
             summary_msg["sections"] = structured["sections"]
+        after_tokens = self._count_tokens([summary_msg] + tail)
+        if after_tokens >= before_tokens:
+            self._compress_noop_fingerprint = fingerprint
+            return self._compress_fail(
+                f"压缩后上下文未变小（{before_tokens}->{after_tokens} token）"
+            )
+
+        self._compress_fail_streak = 0
+        archive_path = self._archive_old_segment(old_segment)
+        pointer = f"\n\n[完整历史已归档: {archive_path}]" if archive_path else ""
+        summary_msg["content"] += pointer
         self.messages = [summary_msg] + tail
         log.info(
             "上下文压缩完成: 旧段%d条(约%d token) -> 摘要%d token(%s) + 尾段%d条原文%s",

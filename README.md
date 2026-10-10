@@ -52,7 +52,7 @@ python main.py                    # 进入 TUI
 | 段 | 用途 |
 |------|------|
 | `providers` / `active_provider_id` / `active_model_id` | 供应商与模型（OpenAI 兼容 base_url） |
-| `task_models` | plan / code / review 分角色模型 |
+| `task_models` | plan / code / review 分角色模型（工作流节点未指定 model 时按角色取用；非工作流主对话跟随激活模型） |
 | `llm` | `retry_times` / `retry_delay` / `retry_wait_seconds` / `stream` 等 |
 | `ui` | 主题、访问模式等（回合中 Enter 插话并入本轮 · Ctrl+Q 排队为新回合） |
 | `context` | 工具结果白名单、行内 token 上限、外置目录、压缩阈值 |

@@ -440,11 +440,10 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         if not name:
             return False
         text = self._buf_text()
-        start = self._word_start()
+        start = 0 if name.startswith("/") else self._word_start()
         end = self.cursor
         while end < len(text) and not text[end].isspace():
             end += 1
-        # 替换当前词（命令名或参数片段），补空格便于继续输入
         new_text = text[:start] + name + " " + text[end:]
         self._buf_set(new_text, start + len(name) + 1)
         self.candidates = []

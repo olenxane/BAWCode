@@ -199,6 +199,10 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             io.phase("")  # 回合完成：状态行空行占位
             log.info("任务完成（共%d轮推理）", round_no + 1)
             if not io.cancelled():
+                # 先收敛工具记录，再压缩，避免摘要模型看到尚未外置的原始大输出
+                finalize = getattr(session, "finalize_turn", None)
+                if callable(finalize):
+                    finalize()
                 session.maybe_compress(llm_fn=lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
             io.status("就绪")
             return {"status": "complete", "content": response.get("content") or ""}
@@ -271,14 +275,15 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
     # while 循环不可达出口：轮次终止统一在循环内 max_rounds 分支返回
 
 
-_DIRECT_EXECUTE_NODE = {"id": "direct", "type": "execute", "max_rounds": 12, "model_role": "code"}
+# 非工作流直接对话的伪节点：只承载轮数，不设模型角色（模型跟随激活模型）
+_DIRECT_EXECUTE_NODE = {"id": "direct", "type": "execute", "max_rounds": 12}
 
 
 def run_direct(turn: TurnContext) -> str:
     """直接对话（工作流未启用）：注入系统提示词后进工具循环，不经节点链。
 
-    行为与最简 default 工作流等价，但作为一等状态存在——工作流是显式启用的
-    处理管线，而非"永远套着一层看不见的默认链"。"""
+    作为一等状态存在——工作流是显式启用的处理管线，而非"永远套着一层看不见的默认链"。
+    模型跟随激活（默认）模型，分角色模型只在工作流节点里生效。"""
     from core import skills as skills_mod
 
     skills_mod.set_injection(enabled=None, allow=None)
@@ -293,10 +298,8 @@ def run_direct(turn: TurnContext) -> str:
         override = 0
     if override > 0:
         max_rounds = override
-    model = None
-    if hasattr(turn.config, "get_task_model"):
-        model = turn.config.get_task_model(_DIRECT_EXECUTE_NODE["model_role"])
-    result = tool_loop(turn, turn.system_prompt_text or None, max_rounds, model=model)
+    # 非工作流：主对话跟随激活（默认）模型，model=None 由 llm 解析为当前激活模型
+    result = tool_loop(turn, turn.system_prompt_text or None, max_rounds, model=None)
     if result["status"] != "complete":
         raise TurnStop()
     return "complete"

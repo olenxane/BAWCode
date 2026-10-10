@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from core import keyinput
 from core import policy
-from core.config import THINKING_OPTIONS, make_model_name
+from core.config import THINKING_OPTIONS, make_model_name, model_preset_defaults
 from core.log import get_logger
 from core.textbuf import TextBuffer
 
@@ -68,6 +68,7 @@ class SettingsPanelMixin:
         self._settings_scroll = 0
         self.settings_notice = ""
         self.settings_model_work: Dict[str, List[dict]] = {}
+        self._settings_model_scratch_name = ""
         self._settings_baseline: Dict[str, Any] = {}
         self._settings_esc_stage = 0
         self.settings_edit: Optional[dict] = None
@@ -217,6 +218,10 @@ class SettingsPanelMixin:
 
     # 焦点离开时才重建模型列表的文本字段
     _MODEL_LIST_TEXT_KEYS = frozenset({"provider_id", "model_id"})
+    _MODEL_PARAMETER_KEYS = frozenset({
+        "model_id", "modalities", "context_window", "max_tokens",
+        "model_temperature", "thinking_effort",
+    })
 
     def _settings_snapshot(self, config) -> dict:
         s = self.settings_scratch
@@ -230,6 +235,12 @@ class SettingsPanelMixin:
             "provider_temperature": s.get("provider_temperature"),
             "default_model_id": s.get("default_model_id"),
             "model_id": s.get("model_id"),
+            "modalities": s.get("modalities"),
+            "context_window": s.get("context_window"),
+            "max_tokens": s.get("max_tokens"),
+            "model_temperature": s.get("model_temperature"),
+            "thinking_effort": s.get("thinking_effort"),
+            "model_work": repr(self.settings_model_work),
             "theme": s.get("theme", getattr(config, "theme", "")),
             "mode": s.get("mode", getattr(config, "mode", "")),
             "log_level": s.get("log_level"),
@@ -241,6 +252,8 @@ class SettingsPanelMixin:
         }
 
     def _settings_is_dirty(self, config) -> bool:
+        if self.settings_tabs[self.settings_tab] == "模型":
+            self._settings_capture_model_scratch(config)
         if not self._settings_baseline:
             return False
         now = self._settings_snapshot(config)
@@ -282,7 +295,9 @@ class SettingsPanelMixin:
             providers = config.providers() or [{}]
             pids = [p.get("provider_id", "") for p in providers]
             pid = self.settings_provider_id or config.data.get("active_provider_id") or (pids[0] if pids else "")
-            if pid not in pids and pids:
+            if scratch_keep.get("switch_provider") == "(新建)":
+                pid = str(scratch_keep.get("provider_id") or "").strip()
+            elif pid not in pids and pids:
                 pid = pids[0]
             self.settings_provider_id = pid
             provider = config.find_provider(pid) or {}
@@ -365,14 +380,20 @@ class SettingsPanelMixin:
                     "type": "choice",
                     "options": live_mids or ["（无模型）"],
                     "current": default_id or (live_mids[0] if live_mids else "（无模型）"),
-                    "hint": "←→ 按实时模型列表选择",
+                    "hint": "←→ 按模型列表选择",
                 },
                 {
                     "key": "provider_models_list",
-                    "label": "实时模型列表",
-                    "type": "text",
+                    "label": "模型列表",
+                    "type": "readonly",
                     "current": model_list,
                     "hint": "只读 · 与模型页工作列表同步",
+                },
+                {
+                    "key": "fetch_models",
+                    "label": "获取模型列表",
+                    "type": "action",
+                    "hint": "Enter 拉取模型并一键添加 · 保存提供商后生效",
                 },
                 {"key": "_sep_cfg", "label": "——————————————", "type": "sep", "hint": ""},
                 {
@@ -389,7 +410,12 @@ class SettingsPanelMixin:
             if current_model not in names:
                 current_model = active if active in names else (names[0] if names else "")
             self.settings_model_name = current_model
-            row = config.find_model(current_model) or {}
+            if current_model != self._settings_model_scratch_name:
+                for key in self._MODEL_PARAMETER_KEYS:
+                    scratch_keep.pop(key, None)
+                self._settings_model_scratch_name = current_model
+                scratch_keep["select_model"] = current_model
+            row = self._settings_model_row(config, current_model)
             pids = [p.get("provider_id", "") for p in config.providers()] or ["-"]
             edit_pid = row.get("provider_id") or self.settings_provider_id or config.data.get("active_provider_id")
             live = self._provider_live_models(config, edit_pid)
@@ -397,13 +423,15 @@ class SettingsPanelMixin:
             if live_names and current_model not in live_names:
                 current_model = live_names[0]
                 self.settings_model_name = current_model
-                row = config.find_model(current_model) or {}
+                row = self._settings_model_row(config, current_model)
             modalities = row.get("modalities") or ["text"]
             mod_joined = ",".join(modalities)
             mod_choices = [
                 "text",
                 "text,vision",
                 "text,vision,audio",
+                "text,vision,audio,video",
+                "text,vision,video",
                 "text,audio",
                 "text,embedding",
             ]
@@ -415,14 +443,14 @@ class SettingsPanelMixin:
                 {"key": "select_provider", "label": "提供商", "type": "choice", "options": pids, "current": edit_pid, "hint": "←→ 选择"},
                 {"key": "select_model", "label": "模型", "type": "choice", "options": live_names or model_options, "current": current_model, "hint": "实时列表"},
                 {"key": "model_id", "label": "模型ID", "type": "text", "current": row.get("model_id", "")},
-                {"key": "modalities", "label": "支持模态", "type": "choice", "options": mod_choices, "current": mod_joined, "hint": "←→ 预置组合"},
+                {"key": "modalities", "label": "支持模态", "type": "text", "current": mod_joined, "hint": "逗号分隔，如 text,vision,audio,video"},
                 {"key": "context_window", "label": "最大上下文", "type": "text", "current": row.get("context_window", 0)},
                 {"key": "max_tokens", "label": "最大输出token", "type": "text", "current": row.get("max_tokens", 0)},
                 {"key": "model_temperature", "label": "温度", "type": "text", "current": row.get("temperature", 1.0)},
                 {"key": "thinking_effort", "label": "思考强度", "type": "choice", "options": THINKING_OPTIONS, "current": row.get("thinking_effort", "none"), "hint": "←→"},
-                {"key": "task_plan", "label": "规划模型", "type": "choice", "options": names or model_options, "current": task.get("plan", active), "hint": "任务规划默认模型"},
-                {"key": "task_code", "label": "编写模型", "type": "choice", "options": names or model_options, "current": task.get("code", active), "hint": "代码编写默认模型"},
-                {"key": "task_review", "label": "审查模型", "type": "choice", "options": names or model_options, "current": task.get("review", active), "hint": "代码审查默认模型"},
+                {"key": "task_plan", "label": "规划模型", "type": "choice", "options": names or model_options, "current": task.get("plan", active), "hint": "工作流规划节点默认模型"},
+                {"key": "task_code", "label": "编写模型", "type": "choice", "options": names or model_options, "current": task.get("code", active), "hint": "工作流执行节点默认模型"},
+                {"key": "task_review", "label": "审查模型", "type": "choice", "options": names or model_options, "current": task.get("review", active), "hint": "工作流审查节点默认模型"},
                 {"key": "add_provider", "label": "添加提供商", "type": "action", "hint": "Enter 后输入 provider_id"},
                 {"key": "add_model", "label": "添加模型到提供商", "type": "action", "hint": "写入工作列表，保存提供商时 diff 生效"},
             ]
@@ -543,7 +571,7 @@ class SettingsPanelMixin:
                 {"key": "workflow_enabled", "label": "启用工作流", "type": "bool", "current": bool(wf_cfg.get("enabled", False)), "hint": "←→ 关=直接对话 · 开=按工作流节点链运行（下一回合生效）"},
                 {"key": "workflow_active", "label": "工作流", "type": "choice", "options": self._settings_workflow_names(config), "current": self._settings_workflow_current(config), "hint": "←→ 选择处理管线（仅在启用工作流时生效）"},
                 {"key": "log_level", "label": "日志等级", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "current": "关闭" if log_level == "off" else log_level, "hint": "←→ 关闭=不记录任何日志（含写盘）"},
-                {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 切换当前模型"},
+                {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 非工作流主对话与压缩摘要使用"},
             ]
         self.settings_fields = fields
         # 初始化 scratch：保留同 key 已编辑值（插件页字段写透持久化，不经 scratch）
@@ -558,9 +586,25 @@ class SettingsPanelMixin:
                 val = scratch_keep[field["key"]]
                 if val not in field["options"] and field.get("type") == "choice":
                     scratch_keep[field["key"]] = field.get("current")
+        if tab == "提供商":
+            scratch_keep["provider_models_list"] = model_list
         self.settings_scratch = scratch_keep
         if self.settings_index >= len(fields):
             self.settings_index = 0
+
+    def _settings_focus_edit(self, config) -> None:
+        field = self._plugin_current_field()
+        if field.get("type") == "text":
+            key = field["key"]
+            cur = self.settings_scratch.get(key, field.get("current"))
+            self._settings_begin_edit(
+                kind="text", label=field.get("label", key),
+                initial="" if cur is None else str(cur), key=key,
+            )
+        elif field.get("type") == "ptext":
+            self._settings_plugin_edit_text(config, field)
+        if self.settings_edit is not None:
+            self.render()
 
     def show_settings_form(self, config) -> dict:
         """设置页：↑↓ 移动 · ←→ 修改选项 · Tab 切标签 · Enter 保存并退出 · Esc 放弃"""
@@ -574,6 +618,7 @@ class SettingsPanelMixin:
         self.settings_model_name = config.model_name
         self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
         self.settings_model_work = getattr(self, "settings_model_work", {}) or {}
+        self._settings_model_scratch_name = ""
         self.settings_edit = None
         self._build_settings_fields(config)
         self._settings_baseline = self._settings_snapshot(config)
@@ -584,6 +629,8 @@ class SettingsPanelMixin:
             pass
         self.render()
         while True:
+            if self.settings_edit is None and self._settings_esc_stage == 0:
+                self._settings_focus_edit(config)
             key = _read_key()
             if key is None:
                 key = ("tick", "")
@@ -592,9 +639,20 @@ class SettingsPanelMixin:
                 continue
             # 行内编辑态：按键全部交给编辑器（走 pt 管线，中文 IME 上屏可用）
             if self.settings_edit is not None:
-                self._settings_edit_key(kind, value, config)
-                self.render()
-                continue
+                navigation = _key_direction(kind, value) in ("up", "down")
+                field_edit = self.settings_edit["kind"] in ("text", "plugin")
+                if field_edit and (navigation or kind in ("tab", "escape", "interrupt", "submit", "submit_ctrl")):
+                    self._settings_edit_commit(config)
+                    if kind in ("submit", "submit_ctrl"):
+                        updates = self._settings_apply(config)
+                        self.settings_mode = False
+                        self.bind_config(config)
+                        self.render()
+                        return updates
+                else:
+                    self._settings_edit_key(kind, value, config)
+                    self.render()
+                    continue
             if kind == "interrupt":
                 if self._settings_is_dirty(config) and self._settings_esc_stage == 0:
                     self._settings_esc_stage = 1
@@ -628,6 +686,7 @@ class SettingsPanelMixin:
             if self._is_mode_switch(kind, value) and kind != "tab":
                 continue
             if kind == "tab":
+                self._settings_capture_model_scratch(config)
                 self.settings_tab = (self.settings_tab + 1) % len(self.settings_tabs)
                 self.settings_index = 0
                 self._settings_scroll = 0
@@ -804,6 +863,7 @@ class SettingsPanelMixin:
             # 切换提供商属于明确操作，立即刷新列表
             self._immediate_settings_refresh(config)
         elif key == "select_provider":
+            self._settings_capture_model_scratch(config)
             pids_models = []
             for row in config.list_models():
                 if row["provider_id"] == self.settings_scratch[key]:
@@ -814,6 +874,7 @@ class SettingsPanelMixin:
             # 下拉切换提供商：立即刷新模型列表（非逐字输入）
             self._immediate_settings_refresh(config)
         elif key == "select_model":
+            self._settings_capture_model_scratch(config)
             self.settings_model_name = self.settings_scratch[key]
             self._immediate_settings_refresh(config)
         elif key == "theme":
@@ -837,6 +898,59 @@ class SettingsPanelMixin:
             if mid:
                 by_id[mid] = dict(m)
         return list(by_id.values())
+
+    def _settings_model_row(self, config, model_name: str) -> dict:
+        for provider in config.providers():
+            pid = provider.get("provider_id") or ""
+            for model in self._provider_live_models(config, pid):
+                if make_model_name(pid, model.get("model_id", "")) == model_name:
+                    return {**model, "provider_id": pid, "model_name": model_name}
+        return config.find_model(model_name) or {} if model_name else {}
+
+    def _settings_capture_model_scratch(self, config) -> None:
+        """把当前模型页字段写入工作副本，切换模型时不丢未保存编辑。"""
+        if self.settings_tabs[self.settings_tab] != "模型":
+            return
+        current_name = self.settings_model_name or self.settings_scratch.get("select_model") or ""
+        row = self._settings_model_row(config, current_name)
+        if not row:
+            return
+        pid = row.get("provider_id") or self.settings_provider_id or config.data.get("active_provider_id")
+        old_mid = str(row.get("model_id") or "").strip()
+        new_mid = str(self.settings_scratch.get("model_id") or old_mid).strip() or old_mid
+        if not pid or not old_mid:
+            return
+        source = None
+        provider = config.find_provider(pid)
+        if provider:
+            source = next((m for m in provider.get("models") or [] if m.get("model_id") == old_mid), None)
+        for item in self.settings_model_work.get(pid, []) or []:
+            if item.get("model_id") in (old_mid, new_mid):
+                source = item
+        entry = dict(source or {})
+        entry.setdefault("model_id", old_mid)
+        entry["model_id"] = new_mid
+        entry["modalities"] = [
+            part.strip().lower()
+            for part in str(self.settings_scratch.get("modalities") or ",".join(row.get("modalities") or ["text"])).split(",")
+            if part.strip()
+        ] or ["text"]
+        for key in ("context_window", "max_tokens"):
+            try:
+                entry[key] = max(1, int(float(self.settings_scratch.get(key, row.get(key, 1)))))
+            except (TypeError, ValueError):
+                entry[key] = row.get(key) or 1
+        try:
+            entry["temperature"] = float(self.settings_scratch.get("model_temperature", row.get("temperature", 1.0)))
+        except (TypeError, ValueError):
+            entry["temperature"] = row.get("temperature", 1.0)
+        entry["thinking_effort"] = str(self.settings_scratch.get("thinking_effort", row.get("thinking_effort", "none")) or "none")
+        work = self.settings_model_work.setdefault(pid, [])
+        work[:] = [m for m in work if m.get("model_id") not in {old_mid, new_mid}]
+        work.append(entry)
+        if new_mid != old_mid:
+            self.settings_model_name = make_model_name(pid, new_mid)
+            self.settings_scratch["select_model"] = self.settings_model_name
 
     def _settings_save_provider(self, config) -> str:
         """提供商独立保存：diff 模型列表（无「附带新增」字段）"""
@@ -1004,7 +1118,9 @@ class SettingsPanelMixin:
 
     def _settings_run_action(self, config, action: str) -> None:
         """添加提供商/模型：进入行内编辑读入 id（提交在 _settings_edit_commit 完成）"""
-        if action == "add_provider":
+        if action == "fetch_models":
+            self._settings_fetch_models(config)
+        elif action == "add_provider":
             self._settings_begin_edit(kind="add_provider", label="新 provider_id", initial="")
         elif action == "add_model":
             pid = (
@@ -1015,6 +1131,49 @@ class SettingsPanelMixin:
             self._settings_begin_edit(
                 kind="add_model", label=f"新 model_id ({pid})", initial="", pid=pid
             )
+
+    def _settings_fetch_models(self, config) -> None:
+        from openai import OpenAI
+        from core.config import normalize_base_url
+
+        s = self.settings_scratch
+        pid = str(s.get("provider_id") or "").strip()
+        base_url = str(s.get("base_url") or "").strip()
+        if not pid or not base_url:
+            self.settings_notice = "请先填写提供商ID和 Base URL"
+            return
+        self.settings_notice = "正在获取模型列表…"
+        self.render()
+        try:
+            with OpenAI(
+                api_key=str(s.get("api_key") or "").strip() or "not-required",
+                base_url=normalize_base_url(base_url), timeout=15.0, max_retries=0,
+            ) as client:
+                rows = client.models.list()
+                ids = list(dict.fromkeys(
+                    row.id.strip() for row in rows.data
+                    if isinstance(row.id, str) and row.id.strip()
+                ))
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            self.settings_notice = f"获取模型列表失败 · HTTP {status}" if status else "获取模型列表失败 · 请检查地址、网络和 API Key"
+            return
+        existing = {m["model_id"] for m in self._provider_live_models(config, pid)}
+        work = self.settings_model_work.setdefault(pid, [])
+        for mid in ids:
+            if mid not in existing:
+                preset = model_preset_defaults(mid)
+                work.append({
+                    "model_id": mid,
+                    "context_window": preset["context_window"],
+                    "max_tokens": preset["max_tokens"],
+                    "temperature": 1.0,
+                    "modalities": preset["modalities"],
+                    "thinking_effort": preset["thinking_effort"],
+                })
+        self.settings_provider_id = pid
+        self._immediate_settings_refresh(config)
+        self.settings_notice = f"已获取 {len(ids)} 个模型 · 新增 {len(set(ids) - existing)} 个 · 已按预置表填充参数 · 保存提供商后生效"
 
     def _settings_commit_add_provider(self, config, pid: str) -> None:
         pid = pid.strip()
@@ -1027,7 +1186,7 @@ class SettingsPanelMixin:
                 "name": pid,
                 "api_key": "",
                 "base_url": "https://api.openai.com/v1",
-                "models": [{"model_id": "default", "context_window": 65536, "max_tokens": 8192}],
+                "models": [{"model_id": "default"}],
             }
         )
         self.settings_provider_id = pid
@@ -1039,13 +1198,14 @@ class SettingsPanelMixin:
         if not mid:
             self.settings_notice = "model_id 为空，已取消"
             return
+        preset = model_preset_defaults(mid)
         entry = {
             "model_id": mid,
-            "context_window": 65536,
-            "max_tokens": 8192,
+            "context_window": preset["context_window"],
+            "max_tokens": preset["max_tokens"],
             "temperature": 1.0,
-            "modalities": ["text"],
-            "thinking_effort": "none",
+            "modalities": preset["modalities"],
+            "thinking_effort": preset["thinking_effort"],
         }
         # 写入工作副本，保存提供商时 diff；若提供商已存在也同步 config 便于模型页编辑
         work = self.settings_model_work.setdefault(pid, [])
@@ -1059,6 +1219,7 @@ class SettingsPanelMixin:
 
     def _settings_apply(self, config) -> dict:
         """将三个标签页 scratch 写入 config 并 save"""
+        self._settings_capture_model_scratch(config)
         s = self.settings_scratch
         # 提供商
         pid = s.get("provider_id") or self.settings_provider_id or config.data.get("active_provider_id")
@@ -1074,9 +1235,8 @@ class SettingsPanelMixin:
         except (TypeError, ValueError):
             provider["temperature"] = 1.0
         existing = config.find_provider(str(pid))
-        if existing:
-            provider["models"] = existing.get("models") or []
-            provider["default_model_id"] = s.get("default_model_id") or existing.get("default_model_id")
+        provider["models"] = self._provider_live_models(config, str(pid))
+        provider["default_model_id"] = s.get("default_model_id") or (existing or {}).get("default_model_id")
         config.add_or_update_provider(provider)
         # 激活提供商
         self._settings_apply_active_provider(config)
@@ -1309,8 +1469,7 @@ class SettingsPanelMixin:
         if kind == "text":
             key_name = edit.get("key")
             label = edit["label"]
-            if raw != "":
-                self.settings_scratch[key_name] = raw
+            self.settings_scratch[key_name] = raw
             if key_name in self._MODEL_LIST_TEXT_KEYS:
                 self._immediate_settings_refresh(config)
             else:
@@ -1340,5 +1499,6 @@ class SettingsPanelMixin:
     def _compose_edit_line(self, w: int) -> str:
         edit = self.settings_edit or {}
         label = edit.get("label", "")
-        body = f" {label} [{self._edit_caret_text(edit)}]  Enter 提交 · Esc 取消"
+        hint = "↑↓ 切换字段 · Tab 切换标签 · Enter 保存退出 · Esc 放弃" if edit.get("kind") in ("text", "plugin") else "Enter 提交 · Esc 取消"
+        body = f" {label} [{self._edit_caret_text(edit)}]  {hint}"
         return self.c("warn") + _clip(body, w) + self.RESET

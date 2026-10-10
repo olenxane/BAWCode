@@ -293,20 +293,128 @@ TASK_ROLES = {
     "review": "代码审查",
 }
 
+# 模型参数预置表：按顺序 re.search 匹配 model_id（不区分大小写），首个命中生效。
+# 未命中时回退到 DEFAULT_CONTEXT_WINDOW / DEFAULT_MAX_TOKENS / 纯文本模态。
+# 规则为 (pattern, context_window, max_tokens, modalities, thinking_effort)；
+# pattern 使用宽松的分隔符匹配，兼容中转站常见的 provider/model、连字符、下划线和点号命名。
+DEFAULT_CONTEXT_WINDOW = 131072   # 128k
+DEFAULT_MAX_TOKENS = 32768        # 32k
+DEFAULT_MODALITIES = ["text"]
+FULL_MODALITIES = ["text", "vision", "audio", "video"]
+
+MODEL_PRESET_RULES = [
+    # —— DeepSeek V4+：V4.1 额外支持图片，其余按纯文本预置 ——
+    (r"deepseek[-_ ]?v4[._-]1(?:\b|[-_])", 1000000, 384000, ["text", "vision"], "high"),
+    (r"deepseek[-_ ]?v(?:4(?:\.\d+)?|[5-9]\d*(?:\.\d+)?)(?:\b|[-_])", 1000000, 384000, ["text"], "high"),
+    # —— OpenAI GPT 5.6+ ——
+    (r"gpt[-_ ]?5(?:[._-](?:6|[7-9]\d*|\d{2,}))(?:\b|[-_])", 1050000, 256000, ["text", "vision"], "high"),
+    # —— Google Gemini 全系列：文本、图片、音频、视频 ——
+    (r"gemini(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, FULL_MODALITIES, "none"),
+    # —— GLM 5.2+；5.3 Flash 全模态，普通 5.3 图片，其他版本纯文本 ——
+    (r"glm[-_ ]?5[._-]3[-_ ]?flash(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, FULL_MODALITIES, "high"),
+    (r"glm[-_ ]?5[._-]3(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    (r"glm[-_ ]?5[._-](?:2|[3-9]\d*|\d{2,})(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text"], "high"),
+    # —— Anthropic Claude 4.5+ ——
+    (r"claude(?:[-_ ][a-z0-9]+)*[-_ ]4[-_.-]5(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    (r"claude(?:[-_ ][a-z0-9]+)*[-_ ]4[-_.-](?:[6-9]\d*|\d{2,})(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    (r"claude(?:[-_ ][a-z0-9]+)*[-_ ][5-9](?:[._-]\d+)?(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    # —— Kimi K3 ——
+    (r"kimi[-_ ]?k3(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    # —— SpaceBunny ——
+    (r"space[-_ ]?bunny(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "none"),
+    # —— Qwen 3.5+ ——
+    (r"qwen[-_ ]?3[._-]5(?:\b|[-_])", 256000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    (r"qwen[-_ ]?3[._-](?:[6-9]\d*|\d{2,})(?:\b|[-_])", 256000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    (r"qwen[-_ ]?[4-9](?:[._-]\d+)?(?:\b|[-_])", 256000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
+    # —— 仍保留的已知旧型号预置；未命中这些规则的模型走统一回退 ——
+    (r"gpt-4\.1\b", 1047576, 32768, ["text", "vision"], "high"),
+    (r"gpt-4o\b", 128000, 16384, ["text", "vision"], "medium"),
+    (r"gpt-4-turbo\b", 128000, 4096, ["text"], "none"),
+    (r"gpt-3\.5\b", 16385, 4096, ["text"], "none"),
+    (r"gpt-4\b", 8192, 8192, ["text"], "none"),
+    (r"o3\b", 200000, 100000, ["text"], "high"),
+    (r"o1\b", 200000, 100000, ["text"], "high"),
+    (r"(?:o|gpt)[-_ ]?image(?:\b|[-_])", 10000, 2048, ["text", "vision"], "none"),
+    (r"claude-3\.5-sonnet", 200000, 8192, ["text", "vision"], "medium"),
+    (r"claude-3-opus", 200000, 4096, ["text"], "none"),
+    (r"claude-3-haiku", 200000, 4096, ["text", "vision"], "none"),
+    (r"deepseek-v3", 65536, 8192, ["text"], "high"),
+    (r"deepseek-v4", 1000000, 384000, ["text"], "high"),
+    (r"deepseek-r1", 65536, 8192, ["text"], "high"),
+    (r"kimi-k2", 131072, 8192, ["text", "vision"], "high"),
+    (r"llama-4", 128000, 16384, ["text", "vision"], "none"),
+    (r"llama-3\.2", 128000, 8192, ["text", "vision"], "none"),
+    (r"llama-3\.1", 128000, 8192, ["text", "vision"], "none"),
+    (r"mistral-large", 128000, 128000, ["text"], "none"),
+    (r"mixtral", 32000, 8192, ["text"], "none"),
+    (r"mistral", 32000, 8192, ["text"], "none"),
+    (r"minimax", 128000, 128000, ["text"], "none"),
+    (r"yi-", 32768, 4096, ["text"], "none"),
+    (r"ernie", 32000, 8192, ["text"], "none"),
+    (r"doubao", 32000, 4096, ["text", "vision"], "none"),
+    (r"step", 32000, 4096, ["text"], "none"),
+]
+
+
+def model_preset_defaults(model_id: str) -> dict:
+    """按正则匹配表返回模型默认参数；未命中时回退 128k/32k/text。
+
+    返回值包含 context_window / max_tokens / modalities / thinking_effort 四项，
+    用于为新增或拉取的模型条目预填合理参数。匹配不区分大小写；带 provider
+    前缀的 model_id（如 free-hkbu/gpt-4.1）通过 re.search 天然支持。
+    """
+    mid = (model_id or "").strip().lower()
+    for pattern, ctx, maxt, mods, effort in MODEL_PRESET_RULES:
+        if re.search(pattern, mid):
+            return {
+                "context_window": ctx,
+                "max_tokens": maxt,
+                "modalities": list(mods),
+                "thinking_effort": effort,
+            }
+    return {
+        "context_window": DEFAULT_CONTEXT_WINDOW,
+        "max_tokens": DEFAULT_MAX_TOKENS,
+        "modalities": list(DEFAULT_MODALITIES),
+        "thinking_effort": "none",
+    }
+
 
 def normalize_model_entry(entry: dict) -> dict:
-    """补全模型条目默认字段"""
+    """补全单模型参数；预置只填缺失字段，不覆盖用户已保存的值。"""
     data = dict(entry or {})
     data.setdefault("model_id", data.get("model") or "")
-    data.setdefault("context_window", 65536)
-    data.setdefault("max_tokens", 8192)
+    if "max_tokens" not in data and "max_output_tokens" in data:
+        data["max_tokens"] = data.get("max_output_tokens")
+    if "modalities" not in data and "modality" in data:
+        data["modalities"] = data.get("modality")
+    data.pop("max_output_tokens", None)
+    data.pop("modality", None)
+    preset = model_preset_defaults(data.get("model_id") or "")
+    for key in ("context_window", "max_tokens"):
+        value = data.get(key)
+        if value is None or value == "":
+            data[key] = preset[key]
+        else:
+            try:
+                data[key] = max(1, int(float(value)))
+            except (TypeError, ValueError):
+                data[key] = preset[key]
     data.setdefault("temperature", 1.0)
+    try:
+        data["temperature"] = float(data.get("temperature", 1.0))
+    except (TypeError, ValueError):
+        data["temperature"] = 1.0
     modalities = data.get("modalities")
+    if isinstance(modalities, str):
+        modalities = [part.strip() for part in modalities.split(",") if part.strip()]
     if not isinstance(modalities, list) or not modalities:
-        modalities = ["text"]
-    data["modalities"] = [str(m) for m in modalities if str(m) in MODALITY_OPTIONS] or ["text"]
-    effort = str(data.get("thinking_effort") or "none").lower()
-    data["thinking_effort"] = effort if effort in THINKING_OPTIONS else "none"
+        modalities = list(preset["modalities"])
+    data["modalities"] = [str(m).strip().lower() for m in modalities if str(m).strip().lower() in MODALITY_OPTIONS]
+    if not data["modalities"]:
+        data["modalities"] = list(preset["modalities"])
+    effort = str(data.get("thinking_effort") or preset["thinking_effort"]).lower()
+    data["thinking_effort"] = effort if effort in THINKING_OPTIONS else preset["thinking_effort"]
     return data
 
 
@@ -515,6 +623,39 @@ class Config:
             if item.get("provider_id") == provider_id:
                 return item
         return None
+
+    def remove_provider(self, provider_id: str) -> None:
+        """删除提供商并修复激活模型与任务引用"""
+        provider = self.find_provider(provider_id)
+        if provider is None:
+            raise ValueError("提供商不存在")
+        providers = self.providers()
+        if len(providers) <= 1:
+            raise ValueError("不能删除最后一个提供商")
+        removed_names = {
+            make_model_name(provider_id, m.get("model_id") or "")
+            for m in provider.get("models") or []
+        }
+        task_models = self.data.get("task_models") or {}
+        removed_roles = {
+            role for role, name in task_models.items()
+            if name in removed_names or (
+                self.find_model(name) or {}
+            ).get("provider_id") == provider_id
+        }
+        remaining = [p for p in providers if p.get("provider_id") != provider_id]
+        self.data["providers"] = remaining
+        if self.data.get("active_provider_id") == provider_id:
+            replacement = next((p for p in remaining if p.get("models")), remaining[0])
+            mids = [m.get("model_id") for m in replacement.get("models") or []]
+            default = replacement.get("default_model_id")
+            if not mids:
+                replacement["default_model_id"] = ""
+            self.data["active_provider_id"] = replacement.get("provider_id")
+            self.data["active_model_id"] = default if default in mids else (mids[0] if mids else "")
+        for role in removed_roles:
+            task_models.pop(role, None)
+        self.apply_active()
 
     def add_or_update_provider(self, provider: dict) -> dict:
         """新增/更新提供商；models 规范化"""

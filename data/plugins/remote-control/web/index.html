@@ -149,7 +149,17 @@
   /* ============ 工具正文 / 计划 / 子代理（与 TUI 对齐） ============ */
   .tool .tbody pre.cmdline { background: var(--bg); color: var(--dim); }
   /* 写入/编辑：monokai 词法底色（.hl 作用域，样式表由 /api/hlcss 下发） */
-  pre.hl { border-radius: 8px; padding: 8px 10px; overflow: auto; max-height: 340px; font-size: 12.5px; line-height: 1.55; }
+  pre.hl { border-radius: 8px; padding: 8px 10px; overflow: auto; max-height: 340px; font-size: 12.5px; line-height: 1.55; background: #272822; color: #f8f8f2; }
+  /* 后端样式尚未返回时，写入结果也保持可读的词法着色 */
+  .hl .c { color: #959077; }
+  .hl .k { color: #66d9ef; }
+  .hl .o { color: #ff4689; }
+  .hl .s, .hl .s1, .hl .s2 { color: #e6db74; }
+  .hl .m, .hl .mi, .hl .mf { color: #ae81ff; }
+  .hl .n, .hl .nf, .hl .nc { color: #f8f8f2; }
+  .hl .nb, .hl .nd { color: #a6e22e; }
+  .hl .p { color: #f8f8f2; }
+  .hl .err { color: #ed007e; background: #1e0010; }
   .hl.diff { border-radius: 8px; padding: 6px 0; overflow: auto; max-height: 340px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; }
   .hl.diff .dl { display: flex; white-space: pre-wrap; word-break: break-word; }
   .hl.diff .dl .mk { flex: none; width: 1.4em; text-align: center; color: #8b8b8b; user-select: none; }
@@ -241,6 +251,13 @@
     box-shadow: var(--shadow);
   }
   footer { position: relative; }
+  #input-completions {
+    position: absolute; bottom: 100%; left: 12px; right: 12px; max-height: 220px;
+    overflow-y: auto; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 4px; box-shadow: var(--shadow);
+  }
+  #input-completions button { display: block; width: 100%; text-align: left; padding: 7px 10px; border-radius: 8px; }
+  #input-completions button.active { background: var(--accent-soft); color: var(--accent-deep); }
 
   /* ============ 抽屉（侧栏） ============ */
   #scrim {
@@ -1040,6 +1057,7 @@ function renderPlanBanner(s) {
 async function send() {
   const text = input.value.trim();
   if (!text) return;
+  clearInputCompletions();
   input.value = "";
   input.style.height = "auto";
   try {
@@ -1058,13 +1076,80 @@ async function send() {
   } catch (e) { toast("网络错误: " + e, true); }
 }
 $("send").onclick = send;
+const completionBox = el("div");
+completionBox.id = "input-completions";
+completionBox.hidden = true;
+input.parentElement.append(completionBox);
+let inputCompletions = [], completionIndex = 0, completionEpoch = 0;
+let completionTimer = null, completionPrefix = "";
+function clearInputCompletions() {
+  completionEpoch++;
+  clearTimeout(completionTimer);
+  inputCompletions = [];
+  completionBox.hidden = true;
+}
+function renderInputCompletions() {
+  completionBox.replaceChildren();
+  completionBox.hidden = !inputCompletions.length;
+  inputCompletions.forEach((item, i) => {
+    const btn = el("button", i === completionIndex ? "active" : "", item.name);
+    btn.type = "button";
+    btn.onmousedown = e => e.preventDefault();
+    btn.onclick = () => { completionIndex = i; applyInputCompletion(); };
+    completionBox.append(btn);
+  });
+  const active = completionBox.querySelector(".active");
+  if (active) active.scrollIntoView({ block: "nearest" });
+}
+async function refreshInputCompletions() {
+  const prefix = input.value.slice(0, input.selectionStart);
+  clearInputCompletions();
+  if (!prefix.startsWith("/") || prefix.includes("\n")) return;
+  const epoch = completionEpoch;
+  try {
+    const r = await api("/api/complete", { prefix });
+    if (epoch !== completionEpoch || prefix !== input.value.slice(0, input.selectionStart)) return;
+    inputCompletions = r.ok ? (r.items || []) : [];
+    completionPrefix = prefix;
+    completionIndex = 0;
+    renderInputCompletions();
+  } catch (e) { if (epoch === completionEpoch) clearInputCompletions(); }
+}
+function applyInputCompletion() {
+  const item = inputCompletions[completionIndex];
+  if (!item || completionPrefix !== input.value.slice(0, input.selectionStart)) return;
+  let end = input.selectionStart;
+  while (end < input.value.length && !/\s/.test(input.value[end])) end++;
+  const text = item.name + " ";
+  input.value = text + input.value.slice(end);
+  input.setSelectionRange(text.length, text.length);
+  clearInputCompletions();
+  input.focus();
+}
 input.addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !coarse) { e.preventDefault(); send(); }
+  if (e.isComposing) return;
+  if (e.key === "Tab" && !e.shiftKey && input.value.startsWith("/")) {
+    e.preventDefault();
+    if (inputCompletions.length) applyInputCompletion();
+    else refreshInputCompletions().then(applyInputCompletion);
+    return;
+  }
+  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && inputCompletions.length) {
+    e.preventDefault();
+    completionIndex = (completionIndex + (e.key === "ArrowUp" ? -1 : 1) + inputCompletions.length) % inputCompletions.length;
+    renderInputCompletions();
+    return;
+  }
+  if (e.key === "Escape") clearInputCompletions();
+  if (e.key === "Enter" && !e.shiftKey && !coarse) { e.preventDefault(); send(); }
 });
 input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 140) + "px";
+  clearInputCompletions();
+  completionTimer = setTimeout(refreshInputCompletions, 120);
 });
+input.addEventListener("click", refreshInputCompletions);
 $("stop").onclick = async () => {
   try {
     const r = await api("/api/stop", {});
@@ -1347,6 +1432,13 @@ function openSettingsModal() {
   const tabs = el("div", "m-tabs");
   const body = el("div", "m-body");
   modal.append(head, tabs, body);
+  modal.addEventListener("keydown", e => {
+    if (e.isComposing || !["ArrowUp", "ArrowDown"].includes(e.key) || e.target.tagName !== "INPUT") return;
+    const controls = [...body.querySelectorAll("input, select, button")].filter(x => !x.disabled);
+    const index = controls.indexOf(e.target);
+    const next = controls[index + (e.key === "ArrowUp" ? -1 : 1)];
+    if (next) { e.preventDefault(); next.focus(); }
+  });
   scrim.append(modal);
   document.body.append(scrim);
   scrim.onclick = e => { if (e.target === scrim) scrim.remove(); };
@@ -1407,7 +1499,7 @@ function stToggle(on) {
   t.onclick = () => t.classList.toggle("on");
   return t;
 }
-function stSaveBtn(section, collectFn) {
+function stSaveBtn(section, collectFn, onSaved) {
   const btn = el("button", "btn small primary", "保存");
   btn.onclick = async () => {
     const values = collectFn();
@@ -1415,6 +1507,7 @@ function stSaveBtn(section, collectFn) {
     try {
       const r = await api("/api/settings", { section, values });
       toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
+      if (r.ok && onSaved) await onSaved();
     } catch (e) { toast("网络错误: " + e, true); }
     btn.disabled = false;
   };
@@ -1426,6 +1519,8 @@ function buildProviderTab(body, data) {
   const p = data.provider || {};
   const card = el("div", "st-card");
   const providers = p.providers || [];
+  const entries = p.entries || [];
+  const editSel = stSelect([...providers.map(x => x.provider_id), "(新建)"], p.provider_id || "(新建)");
   const pidInput = stInput(p.provider_id);
   const nameInput = stInput(p.provider_name);
   const keyInput = stInput(p.api_key);
@@ -1433,9 +1528,67 @@ function buildProviderTab(body, data) {
   const balInput = stInput(p.balance_url);
   const tempInput = stInput(p.temperature, "number");
   tempInput.step = "0.1";
-  const defModelSel = stSelect(p.models || [], p.default_model_id);
+  let modelIds = [...(p.models || [])];
+  const defModelSel = stSelect(modelIds, p.default_model_id);
+  const modelList = el("div", "st-note", modelIds.join(", ") || "（暂无模型）");
   const activeSel = stSelect(providers.map(x => x.provider_id), p.active_provider_id);
+  const fetchBtn = el("button", "btn small", "获取模型列表");
+  const deleteBtn = el("button", "btn small danger", "删除提供商");
+  function syncModels(current) {
+    const selected = current || defModelSel.value;
+    defModelSel.replaceChildren(...stSelect(modelIds, selected).children);
+    modelList.textContent = modelIds.join(", ") || "（暂无模型）";
+  }
+  function selectProvider() {
+    const row = entries.find(x => x.provider_id === editSel.value) || {};
+    const creating = editSel.value === "(新建)";
+    pidInput.value = row.provider_id || "";
+    nameInput.value = row.name || "";
+    keyInput.value = row.api_key || "";
+    urlInput.value = row.base_url || "https://api.openai.com/v1";
+    balInput.value = row.balance_url || "";
+    tempInput.value = row.temperature ?? 1.0;
+    modelIds = (row.models || []).map(x => x.model_id);
+    syncModels(row.default_model_id);
+    deleteBtn.disabled = creating || providers.length <= 1;
+  }
+  editSel.onchange = selectProvider;
+  deleteBtn.disabled = providers.length <= 1 || editSel.value === "(新建)";
+  deleteBtn.title = providers.length <= 1 ? "至少保留一个提供商" : "删除当前编辑的提供商及全部模型";
+  fetchBtn.onclick = async () => {
+    const pid = pidInput.value.trim(), base = urlInput.value.trim();
+    if (!pid || !base) { toast("请先填写提供商ID和 Base URL", true); return; }
+    const target = editSel.value;
+    fetchBtn.disabled = true;
+    editSel.disabled = true;
+    fetchBtn.textContent = "正在获取…";
+    try {
+      const r = await api("/api/provider/models", { provider_id: pid, base_url: base, api_key: keyInput.value });
+      if (!r.ok) { toast(r.message || "获取失败", true); return; }
+      if (target !== editSel.value || pid !== pidInput.value.trim() || base !== urlInput.value.trim()) return;
+      const previous = modelIds.length;
+      modelIds = [...new Set([...modelIds, ...(r.models || [])])];
+      syncModels();
+      toast(`已获取 ${(r.models || []).length} 个模型，新增 ${modelIds.length - previous} 个；保存后生效`);
+    } catch (e) { toast("获取模型列表网络错误", true); }
+    finally { fetchBtn.disabled = false; editSel.disabled = false; fetchBtn.textContent = "获取模型列表"; }
+  };
+  deleteBtn.onclick = async () => {
+    const pid = editSel.value;
+    if (pid === "(新建)" || !confirm(`确定删除提供商“${pid}”及其全部模型？删除当前提供商会自动切换到其他提供商。`)) return;
+    deleteBtn.disabled = true;
+    try {
+      const r = await api("/api/provider/delete", { provider_id: pid });
+      toast(r.ok ? (r.result || "已删除") : (r.message || "删除失败"), !r.ok);
+      if (r.ok) {
+        const fresh = await api("/api/settings");
+        if (fresh.ok) { body.replaceChildren(); buildProviderTab(body, fresh); }
+      }
+    } catch (e) { toast("删除提供商网络错误", true); }
+    finally { deleteBtn.disabled = providers.length <= 1; }
+  };
   card.append(
+    stRow("编辑提供商", editSel),
     stRow("激活提供商", activeSel),
     stRow("提供商ID", pidInput),
     stRow("显示名称", nameInput),
@@ -1444,19 +1597,26 @@ function buildProviderTab(body, data) {
     stRow("余额URL", balInput),
     stRow("默认温度", tempInput),
     stRow("默认模型", defModelSel),
+    stRow("模型列表", modelList),
+    stRow("", fetchBtn),
   );
-  card.append(el("div", "st-note", "修改后点击保存生效；API Key 明文存储于本地配置文件"));
+  card.append(el("div", "st-note", "获取的模型保存后生效；API Key 明文存储于本地配置文件"));
   const actions = el("div", "st-actions");
-  actions.append(stSaveBtn("provider", () => ({
+  const saveBtn = stSaveBtn("provider", () => ({
     active_provider_id: activeSel.value,
     provider_id: pidInput.value,
     provider_name: nameInput.value,
     api_key: keyInput.value,
     base_url: urlInput.value,
     balance_url: balInput.value,
-    temperature: parseFloat(tempInput.value) || 1.0,
+    temperature: Number.isFinite(parseFloat(tempInput.value)) ? parseFloat(tempInput.value) : 1.0,
     default_model_id: defModelSel.value,
-  })));
+    models: modelIds,
+  }), async () => {
+    const fresh = await api("/api/settings");
+    if (fresh.ok) { body.replaceChildren(); buildProviderTab(body, fresh); }
+  });
+  actions.append(saveBtn, deleteBtn);
   card.append(actions);
   body.append(card);
 }
@@ -1465,6 +1625,7 @@ function buildProviderTab(body, data) {
 function buildModelTab(body, data) {
   const m = data.model || {};
   const card = el("div", "st-card");
+  const entries = m.entries || [];
   const modelSel = stSelect(m.model_names || [], m.active_model_name);
   const midInput = stInput(m.model_id);
   const modInput = stInput(m.modalities);
@@ -1476,6 +1637,17 @@ function buildModelTab(body, data) {
   const planSel = stSelect(m.model_names || [], m.task_plan);
   const codeSel = stSelect(m.model_names || [], m.task_code);
   const revSel = stSelect(m.model_names || [], m.task_review);
+  function loadModel(name) {
+    const row = entries.find(x => x.model_name === name);
+    if (!row) return;
+    midInput.value = row.model_id || "";
+    modInput.value = row.modalities || "text";
+    ctxInput.value = row.context_window ?? "";
+    maxInput.value = row.max_tokens ?? "";
+    tempInput.value = row.temperature ?? 1.0;
+    thinkSel.value = row.thinking_effort || "none";
+  }
+  modelSel.onchange = () => loadModel(modelSel.value);
   card.append(
     stRow("当前模型", modelSel),
     stRow("模型ID", midInput),

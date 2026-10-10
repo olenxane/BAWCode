@@ -431,7 +431,10 @@ def _exec_analyze(node: dict, turn: TurnContext) -> None:
     io.phase("思考中")
     stage = _node_stage(turn, node, JUDGE_PROMPT_BUILTIN)
     payload = session.build_messages(extra_system=_stage_system(turn, node, stage))
-    result = llm.chat(payload, model=_node_model(turn.config, node), on_delta=io.on_delta)
+    model = _node_model(turn.config, node)
+    if model is None:
+        model = _role_model(turn.config, node.get("model_role") or "plan")
+    result = llm.chat(payload, model=model, on_delta=io.on_delta)
     io.clear_stream()
     check_cancel(turn)
     reply = ""
@@ -476,7 +479,7 @@ def _exec_review(node: dict, turn: TurnContext) -> None:
 
 def _exec_understand(node: dict, turn: TurnContext) -> None:
     turn.io.status("任务理解")
-    _run_aux_loop(node, turn, UNDERSTAND_PROMPT_BUILTIN, 8, None)
+    _run_aux_loop(node, turn, UNDERSTAND_PROMPT_BUILTIN, 8, "plan")
 
 
 def _exec_execute(node: dict, turn: TurnContext) -> None:

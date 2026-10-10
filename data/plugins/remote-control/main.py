@@ -28,6 +28,7 @@
   hooks 事件 stream_delta / turn_status（collect）；
   plugins.runtime() 只读运行时载体；ctx.register_teardown 卸载回调。
 """
+import copy
 import difflib
 import functools
 import hmac
@@ -43,6 +44,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
+
+from core.config import make_model_name
 
 try:
     from core import memory as memory_mod
@@ -965,6 +968,60 @@ def setup(ctx):
     # 回合进行中拒绝的会话结构操作（与主循环口径一致）
     _CMD_BUSY_BLOCKED = {"/clear", "/new", "/resume", "/undo", "/clear-trash"}
 
+    def _provider_models(data: dict) -> dict:
+        from core.config import normalize_base_url
+
+        url = data.get("base_url", "")
+        key = data.get("api_key", "")
+        if not isinstance(url, str) or not url.strip() or not isinstance(key, str):
+            return {"ok": False, "message": "请填写有效的 base_url 和 api_key"}
+        url = url.strip()
+        key = key.strip()
+        try:
+            from openai import OpenAI
+
+            with OpenAI(base_url=normalize_base_url(url), api_key=key or "no-key",
+                        timeout=15, max_retries=0) as client:
+                ids = []
+                seen = set()
+                for model in client.models.list().data:
+                    mid = model.id
+                    if not isinstance(mid, str):
+                        continue
+                    mid = mid.strip()
+                    if mid and mid not in seen:
+                        seen.add(mid)
+                        ids.append(mid)
+            return {"ok": True, "models": ids}
+        except Exception:
+            return {"ok": False, "message": "获取模型失败，请检查地址、密钥和网络"}
+
+    @_idle_operation
+    def _provider_delete(provider_id: str) -> dict:
+        err = _session_op_guard()
+        if err:
+            return err
+        try:
+            ctx.config.remove_provider(provider_id)
+        except ValueError as exc:
+            return {"ok": False, "message": str(exc)}
+        ctx.config.save()
+        llm = _llm()
+        if llm is not None and hasattr(llm, "refresh_from_config"):
+            llm.refresh_from_config(ctx.config)
+        app = _app()
+        if app is not None and hasattr(app, "bind_config"):
+            app.bind_config(ctx.config)
+        _broadcast({"t": "reset"})
+        return {"ok": True, "result": "提供商已删除", "model": ctx.config.active_model_name()}
+
+    def _complete(prefix) -> dict:
+        if not isinstance(prefix, str):
+            return {"ok": False, "message": "prefix 须为字符串"}
+        if commands_mod is None:
+            return {"ok": False, "message": "宿主缺少 commands 模块"}
+        return {"ok": True, "items": commands_mod.complete(prefix, config=ctx.config)}
+
     # ---- 设置面板：读取 / 保存（与 TUI /settings 同源，经 config 对象读写）----
 
     def _settings_get() -> dict:
@@ -984,6 +1041,19 @@ def setup(ctx):
         models = provider.get("models") or []
         active_mid = d.get("active_model_id", "")
         model_row = next((m for m in models if m.get("model_id") == active_mid), models[0] if models else {})
+        model_entries = [
+            {
+                "model_name": row.get("model_name", ""),
+                "provider_id": row.get("provider_id", ""),
+                "model_id": row.get("model_id", ""),
+                "modalities": ",".join(row.get("modalities") or ["text"]),
+                "context_window": row.get("context_window", 0),
+                "max_tokens": row.get("max_tokens", 0),
+                "temperature": row.get("temperature", 1.0),
+                "thinking_effort": row.get("thinking_effort", "none"),
+            }
+            for row in cfg.list_models()
+        ]
         themes = ["dark"] + [t for t in cfg.list_themes() if t != "dark"]
         workflows = workflow_mod.list_workflows(cfg) if workflow_mod else []
         wf_active = workflow_mod.active_name(cfg) if workflow_mod else ""
@@ -1018,6 +1088,7 @@ def setup(ctx):
             "ok": True,
             "provider": {
                 "providers": [{"provider_id": p.get("provider_id"), "name": p.get("name")} for p in providers],
+                "entries": copy.deepcopy(providers),
                 "active_provider_id": active_pid,
                 "provider_id": provider.get("provider_id", ""),
                 "provider_name": provider.get("name", ""),
@@ -1040,6 +1111,7 @@ def setup(ctx):
                 "task_code": (cfg.task_models() or {}).get("code", ""),
                 "task_review": (cfg.task_models() or {}).get("review", ""),
                 "model_names": cfg.list_model_names() or [],
+                "entries": model_entries,
             },
             "system": {
                 "theme": getattr(cfg, "theme", ui.get("theme", "dark")),
@@ -1092,22 +1164,33 @@ def setup(ctx):
             pid = str(values.get("provider_id") or "").strip()
             if not pid:
                 return {"ok": False, "message": "provider_id 不能为空"}
-            provider = {
-                "provider_id": pid,
-                "name": str(values.get("provider_name") or pid),
-                "api_key": str(values.get("api_key") or ""),
-                "base_url": str(values.get("base_url") or ""),
-                "balance_url": str(values.get("balance_url") or ""),
-                "temperature": float(values.get("temperature", 1.0)),
-                "default_model_id": str(values.get("default_model_id") or ""),
-            }
-            existing = cfg.find_provider(pid)
-            if existing:
-                provider["models"] = existing.get("models") or []
-            cfg.add_or_update_provider(provider)
+            existing = cfg.find_provider(pid) or {}
+            models_after = None
+            if "models" in values:
+                ids = values["models"]
+                if not isinstance(ids, list) or any(not isinstance(mid, str) or not mid.strip() for mid in ids):
+                    return {"ok": False, "message": "models 须为非空字符串 ID 列表"}
+                before = {m["model_id"]: m for m in existing.get("models") or []}
+                models_after = [copy.deepcopy(before.get(mid, {"model_id": mid})) for mid in ids]
+            provider = dict(existing)
+            provider["provider_id"] = pid
+            for key in ("api_key", "base_url", "balance_url", "temperature", "default_model_id"):
+                if key in values:
+                    provider[key] = values[key]
+            if "provider_name" in values:
+                provider["name"] = str(values["provider_name"] or pid)
+            cfg.save_provider_from_form(provider, models_after=models_after)
+            if models_after == []:
+                saved = cfg.find_provider(pid)
+                saved["models"] = []
+                saved["default_model_id"] = ""
+                if d.get("active_provider_id") == pid:
+                    d["active_model_id"] = ""
             active = str(values.get("active_provider_id") or pid)
             if cfg.find_provider(active):
                 d["active_provider_id"] = active
+                if not cfg.provider_model_ids(active):
+                    d["active_model_id"] = ""
             cfg.apply_active()
 
         elif section == "model":
@@ -1116,9 +1199,9 @@ def setup(ctx):
             if row:
                 updates = {}
                 if "model_id" in values:
-                    updates["model_id"] = str(values["model_id"])
+                    updates["model_id"] = str(values["model_id"]).strip()
                 if "modalities" in values:
-                    updates["modalities"] = [x.strip() for x in str(values["modalities"]).split(",") if x.strip()]
+                    updates["modalities"] = [x.strip().lower() for x in str(values["modalities"]).split(",") if x.strip()]
                 if "context_window" in values:
                     updates["context_window"] = int(float(values["context_window"]))
                 if "max_tokens" in values:
@@ -1135,6 +1218,8 @@ def setup(ctx):
                 if v:
                     cfg.set_task_model(task_key.replace("task_", ""), v)
             active_model = str(values.get("active_model_name") or "").strip()
+            if active_model == select_model:
+                active_model = make_model_name(row["provider_id"], updates.get("model_id", row["model_id"]))
             if active_model:
                 cfg.switch_model(active_model)
             cfg.apply_active()
@@ -1480,6 +1565,12 @@ def setup(ctx):
                     self._json(200, _op_session_delete(str(data.get("id") or "")))
                 elif path == "/api/model/switch":
                     self._json(200, _op_model_switch(str(data.get("name") or "")))
+                elif path == "/api/provider/models":
+                    self._json(200, _provider_models(data))
+                elif path == "/api/provider/delete":
+                    self._json(200, _provider_delete(str(data.get("provider_id") or "")))
+                elif path == "/api/complete":
+                    self._json(200, _complete(data.get("prefix", "")))
                 elif path == "/api/mode":
                     self._json(200, _op_mode(str(data.get("mode") or "")))
                 elif path == "/api/workflow/switch":
