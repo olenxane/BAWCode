@@ -194,12 +194,42 @@ Pillow>=10
 | `ctx.register_tool(name=None, description="", usage="", schema=None)` | 注册模型可见工具（装饰器） | §7 |
 | `ctx.call(event, payload, default=None)` | 主动触发变换链事件 | §5.5 |
 | `ctx.collect(event, payload)` | 主动触发观察链事件 | §5.5 |
+| `ctx.register_ui_tree(fn, priority=100)` | 每帧提供主窗口会话树根节点（返回 `TreeNode` 或列表） | §4.6 |
+| `ctx.register_ui_bottom(fn, priority=100)` | 每帧提供统计栏下方的 ANSI 文本行 | §4.6 |
 | `ctx.storage_dir()` | 插件专属持久化目录（自动创建） | §4.3 |
 | `ctx.register_teardown(fn)` | 注册卸载回调：卸载/重载时停线程、释放资源 | §12 |
 | `core.plugins.runtime()` | 模块级函数：只读运行时载体 `{app, runner}` | §12 |
 | `ctx.submit_turn(text)` | 以用户语义提交一条消息开启回合 | §4.4 |
 | `ctx.notify(text)` | 用户可见通知（写入会话系统消息） | §4.4 |
 | `ctx.request_llm_retry()` | 请求重试当前失败的 LLM 请求（仅 API 错误等待态有效） | §4.5 |
+
+### 4.6 主窗口扩展：树节点与底部行
+
+插件可把实时状态显示在主窗口中。两个回调都在 UI 帧线程调用，应保持快速、无阻塞；回调异常由 hook 系统隔离。
+
+```python
+from core.ui import TreeNode
+
+
+def setup(ctx):
+    def tree_nodes(payload):
+        return TreeNode(
+            f"plugin:{ctx.plugin_id}:status",
+            "插件 · 正在工作",
+            "text",
+            children=[TreeNode(f"plugin:{ctx.plugin_id}:detail", "当前任务：同步")],
+        )
+
+    def bottom_rows(payload):
+        return ["\033[32m插件状态：运行中\033[0m", "插件提示：按 /sync 同步"]
+
+    ctx.register_ui_tree(tree_nodes)
+    ctx.register_ui_bottom(bottom_rows)
+```
+
+`register_ui_tree(fn, priority=100)` 的 `fn(payload)` 每帧返回 `TreeNode` 或节点列表；节点加入会话树根部，使用节点 ID 作为稳定唯一标识，可展开/折叠并显示 children。应以 `plugin:<插件 id>:` 为 ID 前缀避免冲突。
+
+`register_ui_bottom(fn, priority=100)` 的回调每帧返回字符串或字符串列表，内容可含 ANSI 转义序列，绘制在输入框、项目/模型信息及会话状态统计栏之后；每个返回项占一行，宿主按终端宽度裁剪并将多行高度从会话区扣除。避免执行网络/磁盘操作或长时间计算。
 
 ### 4.3 持久化：`ctx.storage_dir()`
 
@@ -363,6 +393,8 @@ BAWCode 的每个 hook 事件属于两种语义之一（下表标明），写处
 | `before_tool` | call | 工具确认通过、执行前 | `{name, args}` | `{args: {...}}` 改写参数；`{decision: "deny", message: str}` 拒绝执行（拒绝文案回传给模型）；None 原样执行 |
 | `after_tool` | collect | 工具执行完成（含出错） | `{name, args, output, elapsed}` | 无消费方 |
 | `context_supplement` | collect | 每回合构建上下文补充时 | `{project_id, session_id}` | `str`（非空文本）—— 以 `[插件补充]` 消息注入本回合上下文（不进会话历史，每回合重建） |
+| `ui_tree_nodes` | collect | 每帧主窗口渲染 | `{app}` | `TreeNode` 或节点列表，加入会话树根部 |
+| `ui_bottom_rows` | collect | 每帧主窗口渲染 | `{app, width}` | ANSI 字符串或字符串列表，显示在状态栏下方 |
 
 ### 5.3 上下文补充的预算与礼仪
 

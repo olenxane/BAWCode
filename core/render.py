@@ -168,6 +168,7 @@ DEFAULT_COLORS = {
     "func": (199, 146, 234),         # c792ea 函数/方法名
     "cmd": (152, 195, 121),          # 98c379 命令
     "url": (86, 182, 194),           # 56b6c2 URL
+    "code_string": (152, 195, 121),  # 98c379 代码字符串
 }
 
 TIPS = [
@@ -422,8 +423,8 @@ def _lexer_by_name(lang: str):
     except Exception:
         return None
 
-def _kw_lines_lexer(lexer, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ...]:
-    """已定词法：代码 → 每行仅关键词着色的字符串；其余字符不着色，由外层主题色决定。"""
+def _kw_lines_lexer(lexer, code: str, kw_fg: str, base_fg: str, cmt_fg: str, str_fg: str) -> Tuple[str, ...]:
+    """已定词法：代码 → 每行关键词/注释/字符串着色的字符串，其余由外层主题色决定。"""
     if not code:
         return ()
     code = safe_text(code)
@@ -435,7 +436,11 @@ def _kw_lines_lexer(lexer, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ..
         for ttype, value in lexer.get_tokens(code):
             if not value:
                 continue
-            if ttype in Token.Keyword:
+            if ttype in Token.Comment:
+                parts.append(cmt_fg + value + base_fg)
+            elif ttype in Token.String:
+                parts.append(str_fg + value + base_fg)
+            elif ttype in Token.Keyword:
                 parts.append(kw_fg + value + base_fg)
             else:
                 parts.append(value)
@@ -449,29 +454,31 @@ def _kw_lines_lexer(lexer, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ..
     return tuple(lines)
 
 @functools.lru_cache(maxsize=128)
-def _kw_lines(filename: str, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ...]:
-    """代码 → 每行仅关键词着色的字符串；其余字符不着色，由外层主题色决定。
+def _kw_lines(filename: str, code: str, kw_fg: str, base_fg: str, cmt_fg: str, str_fg: str) -> Tuple[str, ...]:
+    """代码 → 每行关键词/注释/字符串着色，其余字符不着色由外层主题色决定。
 
-    关键词取 pygments 的 Token.Keyword，着色后立即恢复 base_fg；行数与 splitlines 对齐。"""
-    return _kw_lines_lexer(_lexer_for(filename), code, kw_fg, base_fg)
+    关键词取 Token.Keyword，注释取 Token.Comment，字符串取 Token.String；
+    着色后立即恢复 base_fg，行数与 splitlines 对齐。"""
+    return _kw_lines_lexer(_lexer_for(filename), code, kw_fg, base_fg, cmt_fg, str_fg)
 
 @functools.lru_cache(maxsize=128)
-def _kw_lines_lang(lang: str, code: str, kw_fg: str, base_fg: str) -> Tuple[str, ...]:
-    """围栏代码块按语言名高亮；未知语言降级纯文本"""
-    return _kw_lines_lexer(_lexer_by_name(lang), code, kw_fg, base_fg)
+def _kw_lines_lang(lang: str, code: str, kw_fg: str, base_fg: str, cmt_fg: str, str_fg: str) -> Tuple[str, ...]:
+    """围栏代码块按语言名高亮关键词/注释/字符串；未知语言降级纯文本"""
+    return _kw_lines_lexer(_lexer_by_name(lang), code, kw_fg, base_fg, cmt_fg, str_fg)
 
 @functools.lru_cache(maxsize=64)
-def _hl_rows_wrapped(filename: str, code: str, width: int, kw_fg: str, base_fg: str, dim_fg: str) -> Tuple[str, ...]:
-    """代码全文 → 行号 + 仅关键词高亮 + 按宽度折行的渲染行。
+def _hl_rows_wrapped(filename: str, code: str, width: int, kw_fg: str, base_fg: str, dim_fg: str, str_fg: str) -> Tuple[str, ...]:
+    """代码全文 → 行号 + 关键词/注释/字符串高亮 + 按宽度折行的渲染行。
 
-    行号右对齐定宽、后接 │ 分隔；折行续行留等宽空白，内容列与行号列对齐。"""
+    行号右对齐定宽、后接 │ 分隔；折行续行留等宽空白，内容列与行号列对齐；
+    注释沿用 dim_fg 灰色。"""
     src = code.splitlines() or [""]
     num_w = len(str(len(src)))
     lead_w = num_w + 3  # "NN │ "
     code_w = max(1, width - lead_w)
     pad = " " * lead_w
     rows: List[str] = []
-    for i, line in enumerate(_kw_lines(filename, code, kw_fg, base_fg) or tuple(src), 1):
+    for i, line in enumerate(_kw_lines(filename, code, kw_fg, base_fg, dim_fg, str_fg) or tuple(src), 1):
         pieces = _wrap_keep_ansi(line, code_w)
         for k, piece in enumerate(pieces):
             head = f"{str(i).rjust(num_w)} {dim_fg}│{base_fg} " if k == 0 else pad
@@ -480,15 +487,15 @@ def _hl_rows_wrapped(filename: str, code: str, width: int, kw_fg: str, base_fg: 
 
 
 @functools.lru_cache(maxsize=64)
-def _diff_wrapped(filename: str, old: str, new: str, code_w: int, kw_fg: str, base_fg: str) -> Tuple[Tuple[str, int, Tuple[str, ...]], ...]:
+def _diff_wrapped(filename: str, old: str, new: str, code_w: int, kw_fg: str, base_fg: str, cmt_fg: str, str_fg: str) -> Tuple[Tuple[str, int, Tuple[str, ...]], ...]:
     """old→new 统一 diff → ((标记, 行号, 折行后的行元组), ...)。
 
-    标记 ' ' / '-' / '+'；行号删除行取旧文件、其余取新文件；代码仅关键词高亮。
+    标记 ' ' / '-' / '+'；行号删除行取旧文件、其余取新文件；代码按关键词/注释/字符串高亮。
     code_w 为内容折行宽度，不含行号与标记列。"""
     old_l = old.splitlines() if old else []
     new_l = new.splitlines() if new else []
-    old_hl = list(_kw_lines(filename, old, kw_fg, base_fg)) if old else []
-    new_hl = list(_kw_lines(filename, new, kw_fg, base_fg)) if new else []
+    old_hl = list(_kw_lines(filename, old, kw_fg, base_fg, cmt_fg, str_fg)) if old else []
+    new_hl = list(_kw_lines(filename, new, kw_fg, base_fg, cmt_fg, str_fg)) if new else []
     if len(old_hl) != len(old_l):
         old_hl = old_l
     if len(new_hl) != len(new_l):
@@ -701,9 +708,9 @@ def _md_prefixed(prefix: str, prefix_c: str, content: str, width: int) -> List[s
     return out
 
 def _md_code_block(code_lines: List[str], lang: str, pal: dict, width: int) -> List[str]:
-    """围栏代码块：语言可识别则关键词高亮，逐行折行；前缀竖线标示代码区"""
+    """围栏代码块：语言可识别则关键词/注释/字符串高亮，逐行折行；前缀竖线标示代码区"""
     code = "\n".join(code_lines)
-    hl = list(_kw_lines_lang(lang, code, pal["accent"], pal["code"])) if code else []
+    hl = list(_kw_lines_lang(lang, code, pal["accent"], pal["code"], pal["dim"], pal["str"])) if code else []
     if len(hl) != len(code_lines):
         hl = list(code_lines)
     rows: List[str] = []
@@ -1091,6 +1098,7 @@ class RenderMixin:
             "func": self.c("func"),
             "cmd": self.c("cmd"),
             "url": self.c("url"),
+            "str": self.c("code_string"),
         }
 
     def _clamp_tree_scroll(self, total: int, tree_h: int) -> int:
@@ -1204,6 +1212,7 @@ class RenderMixin:
             root_label = f"任务 · {_oneline(self.task or '（新会话）', 40)}"
         task_node = TreeNode("task", root_label, "task", default_expanded=True)
         roots.append(task_node)
+        roots.extend(getattr(self, "_ui_tree_snapshot", []))
 
         # 消息按对话轮次挂在树上：每条用户消息都是独立节点（不替换根标题）。
         # 计划/步骤不再用置顶/置底状态单节点：四件套工具消息与工作流快照消息自带
@@ -1657,7 +1666,24 @@ class RenderMixin:
         plan = self.plan or {}
         streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
         live = self.subagent_stream if isinstance(self.subagent_stream, dict) else None
+        payload = {"app": self}
+        try:
+            ui_nodes = hooks_mod.collect_hook("ui_tree_nodes", payload)
+        except Exception:
+            ui_nodes = []
+        self._ui_tree_snapshot = []
+        for result in ui_nodes:
+            items = result if isinstance(result, (list, tuple)) else [result]
+            for item in items:
+                if isinstance(item, TreeNode):
+                    self._ui_tree_snapshot.append(item)
+        def _node_sig(nodes):
+            return tuple(
+                (node.id, node.label, node.kind, node.summary, node.detail, _node_sig(node.children))
+                for node in nodes
+            )
         return (
+            _node_sig(self._ui_tree_snapshot),
             len(msgs),
             total,
             self.task or "",
@@ -1977,7 +2003,7 @@ class RenderMixin:
             if not code:
                 out.append(gseg + self.c("dim") + _clip(ind + "（空内容）", body_w) + self.RESET)
             else:
-                rows = _hl_rows_wrapped(path, code, max(1, body_w - len(ind)), self.c("accent"), base_fg, self.c("dim"))
+                rows = _hl_rows_wrapped(path, code, max(1, body_w - len(ind)), self.c("accent"), base_fg, self.c("dim"), self.c("code_string"))
                 for row in rows:
                     out.append(gseg + base_fg + ind + row + self.RESET)
         elif kind == "edit":
@@ -1995,7 +2021,7 @@ class RenderMixin:
             for gi, (old, new) in enumerate(items):
                 if multi:
                     out.append(gseg + self.c("dim") + _clip(ind + f"—— 第 {gi + 1} 处 ——", body_w) + self.RESET)
-                for marker, lineno, pieces in _diff_wrapped(path, str(old), str(new), code_w, self.c("accent"), base_fg):
+                for marker, lineno, pieces in _diff_wrapped(path, str(old), str(new), code_w, self.c("accent"), base_fg, self.c("dim"), self.c("code_string")):
                     if marker == "+":
                         mcol, bg = self.c("ok"), _bg(_DIFF_ADD_BG)
                     elif marker == "-":
@@ -2102,11 +2128,17 @@ class RenderMixin:
         if confirm_panel is not None:
             input_zone_h = len(confirm_panel)
 
-        bottom_fixed = 1 + 2 + 1 + 1  # rule + info/mode+tip + rule + status
+        bottom_rows = []
+        for result in hooks_mod.collect_hook("ui_bottom_rows", {"app": self, "width": w}):
+            items = result if isinstance(result, (list, tuple)) else [result]
+            bottom_rows.extend(str(item) for item in items if item is not None)
         # todo 清单：本轮进行中且未全部完成时固定在输入框上方；对话框/确认面板期间隐藏
         todo_lines = self._compose_todo(w) if (confirm_panel is None and not self._dialog_active) else []
         phase_fixed = 1 + len(todo_lines)  # 树底阶段提示行 + todo 清单
         top_fixed = 1 + 1
+        max_bottom_rows = max(0, h - top_fixed - 5 - input_zone_h - phase_fixed - 4)
+        bottom_rows = bottom_rows[:max_bottom_rows]
+        bottom_fixed = 1 + 2 + 1 + 1 + len(bottom_rows)  # rule/info/tip/rule/status + plugin rows
         tree_h = max(4, h - top_fixed - bottom_fixed - input_zone_h - phase_fixed)
         self._row_meta["tree_h"] = tree_h
         tree_focus = self.focus == "tree"
@@ -2266,6 +2298,8 @@ class RenderMixin:
         token_txt = self.token_meter.status_text()
         status = f" {self.status or '就绪'} · {focus_tag} · {len(self.messages)}msg · {token_txt} "
         lines.append(self.c("dim") + _pad(_clip(status, w), w) + self.RESET)
+        for row in bottom_rows:
+            lines.append(_clip_keep_ansi(row, w))
 
         if len(lines) > h:
             lines = lines[: h - 1] + lines[-1:]

@@ -63,6 +63,8 @@ EVENTS: Dict[str, dict] = {
     "after_tool": {"kind": "collect", "desc": "工具执行后通知（collect）"},
     "context_supplement": {"kind": "collect", "desc": "回合上下文补充文本（collect，返回 str 生效）"},
     "message_added": {"kind": "collect", "desc": "会话消息新增通知 {role, content, type, ...extra}（collect，content 可能为多模态数组；处理函数内禁止再写会话消息，否则递归）"},
+    "ui_tree_nodes": {"kind": "collect", "desc": "每帧提供插件主窗口会话树根节点（collect）"},
+    "ui_bottom_rows": {"kind": "collect", "desc": "每帧提供主窗口统计状态栏下方的 ANSI 文本行（collect）"},
 }
 
 

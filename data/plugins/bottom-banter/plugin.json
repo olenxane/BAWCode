@@ -1,0 +1,8 @@
+{
+  "id": "bottom-banter",
+  "name": "底部随机骚话",
+  "version": "0.1.0",
+  "description": "示例插件：在主窗口底部固定显示三行随机骚话",
+  "author": "BAWCode",
+  "entry": "main.py"
+}

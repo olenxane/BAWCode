@@ -347,6 +347,14 @@ class PluginContext:
             "context_supplement", fn, priority=priority, owner=self.plugin_id, name="supplement"
         )
 
+    def register_ui_tree(self, fn: Callable[[dict], Any], priority: int = 100):
+        """注册每帧会话树节点回调；返回 TreeNode 或 TreeNode 列表。"""
+        return hooks.register_hook("ui_tree_nodes", fn, priority=priority, owner=self.plugin_id, name="ui_tree")
+
+    def register_ui_bottom(self, fn: Callable[[dict], Any], priority: int = 100):
+        """注册每帧底部 ANSI 文本行回调；返回字符串或字符串列表。"""
+        return hooks.register_hook("ui_bottom_rows", fn, priority=priority, owner=self.plugin_id, name="ui_bottom")
+
     def register_external_api(self, event: str, fn: Optional[Callable] = None, url: str = "", priority: int = 50):
         """插件侧实现 external_apis 同名扩展点（如 computer_use/memory_write）。
         传 fn 直接挂进程内处理函数；传 url 挂 HTTP POST 处理函数。"""
