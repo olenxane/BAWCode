@@ -71,6 +71,7 @@ def default_config() -> dict:
             "plan_files": ["plan.md"],
         },
         "system": {"font_size": 16},
+        "security": {"delete_guard": True},
         "ui": {
             "theme": "dark",
             "mode": "auto",

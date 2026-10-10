@@ -155,7 +155,12 @@ def _join_argv(parts: List[str]) -> str:
 
 
 def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute_command") -> Optional[str]:
-    """删除类命令改为移入回收站：返回替代结果文本；非删除类命令返回 None"""
+    """护栏开启时把删除命令的目标移入回收站；非删除类命令返回 None"""
+    session = _session()
+    config = getattr(session, "config", None)
+    safety_cfg = (getattr(config, "data", None) or {}).get("security") or {}
+    if not safety_cfg.get("delete_guard", True):
+        return None
     targets = policy.delete_targets(command)
     if targets is None:
         return None
@@ -921,35 +926,33 @@ def _match_spots(content: str, needle: str) -> list:
 @register.register(
     name="delete_file",
     description=(
-        "Delete a single file safely: the file is moved to the project trash "
-        "rather than destroyed, recoverable via /undo, truly emptied via "
-        "/clear-trash. Files only, no directories. Shell delete commands like "
-        "rm/del are intercepted and their targets moved to the project trash "
-        "instead of being executed — always delete files with this tool"
+        "Move a file or directory to the project trash instead of permanently "
+        "deleting it. The item can be restored with /undo when applicable; "
+        "/clear-trash permanently removes items from the trash. Use this tool "
+        "for file and directory deletion; shell delete commands are redirected "
+        "to the project trash while the delete safety guard is enabled."
     ),
-    usage="delete_file <file_path>",
+    usage="delete_file <file_or_directory_path>",
     schema={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "File path to delete, absolute or relative to the current directory"},
+            "file_path": {"type": "string", "description": "File or directory path to move to the project trash, absolute or relative to the current directory"},
         },
         "required": ["file_path"],
     },
 )
 def delete_file(file_path: str) -> str:
-    """删除文件：移入项目回收站，可 /undo 回滚、/clear-trash 真正清空"""
+    """将文件或目录移入项目回收站，可 /undo 回滚、/clear-trash 真正清空"""
     path = Path(file_path)
     if not path.exists():
-        return f"找不到文件: {file_path}"
-    if path.is_dir():
-        return "不支持删除目录（递归删除风险高，请逐个文件处理）"
+        return f"找不到文件或目录: {file_path}"
     snapshot.capture_before(path, tool="delete_file")
     try:
         dest = snapshot.move_to_trash(path)
     except (OSError, shutil.Error) as e:
         log.error("移入回收站失败 %s: %s", path, e)
         return f"删除失败（移入回收站出错）: {e}"
-    log.info("文件已移入回收站: %s -> %s", path, dest)
+    log.info("文件或目录已移入回收站: %s -> %s", path, dest)
     return f"已移入回收站: {dest}\n（/undo 可回滚本次删除 · /clear-trash 真正清空回收站）"
 
 

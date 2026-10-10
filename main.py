@@ -187,6 +187,22 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         ctx["app"].status = policy.MODE_LABELS[ctx["app"].mode]
         return True
 
+    @commands.register("/security", hint="删除安全护栏 · /security [on|off]", usage="/security [on|off]", source="builtin")
+    def _security(ctx, args):
+        security_cfg = ctx["config"].data.setdefault("security", {})
+        arg = (args or "").strip().lower()
+        if arg not in ("", "on", "off"):
+            _echo(ctx, "用法: /security [on|off]")
+            return True
+        if arg:
+            security_cfg["delete_guard"] = arg == "on"
+            ctx["config"].save()
+        enabled = bool(security_cfg.get("delete_guard", True))
+        state = "开启" if enabled else "关闭"
+        ctx["app"].status = f"删除安全护栏{state}"
+        _echo(ctx, f"删除安全护栏已{state}：" + ("shell 删除命令会移入项目回收站" if enabled else "shell 删除命令将直接执行"))
+        return True
+
     @commands.register("/theme", hint="主题 /theme [名称]", usage="/theme [dark|ocean]", source="builtin")
     def _theme(ctx, args):
         name = (args or "").strip()

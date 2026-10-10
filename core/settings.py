@@ -714,6 +714,7 @@ class SettingsPanelMixin:
             ctx_cfg = (config.data or {}).get("context") or {}
             wf_cfg = (config.data or {}).get("workflow") or {}
             tools_cfg = (config.data or {}).get("tools") or {}
+            security_cfg = (config.data or {}).get("security") or {}
             log_level = str((config.data or {}).get("log", {}).get("level") or "info").strip().lower()
             if log_level not in ("debug", "info", "warn", "error", "off"):
                 log_level = "info"
@@ -738,7 +739,9 @@ class SettingsPanelMixin:
                 {"key": "spin_kill_count", "label": "空转计数上限", "type": "text", "current": wf_cfg.get("spin_kill_count", 12), "hint": "重复输出计满即终止回合；未满期间续期不限次"},
                 {"key": "max_tool_timeout", "label": "命令超时上限秒", "type": "text", "current": tools_cfg.get("max_timeout", 600), "hint": "execute_command/run_program 传入超时的钳制上限（1-∞）"},
                 {"key": "ask_user_timeout", "label": "询问自动超时", "type": "bool", "current": bool(tools_cfg.get("ask_user_timeout", True)), "hint": "←→ 开/关 · 开启后询问框 5 分钟未选择自动跳过"},
+                {"key": "delete_guard", "label": "删除安全护栏", "type": "bool", "current": bool(security_cfg.get("delete_guard", True)), "hint": "关闭后 shell 删除命令直接执行；delete_file 始终移入项目回收站"},
                 {"key": "workflow_enabled", "label": "启用工作流", "type": "bool", "current": bool(wf_cfg.get("enabled", False)), "hint": "←→ 关=直接对话 · 开=按工作流节点链运行（下一回合生效）"},
+
                 {"key": "workflow_active", "label": "工作流", "type": "choice", "options": self._settings_workflow_names(config), "current": self._settings_workflow_current(config), "hint": "←→ 选择处理管线（仅在启用工作流时生效）"},
                 {"key": "log_level", "label": "日志等级", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "current": "关闭" if log_level == "off" else log_level, "hint": "←→ 关闭=不记录任何日志（含写盘）"},
                 {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 非工作流主对话与压缩摘要使用"},
@@ -1617,6 +1620,10 @@ class SettingsPanelMixin:
             tools_cfg = config.data.setdefault("tools", {})
             raw = s["ask_user_timeout"]
             tools_cfg["ask_user_timeout"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
+        if "delete_guard" in s:
+            security_cfg = config.data.setdefault("security", {})
+            raw = s["delete_guard"]
+            security_cfg["delete_guard"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
         if "log_level" in s and s["log_level"]:
             level = str(s["log_level"]).strip()
             level = {"关闭": "off"}.get(level, level.lower())

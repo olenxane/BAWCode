@@ -25,3 +25,8 @@ data/memory/global/
 data/memory/Projects/
 data/temp/
 data/subagents/
+.zcodeignore
+.qwen
+.bawcode
+data/allowlist
+data/config.json

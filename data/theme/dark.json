@@ -29,7 +29,8 @@
     "path": "#61AFEF",
     "func": "#C792EA",
     "cmd": "#98C379",
-    "url": "#56B6C2"
+    "url": "#56B6C2",
+    "code_string": "#98C379"
   },
   "tips_rotate_seconds": 5
 }

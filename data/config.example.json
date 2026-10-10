@@ -82,6 +82,9 @@
   "system": {
     "font_size": 16
   },
+  "security": {
+    "delete_guard": true
+  },
   "ui": {
     "theme": "dark",
     "mode": "auto",
