@@ -21,6 +21,7 @@ except ImportError:
     HAS_RICH = False
 
 from core import commands as cmdsys
+from core import file as file_mod
 from core import hooks as hooks_mod
 from core import keymap as keymap_mod
 from core import mcp as mcp_mod
@@ -159,6 +160,10 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.hist_index = -1
         self.candidates: List[dict] = []
         self.candidate_index = 0
+        # 文件候选后台扫描：输入停止 SCAN_INTERVAL 后扫第一层，之后每 interval 下钻一层
+        self.file_scan = file_mod.CandidateScanner()
+        self._file_query: Optional[str] = None
+        self._scan_items: Optional[list] = None
         self._cand_text: Optional[str] = None
         self._cand_cursor: int = -1
         self._cand_config = None
@@ -352,6 +357,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         if not self._entered:
             return
         log.info("离开 TUI 界面")
+        self.file_scan.stop()
         try:
             if self._live is not None:
                 self._live.stop()
@@ -427,10 +433,45 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         frag = text[: self.cursor]
         if frag.startswith("/"):
             self.candidates = cmdsys.complete(frag, config=config)
-            if self.candidate_index >= len(self.candidates):
-                self.candidate_index = 0
         else:
-            self.candidates = []
+            active = file_mod.active_reference(text, self.cursor)
+            workspace = getattr(getattr(self, "config", None), "workspace", None)
+            if workspace is None:
+                session = memory_mod.get_session()
+                workspace = getattr(session, "workspace", None) if session is not None else None
+            if active is not None:
+                # 分级扫描在后台按秒推进；结果由帧尾 _tick_file_candidates 取回
+                self._file_query = active["query"]
+                self.candidates = []
+                self.file_scan.submit(active["query"], workspace)
+            else:
+                self._cancel_file_scan()
+        if self.candidate_index >= len(self.candidates):
+            self.candidate_index = 0
+
+    def _cancel_file_scan(self) -> None:
+        """丢弃在途扫描与候选（离开 @ 引用或已提交时调用）"""
+        self._file_query = None
+        self._scan_items = None
+        self.candidates = []
+        self.file_scan.cancel()
+
+    def _tick_file_candidates(self) -> None:
+        """帧尾取回后台分级扫描结果；结果与当前 @ 查询不符时丢弃"""
+        snap = self.file_scan.snapshot()
+        if snap["items"] is self._scan_items:
+            return
+        self._scan_items = snap["items"]
+        if self._file_query is None or snap["query"] != self._file_query:
+            return
+        active = file_mod.active_reference(self._buf_text(), self.cursor)
+        if active is None:
+            return
+        self.candidates = [
+            dict(item, _file_start=active["start"], _file_end=active["end"])
+            for item in snap["items"]
+        ]
+        if self.candidate_index >= len(self.candidates):
             self.candidate_index = 0
 
     def _apply_completion(self) -> bool:
@@ -440,12 +481,19 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         if not name:
             return False
         text = self._buf_text()
-        start = 0 if name.startswith("/") else self._word_start()
-        end = self.cursor
-        while end < len(text) and not text[end].isspace():
-            end += 1
-        new_text = text[:start] + name + " " + text[end:]
-        self._buf_set(new_text, start + len(name) + 1)
+        is_file = bool(self.candidates[self.candidate_index].get("path"))
+        if is_file:
+            start = int(self.candidates[self.candidate_index].get("_file_start", self._word_start()))
+            end = int(self.candidates[self.candidate_index].get("_file_end", self.cursor))
+            new_text = text[:start] + name + text[end:]
+            self._buf_set(new_text, start + len(name))
+        else:
+            start = 0 if name.startswith("/") else self._word_start()
+            end = self.cursor
+            while end < len(text) and not text[end].isspace():
+                end += 1
+            new_text = text[:start] + name + " " + text[end:]
+            self._buf_set(new_text, start + len(name) + 1)
         self.candidates = []
         self.candidate_index = 0
         return True
@@ -513,7 +561,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self._buf_clear()
         self.buffer = TextBuffer()
         self.cursor = 0
-        self.candidates = []
+        self._cancel_file_scan()
         self.input_scroll = 0
         self._input_prompt = prompt or "> "
         self.render()
@@ -543,6 +591,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                     return ""
                 raise KeyboardInterrupt("终端输入不可用")
             self._tick_paste_async()
+            self._tick_file_candidates()
             self._tick_restore_input()
             self._selection_tick()
             self.render()
@@ -691,7 +740,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 self._llm_retry_gate.give_up.set()
         self.hist_index = len(self.input_history)
         self._buf_clear()
-        self.candidates = []
+        self._cancel_file_scan()
         return line
 
     def _dispatch_key(self, kind: str, value: Any, config=None) -> Optional[str]:
@@ -803,7 +852,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
 
         if act == Action.ESCAPE:
             if self.candidates:
-                self.candidates = []
+                self._cancel_file_scan()
                 self.render()
             else:
                 self._buf_clear()

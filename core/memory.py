@@ -197,6 +197,7 @@ class Memory:
         self.projects_dir = self.memory_dir / "Projects"
         self.project_identity = project_identity or {}
         self.project_id = self.project_identity.get("project_id") or ""
+        self.workspace = Path(self.project_identity.get("workspace_path") or Path.cwd()).resolve()
         self.project_md_path = (
             self.projects_dir / f"{self.project_id}.md" if self.project_id else self.projects_dir / "_default.md"
         )

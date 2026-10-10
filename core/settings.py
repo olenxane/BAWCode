@@ -12,7 +12,13 @@ from typing import Any, Dict, List, Optional
 
 from core import keyinput
 from core import policy
-from core.config import THINKING_OPTIONS, make_model_name, model_preset_defaults
+from core.config import (
+    THINKING_OPTIONS,
+    is_auto_filled_model,
+    make_model_name,
+    model_preset_defaults,
+    refill_model_entry,
+)
 from core.log import get_logger
 from core.textbuf import TextBuffer
 
@@ -53,6 +59,20 @@ def _key_direction(kind: str, value: str) -> Optional[str]:
     return keyinput.direction_of(kind, value)
 
 
+def _binding_text(value: Any) -> str:
+    """绑定值显示文本：多绑定列表按 ' / ' 连接，其余原样"""
+    if isinstance(value, (list, tuple)):
+        return " / ".join(str(x).lower() for x in value if x not in (None, ""))
+    return "" if value is None else str(value)
+
+
+def _binding_value(value: Any) -> Any:
+    """绑定值规范化：列表保留多绑定形态，其余转小写字符串"""
+    if isinstance(value, (list, tuple)):
+        return [str(x).lower() for x in value if x not in (None, "")]
+    return str(value).lower()
+
+
 class SettingsPanelMixin:
     """设置面板状态与方法（由 TuiApp 继承）。"""
 
@@ -72,6 +92,8 @@ class SettingsPanelMixin:
         self._settings_baseline: Dict[str, Any] = {}
         self._settings_esc_stage = 0
         self.settings_edit: Optional[dict] = None
+        # 提供商页「高级设置」折叠区状态（默认折叠）
+        self._provider_adv_expanded = False
 
     def _compose_settings(self, w: int, h: int) -> List[str]:
         """设置：标签页 + 表单；choice 用 ←→，text 直接键入"""
@@ -126,8 +148,21 @@ class SettingsPanelMixin:
                 elif ftype == "ptext":
                     show = self._edit_caret_text(edit) if editing else ("" if field.get("current") is None else str(field.get("current")))
                     display = _clip(f"    {label:18} {show}", w - 4)
-                elif ftype == "choice":
+                elif ftype == "section":
+                    # 折叠区域标题行：Enter/←→ 展开或收起
+                    arrow = "▾" if field.get("expanded") else "▸"
+                    display = _clip(f"{arrow} {label} · Enter{'收起' if field.get('expanded') else '展开'}", w - 4)
+                elif ftype in ("advbool", "check"):
+                    mark = "[x]" if value in (True, "true", "1", 1) else "[ ]"
+                    display = _clip(f"    {mark} {label}", w - 4)
+                elif ftype == "advchoice":
                     show = "" if value is None else str(value)
+                    display = _clip(f"    {label:18} < {show} > ←→", w - 4)
+                elif ftype == "advtext":
+                    show = self._edit_caret_text(edit) if editing else ("" if value is None else str(value))
+                    display = _clip(f"    {label:18} {show}", w - 4)
+                elif ftype == "choice":
+                    show = _binding_text(value)
                     hint_lr = " ←→"
                     display = _clip(f"{label:20}  < {show} >{hint_lr}", w - 4)
                 elif ftype == "bool":
@@ -218,10 +253,126 @@ class SettingsPanelMixin:
 
     # 焦点离开时才重建模型列表的文本字段
     _MODEL_LIST_TEXT_KEYS = frozenset({"provider_id", "model_id"})
+    _MODEL_MODALITIES = {
+        "modality_text": "text",
+        "modality_image": "vision",
+        "modality_audio": "audio",
+        "modality_video": "video",
+        "modality_embedding": "embedding",
+    }
     _MODEL_PARAMETER_KEYS = frozenset({
-        "model_id", "modalities", "context_window", "max_tokens",
+        "model_id", *_MODEL_MODALITIES, "context_window", "max_tokens",
         "model_temperature", "thinking_effort",
     })
+
+    # 提供商「高级设置」：显示态与 config 形态互转（跟随/空 = 不覆盖模型档位）
+    _ADV_THINKING_MODES = ("跟随", "开", "关")
+    _ADV_THINKING_EFFORTS = ("跟随", *THINKING_OPTIONS)
+
+
+    @staticmethod
+    def _provider_advanced_display(provider: Optional[dict]) -> dict:
+        """provider.advanced → 面板显示态（scratch 值）"""
+        adv = (provider or {}).get("advanced")
+        adv = adv if isinstance(adv, dict) else {}
+        mode = adv.get("thinking_enabled")
+        effort = str(adv.get("thinking_effort") or "").strip().lower()
+        return {
+            "adv_send_temperature": bool(adv.get("send_temperature", False)),
+            "adv_thinking_enabled": "开" if mode is True else ("关" if mode is False else "跟随"),
+            "adv_thinking_effort": effort if effort in THINKING_OPTIONS else "跟随",
+            "adv_thinking_effort_field": str(adv.get("thinking_effort_field") or "").strip(),
+            "adv_thinking_enabled_field": str(adv.get("thinking_enabled_field") or "").strip(),
+        }
+
+    @staticmethod
+    def _provider_advanced_form(scratch: dict) -> dict:
+        """面板显示态 → provider.advanced 配置形态"""
+        mode = str(scratch.get("adv_thinking_enabled") or "跟随")
+        effort = str(scratch.get("adv_thinking_effort") or "跟随").strip().lower()
+        raw = scratch.get("adv_send_temperature")
+        return {
+            "send_temperature": bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw)),
+            "thinking_enabled": {"开": True, "关": False}.get(mode),
+            "thinking_effort": effort if effort in THINKING_OPTIONS else "",
+            "thinking_effort_field": str(scratch.get("adv_thinking_effort_field") or "").strip(),
+            "thinking_enabled_field": str(scratch.get("adv_thinking_enabled_field") or "").strip(),
+        }
+
+    def _provider_advanced_fields(self, provider: Optional[dict]) -> List[dict]:
+        """展开态下的高级设置子行：勾选框/选择/文本各一"""
+        cur = self._provider_advanced_display(provider)
+        return [
+            {
+                "key": "adv_send_temperature",
+                "label": "携带温度",
+                "type": "advbool",
+                "current": cur["adv_send_temperature"],
+                "hint": "勾选后请求才携带 temperature 参数（默认不携带）",
+            },
+            {
+                "key": "adv_thinking_enabled",
+                "label": "启用思考",
+                "type": "advchoice",
+                "options": list(self._ADV_THINKING_MODES),
+                "current": cur["adv_thinking_enabled"],
+                "hint": "覆盖模型思考开关 · 跟随=不改",
+            },
+            {
+                "key": "adv_thinking_effort",
+                "label": "思考强度",
+                "type": "advchoice",
+                "options": list(self._ADV_THINKING_EFFORTS),
+                "current": cur["adv_thinking_effort"],
+                "hint": "覆盖模型思考强度 · 跟随=用模型值",
+            },
+            {
+                "key": "adv_thinking_effort_field",
+                "label": "向提供商发送的思考字段",
+                "type": "text",
+                "current": cur["adv_thinking_effort_field"],
+                "hint": "发送思考强度的请求键名 · 空=reasoning_effort",
+            },
+            {
+                "key": "adv_thinking_enabled_field",
+                "label": "向提供商发送的思考开关",
+                "type": "text",
+                "current": cur["adv_thinking_enabled_field"],
+                "hint": "发送思考开关的请求键名 · 空=enable_thinking",
+            },
+        ]
+
+    @classmethod
+    def _model_modalities_values(cls, scratch: dict) -> List[str]:
+        """读取模态勾选状态，界面 image 映射为内部 vision，至少保留 text。"""
+        selected = [
+            modality
+            for key, modality in cls._MODEL_MODALITIES.items()
+            if bool(scratch.get(key))
+        ]
+        return selected or ["text"]
+
+    @classmethod
+    def _model_modality_fields(cls, modalities: List[str]) -> List[dict]:
+        """模型页模态 checkbox 行；vision 面向用户显示为 image。"""
+        selected = set(modalities or ["text"])
+        labels = {
+            "modality_text": "文本",
+            "modality_image": "图像",
+            "modality_audio": "音频",
+            "modality_video": "视频",
+            "modality_embedding": "嵌入",
+        }
+        return [
+            {
+                "key": key,
+                "label": labels[key],
+                "type": "check",
+                "current": modality in selected,
+                "hint": "勾选支持的模态 · 图像对应配置 vision",
+            }
+            for key, modality in cls._MODEL_MODALITIES.items()
+        ]
 
     def _settings_snapshot(self, config) -> dict:
         s = self.settings_scratch
@@ -234,8 +385,13 @@ class SettingsPanelMixin:
             "balance_url": s.get("balance_url"),
             "provider_temperature": s.get("provider_temperature"),
             "default_model_id": s.get("default_model_id"),
+            "adv_send_temperature": s.get("adv_send_temperature"),
+            "adv_thinking_enabled": s.get("adv_thinking_enabled"),
+            "adv_thinking_effort": s.get("adv_thinking_effort"),
+            "adv_thinking_effort_field": s.get("adv_thinking_effort_field"),
+            "adv_thinking_enabled_field": s.get("adv_thinking_enabled_field"),
+            **{key: s.get(key) for key in self._MODEL_MODALITIES},
             "model_id": s.get("model_id"),
-            "modalities": s.get("modalities"),
             "context_window": s.get("context_window"),
             "max_tokens": s.get("max_tokens"),
             "model_temperature": s.get("model_temperature"),
@@ -301,6 +457,11 @@ class SettingsPanelMixin:
                 pid = pids[0]
             self.settings_provider_id = pid
             provider = config.find_provider(pid) or {}
+            # 高级设置显示态始终进 scratch：未展开时保存/脏值比对也不丢原配置
+            for adv_key, adv_value in self._provider_advanced_display(provider).items():
+                scratch_keep.setdefault(adv_key, adv_value)
+            scratch_keep["adv_thinking_effort_field"] = str(provider.get("advanced", {}).get("thinking_effort_field") or "").strip()
+            scratch_keep["adv_thinking_enabled_field"] = str(provider.get("advanced", {}).get("thinking_enabled_field") or "").strip()
             # 实时模型列表 = 配置中已有 + 本页/模型页工作副本
             live_models = self._provider_live_models(config, pid)
             live_mids = [m.get("model_id") for m in live_models]
@@ -315,6 +476,8 @@ class SettingsPanelMixin:
                 default_id = live_mids[0]
             if not live_mids:
                 default_id = ""
+            adv_expanded = bool(getattr(self, "_provider_adv_expanded", False))
+            adv_fields = self._provider_advanced_fields(provider) if adv_expanded else []
             fields = [
                 # —— 切换与激活（置顶，与下方配置隔离）——
                 {
@@ -373,7 +536,16 @@ class SettingsPanelMixin:
                     "label": "默认温度",
                     "type": "text",
                     "current": scratch_keep.get("provider_temperature", provider.get("temperature", 1.0)),
+                    "hint": "高级设置勾选「携带温度」后才随请求发送",
                 },
+                {
+                    "key": "_provider_advanced",
+                    "label": "高级设置",
+                    "type": "section",
+                    "expanded": adv_expanded,
+                    "hint": "Enter 展开/收起 · 请求携带温度与思考参数覆盖",
+                },
+                *adv_fields,
                 {
                     "key": "default_model_id",
                     "label": "默认模型",
@@ -393,7 +565,13 @@ class SettingsPanelMixin:
                     "key": "fetch_models",
                     "label": "获取模型列表",
                     "type": "action",
-                    "hint": "Enter 拉取模型并一键添加 · 保存提供商后生效",
+                    "hint": "Enter 拉取模型并一键添加 · 未手动配置的存量模型顺带重填预置",
+                },
+                {
+                    "key": "refill_presets",
+                    "label": "重填预置参数",
+                    "type": "action",
+                    "hint": "Enter：未手动配置的模型按预置表重填参数 · 手动配置的保留",
                 },
                 {"key": "_sep_cfg", "label": "——————————————", "type": "sep", "hint": ""},
                 {
@@ -416,6 +594,8 @@ class SettingsPanelMixin:
                 self._settings_model_scratch_name = current_model
                 scratch_keep["select_model"] = current_model
             row = self._settings_model_row(config, current_model)
+            for key, modality in self._MODEL_MODALITIES.items():
+                scratch_keep[key] = modality in set(row.get("modalities") or ["text"])
             pids = [p.get("provider_id", "") for p in config.providers()] or ["-"]
             edit_pid = row.get("provider_id") or self.settings_provider_id or config.data.get("active_provider_id")
             live = self._provider_live_models(config, edit_pid)
@@ -425,25 +605,13 @@ class SettingsPanelMixin:
                 self.settings_model_name = current_model
                 row = self._settings_model_row(config, current_model)
             modalities = row.get("modalities") or ["text"]
-            mod_joined = ",".join(modalities)
-            mod_choices = [
-                "text",
-                "text,vision",
-                "text,vision,audio",
-                "text,vision,audio,video",
-                "text,vision,video",
-                "text,audio",
-                "text,embedding",
-            ]
-            if mod_joined not in mod_choices:
-                mod_choices = [mod_joined] + mod_choices
             task = config.task_models()
             model_options = names or live_names or ["-"]
             fields = [
                 {"key": "select_provider", "label": "提供商", "type": "choice", "options": pids, "current": edit_pid, "hint": "←→ 选择"},
                 {"key": "select_model", "label": "模型", "type": "choice", "options": live_names or model_options, "current": current_model, "hint": "实时列表"},
                 {"key": "model_id", "label": "模型ID", "type": "text", "current": row.get("model_id", "")},
-                {"key": "modalities", "label": "支持模态", "type": "text", "current": mod_joined, "hint": "逗号分隔，如 text,vision,audio,video"},
+                *self._model_modality_fields(modalities),
                 {"key": "context_window", "label": "最大上下文", "type": "text", "current": row.get("context_window", 0)},
                 {"key": "max_tokens", "label": "最大输出token", "type": "text", "current": row.get("max_tokens", 0)},
                 {"key": "model_temperature", "label": "温度", "type": "text", "current": row.get("temperature", 1.0)},
@@ -469,8 +637,10 @@ class SettingsPanelMixin:
             ]
             fields = []
             for key, label, hint in key_defs:
+                # current 保留原始绑定值（多绑定为列表），显示经 _binding_text 格式化；
+                # 否则列表会被 str() 成 repr 文本混入 options，选中即写回非法绑定
                 options = list(self.SHORTCUT_OPTIONS.get(key) or [self.keys.get(key, "")])
-                current = str(self.keys.get(key) or options[0]).lower()
+                current = self.keys.get(key) or options[0]
                 if current not in options:
                     options = [current] + options
                 fields.append(
@@ -579,6 +749,12 @@ class SettingsPanelMixin:
             if field.get("type") in ("plugin", "pbool", "pchoice", "ptext"):
                 scratch_keep.pop(field["key"], None)
                 continue
+            if field.get("type") in ("bool", "advbool", "check"):
+                if field["key"] not in scratch_keep:
+                    scratch_keep[field["key"]] = bool(field.get("current"))
+                else:
+                    scratch_keep[field["key"]] = bool(scratch_keep[field["key"]])
+                continue
             if field["key"] not in scratch_keep:
                 scratch_keep[field["key"]] = field.get("current")
             # choice 新 options 时校正
@@ -594,7 +770,7 @@ class SettingsPanelMixin:
 
     def _settings_focus_edit(self, config) -> None:
         field = self._plugin_current_field()
-        if field.get("type") == "text":
+        if field.get("type") in ("text", "advtext"):
             key = field["key"]
             cur = self.settings_scratch.get(key, field.get("current"))
             self._settings_begin_edit(
@@ -614,6 +790,7 @@ class SettingsPanelMixin:
         self._settings_scroll = 0
         self.settings_scratch = {}
         self._plugin_expanded = set()
+        self._provider_adv_expanded = False   # 高级设置每次打开都回到折叠态
         self.settings_provider_id = config.data.get("active_provider_id", "")
         self.settings_model_name = config.model_name
         self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
@@ -714,6 +891,14 @@ class SettingsPanelMixin:
                     self._settings_plugin_edit_text(config, field)
                     self.render()
                     continue
+                # 高级设置：标题行展开/收起
+                if ftype == "section":
+                    self._provider_adv_expanded = not bool(getattr(self, "_provider_adv_expanded", False))
+                    self.settings_notice = f"高级设置已{'展开' if self._provider_adv_expanded else '收起'}"
+                    self._immediate_settings_refresh(config)
+                    self._clamp_settings_index()
+                    self.render()
+                    continue
                 # 执行动作 / 文本编辑 / 开关
                 if ftype == "action":
                     if field.get("key") == "save_provider":
@@ -726,7 +911,7 @@ class SettingsPanelMixin:
                     self._settings_run_action(config, field.get("key"))
                     self.render()
                     continue
-                if ftype == "text":
+                if ftype in ("text", "advtext"):
                     key_name = field.get("key")
                     label = field.get("label", key_name)
                     cur = self.settings_scratch.get(key_name, field.get("current"))
@@ -738,7 +923,7 @@ class SettingsPanelMixin:
                     )
                     self.render()
                     continue
-                if ftype == "bool":
+                if ftype in ("bool", "advbool", "check"):
                     cur = self.settings_scratch.get(field["key"], field.get("current"))
                     self.settings_scratch[field["key"]] = not bool(cur in (True, "true", "1", 1))
                     self.render()
@@ -817,11 +1002,11 @@ class SettingsPanelMixin:
             return
         ftype = field.get("type")
         key = field["key"]
-        if ftype == "bool":
+        if ftype in ("bool", "advbool", "check"):
             cur = self.settings_scratch.get(key, field.get("current"))
             self.settings_scratch[key] = not bool(cur in (True, "true", "1", 1))
             return
-        if ftype != "choice":
+        if ftype not in ("choice", "advchoice"):
             return
         if field.get("type") == "sep":
             return
@@ -845,6 +1030,9 @@ class SettingsPanelMixin:
                 s["base_url"] = provider.get("base_url", "")
                 s["balance_url"] = provider.get("balance_url", "")
                 s["provider_temperature"] = provider.get("temperature", 1.0)
+                s.update(self._provider_advanced_display(provider))
+                s["adv_thinking_effort_field"] = str(provider.get("advanced", {}).get("thinking_effort_field") or "").strip()
+                s["adv_thinking_enabled_field"] = str(provider.get("advanced", {}).get("thinking_enabled_field") or "").strip()
                 s["default_model_id"] = provider.get("default_model_id", "")
                 s["provider_models_list"] = ",".join(
                     m.get("model_id") for m in provider.get("models") or []
@@ -858,6 +1046,9 @@ class SettingsPanelMixin:
                 s["base_url"] = "https://api.openai.com/v1"
                 s["balance_url"] = ""
                 s["provider_temperature"] = 1.0
+                s.update(self._provider_advanced_display({}))
+                s["adv_thinking_effort_field"] = ""
+                s["adv_thinking_enabled_field"] = ""
                 s["default_model_id"] = ""
                 s["provider_models_list"] = "（暂无）"
             # 切换提供商属于明确操作，立即刷新列表
@@ -873,9 +1064,10 @@ class SettingsPanelMixin:
                 self.settings_model_name = pids_models[0]
             # 下拉切换提供商：立即刷新模型列表（非逐字输入）
             self._immediate_settings_refresh(config)
-        elif key == "select_model":
+        if key == "select_model":
             self._settings_capture_model_scratch(config)
             self.settings_model_name = self.settings_scratch[key]
+            self._settings_model_scratch_name = ""
             self._immediate_settings_refresh(config)
         elif key == "theme":
             self.load_theme(str(self.settings_scratch[key]))
@@ -930,11 +1122,7 @@ class SettingsPanelMixin:
         entry = dict(source or {})
         entry.setdefault("model_id", old_mid)
         entry["model_id"] = new_mid
-        entry["modalities"] = [
-            part.strip().lower()
-            for part in str(self.settings_scratch.get("modalities") or ",".join(row.get("modalities") or ["text"])).split(",")
-            if part.strip()
-        ] or ["text"]
+        entry["modalities"] = self._model_modalities_values(self.settings_scratch)
         for key in ("context_window", "max_tokens"):
             try:
                 entry[key] = max(1, int(float(self.settings_scratch.get(key, row.get(key, 1)))))
@@ -945,6 +1133,8 @@ class SettingsPanelMixin:
         except (TypeError, ValueError):
             entry["temperature"] = row.get("temperature", 1.0)
         entry["thinking_effort"] = str(self.settings_scratch.get("thinking_effort", row.get("thinking_effort", "none")) or "none")
+        if entry["thinking_effort"] != row.get("thinking_effort"):
+            entry.pop("thinking_effort_explicit", None)
         work = self.settings_model_work.setdefault(pid, [])
         work[:] = [m for m in work if m.get("model_id") not in {old_mid, new_mid}]
         work.append(entry)
@@ -969,7 +1159,10 @@ class SettingsPanelMixin:
             "balance_url": s.get("balance_url", ""),
             "temperature": s.get("provider_temperature", 1.0),
             "default_model_id": s.get("default_model_id", ""),
+            "advanced": self._provider_advanced_form(s),
         }
+        form["advanced"]["thinking_effort_field"] = str(s.get("adv_thinking_effort_field") or "").strip()
+        form["advanced"]["thinking_enabled_field"] = str(s.get("adv_thinking_enabled_field") or "").strip()
         if form["default_model_id"] in ("（无模型）", "-", ""):
             form["default_model_id"] = live_models[0].get("model_id", "") if live_models else ""
         # 与保存前列表 diff
@@ -989,6 +1182,9 @@ class SettingsPanelMixin:
         s["base_url"] = provider.get("base_url", form["base_url"])
         s["balance_url"] = provider.get("balance_url", form["balance_url"])
         s["provider_temperature"] = provider.get("temperature", form["temperature"])
+        s.update(self._provider_advanced_display(provider))
+        s["adv_thinking_effort_field"] = str(provider.get("advanced", {}).get("thinking_effort_field") or "").strip()
+        s["adv_thinking_enabled_field"] = str(provider.get("advanced", {}).get("thinking_enabled_field") or "").strip()
         live_ids = [m.get("model_id") for m in self._provider_live_models(config, pid)]
         s["default_model_id"] = provider.get("default_model_id") or (live_ids[0] if live_ids else "")
         s["provider_models_list"] = ",".join(live_ids) if live_ids else "（暂无）"
@@ -1011,10 +1207,15 @@ class SettingsPanelMixin:
         return fields[self.settings_index]
 
     def _settings_plugin_adjust(self, config, direction: int) -> bool:
-        """←→：插件行=启停（写盘+重载）、pbool=勾选、pchoice=切换选项。
+        """←→：插件行=启停（写盘+重载）、pbool=勾选、pchoice=切换选项、
+        高级设置标题行=展开/收起。
         处理了插件类字段返回 True（调用方跳过通用 choice 循环并重建字段）。"""
         field = self._plugin_current_field()
         ftype = field.get("type")
+        if ftype == "section":
+            self._provider_adv_expanded = not bool(getattr(self, "_provider_adv_expanded", False))
+            self.settings_notice = f"高级设置已{'展开' if self._provider_adv_expanded else '收起'}"
+            return True
         if ftype == "plugin":
             self._settings_plugin_toggle_enable(config, field)
             return True
@@ -1120,6 +1321,17 @@ class SettingsPanelMixin:
         """添加提供商/模型：进入行内编辑读入 id（提交在 _settings_edit_commit 完成）"""
         if action == "fetch_models":
             self._settings_fetch_models(config)
+        elif action == "refill_presets":
+            pid = str(
+                self.settings_scratch.get("provider_id") or self.settings_provider_id or ""
+            ).strip()
+            if not pid:
+                self.settings_notice = "提供商ID为空，无法重填预置参数"
+                return
+            updated, manual, _ = self._settings_refill_auto_models(config, pid)
+            self.settings_notice = (
+                f"已按预置表重填 {len(updated)} 个模型 · 保留手动配置 {len(manual)} 个 · 保存提供商后生效"
+            )
         elif action == "add_provider":
             self._settings_begin_edit(kind="add_provider", label="新 provider_id", initial="")
         elif action == "add_model":
@@ -1159,7 +1371,10 @@ class SettingsPanelMixin:
             self.settings_notice = f"获取模型列表失败 · HTTP {status}" if status else "获取模型列表失败 · 请检查地址、网络和 API Key"
             return
         existing = {m["model_id"] for m in self._provider_live_models(config, pid)}
+        # 存量模型：未手动配置（参数仍为自动填充特征）的按预置表重填
+        updated, manual, _ = self._settings_refill_auto_models(config, pid)
         work = self.settings_model_work.setdefault(pid, [])
+        added = 0
         for mid in ids:
             if mid not in existing:
                 preset = model_preset_defaults(mid)
@@ -1171,9 +1386,43 @@ class SettingsPanelMixin:
                     "modalities": preset["modalities"],
                     "thinking_effort": preset["thinking_effort"],
                 })
+                added += 1
         self.settings_provider_id = pid
         self._immediate_settings_refresh(config)
-        self.settings_notice = f"已获取 {len(ids)} 个模型 · 新增 {len(set(ids) - existing)} 个 · 已按预置表填充参数 · 保存提供商后生效"
+        parts = [f"已获取 {len(ids)} 个模型", f"新增 {added} 个"]
+        if updated:
+            parts.append(f"重填预置 {len(updated)} 个")
+        if manual:
+            parts.append(f"保留手动 {len(manual)} 个")
+        parts.append("保存提供商后生效")
+        self.settings_notice = " · ".join(parts)
+
+    def _settings_refill_auto_models(self, config, pid: str) -> tuple:
+        """按预置表重填该提供商未手动配置的模型（写入工作副本，保存后生效）。
+
+        返回 (updated, manual, unchanged) 三组 model_id：手动配置过的模型一律保留原值。
+        """
+        updated: List[str] = []
+        manual: List[str] = []
+        unchanged: List[str] = []
+        if not pid:
+            return updated, manual, unchanged
+        work = self.settings_model_work.setdefault(pid, [])
+        for model in self._provider_live_models(config, pid):
+            mid = model.get("model_id") or ""
+            if not mid:
+                continue
+            if not is_auto_filled_model(model):
+                manual.append(mid)
+                continue
+            refilled = refill_model_entry(model)
+            if refilled == model:
+                unchanged.append(mid)
+                continue
+            work[:] = [m for m in work if m.get("model_id") != mid]
+            work.append(refilled)
+            updated.append(mid)
+        return updated, manual, unchanged
 
     def _settings_commit_add_provider(self, config, pid: str) -> None:
         pid = pid.strip()
@@ -1229,7 +1478,10 @@ class SettingsPanelMixin:
             "api_key": str(s.get("api_key", "")),
             "base_url": str(s.get("base_url", "")),
             "balance_url": str(s.get("balance_url", "")),
+            "advanced": self._provider_advanced_form(s),
         }
+        provider["advanced"]["thinking_effort_field"] = str(s.get("adv_thinking_effort_field") or "").strip()
+        provider["advanced"]["thinking_enabled_field"] = str(s.get("adv_thinking_enabled_field") or "").strip()
         try:
             provider["temperature"] = float(s.get("provider_temperature", 1.0))
         except (TypeError, ValueError):
@@ -1241,13 +1493,14 @@ class SettingsPanelMixin:
         # 激活提供商
         self._settings_apply_active_provider(config)
         config.apply_active()
-        # 模型
+        # 模型：仅当模型页字段进过 scratch（该标签页构建/编辑过）才回写，
+        # 否则从其它标签页 Enter 保存会用缺省值覆盖当前模型的模态与思考强度
         select_model = s.get("select_model") or self.settings_model_name
         row = config.find_model(select_model) if select_model else None
-        if row:
+        if row and any(key in s for key in self._MODEL_PARAMETER_KEYS):
             model_updates = {
                 "model_id": str(s.get("model_id") or row.get("model_id")),
-                "modalities": [x.strip() for x in str(s.get("modalities") or "text").split(",") if x.strip()],
+                "modalities": self._model_modalities_values(s),
                 "thinking_effort": str(s.get("thinking_effort") or "none"),
             }
             try:
@@ -1276,9 +1529,13 @@ class SettingsPanelMixin:
             if not str(scratch_key).startswith("key_"):
                 continue
             shortcut = str(scratch_key)[4:]
-            if val:
-                ui_cfg[shortcut] = str(val).lower()
-                self.keys[shortcut] = str(val).lower()
+            if val in (None, ""):
+                continue
+            binding = _binding_value(val)
+            if not binding:
+                continue
+            ui_cfg[shortcut] = binding
+            self.keys[shortcut] = binding
         if "theme" in s:
             ui_cfg["theme"] = str(s["theme"])
         if "mode" in s:
@@ -1406,7 +1663,7 @@ class SettingsPanelMixin:
             return False
         field = fields[self.settings_index]
         ftype = field.get("type")
-        if ftype == "text":
+        if ftype in ("text", "advtext"):
             key_name = field.get("key")
             cur = self.settings_scratch.get(key_name, field.get("current"))
             self._settings_begin_edit(

@@ -91,10 +91,12 @@ class TokenMeter:
         self.last_error = ""
         # 本轮输出累计（本地分词，不依赖提供商 usage）：各轮生成 completion
         self.turn_output_tokens = 0
+        self.turn_peak_context_tokens = 0
 
     def begin_turn(self) -> None:
         """回合开始：复位本轮输出 token 累计"""
         self.turn_output_tokens = 0
+        self.turn_peak_context_tokens = 0
 
     def count_text(self, text: str) -> int:
         """本地分词计数；tiktoken 不可用返回 0"""
@@ -124,6 +126,7 @@ class TokenMeter:
             )
             self.source = "api"
             self.last_context_tokens = int(usage.get("prompt_tokens") or self.last_context_tokens)
+            self.turn_peak_context_tokens = max(self.turn_peak_context_tokens, self.last_context_tokens)
         except (TypeError, ValueError):
             pass
 
@@ -132,6 +135,7 @@ class TokenMeter:
         try:
             tokens = count_message_tokens(messages, self.model)
             self.last_context_tokens = tokens
+            self.turn_peak_context_tokens = max(self.turn_peak_context_tokens, tokens)
             self.source = "tokenizer" if self.source != "api" else self.source
             return tokens
         except RuntimeError as e:

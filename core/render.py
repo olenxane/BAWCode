@@ -1353,15 +1353,12 @@ class RenderMixin:
                     if isinstance(c, dict):
                         # execute_command/run_program 优先显示命令头
                         names.append(cmd_heads.get(str(c.get("id") or "")) or str(c.get("name") or ""))
-                # 模型随工具调用输出的说明文字是给用户看的话：独立成 assistant 节点
-                # 全文展示；不并进可折叠的工具节点（否则默认被折叠藏住，且部分模型
-                # 的 content 带 \n\n 包裹，展开后标题行悬空「 · 」+ 空行）
                 text = content.strip()
                 if text:
                     _parent().children.append(
                         TreeNode(
                             f"msg:{index}",
-                            f"Agent · {text}",
+                            f"◆ · {text}",
                             "assistant",
                             default_expanded=True,
                             detail="",

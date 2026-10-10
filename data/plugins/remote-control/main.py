@@ -35,6 +35,7 @@ import hmac
 import html
 import json
 import queue
+import re
 import secrets
 import socket
 import threading
@@ -48,9 +49,11 @@ from urllib.parse import urlparse, parse_qs
 from core.config import make_model_name
 
 try:
+    from core import file as file_mod
     from core import memory as memory_mod
     from core import plugins as plugins_mod
 except ImportError:  # 插件目录被单独导入（类型检查等场景）时的防御
+    file_mod = None
     memory_mod = None
     plugins_mod = None
 
@@ -95,13 +98,19 @@ SSE_HEARTBEAT = 10  # 秒；顺带用于探测死连接与退出检查
 
 # ---- 渲染辅助：与 TUI core/render.py 对齐的工具分类 / pygments 高亮 / diff ----
 # 分类口径与 TUI 的 _tool_display_meta 保持一致；插件不依赖宿主内部实现，逻辑在此独立实现
-_HL_STYLE = "monokai"          # pygments 高亮风格，与 TUI 的 _HL_STYLE 一致
+# 高亮风格与 TUI 有意不同：页面是浅色清新风，深色 monokai 卡片上 #F8F8F2 预设色文字对比弱、
+# 用户反馈「默认白色难以分辨」；网页端改用浅底深字的 xcode 风格（全 token 对比度 ≥5:1）
+_HL_STYLE = "xcode"            # pygments 高亮风格（网页端浅色，独立于 TUI 的 monokai）
+_HL_BG = "#ffffff"             # 高亮卡片底色，须与 _HL_STYLE 背景一致
+_HL_FG = "#333333"             # 无词法着色部分的文字色
 _HL_CLASS = "hl"               # 词法样式作用域类名
 _TOOL_CMD = {"execute_command", "run_program"}
 _TOOL_WRITE = {"write"}
 _TOOL_EDIT = {"edit_file"}
+_TOOL_READ = {"read"}
 _PLAN_TOOLS = {"write_plan", "update_plan", "generate_steps", "update_step_status"}
 _WRITE_MAX_LINES = 500         # 写入高亮行数上限，防大文件拖垮网页
+_READ_MAX_LINES = 500          # 读取高亮行数上限（结果带行号前缀时按行剥离再高亮）
 _DIFF_MAX_LINES = 600          # 单处 diff 行数上限
 
 def _as_text(value) -> str:
@@ -117,6 +126,36 @@ def _as_text(value) -> str:
 
 def _esc(text) -> str:
     return html.escape(str(text or ""), quote=False)
+
+
+# 快捷键项与默认值（网页设置页读取/写回共用同一份清单）
+_SHORTCUT_DEFAULTS = (
+    ("switch_mode", "shift+tab"),
+    ("switch_focus", "tab"),
+    ("send", "ctrl+enter"),
+    ("newline", "shift+enter"),
+    ("complete", "tab"),
+    ("scroll_up", "pageup"),
+    ("scroll_down", "pagedown"),
+    ("expand", "right"),
+    ("collapse", "left"),
+    ("rollback", "ctrl+z"),
+)
+
+
+def _shortcut_text(value) -> str:
+    """绑定值 → 网页文本：多绑定列表按 ' / ' 连接"""
+    if isinstance(value, (list, tuple)):
+        return " / ".join(str(x).lower() for x in value if x not in (None, ""))
+    return str(value or "").lower()
+
+
+def _shortcut_binding(value):
+    """网页文本 → 绑定值：多键（' / ' 或 ',' 分隔）保留列表形态"""
+    parts = [p.strip().lower() for p in re.split(r"[/,]", str(value or "")) if p.strip()]
+    if not parts:
+        return ""
+    return parts if len(parts) > 1 else parts[0]
 
 def _lexer_for(filename: str):
     if not HAS_PYGMENTS or not filename:
@@ -148,21 +187,25 @@ def _hl_lines(filename: str, code: str) -> Tuple[str, ...]:
 
 @functools.lru_cache(maxsize=1)
 def _hl_css() -> str:
-    """monokai 词法样式表，限定在 .hl 作用域；随 /api/hlcss 下发一次"""
-    base = (
-        f".{_HL_CLASS}{{background:#272822;color:#f8f8f2}}"
-        f".{_HL_CLASS} .hll{{background:#49483e}}"
-    )
+    """词法样式表，限定在 .hl 作用域；随 /api/hlcss 下发一次"""
+    base = f".{_HL_CLASS}{{background:{_HL_BG};color:{_HL_FG}}}"
     if not HAS_PYGMENTS:
         return base
     try:
         raw = _PygHtmlFormatter(style=_HL_STYLE).get_style_defs(f".{_HL_CLASS}")
     except Exception:
         return base
-    # 只保留 .hl 作用域内的规则；丢弃 pygments 顺带产出的全局 pre/linenos 规则，避免污染现有样式
-    sel = f".{_HL_CLASS}"
-    defs = "\n".join(line for line in raw.splitlines() if sel in line)
-    return base + defs
+    # 只保留 .hl 作用域内的规则；pygments 顺带的 pre/linenos 全局规则会污染页面样式，丢弃
+    keep = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or not s.startswith(f".{_HL_CLASS}"):
+            continue
+        # 顶格 .hl{background:...} 已由 base 统一接管，跳过避免重复
+        if s.startswith(f".{_HL_CLASS}{{") or s.startswith(f".{_HL_CLASS} {{"):
+            continue
+        keep.append(line)
+    return base + "\n" + "\n".join(keep)
 
 @functools.lru_cache(maxsize=16)
 def _diff_items(filename: str, old: str, new: str) -> List[dict]:
@@ -199,7 +242,7 @@ def _diff_items(filename: str, old: str, new: str) -> List[dict]:
     return out
 
 def _tool_render(name: str, args: dict, content: str, failed: bool) -> Optional[dict]:
-    """命令/写入/编辑类工具 → 网页渲染载荷；读取类或不适用返回 None（保持通用卡片）"""
+    """命令/写入/编辑/读取类工具 → 网页渲染载荷；不适用返回 None（保持通用卡片）"""
     args = args if isinstance(args, dict) else {}
     if name in _TOOL_CMD:
         if name == "execute_command":
@@ -222,13 +265,47 @@ def _tool_render(name: str, args: dict, content: str, failed: bool) -> Optional[
             "truncated": len(lines) > _WRITE_MAX_LINES,
         }
     if name in _TOOL_EDIT and not failed:
-        raw: List[Tuple[str, str]] = [(str(args.get("old_str") or ""), str(args.get("new_str") or ""))]
+        raw: List[Tuple[str, str]] = []
+        if isinstance(args.get("edits"), list):  # multi_edit 合并入 edit_file 前的旧载荷形态，兼容存量会话
+            for e in args["edits"]:
+                if isinstance(e, dict):
+                    raw.append((str(e.get("old_str") or ""), str(e.get("new_str") or "")))
+        else:
+            raw.append((str(args.get("old_str") or ""), str(args.get("new_str") or "")))
+        if not raw:
+            return None
         path = str(args.get("file_path") or "")
         items = []
         for old, new in raw:
             lines = _diff_items(path, old, new)
             items.append({"lines": lines[:_DIFF_MAX_LINES], "truncated": len(lines) > _DIFF_MAX_LINES})
         return {"kind": "edit", "path": path, "items": items}
+    if name in _TOOL_READ and not failed:
+        path = str(args.get("file_path") or "")
+        text = str(content or "")
+        # read 结果形如 "[第 a-b 行 / 共 N 行]\n  100| 代码…"：剥离页眉与行号前缀后按文件语法高亮，
+        # 行号作为独立列回显（与 TUI 行号+分隔线样式对齐）；图片等无页眉结果保持纯文本
+        m = re.match(r"^\[第 (\d+)-(\d+) 行 / 共 \d+ 行\]\n?", text)
+        if not m:
+            return None
+        start = int(m.group(1))
+        body = text[m.end():]
+        src_lines, numbers = [], []
+        for ln in body.splitlines()[:_READ_MAX_LINES]:
+            pm = re.match(r"^\s*(\d+)\| ?(.*)$", ln)
+            if pm:
+                numbers.append(int(pm.group(1)))
+                src_lines.append(pm.group(2))
+            else:
+                numbers.append(None)
+                src_lines.append(ln)
+        hl = _hl_lines(path, "\n".join(src_lines))
+        rows = [
+            {"n": no if no is not None else (start + i), "html": h}
+            for i, (no, h) in enumerate(zip(numbers, hl))
+        ]
+        return {"kind": "read", "path": path, "rows": rows,
+                "truncated": len(body.splitlines()) > _READ_MAX_LINES}
     return None
 
 def _plan_render(tool_name: str, content: str) -> Optional[dict]:
@@ -304,7 +381,11 @@ def setup(ctx):
     remote_confirm = bool(ctx.settings.get("remote_confirm", True))
     confirm_timeout = float(ctx.settings.get("confirm_timeout") or 90)
     max_history = int(ctx.settings.get("max_history") or 80)
+    upload_max_bytes = int(ctx.settings.get("upload_max_bytes") or 10 * 1024 * 1024)
     page_path = Path(ctx.dir) / "web" / "index.html"
+    root_workspace = Path(getattr(ctx, "workspace", Path.cwd())).resolve()
+    attachment_dir = root_workspace / ".bawcode" / "attachments" / "remote"
+    attachment_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- 密钥 ----
 
@@ -1015,6 +1096,45 @@ def setup(ctx):
         _broadcast({"t": "reset"})
         return {"ok": True, "result": "提供商已删除", "model": ctx.config.active_model_name()}
 
+    def _file_candidates(prefix, depth=1) -> dict:
+        if file_mod is None:
+            return {"ok": False, "message": "宿主缺少 file 模块"}
+        session = _session()
+        selected_workspace = getattr(session, "workspace", root_workspace)
+        result = file_mod.scan_candidates(str(prefix or ""), selected_workspace, depth=depth)
+        return {"ok": True, "items": result["items"], "more": result["more"], "depth": max(1, int(depth))}
+
+    @_idle_operation
+    def _provider_refill(provider_id: str) -> dict:
+        """按预置表重填该提供商未手动配置的模型参数（手动配置的保留）"""
+        err = _session_op_guard()
+        if err:
+            return err
+        if not ctx.config.find_provider(provider_id):
+            return {"ok": False, "message": "提供商不存在"}
+        summary = ctx.config.refill_preset_params(provider_id)
+        updated = summary.get("updated") or []
+        skipped = summary.get("skipped_manual") or []
+        if not updated:
+            return {
+                "ok": True,
+                "result": f"没有需要重填的模型（保留手动配置 {len(skipped)} 个）",
+                "updated": [], "skipped": skipped,
+            }
+        ctx.config.save()
+        llm = _llm()
+        if llm is not None and hasattr(llm, "refresh_from_config"):
+            llm.refresh_from_config(ctx.config)
+        app = _app()
+        if app is not None and hasattr(app, "bind_config"):
+            app.bind_config(ctx.config)
+        _broadcast({"t": "reset"})
+        return {
+            "ok": True,
+            "result": f"已重填 {len(updated)} 个模型的预置参数（保留手动配置 {len(skipped)} 个）",
+            "updated": updated, "skipped": skipped,
+        }
+
     def _complete(prefix) -> dict:
         if not isinstance(prefix, str):
             return {"ok": False, "message": "prefix 须为字符串"}
@@ -1137,16 +1257,8 @@ def setup(ctx):
                 "log_level": log_cfg.get("level", "info"),
             },
             "shortcuts": {
-                "switch_mode": ui.get("switch_mode", "shift+tab"),
-                "switch_focus": ui.get("switch_focus", "tab"),
-                "send": ui.get("send", "ctrl+enter"),
-                "newline": ui.get("newline", "shift+enter"),
-                "complete": ui.get("complete", "tab"),
-                "scroll_up": ui.get("scroll_up", "pageup"),
-                "scroll_down": ui.get("scroll_down", "pagedown"),
-                "expand": ui.get("expand", "right"),
-                "collapse": ui.get("collapse", "left"),
-                "rollback": ui.get("rollback", "ctrl+z"),
+                key: _shortcut_text(ui.get(key, default))
+                for key, default in _SHORTCUT_DEFAULTS
             },
             "plugins": plugins_list,
         }
@@ -1277,10 +1389,9 @@ def setup(ctx):
 
         elif section == "shortcuts":
             ui_cfg = d.setdefault("ui", {})
-            for key in ("switch_mode", "switch_focus", "send", "newline", "complete",
-                        "scroll_up", "scroll_down", "expand", "collapse", "rollback"):
+            for key, _default in _SHORTCUT_DEFAULTS:
                 if key in values:
-                    ui_cfg[key] = str(values[key]).lower()
+                    ui_cfg[key] = _shortcut_binding(values[key])
 
         elif section == "plugins":
             # 插件启停：{plugin_id: true/false}
@@ -1401,6 +1512,42 @@ def setup(ctx):
                 except (ValueError, json.JSONDecodeError, OSError):
                     return None
 
+            def _upload(self):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length <= 0 or length > upload_max_bytes + 1024 * 1024:
+                        return None, "上传文件超过大小限制"
+                    content_type = self.headers.get("Content-Type") or ""
+                    match = re.search(r"boundary=([^;]+)", content_type)
+                    if not match:
+                        return None, "上传请求缺少 multipart boundary"
+                    boundary = ("--" + match.group(1).strip().strip('"')).encode("utf-8")
+                    raw = self.rfile.read(length)
+                    parts = raw.split(boundary)
+                    for part in parts:
+                        if b"Content-Disposition:" not in part or b"filename=" not in part:
+                            continue
+                        head, sep, body = part.partition(b"\r\n\r\n")
+                        if not sep:
+                            continue
+                        if body.endswith(b"\r\n"):
+                            body = body[:-2]
+                        header = head.decode("utf-8", errors="replace")
+                        name_match = re.search(r'filename="([^"]*)"', header)
+                        filename = Path(name_match.group(1) if name_match else "upload.txt").name
+                        filename = filename.strip() or "upload.txt"
+                        if len(body) > upload_max_bytes:
+                            return None, "上传文件超过大小限制"
+                        target = attachment_dir / f"{uuid.uuid4().hex[:12]}-{filename}"
+                        tmp = target.with_name(target.name + ".tmp")
+                        tmp.write_bytes(body)
+                        tmp.replace(target)
+                        rel = target.relative_to(root_workspace).as_posix()
+                        return {"name": filename, "path": rel, "reference": file_mod.quote_reference(rel)}, ""
+                    return None, "上传请求中没有文件"
+                except (OSError, ValueError) as exc:
+                    return None, f"上传失败: {exc}"
+
             def do_GET(self):
                 path = urlparse(self.path).path
                 if path == "/favicon.ico":
@@ -1456,6 +1603,14 @@ def setup(ctx):
                     self._json(200, _undo_listing())
                 elif path == "/api/commands":
                     self._json(200, _commands_listing())
+                elif path == "/api/files":
+                    params = parse_qs(urlparse(self.path).query)
+                    query = (params.get("prefix") or [""])[0]
+                    try:
+                        depth = int((params.get("depth") or ["1"])[0])
+                    except ValueError:
+                        depth = 1
+                    self._json(200, _file_candidates(query, depth))
                 elif path == "/api/settings":
                     self._json(200, _settings_get())
                 else:
@@ -1501,6 +1656,10 @@ def setup(ctx):
                 path = urlparse(self.path).path
                 if not _check_key(self):
                     self._deny()
+                    return
+                if path == "/api/upload":
+                    result, error = self._upload()
+                    self._json(200 if result else 400, {"ok": bool(result), **(result or {"message": error})})
                     return
                 data = self._body()
                 if data is None:
@@ -1569,6 +1728,8 @@ def setup(ctx):
                     self._json(200, _provider_models(data))
                 elif path == "/api/provider/delete":
                     self._json(200, _provider_delete(str(data.get("provider_id") or "")))
+                elif path == "/api/provider/refill":
+                    self._json(200, _provider_refill(str(data.get("provider_id") or "")))
                 elif path == "/api/complete":
                     self._json(200, _complete(data.get("prefix", "")))
                 elif path == "/api/mode":

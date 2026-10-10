@@ -75,7 +75,7 @@ _REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking_content", "thin
 
 
 def _reasoning_of(mapping) -> str:
-    """从响应 message 或流式 delta 取思考文本，取不到返回空串"""
+    """从响应 message 或流式 delta 依次探测思考字段，取首个非空值"""
     if not isinstance(mapping, dict):
         return ""
     for key in _REASONING_FIELDS:
@@ -83,6 +83,37 @@ def _reasoning_of(mapping) -> str:
         if value:
             return value if isinstance(value, str) else str(value)
     return ""
+
+
+def _tri_state(value) -> Optional[bool]:
+    """高级设置开关三态解析：None=跟随；字符串布尔（手写配置）按文本容错"""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+        return None
+    return value if isinstance(value, bool) else None
+
+
+def _thinking_effort_of(model_effort, advanced, model_override=False) -> str:
+    """解析最终思考强度；none 表示请求关闭思考。
+
+    显式 /effort 模型值优先于提供商强度覆盖；提供商关闭开关仍保持最高优先级。
+    """
+    mode = _tri_state((advanced or {}).get("thinking_enabled"))
+    if mode is False:
+        return "none"
+    model_value = str(model_effort or "none").strip().lower()
+    if model_override:
+        return model_value if model_value in THINKING_OPTIONS else "none"
+    override = str((advanced or {}).get("thinking_effort") or "").strip().lower()
+    if override in THINKING_OPTIONS:
+        return override
+    if mode is True and model_value == "none":
+        return "high"
+    return model_value if model_value in THINKING_OPTIONS else "none"
 
 
 def get_system_prompt(config=None, files: Optional[List[str]] = None, **kwargs) -> str:
@@ -281,8 +312,11 @@ class LLM:
                     "temperature": getattr(cfg, "temperature", 1.0),
                     "max_tokens": getattr(cfg, "max_tokens", 2048),
                     "model_name": name,
+                    "advanced": {},
                     "ok": False,
                 }
+        provider = cfg.find_provider(row.get("provider_id") or "") or {}
+        advanced = provider.get("advanced")
         return {
             "model_id": row.get("model_id") or "",
             "api_key": row.get("api_key") or "",
@@ -293,6 +327,9 @@ class LLM:
             "max_tokens": row.get("max_tokens") or getattr(cfg, "max_tokens", 2048),
             "model_name": row.get("model_name") or name,
             "thinking_effort": row.get("thinking_effort") or "none",
+            "thinking_effort_explicit": bool(row.get("thinking_effort_explicit", False)),
+            # 提供商级高级设置（请求携带温度/思考覆盖/思考字段名），缺省为空 dict
+            "advanced": advanced if isinstance(advanced, dict) else {},
             "ok": True,
         }
 
@@ -350,11 +387,25 @@ class LLM:
             return agg
         raise exc
 
+    def _sdk_payload(self, payload: dict, req: Optional[dict] = None) -> dict:
+        """把 OpenAI SDK 不认识的思考参数键移入 extra_body，保持线上的 JSON 键名不变"""
+        body = dict(payload)
+        advanced = (req or {}).get("advanced") or {}
+        extension_keys = {
+            str(advanced.get("thinking_effort_field") or "reasoning_effort").strip() or "reasoning_effort",
+            str(advanced.get("thinking_enabled_field") or "enable_thinking").strip() or "enable_thinking",
+        }
+        extra = {key: body.pop(key) for key in extension_keys if key in body}
+        if extra:
+            existing = body.pop("extra_body", None)
+            body["extra_body"] = {**(existing if isinstance(existing, dict) else {}), **extra}
+        return body
+
     def _native_chat_stream(self, payload: dict, req: dict, on_delta) -> Optional["_StreamAggregate"]:
         """openai SDK 流式：逐 chunk 聚合并回调增量；返回 None 表示已取消"""
         agg = _StreamAggregate(on_delta)
         resp = self.client.chat.completions.create(
-            **payload, stream=True, stream_options={"include_usage": True}
+            **self._sdk_payload(payload, req), stream=True, stream_options={"include_usage": True}
         )
         try:
             for chunk in resp:
@@ -426,7 +477,7 @@ class LLM:
             if self.client is not None:
                 if on_delta is not None:
                     return self._native_chat_stream(payload, req, on_delta)
-                resp = self.client.chat.completions.create(**payload)
+                resp = self.client.chat.completions.create(**self._sdk_payload(payload, req))
                 return resp.model_dump() if hasattr(resp, "model_dump") else resp
         if on_delta is not None:
             return self._http_chat_stream(payload, req, on_delta)
@@ -545,18 +596,28 @@ class LLM:
         req = self.resolve_request(model)
         if req.get("error"):
             return {"content": "", "tool_calls": [], "error": req["error"]}
+        advanced = req.get("advanced") if isinstance(req.get("advanced"), dict) else {}
         model_id = req.get("model_id") or req.get("model_name") or ""
         payload = {
             "model": model_id,
             "messages": self._map_api_messages(messages),
-            "temperature": req.get("temperature", 1.0) if temperature is None else temperature,
             "max_tokens": int(req.get("max_tokens") or 2048),
         }
-        # 思考强度 → reasoning_effort；none 不发，避免厂商因未知参数报错
-        # 各厂商思考字段形态不同，后续在此处按 provider 分派，勿散落到调用点
-        effort = str(req.get("thinking_effort") or "none").lower()
-        if effort != "none" and effort in THINKING_OPTIONS:
-            payload["reasoning_effort"] = effort
+        # 温度默认不携带（避免中转/厂商因固定温度报错或限制采样）；高级设置勾选
+        # "携带温度"或调用方显式传入时才发送
+        if temperature is not None:
+            payload["temperature"] = temperature
+        elif _tri_state(advanced.get("send_temperature")):
+            payload["temperature"] = req.get("temperature", 1.0)
+        # 提供商可自定义强度键名；effort=none 仍显式发出 none 和关闭开关
+        effort = _thinking_effort_of(
+            req.get("thinking_effort"), advanced,
+            model_override=bool(req.get("thinking_effort_explicit", False)),
+        )
+        effort_field = str(advanced.get("thinking_effort_field") or "reasoning_effort").strip() or "reasoning_effort"
+        enabled_field = str(advanced.get("thinking_enabled_field") or "enable_thinking").strip() or "enable_thinking"
+        payload[effort_field] = effort
+        payload[enabled_field] = effort != "none"
         if tools:
             payload["tools"] = tools
             # DeepSeek 思考模式不支持 required/指定 function，固定 auto
@@ -664,6 +725,7 @@ class LLM:
         }
 
     def _normalize(self, data: Any, keep_reasoning: bool = False) -> dict:
+        """归一化响应；思考字段固定按 _REASONING_FIELDS 顺序探测"""
         if isinstance(data, dict) and data.get("content") is not None and "tool_calls" in data:
             normalized_calls = []
             for c in data.get("tool_calls") or []:

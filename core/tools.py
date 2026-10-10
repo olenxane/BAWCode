@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,46 @@ def _console_output_encoding() -> str:
         except Exception:
             pass
     return "utf-8"
+
+
+def _terminate_command_tree(proc: subprocess.Popen, command: str) -> None:
+    """超时后终止本次命令进程树，并以有界时间回收 shell 进程"""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warn("命令进程树终止失败 pid=%s: %s", proc.pid, exc)
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        log.warn("命令 shell 进程未在清理期限内退出 pid=%s: %s", proc.pid, command)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            log.warn("命令 shell 进程回收超时 pid=%s", proc.pid)
+    try:
+        proc.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        log.warn("命令输出管道回收超时 pid=%s", proc.pid)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 def _session():
@@ -208,27 +249,33 @@ def execute_command(
     if str(mode or "").strip().lower() == "background":
         return _execute_command_background(command, cwd)
     log.info("执行命令: %s（cwd=%s timeout=%ds）", command, cwd or "-", timeout)
+    proc = None
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=cwd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
             encoding=_console_output_encoding(),
             errors="replace",
+            start_new_session=sys.platform != "win32",
         )
-        output = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0:
-            log.warn("命令退出码 %d: %s", result.returncode, command)
-            return f"命令退出码 {result.returncode}\n{output}".strip()
-        log.debug("命令完成，输出 %d 字符", len(output))
-        return output.strip() or "执行完成。"
+        output, _ = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            log.warn("命令退出码 %d: %s", proc.returncode, command)
+            return f"命令退出码 {proc.returncode}\n{output or ''}".strip()
+        log.debug("命令完成，输出 %d 字符", len(output or ""))
+        return (output or "").strip() or "执行完成。"
     except subprocess.TimeoutExpired:
+        if proc is not None:
+            _terminate_command_tree(proc, command)
         log.warn("命令超时（>%ds）: %s", timeout, command)
         return f"命令超时（>{timeout}s）"
     except OSError as e:
+        if proc is not None and proc.poll() is None:
+            _terminate_command_tree(proc, command)
         log.error("命令执行失败: %s（%s）", e, command)
         return f"执行失败: {e}"
 

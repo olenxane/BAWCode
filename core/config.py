@@ -22,6 +22,11 @@ SAVE_LOCK = threading.Lock()
 
 def default_config() -> dict:
     """内置默认配置：多 provider，model_name = provider_id-model_id"""
+    # providers[].advanced 为提供商级请求高级设置（设置页「提供商」标签折叠区）：
+    # send_temperature 勾选后请求才携带 temperature（默认不携带）；thinking_enabled
+    # true/false 强制开关思考，null=跟随模型档位；thinking_effort ""=跟随，
+    # none/low/medium/high/xhigh/max 覆盖模型档位。thinking_effort_field 和
+    # thinking_enabled_field 可自定义出站 JSON 的强度/开关键名，空值使用默认键名。
     return {
         "providers": [
             {
@@ -286,7 +291,7 @@ def normalize_base_url(url: str) -> str:
 
 # 模型/系统枚举（设置页 ←→ 切换）
 MODALITY_OPTIONS = ["text", "vision", "audio", "video", "embedding"]
-THINKING_OPTIONS = ["none", "low", "medium", "high"]
+THINKING_OPTIONS = ["none", "low", "medium", "high", "xhigh", "max"]
 TASK_ROLES = {
     "plan": "任务规划",
     "code": "代码编写",
@@ -306,8 +311,8 @@ MODEL_PRESET_RULES = [
     # —— DeepSeek V4+：V4.1 额外支持图片，其余按纯文本预置 ——
     (r"deepseek[-_ ]?v4[._-]1(?:\b|[-_])", 1000000, 384000, ["text", "vision"], "high"),
     (r"deepseek[-_ ]?v(?:4(?:\.\d+)?|[5-9]\d*(?:\.\d+)?)(?:\b|[-_])", 1000000, 384000, ["text"], "high"),
-    # —— OpenAI GPT 5.6+ ——
-    (r"gpt[-_ ]?5(?:[._-](?:6|[7-9]\d*|\d{2,}))(?:\b|[-_])", 1050000, 256000, ["text", "vision"], "high"),
+    # —— OpenAI GPT 5.6+（含 6.x 及以上主版本）——
+    (r"gpt[-_ ]?(?:5[._-](?:6|[7-9]\d*|\d{2,})|[6-9](?:[._-]\d+)?)(?:\b|[-_])", 1050000, 256000, ["text", "vision"], "high"),
     # —— Google Gemini 全系列：文本、图片、音频、视频 ——
     (r"gemini(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, FULL_MODALITIES, "none"),
     # —— GLM 5.2+；5.3 Flash 全模态，普通 5.3 图片，其他版本纯文本 ——
@@ -415,6 +420,42 @@ def normalize_model_entry(entry: dict) -> dict:
         data["modalities"] = list(preset["modalities"])
     effort = str(data.get("thinking_effort") or preset["thinking_effort"]).lower()
     data["thinking_effort"] = effort if effort in THINKING_OPTIONS else preset["thinking_effort"]
+    if "thinking_effort_explicit" in data:
+        data["thinking_effort_explicit"] = bool(data["thinking_effort_explicit"])
+    return data
+
+
+# 自动填充特征：参数与内置回退完全一致时视为"未手动配置"，可按预置表重填
+AUTO_FILLED_SIGNATURES = {
+    (65536, 8192, ("text",)),      # 旧版统一默认
+    (131072, 32768, ("text",)),    # 当前统一回退
+}
+
+
+def is_auto_filled_model(entry: dict) -> bool:
+    """判定模型参数是否为自动填充（未手动配置）：缺值或与内置回退完全一致"""
+    data = entry or {}
+    if "context_window" not in data and "max_tokens" not in data:
+        return True
+    try:
+        ctx = int(float(data.get("context_window")))
+        maxt = int(float(data.get("max_tokens")))
+    except (TypeError, ValueError):
+        return False
+    mods = tuple(str(m).strip().lower() for m in (data.get("modalities") or []))
+    return bool(mods) and (ctx, maxt, mods) in AUTO_FILLED_SIGNATURES
+
+
+def refill_model_entry(entry: dict) -> dict:
+    """按预置表重填单条模型参数；仅对自动填充（未手动配置）的条目生效"""
+    data = dict(entry or {})
+    if not is_auto_filled_model(data):
+        return data
+    preset = model_preset_defaults(data.get("model_id") or "")
+    data["context_window"] = preset["context_window"]
+    data["max_tokens"] = preset["max_tokens"]
+    data["modalities"] = list(preset["modalities"])
+    data["thinking_effort"] = preset["thinking_effort"]
     return data
 
 
@@ -559,6 +600,7 @@ class Config:
                         "temperature": model.get("temperature", provider.get("temperature", 1.0)),
                         "modalities": list(model.get("modalities") or ["text"]),
                         "thinking_effort": model.get("thinking_effort", "none"),
+                        "thinking_effort_explicit": bool(model.get("thinking_effort_explicit", False)),
                         "base_url": normalize_base_url(provider.get("base_url", "")),
                         "api_key": provider.get("api_key", ""),
                         "balance_url": provider.get("balance_url", ""),
@@ -723,6 +765,39 @@ class Config:
                 return merged
         return None
 
+    def refill_preset_params(self, provider_id: Optional[str] = None) -> dict:
+        """按预置表重填未手动配置（参数为自动填充特征）的模型参数。
+
+        返回 updated / skipped_manual / unchanged 三组 model_id 名单；
+        provider_id 为空时处理全部提供商。手动配置过的模型一律保留原值。
+        """
+        summary = {"updated": [], "skipped_manual": [], "unchanged": []}
+        for provider in self.providers():
+            if provider_id and (provider.get("provider_id") or "") != provider_id:
+                continue
+            models = provider.get("models") or []
+            for index, model in enumerate(models):
+                mid = (model or {}).get("model_id") or ""
+                if not mid:
+                    continue
+                if not is_auto_filled_model(model):
+                    summary["skipped_manual"].append(mid)
+                    continue
+                refilled = normalize_model_entry(refill_model_entry(model))
+                if refilled == model:
+                    summary["unchanged"].append(mid)
+                    continue
+                models[index] = refilled
+                summary["updated"].append(mid)
+        if summary["updated"]:
+            log.info(
+                "按预置表重填 %d 个模型参数（保留手动配置 %d 个）",
+                len(summary["updated"]),
+                len(summary["skipped_manual"]),
+            )
+            self.apply_active()
+        return summary
+
     def save_provider_from_form(
         self,
         form: dict,
@@ -822,6 +897,9 @@ class Config:
             or (existing or {}).get("default_model_id")
             or (after_list[0]["model_id"] if after_list else ""),
         }
+        # 高级设置随表单透传；未提交时（网页端/旧表单）保留原值，由 add_or_update_provider 深合并
+        if isinstance(form.get("advanced"), dict):
+            provider["advanced"] = form["advanced"]
 
         if existing is None:
             self.add_or_update_provider(provider)

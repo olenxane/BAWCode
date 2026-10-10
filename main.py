@@ -13,6 +13,8 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core import commands
+from core import config as config_mod
+from core import file as file_mod
 from core import hooks
 from core import loop as loop_mod
 from core import mcp as mcp_mod
@@ -24,6 +26,7 @@ from core import project_identity
 from core import register
 from core import session_store
 from core import snapshot as snapshot_mod
+from core import statistics as statistics_mod
 from core import subagent as subagent_mod
 from core import tools as tools_mod  # noqa: F401
 from core import ui
@@ -32,6 +35,14 @@ from core.llm import CANCELLED, LLM
 from core.log import get_logger
 
 log = get_logger("main")
+
+
+def _init_usage_statistics():
+    try:
+        return statistics_mod.initialize()
+    except Exception as exc:
+        log.debug("使用统计初始化失败: %r", exc)
+        return None
 
 
 def _sync(app: "ui.TuiApp", session, task: str = "", status: str = "", render: bool = True) -> None:
@@ -110,6 +121,33 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
             return True
         name = ctx["session"].rename_session(title)
         ctx["app"].status = f"已重命名: {name}"
+        return True
+
+    @commands.register("/effort", hint="设置当前模型思考强度 none|low|medium|high|xhigh|max", usage="/effort <none|low|medium|high|xhigh|max>", source="builtin")
+    def _effort(ctx, args):
+        choices = config_mod.THINKING_OPTIONS
+        arg = (args or "").strip().lower()
+        row = ctx["config"].find_model(ctx["config"].model_name)
+        if row is None:
+            _echo(ctx, "当前模型不可用，无法设置思考强度")
+            return True
+        if not arg:
+            _echo(ctx, f"当前模型思考强度: {row.get('thinking_effort') or 'none'}")
+            return True
+        if arg not in choices:
+            _echo(ctx, "用法: /effort <none|low|medium|high|xhigh|max>")
+            return True
+        updated = ctx["config"].update_model(
+            row["provider_id"], row["model_id"],
+            {"thinking_effort": arg, "thinking_effort_explicit": True},
+        )
+        if updated is None:
+            _echo(ctx, "当前模型更新失败，思考强度未改变")
+            return True
+        ctx["config"].save()
+        ctx["llm"].refresh_from_config(ctx["config"])
+        ctx["app"].bind_config(ctx["config"])
+        ctx["app"].status = f"当前模型思考强度: {arg}"
         return True
 
     @commands.register("/model", hint="切换模型 /model <model_name>", usage="/model <provider-model>", source="builtin")
@@ -544,6 +582,14 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
     """回合入口：无论正常结束/出错/中断，回合末执行上下文维护（剥离+预算外置），
     并清掉流式树尾消息（partial 丢弃，与在途回合丢弃语义一致）与子代理运行时/直播槽"""
     snap = None
+    stats = getattr(app, "usage_statistics", None)
+    meter = getattr(llm, "meter", None)
+    try:
+        stats_handle = stats.begin_turn(session.session_id, llm.config.model_name) if stats else None
+    except Exception as exc:
+        log.debug("使用统计回合初始化失败: %r", exc)
+        stats_handle = None
+    api_tokens_before = getattr(meter, "api_total_tokens", 0)
     try:
         _agent_turn_impl(llm, session, user_text, app, runner=runner)
     finally:
@@ -562,6 +608,16 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
             session.finalize_turn()
         except Exception as exc:
             log.error("回合末上下文维护失败: %r", exc)
+        if stats and stats_handle:
+            try:
+                stats.end_turn(
+                    stats_handle,
+                    llm.config.model_name,
+                    max(0, getattr(meter, "api_total_tokens", 0) - api_tokens_before),
+                    getattr(meter, "turn_peak_context_tokens", getattr(meter, "context_tokens", 0)),
+                )
+            except Exception as exc:
+                log.debug("使用统计更新失败: %r", exc)
         subagent_mod.unbind_runtime()
         app.streaming_msg = None
         app.subagent_stream = None
@@ -620,6 +676,14 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     def _cancelled() -> bool:
         return runner is not None and llm.cancelled()
 
+    resolved_files = file_mod.resolve_references(user_text, getattr(session, "workspace", None))
+    expanded_user_text = resolved_files["text"]
+    file_refs = resolved_files["references"]
+    failed_refs = [item for item in file_refs if item.get("status") not in ("loaded", "duplicate")]
+    if failed_refs:
+        names = ", ".join(str(item.get("path") or item.get("token") or "") for item in failed_refs[:3])
+        app.status = f"文件引用未加载: {names}"
+
     def _syncq(task=None, status=""):
         # 后台线程只改状态不渲染：主循环帧渲染统一完成
         _sync(app, session, task=task, status=status, render=False)
@@ -669,13 +733,13 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     pending = getattr(runner, "turn_images", None) if runner is not None else None
     if pending and getattr(llm.config, "supports_vision", True):
         parts, notes = memory_mod.build_image_parts(pending)
-        content: list = [{"type": "text", "text": user_text}]
+        content: list = [{"type": "text", "text": expanded_user_text}]
         if notes:
             content[0]["text"] += "\n[图片说明] " + "；".join(notes)
         content.extend(parts)
-        session.add_message("user", content, type="task")
+        session.add_message("user", content, type="task", file_refs=file_refs)
     else:
-        session.add_message("user", user_text, type="task")
+        session.add_message("user", expanded_user_text, type="task", file_refs=file_refs)
     # 回合快照：绑定上下文 + 轻量清单对账基线（写入工具经 capture_before 留底）；
     # msg_index=本回合用户消息绝对序号，树模式 Ctrl+Z 按它联动文件回滚
     snapshot_mod.begin_turn(
@@ -706,7 +770,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         wait_llm_retry=(lambda text: retry_wait(text, _cancelled)) if retry_wait else None,
     )
     turn = loop_mod.TurnContext(
-        session=session, llm=llm, app=app, config=llm.config, user_text=user_text, io=io
+        session=session, llm=llm, app=app, config=llm.config, user_text=expanded_user_text, io=io
     )
     # 子代理运行时随回合绑定/解绑：task 工具经此取得 llm/io/app/session
     subagent_mod.bind_runtime(llm=llm, config=llm.config, io=io, app=app, session=session)
@@ -999,6 +1063,7 @@ def main_headless(args) -> int:
         config.mode = policy.MODE_FULL  # --full：完全访问（策略判定读 config.mode）
     app = _HeadlessApp(mode=config.mode or policy.MODE_AUTO)
     app.bind_config(config)
+    app.usage_statistics = _init_usage_statistics()
     app.token_meter = llm.meter
     _register_commands(llm, session, config, app)
 
@@ -1079,6 +1144,7 @@ def main() -> None:
     mcp_mod.register_tools(config)  # MCP 服务器后台连接发现，工具随注册进度逐个可见
     app = ui.get_app()
     app.bind_config(config)
+    app.usage_statistics = _init_usage_statistics()
     app.token_meter = llm.meter
     _register_commands(llm, session, config, app)
 

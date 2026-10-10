@@ -88,6 +88,16 @@ def _complete_model(config, arg: str) -> List[dict]:
     return items
 
 
+def _complete_effort(config, arg: str) -> List[dict]:
+    from core.config import THINKING_OPTIONS
+
+    items = [
+        {"name": f"/effort {effort}", "hint": "当前模型思考强度并保存", "source": "arg", "callable": True}
+        for effort in THINKING_OPTIONS
+    ]
+    return _filter_arg_items(items, arg)
+
+
 def _complete_plugin_echo(config, arg: str) -> List[dict]:
     samples = ["hello", "world", "测试"]
     items = [{"name": f"/plugin_echo {s}", "hint": "示例参数", "source": "arg", "callable": True} for s in samples]
@@ -122,6 +132,7 @@ register_arg_completer("/mode", _complete_mode)
 register_arg_completer("/theme", _complete_theme)
 register_arg_completer("/model", _complete_model)
 register_arg_completer("/use", _complete_model)
+register_arg_completer("/effort", _complete_effort)
 register_arg_completer("/plugin_echo", _complete_plugin_echo)
 register_arg_completer("/skill", _complete_skill)
 register_arg_completer("/workflow", _complete_workflow)

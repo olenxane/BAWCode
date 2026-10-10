@@ -2,9 +2,9 @@
   "providers": [
     {
       "provider_id": "deepseek",
-      "name": "deepseek",
+      "name": "DeepSeek",
       "api_key": "",
-      "base_url": "https://api.deepseek.com/v1",
+      "base_url": "https://api.deepseek.com",
       "default_model_id": "deepseek-flash",
       "temperature": 1.0,
       "balance_url": "https://api.deepseek.com/user/balance",
@@ -33,7 +33,7 @@
     },
     {
       "provider_id": "sensenova",
-      "name": "sensenova",
+      "name": "SenseNova",
       "api_key": "",
       "base_url": "https://token.sensenova.cn/v1",
       "default_model_id": "sensenova-6.8-flash-lite",
@@ -46,8 +46,7 @@
           "max_tokens": 32000,
           "temperature": 1.0,
           "modalities": [
-            "text",
-            "vision"
+            "text"
           ],
           "thinking_effort": "high"
         },
@@ -64,12 +63,12 @@
       ]
     }
   ],
-  "active_provider_id": "sensenova",
-  "active_model_id": "sensenova-6.8-flash-lite",
+  "active_provider_id": "deepseek",
+  "active_model_id": "deepseek-flash",
   "task_models": {
-    "plan": "sensenova-sensenova-6.8-flash-lite",
-    "code": "sensenova-sensenova-6.8-flash-lite",
-    "review": "sensenova-sensenova-6.8-flash-lite"
+    "plan": "deepseek-deepseek-flash",
+    "code": "deepseek-deepseek-flash",
+    "review": "deepseek-deepseek-flash"
   },
   "prompt": {
     "dir": "core/prompts",
@@ -91,22 +90,32 @@
     "newline": "shift+enter",
     "switch_focus": "tab",
     "switch_mode": "shift+tab",
-    "expand": "['right', 'l']",
-    "collapse": "['left', 'h']",
+    "expand": [
+      "right",
+      "l"
+    ],
+    "collapse": [
+      "left",
+      "h"
+    ],
     "toggle_fold": [
       "enter",
       "space"
     ],
-    "scroll_up": "pageup",
-    "scroll_down": "pagedown",
+    "scroll_up": [
+      "pageup"
+    ],
+    "scroll_down": [
+      "pagedown"
+    ],
     "complete": "tab",
     "collapse_done_steps": true,
     "scroll_v0": 1.0,
     "scroll_hold_ms": 150,
     "scroll_max_step": 20,
-    "tip_interval": 5.0,
-    "settings_debounce_ms": 350,
-    "font_size": 16
+    "tip_interval": 5,
+    "busy_send_mode": "queue",
+    "settings_debounce_ms": 350
   },
   "llm": {
     "retry_times": 3,
@@ -114,7 +123,7 @@
     "stream": true
   },
   "log": {
-    "level": "debug",
+    "level": "info",
     "modules": {},
     "console": false,
     "days_to_keep": 14
@@ -136,6 +145,7 @@
       "generate_steps",
       "update_step_status",
       "read_memory",
+      "rag_search",
       "read",
       "edit_file",
       "write",
@@ -147,11 +157,13 @@
       "read",
       "search",
       "write",
-      "edit_file"
+      "edit_file",
+      "load_skill",
+      "webfetch"
     ],
     "inline_limit_tokens_large": 32768,
     "persist_dir": "data/toolcalls",
-    "strip_keep_recent": 0
+    "strip_keep_recent": 6
   },
   "skills": {
     "enabled": true,
@@ -164,17 +176,16 @@
   "plugins": {
     "enabled": true,
     "dir": "data/plugins",
-    "disable": [
-      "hello-plugin"
-    ]
+    "disable": [],
+    "auto_install_deps": true
   },
   "plugins_config": {},
   "workflow": {
     "enabled": false,
     "dir": "data/workflows",
-    "active": "gui-test",
+    "active": "default",
     "max_rounds": 0,
-    "max_rounds_extensions": 5
+    "spin_kill_count": 12
   },
   "subagent": {
     "enabled": true,
@@ -212,11 +223,10 @@
     "step_update": null,
     "memory_write": null,
     "memory_read": null,
+    "rag_add": null,
+    "rag_query": null,
     "computer_use": null,
     "llm_request": null,
-    "tool_confirm": null,
-    "complexity_judge": null,
-    "rag_add": null,
-    "rag_query": null
+    "tool_confirm": null
   }
 }

@@ -105,7 +105,10 @@
   }
   .msg.summary .who { color: var(--amber); }
 
-  /* markdown-lite */
+  /* markdown */
+  .bubble p { margin: 6px 0; }
+  .bubble p:first-child { margin-top: 0; }
+  .bubble p:last-child { margin-bottom: 0; }
   .bubble pre.code {
     background: #0f172a; color: #dbe4f0; border-radius: 10px; padding: 10px 12px;
     margin: 8px 0 2px; overflow-x: auto; font-size: 12.5px; line-height: 1.55;
@@ -116,6 +119,32 @@
   }
   .bubble pre.code code { font-family: var(--mono); }
   .msg.user .bubble code.ic { background: rgba(255,255,255,.2); color: #fff; }
+  /* 标题：分级字重+字号，二级以下留细分隔 */
+  .bubble .md-h { font-weight: 700; color: var(--ink); margin: 12px 0 4px; line-height: 1.35; }
+  .bubble .md-h1 { font-size: 19px; }
+  .bubble .md-h2 { font-size: 17px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+  .bubble .md-h3 { font-size: 15px; }
+  .bubble .md-h4, .bubble .md-h5, .bubble .md-h6 { font-size: 13.5px; }
+  .bubble .md-h:first-child { margin-top: 2px; }
+  /* 列表 / 任务 */
+  .bubble .md-ul, .bubble .md-ol { margin: 6px 0; padding-left: 22px; }
+  .bubble .md-ul li, .bubble .md-ol li { margin: 2px 0; }
+  .bubble .md-task { list-style: none; margin-left: -18px; }
+  /* 引用 */
+  .bubble .md-q {
+    margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--accent);
+    background: var(--accent-soft); border-radius: 0 8px 8px 0; color: var(--dim);
+  }
+  /* 分隔线 */
+  .bubble .md-hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+  /* 表格 */
+  .bubble .md-tbl { border-collapse: collapse; margin: 8px 0; font-size: 12.5px; max-width: 100%; }
+  .bubble .md-tbl th, .bubble .md-tbl td { border: 1px solid var(--line); padding: 4px 10px; }
+  .bubble .md-tbl th { background: var(--bg); font-weight: 600; }
+  .bubble .md-tbl tr:nth-child(even) td { background: var(--bg); }
+  /* 链接 */
+  .bubble a.lk { color: var(--accent-deep); text-decoration: none; border-bottom: 1px solid var(--accent); }
+  .msg.user .bubble a.lk { color: #fff; border-bottom-color: #fff; }
 
   /* 思考链 */
   details.think { margin-top: 6px; }
@@ -148,25 +177,21 @@
 
   /* ============ 工具正文 / 计划 / 子代理（与 TUI 对齐） ============ */
   .tool .tbody pre.cmdline { background: var(--bg); color: var(--dim); }
-  /* 写入/编辑：monokai 词法底色（.hl 作用域，样式表由 /api/hlcss 下发） */
-  pre.hl { border-radius: 8px; padding: 8px 10px; overflow: auto; max-height: 340px; font-size: 12.5px; line-height: 1.55; background: #272822; color: #f8f8f2; }
-  /* 后端样式尚未返回时，写入结果也保持可读的词法着色 */
-  .hl .c { color: #959077; }
-  .hl .k { color: #66d9ef; }
-  .hl .o { color: #ff4689; }
-  .hl .s, .hl .s1, .hl .s2 { color: #e6db74; }
-  .hl .m, .hl .mi, .hl .mf { color: #ae81ff; }
-  .hl .n, .hl .nf, .hl .nc { color: #f8f8f2; }
-  .hl .nb, .hl .nd { color: #a6e22e; }
-  .hl .p { color: #f8f8f2; }
-  .hl .err { color: #ed007e; background: #1e0010; }
-  .hl.diff { border-radius: 8px; padding: 6px 0; overflow: auto; max-height: 340px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; }
+  /* 写入/编辑/读取：浅底词法卡片（.hl 作用域，样式表由 /api/hlcss 下发）；
+     页面整体浅色清新风，故弃用 TUI 同款深色 monokai（其 #F8F8F2 预设色文字在网页端难以分辨） */
+  pre.hl { border-radius: 8px; padding: 8px 10px; overflow: auto; max-height: 340px; font-size: 12.5px; line-height: 1.55; background: #ffffff; color: #333; border: 1px solid var(--line); }
+  .hl.diff { border-radius: 8px; padding: 6px 0; overflow: auto; max-height: 340px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; background: #ffffff; border: 1px solid var(--line); }
   .hl.diff .dl { display: flex; white-space: pre-wrap; word-break: break-word; }
-  .hl.diff .dl .mk { flex: none; width: 1.4em; text-align: center; color: #8b8b8b; user-select: none; }
-  .hl.diff .dl .dc { flex: 1; min-width: 0; }
-  .hl.diff .dl.add { background: #1a3622; }
-  .hl.diff .dl.del { background: #3a1a1e; }
-  .hl.diff .dl.ctx .dc { color: #cfcfc2; }
+  .hl.diff .dl .mk { flex: none; width: 1.4em; text-align: center; color: #9aa0a6; user-select: none; }
+  .hl.diff .dl .dc { flex: 1; min-width: 0; padding-right: 8px; }
+  .hl.diff .dl.add { background: #e6f4ea; }
+  .hl.diff .dl.del { background: #fce8e6; }
+  .hl.diff .dl.ctx .dc { color: #5f6368; }
+  /* 读取：行号列 + 高亮代码列 */
+  .hl.read { border-radius: 8px; padding: 8px 0; overflow: auto; max-height: 340px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; background: #ffffff; border: 1px solid var(--line); }
+  .hl.read .rl { display: flex; white-space: pre-wrap; word-break: break-word; }
+  .hl.read .rl .rn { flex: none; min-width: 3.2em; padding: 0 8px; text-align: right; color: #9aa0a6; user-select: none; border-right: 1px solid var(--line); margin-right: 8px; }
+  .hl.read .rl .rc { flex: 1; min-width: 0; padding-right: 10px; }
   /* 计划 / 步骤时间线节点 */
   .msg.planblock, .msg.stepsblock, .msg.stepupdate { max-width: 860px; margin: 10px auto; }
   .planblock { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; box-shadow: var(--shadow); }
@@ -228,7 +253,7 @@
     display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
     background: var(--card); border-top: 1px solid var(--line); z-index: 20;
   }
-  #cmd-btn {
+  #cmd-btn, #file-btn {
     flex: none; width: 38px; height: 38px; border-radius: 12px; background: var(--bg);
     color: var(--dim); font-family: var(--mono); font-size: 15px; font-weight: 700;
   }
@@ -545,7 +570,9 @@
   <footer>
     <div id="queue-chip" hidden></div>
     <button id="cmd-btn" title="命令面板">/</button>
-    <textarea id="input" rows="1" placeholder="发送消息给 BAWCode…（/ 开头为命令）"></textarea>
+    <button id="file-btn" title="上传文件">+</button>
+    <input id="file-input" type="file" hidden>
+    <textarea id="input" rows="1" placeholder="发送消息给 BAWCode…（@ 引用文件，/ 开头为命令）"></textarea>
     <button id="stop" hidden title="停止当前回合">■</button>
     <button id="send" title="发送">↑</button>
   </footer>
@@ -561,7 +588,7 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const logEl = $("log"), input = $("input");
+const logEl = $("log"), input = $("input"), fileInput = $("file-input");
 const coarse = matchMedia("(pointer: coarse)").matches;
 const desktopMQ = matchMedia("(min-width: 960px)");
 
@@ -637,21 +664,110 @@ function twoTap(btn, fn) {
   }
 }
 
-/* markdown-lite：先转义，再提取代码围栏，行内仅 `code` 与 **bold** */
-function mdLite(src) {
+/* markdown 渲染：与 TUI core/render.py 同口径（标题/引用/任务/列表/HR/表格/围栏/行内样式），
+   先整体转义再按结构提取，行内仅 `code` **bold** *italic* ~~strike~~ [link] */
+function mdRender(src) {
   const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const inline = s => s
-    .replace(/`([^`\n]+)`/g, '<code class="ic">$1</code>')
-    .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  const escAttr = s => esc(s).replace(/"/g, "&quot;");
+  const safeUrl = u => /^\s*(javascript|vbscript|data)\s*:/i.test(u) ? "#" : escAttr(u);
+  const INLINE_RE = /`([^`\n]+)`|\*\*([^*\n]+)\*\*|__([^_\n]+)__|~~([^~\n]+)~~|\[([^\]\n]+)\]\(([^)\n]+)\)|\*([^*\n]+)\*|(?<![\w])_([^_\n]+)_(?![\w])/g;
+  const inline = s => esc(s).replace(INLINE_RE, (m, code, b1, b2, st, lt, lu, i1, i2) => {
+    if (code !== undefined) return `<code class="ic">${code}</code>`;
+    if (b1 !== undefined || b2 !== undefined) return `<b>${b1 ?? b2}</b>`;
+    if (st !== undefined) return `<s>${st}</s>`;
+    if (lt !== undefined) return `<a class="lk" href="${safeUrl(lu)}" target="_blank" rel="noopener">${lt}</a>`;
+    return `<i>${i1 ?? i2}</i>`;
+  });
+  const FENCE_RE = /^\s*(```|~~~)\s*([\w+#.-]*)\s*$/;
+  const HEADING_RE = /^(#{1,6})\s+(.*)$/;
+  const QUOTE_RE = /^\s*>\s?(.*)$/;
+  const TASK_RE = /^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$/;
+  const UL_RE = /^(\s*)[-*+]\s+(.*)$/;
+  const OL_RE = /^(\s*)(\d{1,3})[.)]\s+(.*)$/;
+  const HR_RE = /^\s*(-{3,}|\*{3,}|_{3,})\s*$/;
+  const TSEP_RE = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/;
+  const splitRow = line => {
+    let t = line.trim();
+    if (t.startsWith("|")) t = t.slice(1);
+    if (t.endsWith("|")) t = t.slice(0, -1);
+    return t.split("|").map(c => c.trim());
+  };
+  const alignOf = cell => {
+    const l = cell.startsWith(":"), r = cell.endsWith(":");
+    return l && r ? "center" : r ? "right" : "left";
+  };
+  const lines = src.split("\n");
   const out = [];
-  const re = /```[^\n]*\n?([\s\S]*?)```/g;
-  let last = 0, m;
-  while ((m = re.exec(src))) {
-    out.push(inline(esc(src.slice(last, m.index))));
-    out.push('<pre class="code"><code>' + esc(m[1].replace(/\n$/, "")) + "</code></pre>");
-    last = m.index + m[0].length;
+  let i = 0, para = [];
+  const flushPara = () => {
+    if (!para.length) return;
+    out.push("<p>" + para.map(inline).join("<br>") + "</p>");
+    para = [];
+  };
+  const listBuffer = [];
+  const flushList = () => {
+    if (!listBuffer.length) return;
+    out.push('<ul class="md-ul">' + listBuffer.map(it =>
+      it.task
+        ? `<li class="md-task">${it.done ? "☑" : "☐"} ${inline(it.text)}</li>`
+        : `<li>${inline(it.text)}</li>`
+    ).join("") + "</ul>");
+    listBuffer.length = 0;
+  };
+  const olBuffer = [];
+  const flushOl = () => {
+    if (!olBuffer.length) return;
+    out.push('<ol class="md-ol">' + olBuffer.map(t => `<li>${inline(t)}</li>`).join("") + "</ol>");
+    olBuffer.length = 0;
+  };
+  const flushAll = () => { flushPara(); flushList(); flushOl(); };
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = line.match(FENCE_RE);
+    if (fence) {
+      flushAll();
+      const body = [];
+      i += 1;
+      while (i < lines.length && !lines[i].match(FENCE_RE)) { body.push(lines[i]); i += 1; }
+      i += 1;  // 跳过收尾围栏；缺收尾围栏时整段吃到末尾（与 TUI 一致）
+      out.push('<pre class="code"><code>' + esc(body.join("\n")) + "</code></pre>");
+      continue;
+    }
+    if (!line.trim()) { flushAll(); i += 1; continue; }
+    if (HR_RE.test(line.trim())) { flushAll(); out.push('<hr class="md-hr">'); i += 1; continue; }
+    // 表格：表头含 | 且下一行为分隔行（分隔行须含 | 以免误吞 HR）
+    if (line.includes("|") && i + 1 < lines.length && lines[i + 1].includes("|") && TSEP_RE.test(lines[i + 1])) {
+      flushAll();
+      const header = splitRow(line);
+      const aligns = splitRow(lines[i + 1]).map(alignOf);
+      i += 2;
+      const bodyRows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) { bodyRows.push(splitRow(lines[i])); i += 1; }
+      let t = '<table class="md-tbl"><thead><tr>';
+      header.forEach((h, k) => { t += `<th style="text-align:${aligns[k] || "left"}">${inline(h)}</th>`; });
+      t += "</tr></thead><tbody>";
+      for (const r of bodyRows) {
+        t += "<tr>";
+        header.forEach((_, k) => { t += `<td style="text-align:${aligns[k] || "left"}">${inline(r[k] || "")}</td>`; });
+        t += "</tr>";
+      }
+      out.push(t + "</tbody></table>");
+      continue;
+    }
+    const heading = line.match(HEADING_RE);
+    if (heading) { flushAll(); const lv = heading[1].length; out.push(`<div class="md-h md-h${lv}">${inline(heading[2].trim())}</div>`); i += 1; continue; }
+    const quote = line.match(QUOTE_RE);
+    if (quote) { flushAll(); out.push(`<blockquote class="md-q">${inline(quote[1])}</blockquote>`); i += 1; continue; }
+    const task = line.match(TASK_RE);
+    if (task) { flushPara(); flushOl(); listBuffer.push({ task: true, done: task[2].toLowerCase() === "x", text: task[3] }); i += 1; continue; }
+    const ul = line.match(UL_RE);
+    if (ul) { flushPara(); flushOl(); listBuffer.push({ task: false, text: ul[2] }); i += 1; continue; }
+    const ol = line.match(OL_RE);
+    if (ol) { flushPara(); flushList(); olBuffer.push(ol[3]); i += 1; continue; }
+    para.push(line);
+    i += 1;
   }
-  out.push(inline(esc(src.slice(last))));
+  flushAll();
   return out.join("");
 }
 
@@ -711,6 +827,21 @@ function toolBody(o) {
     });
     return b;
   }
+  if (r && r.kind === "read") {
+    b.append(el("div", "label", "读取 " + (r.path || "")));
+    const box = el("div", "hl read");
+    for (const row of (r.rows || [])) {
+      const line = el("div", "rl");
+      line.append(el("span", "rn", String(row.n)));
+      const c = el("span", "rc");
+      c.innerHTML = row.html || "";
+      line.append(c);
+      box.append(line);
+    }
+    b.append(box);
+    if (r.truncated) b.append(el("div", "label", "（仅显示前若干行）"));
+    return b;
+  }
   if (o.args && Object.keys(o.args).length) {
     b.append(el("div", "label", "参数"));
     b.append(el("pre", "", JSON.stringify(o.args, null, 2)));
@@ -725,7 +856,7 @@ function toolBody(o) {
 function toolTitle(o) {
   const r = o.render;
   if (r && r.kind === "cmd" && r.command) return r.command.trim().split(/\s+/).slice(0, 2).join(" ");
-  if (r && (r.kind === "write" || r.kind === "edit") && r.path) return `${o.name || "tool"} ${r.path}`;
+  if (r && (r.kind === "write" || r.kind === "edit" || r.kind === "read") && r.path) return `${o.name || "tool"} ${r.path}`;
   return o.name || "tool";
 }
 
@@ -825,7 +956,7 @@ function renderMessage(m) {
     const b = el("div", "bubble");
     if (m.content) {
       const span = el("div");
-      span.innerHTML = mdLite(m.content);
+      span.innerHTML = mdRender(m.content);
       b.append(span);
     }
     if (calls.length) b.append(el("div", "calls", "🔧 调用 " + calls.join("、")));
@@ -894,7 +1025,7 @@ function liveSeal() {
     const d = el("div", "msg assistant");
     d.append(el("span", "who", "BAWCode"));
     const b = el("div", "bubble");
-    if (body) { const s = el("div"); s.innerHTML = mdLite(body); b.append(s); }
+    if (body) { const s = el("div"); s.innerHTML = mdRender(body); b.append(s); }
     if (think) b.append(thinkDetails(think));
     d.append(b);
     logEl.append(d);
@@ -1088,6 +1219,14 @@ function clearInputCompletions() {
   inputCompletions = [];
   completionBox.hidden = true;
 }
+function activeFilePrefix() {
+  const prefix = input.value.slice(0, input.selectionStart);
+  if (prefix.includes("\n")) return null;
+  const at = prefix.lastIndexOf("@");
+  if (at < 0 || (at > 0 && !/\s/.test(prefix[at - 1]))) return null;
+  const query = prefix.slice(at + 1);
+  return query.startsWith('"') ? query.slice(1) : query;
+}
 function renderInputCompletions() {
   completionBox.replaceChildren();
   completionBox.hidden = !inputCompletions.length;
@@ -1104,31 +1243,64 @@ function renderInputCompletions() {
 async function refreshInputCompletions() {
   const prefix = input.value.slice(0, input.selectionStart);
   clearInputCompletions();
-  if (!prefix.startsWith("/") || prefix.includes("\n")) return;
+  const filePrefix = activeFilePrefix();
+  const isCommand = prefix.startsWith("/") && !prefix.includes("\n");
+  if (!isCommand && filePrefix === null) return;
   const epoch = completionEpoch;
   try {
-    const r = await api("/api/complete", { prefix });
-    if (epoch !== completionEpoch || prefix !== input.value.slice(0, input.selectionStart)) return;
-    inputCompletions = r.ok ? (r.items || []) : [];
-    completionPrefix = prefix;
-    completionIndex = 0;
-    renderInputCompletions();
+    if (isCommand) {
+      const r = await api("/api/complete", { prefix });
+      if (epoch !== completionEpoch || prefix !== input.value.slice(0, input.selectionStart)) return;
+      inputCompletions = r.ok ? (r.items || []) : [];
+      completionPrefix = prefix;
+      completionIndex = 0;
+      renderInputCompletions();
+      return;
+    }
+    // 分级扫描：每秒提升一层深度，结果累积展示，直到没有更深目录
+    let depth = 1, items = [];
+    for (;;) {
+      const r = await fetchFiles(filePrefix, depth);
+      if (epoch !== completionEpoch || prefix !== input.value.slice(0, input.selectionStart)) return;
+      if (!r.ok) { inputCompletions = []; completionBox.hidden = true; return; }
+      items = mergeCompletions(items, r.items || []);
+      inputCompletions = items;
+      completionPrefix = prefix;
+      completionIndex = Math.min(completionIndex, Math.max(0, items.length - 1));
+      renderInputCompletions();
+      if (!r.more || depth >= 32) return;
+      depth += 1;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   } catch (e) { if (epoch === completionEpoch) clearInputCompletions(); }
+}
+async function fetchFiles(query, depth) {
+  const url = "/api/files?key=" + encodeURIComponent(KEY)
+    + "&prefix=" + encodeURIComponent(query) + "&depth=" + depth;
+  return await fetch(url).then(x => x.json());
+}
+function mergeCompletions(items, more) {
+  const seen = new Set(items.map(item => item.path));
+  more.forEach(item => { if (!seen.has(item.path)) { seen.add(item.path); items.push(item); } });
+  return items;
 }
 function applyInputCompletion() {
   const item = inputCompletions[completionIndex];
   if (!item || completionPrefix !== input.value.slice(0, input.selectionStart)) return;
+  const isFile = !!item.path;
+  let start = completionPrefix.lastIndexOf("@");
   let end = input.selectionStart;
   while (end < input.value.length && !/\s/.test(input.value[end])) end++;
-  const text = item.name + " ";
-  input.value = text + input.value.slice(end);
-  input.setSelectionRange(text.length, text.length);
+  if (start < 0 || !isFile) start = 0;
+  const text = isFile ? item.name : item.name + " ";
+  input.value = input.value.slice(0, start) + text + input.value.slice(end);
+  input.setSelectionRange(start + text.length, start + text.length);
   clearInputCompletions();
   input.focus();
 }
 input.addEventListener("keydown", e => {
   if (e.isComposing) return;
-  if (e.key === "Tab" && !e.shiftKey && input.value.startsWith("/")) {
+  if (e.key === "Tab" && !e.shiftKey && (input.value.startsWith("/") || activeFilePrefix() !== null)) {
     e.preventDefault();
     if (inputCompletions.length) applyInputCompletion();
     else refreshInputCompletions().then(applyInputCompletion);
@@ -1147,9 +1319,29 @@ input.addEventListener("input", () => {
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 140) + "px";
   clearInputCompletions();
-  completionTimer = setTimeout(refreshInputCompletions, 120);
+  // 文件候选涉及目录扫描：去抖 1 秒，期间连续输入只触发一次
+  completionTimer = setTimeout(refreshInputCompletions, activeFilePrefix() !== null ? 1000 : 120);
 });
 input.addEventListener("click", refreshInputCompletions);
+$("file-btn").onclick = () => fileInput.click();
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file, file.name);
+  try {
+    const res = await fetch("/api/upload" + qs(), { method: "POST", body: form });
+    const data = await res.json();
+    if (!data.ok) { toast(data.message || "上传失败", true); return; }
+    const text = input.value;
+    const sep = text && !/\s$/.test(text) ? " " : "";
+    input.value = text + sep + data.reference + " ";
+    input.focus();
+    input.dispatchEvent(new Event("input"));
+    toast("文件已上传");
+  } catch (e) { toast("上传失败: " + e, true); }
+  fileInput.value = "";
+});
 $("stop").onclick = async () => {
   try {
     const r = await api("/api/stop", {});
@@ -1533,6 +1725,8 @@ function buildProviderTab(body, data) {
   const modelList = el("div", "st-note", modelIds.join(", ") || "（暂无模型）");
   const activeSel = stSelect(providers.map(x => x.provider_id), p.active_provider_id);
   const fetchBtn = el("button", "btn small", "获取模型列表");
+  const refillBtn = el("button", "btn small", "重填预置参数");
+  refillBtn.title = "未手动配置的模型按内置预置表重填参数；手动配置的保留";
   const deleteBtn = el("button", "btn small danger", "删除提供商");
   function syncModels(current) {
     const selected = current || defModelSel.value;
@@ -1573,6 +1767,17 @@ function buildProviderTab(body, data) {
     } catch (e) { toast("获取模型列表网络错误", true); }
     finally { fetchBtn.disabled = false; editSel.disabled = false; fetchBtn.textContent = "获取模型列表"; }
   };
+  refillBtn.onclick = async () => {
+    const pid = pidInput.value.trim();
+    if (!pid) { toast("请先填写提供商ID", true); return; }
+    refillBtn.disabled = true;
+    refillBtn.textContent = "正在重填…";
+    try {
+      const r = await api("/api/provider/refill", { provider_id: pid });
+      toast(r.ok ? (r.result || "已重填") : (r.message || "重填失败"), !r.ok);
+    } catch (e) { toast("重填预置参数网络错误", true); }
+    finally { refillBtn.disabled = false; refillBtn.textContent = "重填预置参数"; }
+  };
   deleteBtn.onclick = async () => {
     const pid = editSel.value;
     if (pid === "(新建)" || !confirm(`确定删除提供商“${pid}”及其全部模型？删除当前提供商会自动切换到其他提供商。`)) return;
@@ -1599,6 +1804,7 @@ function buildProviderTab(body, data) {
     stRow("默认模型", defModelSel),
     stRow("模型列表", modelList),
     stRow("", fetchBtn),
+    stRow("", refillBtn),
   );
   card.append(el("div", "st-note", "获取的模型保存后生效；API Key 明文存储于本地配置文件"));
   const actions = el("div", "st-actions");
