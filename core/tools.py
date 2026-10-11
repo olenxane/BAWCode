@@ -13,13 +13,15 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 from core import hooks
 from core import memory as memory_mod
 from core import policy
 from core import register
+from core import shells
 from core import snapshot
 from core import toolstore
 from core.log import get_logger
@@ -154,15 +156,31 @@ def _join_argv(parts: List[str]) -> str:
     return " ".join(f'"{p}"' if any(c.isspace() for c in p) else p for p in parts)
 
 
-def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute_command") -> Optional[str]:
-    """护栏开启时把删除命令的目标移入回收站；非删除类命令返回 None"""
+def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute_command", shell: str = "") -> Optional[str]:
+    """护栏开启时把删除命令的目标移入回收站；非删除类命令返回 None
+
+    目标解析跟随执行器：PowerShell 走 AST 取字面路径，动态表达式（变量/展开）不猜目标，
+    返回要求改用 delete_file 的明确结果；护栏关闭时直接放行原始删除命令。"""
     session = _session()
     config = getattr(session, "config", None)
     safety_cfg = (getattr(config, "data", None) or {}).get("security") or {}
     if not safety_cfg.get("delete_guard", True):
         return None
-    targets = policy.delete_targets(command)
+    shell_name = shells.resolve_name(shell)
+    targets = policy.delete_targets(command, shell_name)
     if targets is None:
+        return None
+    if not targets:
+        if not policy.is_delete_command(command):
+            return None  # 非删除命令：原样执行，不进删除护栏
+        if shell_name == shells.POWERSHELL and shells.powershell_parse(command) == (None, False):
+            return None
+        if shell_name == shells.POWERSHELL or any(ch in command for ch in "*?["):
+            # 已识别为删除但目标含变量/通配符/子表达式：不猜目标，避免误搬整个目录
+            return (
+                "删除命令已被安全策略拦截：目标不是确定的字面路径（含变量、通配符或表达式），"
+                "未执行也未移入回收站。请改用 delete_file 工具逐个删除确定路径。"
+            )
         return None
     log.info("删除命令被拦截，改为移入回收站: %s", command)
     base = Path(cwd) if cwd else Path.cwd()
@@ -203,12 +221,56 @@ def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute
     return _trash_result_text(moved, missing, skipped, failed, trash)
 
 
+def shell_syntax_issue(command: str, shell: str = "") -> str:
+    """命令在当前执行器下不能安全执行的语法问题，返回可操作的提示；无问题返回空串。
+
+    按实际执行器判定：Git Bash / PowerShell 交各自解释器做语法检查（只解析不执行），
+    cmd.exe 只拦可确定会截断命令的换行。执行器不可用时按回退后的执行器检查，
+    检查与删除安全无关，与 delete_guard 开关独立。"""
+    name, _notice, error = _resolve_shell(shell)
+    if error:
+        return error
+    return shells.syntax_issue(command, name)
+
+
+def _with_notice(text: str, notice: str) -> str:
+    """回退提示随结果回给模型：与结果同一条消息，避免模型误判命令没跑"""
+    return f"{notice}\n{text}" if notice else text
+
+
+def _resolve_shell(shell: str) -> Tuple[str, str, str]:
+    """解析执行器：返回 (执行器, 回退提示, 错误文本)
+
+    未知名称是参数错误（不执行）；已知执行器不可用时回退到 cmd.exe 并给出提示——
+    命令仍会执行，只是换了解释器，提示随结果一并回给模型。"""
+    name = shells.resolve_name(shell)
+    if not shells.is_valid(name):
+        return name, "", (
+            f"参数错误: shell 必须是 {'/'.join(shells.SHELL_NAMES)} 之一（当前: {shell}）"
+        )
+    if shells.available(name):
+        return name, "", ""
+    fallback = shells.CMD
+    if not shells.available(fallback):
+        return name, "", shells.unavailable_message(name)
+    shown = shells.label(name)
+    return fallback, (
+        f"注意：执行器 {shown} 在本机不可用，本次命令已回退到 {shells.label(fallback)} 执行；"
+        f"命令需按 {shells.label(fallback)} 语法书写（可在设置中改默认执行器，"
+        f"或用 BAWCODE_GIT_BASH 指定 bash.exe 路径）。"
+    ), ""
+
+
 @register.register(
     name="execute_command",
     description=(
-        "Run a shell command through the system shell; stdout and stderr are "
-        "merged in the result, and a non-zero exit code is reported with the "
-        "output. Use mode='background' for long-running commands. Prefer "
+        "Run a shell command through the configured shell executor; stdout and "
+        "stderr are merged in the result, and a non-zero exit code is reported "
+        "with the output. The default executor is the session setting (cmd.exe "
+        "unless the user changed it): write commands in that shell's syntax — "
+        "check the session's shell note before using ';', '&&' or quoting. Pass shell="
+        "'git_bash'|'powershell'|'cmd' for one call when another executor is "
+        "needed. Use mode='background' for long-running commands. Prefer "
         "dedicated tools (read/write/edit_file/search/...) over shell commands"
     ),
     usage="execute_command <command>",
@@ -217,7 +279,7 @@ def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command to execute",
+                "description": "The command to execute, written in the selected shell's syntax",
             },
             "cwd": {
                 "type": "string",
@@ -236,6 +298,15 @@ def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute
                     "and the system notifies on completion (timeout is ignored)"
                 ),
             },
+            "shell": {
+                "type": "string",
+                "enum": list(shells.SHELL_NAMES),
+                "description": (
+                    "Executor for this call: git_bash (bash syntax), powershell "
+                    "(Windows PowerShell 5.1), cmd (cmd.exe). Omit to use the "
+                    "session default"
+                ),
+            },
         },
         "required": ["command"],
     },
@@ -245,44 +316,59 @@ def execute_command(
     cwd: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
     mode: str = "foreground",
+    shell: str = "",
 ) -> str:
-    """终端命令调用：前台阻塞收输出，后台落盘+完成通知"""
-    trash_result = _trash_delete_command(command, cwd)
+    """终端命令调用：前台阻塞收输出，后台落盘+完成通知；按选定执行器直接启动"""
+    shell_name, fallback_notice, shell_error = _resolve_shell(shell)
+    if shell_error:
+        return shell_error
+    # 语法预检必须按回退后的执行器做：否则会用 bash 规则检查将交给 cmd 的命令
+    issue = shells.syntax_issue(command, shell_name)
+    if issue:
+        log.warn("命令语法与执行器 %s 不匹配，已拦下: %s", shell_name, command)
+        return f"{fallback_notice}\n{issue}".strip() if fallback_notice else issue
+    trash_result = _trash_delete_command(command, cwd, shell=shell_name)
     if trash_result is not None:
-        return trash_result
+        return f"{fallback_notice}\n{trash_result}".strip() if fallback_notice else trash_result
+    argv, stdin_text, use_shell = shells.build_command(command, shell_name)
+    if argv is None:
+        return stdin_text
     timeout = _clamp_timeout(timeout)
     if str(mode or "").strip().lower() == "background":
-        return _execute_command_background(command, cwd)
-    log.info("执行命令: %s（cwd=%s timeout=%ds）", command, cwd or "-", timeout)
+        return _execute_command_background(command, cwd, argv, stdin_text, use_shell, shell_name, fallback_notice)
+    log.info("执行命令[%s]: %s（cwd=%s timeout=%ds）", shell_name, command, cwd or "-", timeout)
     proc = None
     try:
         proc = subprocess.Popen(
-            command,
-            shell=True,
+            argv,
+            shell=use_shell,
             cwd=cwd,
+            stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding=_console_output_encoding(),
             errors="replace",
             start_new_session=sys.platform != "win32",
+            env=shells.build_env(shell_name),
         )
-        output, _ = proc.communicate(timeout=timeout)
+        output, _ = proc.communicate(input=stdin_text or None, timeout=timeout)
         if proc.returncode != 0:
             log.warn("命令退出码 %d: %s", proc.returncode, command)
-            return f"命令退出码 {proc.returncode}\n{output or ''}".strip()
+            return _with_notice(f"命令退出码 {proc.returncode}\n{output or ''}".strip(), fallback_notice)
         log.debug("命令完成，输出 %d 字符", len(output or ""))
-        return (output or "").strip() or "执行完成。"
+        # 无输出也要明说，便于模型与真失败（退出码非 0）区分
+        return _with_notice((output or "").strip() or "命令完成，无输出（退出码 0）。", fallback_notice)
     except subprocess.TimeoutExpired:
         if proc is not None:
             _terminate_command_tree(proc, command)
         log.warn("命令超时（>%ds）: %s", timeout, command)
-        return f"命令超时（>{timeout}s）"
+        return _with_notice(f"命令超时（>{timeout}s）", fallback_notice)
     except OSError as e:
         if proc is not None and proc.poll() is None:
             _terminate_command_tree(proc, command)
         log.error("命令执行失败: %s（%s）", e, command)
-        return f"执行失败: {e}"
+        return _with_notice(f"执行失败: {e}", fallback_notice)
 
 
 # execute_command 后台执行：监视线程在进程退出后经 main 注册的 runner.notify 发起新回合通知
@@ -297,35 +383,55 @@ def set_background_notifier(fn) -> None:
 
 
 def _bg_output_file() -> Path:
-    """后台输出文件：沿用外置存储目录 data/toolcalls/{project}/{session}/，无会话退项目根 data/bgtasks"""
+    """后台输出文件：沿用外置存储目录 data/toolcalls/{project}/{session}/，无会话退项目根 data/bgtasks
+
+    同秒多次后台调用会撞名：加进程内自增序号，保证每个任务独占输出文件。"""
     session = memory_mod.get_session()
     if session is not None:
         d = toolstore.store_dir(session.config, session.project_id, session.session_id)
     else:
         d = Path(__file__).resolve().parent.parent / "data" / "bgtasks"
     d.mkdir(parents=True, exist_ok=True)
-    return d / f"bg_{time.strftime('%H%M%S')}_{os.getpid()}_{threading.get_ident() % 10000}.log"
+    with _BG_SEQ_LOCK:
+        _BG_SEQ[0] += 1
+        seq = _BG_SEQ[0]
+    return d / f"bg_{time.strftime('%H%M%S')}_{os.getpid()}_{threading.get_ident() % 10000}_{seq}.log"
 
 
-def _execute_command_background(command: str, cwd: Optional[str]) -> str:
+_BG_SEQ = [0]
+_BG_SEQ_LOCK = threading.Lock()
+
+
+def _execute_command_background(command: str, cwd: Optional[str], argv, stdin_text: str, use_shell: bool, shell_name: str, notice: str = "") -> str:
     out_file = _bg_output_file()
     try:
         fh = open(out_file, "w", encoding=_console_output_encoding(), errors="replace")
     except OSError as e:
-        return f"后台启动失败（输出文件不可写）: {e}"
+        return _with_notice(f"后台启动失败（输出文件不可写）: {e}", notice)
     started = time.monotonic()
+    proc = None
     try:
         proc = subprocess.Popen(
-            command,
-            shell=True,
+            argv,
+            shell=use_shell,
             cwd=cwd,
+            stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
             stdout=fh,
             stderr=subprocess.STDOUT,
+            env=shells.build_env(shell_name),
         )
+        if stdin_text:
+            os.write(proc.stdin.fileno(), stdin_text.encode("utf-8", errors="replace"))
+            proc.stdin.close()
     except OSError as e:
+        if proc is not None and proc.stdin is not None and not proc.stdin.closed:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
         fh.close()
         log.error("后台启动失败: %s（%s）", e, command)
-        return f"后台启动失败: {e}"
+        return _with_notice(f"后台启动失败: {e}", notice)
     task_id = out_file.stem
     threading.Thread(
         target=_bg_watch,
@@ -333,11 +439,12 @@ def _execute_command_background(command: str, cwd: Optional[str]) -> str:
         daemon=True,
         name=f"bawcode-bg-{task_id}",
     ).start()
-    log.info("后台任务启动 id=%s pid=%s 输出=%s", task_id, proc.pid, out_file)
-    return (
+    log.info("后台任务启动 id=%s pid=%s 执行器=%s 输出=%s", task_id, proc.pid, shell_name, out_file)
+    return _with_notice(
         f"已在后台启动（id={task_id} pid={proc.pid}，cwd={cwd or '当前目录'}）\n"
         f"输出文件: {out_file}\n"
-        f"完成后系统会自动通知（届时用 read 工具读取输出文件）；期间也可随时用 read 查看该文件获取当前输出。"
+        f"完成后系统会自动通知（届时用 read 工具读取输出文件）；期间也可随时用 read 查看该文件获取当前输出。",
+        notice,
     )
 
 
@@ -464,6 +571,82 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
     if isinstance(idx, int):
         return f"用户选择了: {answer}"
     return f"用户自行输入: {answer}"
+
+
+# request_mode_switch：申请切换访问模式（纯交互，切换由用户面板批准）
+# 主代理回合经 set_mode_bridge 绑全局桥，后台子代理任务线程经 bind_thread_mode_bridge 绑线程级桥，互不覆盖
+
+_mode_bridge = None  # Callable[[dict], dict]
+_bridge_local = threading.local()  # 线程级桥：仅后台子代理任务线程可见
+
+
+def set_mode_bridge(fn) -> None:
+    """注册模式切换申请桥：payload 进，result dict 出（主回合全局绑定）"""
+    global _mode_bridge
+    _mode_bridge = fn
+
+
+@contextmanager
+def bind_thread_mode_bridge(fn):
+    """线程级模式切换桥：后台子代理在任务线程内申请切模式，退出恢复原值，不动全局绑定"""
+    previous = getattr(_bridge_local, "fn", None)
+    _bridge_local.fn = fn
+    try:
+        yield
+    finally:
+        _bridge_local.fn = previous
+
+
+@register.register(
+    name="request_mode_switch",
+    description=(
+        "Request the user to switch the session access mode (confirm/edit/auto/full) "
+        "when the current mode blocks a command you deem necessary for the task. The "
+        "user decides; on approval the mode takes effect immediately and you may retry "
+        "the blocked call. State a concrete reason"
+    ),
+    usage="request_mode_switch <mode> <reason>",
+    schema={
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": list(policy.MODES),
+                "description": "Target access mode to switch to",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why the current mode blocks your work; one or two concrete sentences",
+            },
+        },
+        "required": ["mode", "reason"],
+    },
+)
+def request_mode_switch(mode: str, reason: str = "") -> str:
+    """申请切换访问模式：经模式桥请用户裁决，批准后切换并落盘"""
+    target = str(mode or "").strip().lower()
+    if target == "manual":
+        target = policy.MODE_CONFIRM
+    if target not in policy.MODES:
+        return f"参数错误: mode 必须是 {'/'.join(policy.MODES)}"
+    note = " ".join(str(reason or "").split())
+    if not note:
+        return "参数错误: reason 不能为空（说明为何需要切换模式）"
+    bridge = getattr(_bridge_local, "fn", None) or _mode_bridge
+    if bridge is None:
+        return "当前环境无交互通道，无法申请切换模式；请在现有权限内继续，并向用户说明所需模式。"
+    try:
+        result = bridge({"mode": target, "reason": note})
+    except Exception as exc:
+        log.error("模式切换申请桥异常: %r", exc)
+        return f"申请切换模式失败: {exc}"
+    if not isinstance(result, dict):
+        return "模式切换申请未获处理（交互中断），当前模式不变。"
+    detail = str(result.get("detail") or "")
+    if result.get("approved"):
+        label = policy.MODE_LABELS.get(target, target)
+        return f"用户已批准切换到「{label}」模式，立即生效。{detail}可重试此前被拒的操作。"
+    return f"用户未批准模式切换申请，当前模式不变；不要在本次任务中重复申请，改用其他可行方案或说明受阻原因。{detail}"
 
 
 @register.register(
@@ -979,6 +1162,7 @@ _TOOL_FAILURE_PATTERNS = (
     "删除命令已被安全策略拦截",
     "已拒绝",
     "拒绝写入",
+    "命令未执行",  # shell 语法在 cmd.exe 下会静默错跑，前置拦下
     # MCP 工具的 isError 结果与调用失败统一前缀
     "MCP 工具返回错误",
     "MCP 调用失败",
@@ -1592,7 +1776,12 @@ def run_program(
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
     """程序调用：独立进程启动并收集输出"""
-    trash_result = _trash_delete_command(_join_argv([str(program)] + [str(a) for a in (args or [])]), cwd, tool="run_program")
+    trash_result = _trash_delete_command(
+        _join_argv([str(program)] + [str(a) for a in (args or [])]),
+        cwd,
+        tool="run_program",
+        shell=shells.default_name(),
+    )
     if trash_result is not None:
         return trash_result
     timeout = _clamp_timeout(timeout)

@@ -196,11 +196,13 @@
     "agents_dir": "data/agents",
     "max_rounds": 20,
     "result_char_cap": 3000,
-    "query_default_rounds": 3
+    "query_default_rounds": 3,
+    "max_concurrent": 3
   },
   "tools": {
     "max_timeout": 600,
-    "ask_user_timeout": true
+    "ask_user_timeout": true,
+    "default_shell": "cmd"
   },
   "mcp": {
     "enabled": false,

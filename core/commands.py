@@ -39,7 +39,7 @@ def register_arg_completer(name: str, fn: Callable, source: str = "") -> None:
 
 
 def _filter_arg_items(items: List[dict], arg: str) -> List[dict]:
-    """参数补全：对最后一个参数做前缀匹配（/mode a → auto）"""
+    """参数补全：对最后一个参数做前缀匹配（/mode e → edit）"""
     arg = (arg or "").strip().lower()
     if not arg:
         return items
@@ -55,8 +55,9 @@ def _filter_arg_items(items: List[dict], arg: str) -> List[dict]:
 
 def _complete_mode(config, arg: str) -> List[dict]:
     rows = [
-        ("auto", "自动模式 · 安全指令放行"),
-        ("manual", "手动模式 · 只读放行"),
+        ("confirm", "手动确认 · 非安全操作逐次确认"),
+        ("edit", "自动接收编辑 · 自动放行文件写入/编辑"),
+        ("auto", "自动模式 · 安全调用自动放行，其余由 LLM 审批"),
         ("full", "完全访问 · 全部放行"),
     ]
     items = [{"name": f"/mode {m}", "hint": h, "source": "arg", "callable": True} for m, h in rows]
@@ -275,7 +276,7 @@ def complete(prefix: str, limit: int = 12, config: Any = None) -> List[dict]:
     """命令名 + 参数补全
 
     - `/mo` → 命令名补全
-    - `/mode ` 或 `/mode a` → 参数补全（auto/manual/full）
+    - `/mode ` 或 `/mode a` → 参数补全（confirm/edit/auto/full）
     - `/model deep` → 模型名补全（model_name 优先于 provider_id）
     - 插件可用 register_arg_completer 扩展任意命令参数
     """

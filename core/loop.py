@@ -20,6 +20,7 @@ from typing import Callable, Dict, Optional
 from core import policy
 from core import prompt_loader
 from core import register
+from core import subagent as subagent_mod
 from core.llm import CANCELLED, get_system_prompt
 from core.log import get_logger
 from core.tools import SpinGuard
@@ -84,17 +85,17 @@ def check_cancel(turn: TurnContext) -> None:
 def drain_injections(turn: TurnContext) -> int:
     """把回合进行中到达的插话并入当前会话（作为 user 消息），返回并入条数。
 
-    插话由主线程入队（app.inject_queue），回合循环在每轮取走——下一轮
-    build_messages 即包含它，模型在当前回合内看到并回应；回合收尾前再取一次，
-    有插话则多跑一轮，避免插话落在末尾被丢弃。"""
+    用户插话与后台任务完成通知都由 runner 放入 app.inject_queue；每轮边界取走，
+    下一轮 build_messages 即包含，模型在当前回合内看到并回应；收尾前再取一次，
+    避免通知恰好落在回合尾部而无人处理。"""
     app = turn.app
     take = getattr(app, "take_injections", None)
     pending = take() if callable(take) else []
     for text in pending:
-        turn.session.add_message("user", text, type="task")
+        turn.session.add_message("user", text, type="subagent_notice" if str(text).startswith("[子代理完成通知") else "task")
     if pending:
-        turn.io.status(f"插话 {len(pending)} 条 · 并入当前回合")
-        log.info("插话并入当前回合: %d 条", len(pending))
+        turn.io.status(f"新消息 {len(pending)} 条 · 并入当前回合")
+        log.info("回合注入新消息: %d 条", len(pending))
     return len(pending)
 
 
@@ -167,8 +168,10 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 turn.app.token_meter = llm.meter
             if response.get("error") == CANCELLED or io.cancelled():
                 raise TurnInterrupt()
-            if response.get("error") and io.wait_llm_retry is not None:
-                # 手动重试等待态：任意错误均允许 Ctrl+Y 重发同一请求（不计轮次、不写消息），放弃则走错误路径
+            if response.get("error") and not response.get("error_fatal") and io.wait_llm_retry is not None:
+                # 手动重试等待态：可重试错误（超时/5xx 等自动重试耗尽）允许 Ctrl+Y 重发同一请求，
+                # 不计轮次、不写消息；error_fatal=确定性失败（400 等重发必现）跳过等待直接走错误回滚；
+                # 放弃（Esc/提交新消息）同样落入错误路径
                 io.phase("")  # 停掉思考中转轮，状态行交给等待态提示
                 retry_requested = io.wait_llm_retry(str(response["error"]))
                 check_cancel(turn)
@@ -189,8 +192,8 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         tool_calls = response.get("tool_calls") or []
         if not tool_calls:
             if drain_injections(turn):
-                # 回合收尾前有插话：不结束，再跑一轮回应插话（仍属当前回合）
-                io.status("插话并入 · 继续")
+                # 回合收尾前有用户插话或后台子代理完成通知：不结束，下一轮回应
+                io.status("新消息并入 · 继续")
                 continue
             io.phase("")  # 回合完成：状态行空行占位
             log.info("任务完成（共%d轮推理）", round_no + 1)
@@ -232,6 +235,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         registered = 0
         round_results = []
         log.debug("第%d轮返回 %d 个工具调用", round_no + 1, len(tool_calls))
+        # task 工具自身已立即提交后台任务；同轮多个 task 自然连续返回，不在此 join
         try:
             for call in tool_calls:
                 check_cancel(turn)
@@ -241,6 +245,13 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     io.phase(f"工具调用中 · {call.get('name')}")
                     check_cancel(turn)
                     result = llm.execute_approved_tool(call)
+                elif action == policy.LLM_APPROVE:
+                    io.phase(f"LLM 审批中 · {call.get('name')}")
+                    check_cancel(turn)
+                    if llm.approve_tool_call(call):
+                        result = llm.execute_approved_tool(call)
+                    else:
+                        result = {"content": policy.default_reject_message("LLM 审批拒绝或失败")}
                 elif action == policy.CONFIRM:
                     io.phase(f"待确认 · {call.get('name')}")
                     check_cancel(turn)
@@ -296,6 +307,9 @@ def run_direct(turn: TurnContext) -> str:
         max_rounds = override
     # 非工作流：主对话跟随激活（默认）模型，model=None 由 llm 解析为当前激活模型
     result = tool_loop(turn, turn.system_prompt_text or None, max_rounds, model=None)
+    if result["status"] == "error":
+        # 请求级失败：标记回合收尾整体回滚（main._agent_turn 消费），失败信息不留在上下文
+        turn.captured["turn_failed"] = True
     if result["status"] != "complete":
         raise TurnStop()
     return "complete"

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from core import keyinput
 from core import policy
+from core import shells
 from core.config import (
     THINKING_OPTIONS,
     is_auto_filled_model,
@@ -23,6 +24,16 @@ from core.log import get_logger
 from core.textbuf import TextBuffer
 
 log = get_logger("settings")
+
+
+def _shell_availability_hint() -> str:
+    """默认执行器字段的提示：列出本机探测结果，选到不可用的会自动回退 cmd 并提示"""
+    ready = [name for name in shells.SHELL_NAMES if shells.available(name)]
+    missing = [name for name in shells.SHELL_NAMES if name not in ready]
+    parts = [f"本机可用: {'/'.join(ready) or '无'}"]
+    if missing:
+        parts.append(f"不可用: {'/'.join(missing)}（选用后自动回退 {shells.label(shells.CMD)}）")
+    return " · ".join(parts)
 
 
 # ----- 渲染层纯函数：运行期惰性导入，避免循环依赖 -----
@@ -721,7 +732,7 @@ class SettingsPanelMixin:
             themes = ["dark"] + [t for t in config.list_themes() if t != "dark"]
             fields = [
                 {"key": "theme", "label": "主题", "type": "choice", "options": themes, "current": config.theme, "hint": "←→ 切换主题"},
-                {"key": "mode", "label": "访问模式", "type": "choice", "options": list(policy.MODES), "current": config.mode, "hint": "auto/manual/full"},
+                {"key": "mode", "label": "访问模式", "type": "choice", "options": list(policy.MODES), "current": config.mode, "hint": "confirm/edit/auto/full"},
                 {"key": "logo", "label": "会话区Logo", "type": "bool", "current": bool(ui_cfg.get("logo", True)), "hint": "←→ 开/关"},
                 {"key": "font_size", "label": "字体大小", "type": "text", "current": getattr(config, "font_size", 16)},
                 {"key": "tip_interval", "label": "提示间隔秒", "type": "text", "current": ui_cfg.get("tip_interval", 5)},
@@ -737,6 +748,7 @@ class SettingsPanelMixin:
                 {"key": "tool_whitelist", "label": "工具白名单", "type": "text", "current": ", ".join(str(x) for x in (ctx_cfg.get("tool_whitelist") or [])), "hint": "逗号分隔 · 白名单工具结果跨回合保留"},
                 {"key": "max_tool_rounds", "label": "最大工具轮数", "type": "text", "current": wf_cfg.get("max_rounds", 0), "hint": "0=用工作流文件值 · 超限后仍有进展会自动续期"},
                 {"key": "spin_kill_count", "label": "空转计数上限", "type": "text", "current": wf_cfg.get("spin_kill_count", 12), "hint": "重复输出计满即终止回合；未满期间续期不限次"},
+                {"key": "default_shell", "label": "默认命令执行器", "type": "choice", "options": list(shells.SHELL_NAMES), "current": tools_cfg.get("default_shell", shells.DEFAULT_SHELL), "hint": "←→ 切换 · " + _shell_availability_hint()},
                 {"key": "max_tool_timeout", "label": "命令超时上限秒", "type": "text", "current": tools_cfg.get("max_timeout", 600), "hint": "execute_command/run_program 传入超时的钳制上限（1-∞）"},
                 {"key": "ask_user_timeout", "label": "询问自动超时", "type": "bool", "current": bool(tools_cfg.get("ask_user_timeout", True)), "hint": "←→ 开/关 · 开启后询问框 5 分钟未选择自动跳过"},
                 {"key": "delete_guard", "label": "删除安全护栏", "type": "bool", "current": bool(security_cfg.get("delete_guard", True)), "hint": "关闭后 shell 删除命令直接执行；delete_file 始终移入项目回收站"},
@@ -1610,6 +1622,11 @@ class SettingsPanelMixin:
                 wf_cfg["spin_kill_count"] = max(1, int(float(s["spin_kill_count"])))
             except (TypeError, ValueError):
                 pass
+        if "default_shell" in s:
+            tools_cfg = config.data.setdefault("tools", {})
+            value = shells.resolve_name(s["default_shell"])
+            if shells.is_valid(value):
+                tools_cfg["default_shell"] = value
         if "max_tool_timeout" in s:
             tools_cfg = config.data.setdefault("tools", {})
             try:

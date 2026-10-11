@@ -76,6 +76,25 @@ def memory_paths(config=None) -> Dict[str, Path]:
     }
 
 
+def _shell_hint(config=None) -> str:
+    """当前默认执行器说明：与实际执行口径一致，含实际解释器版本
+
+    配置的执行器不可用时会回退到 cmd.exe（core/tools._resolve_shell），这里同步注明，
+    避免模型按不可用执行器的语法写命令。"""
+    from core import shells
+
+    name = shells.default_name()
+    if config is not None:
+        value = shells.resolve_name(((config.data or {}).get("tools") or {}).get("default_shell"))
+        if shells.is_valid(value):
+            name = value
+    if not shells.available(name) and shells.available(shells.CMD):
+        return f"{shells.NOTES.get(shells.CMD, shells.CMD)}（配置的 {shells.label(name)} 在本机不可用，命令自动回退到 cmd.exe）"
+    text = shells.NOTES.get(name, name)
+    version = shells.version(name)
+    return f"{text}（实际版本 {version}）" if version else text
+
+
 def build_variable_context(
     config=None,
     session=None,
@@ -161,7 +180,8 @@ def build_variable_context(
         "cpu_arch": platform.machine(),
         "username": os.environ.get("USERNAME") or os.environ.get("USER") or "",
         "home_dir": str(Path.home()),
-        "shell_hint": "PowerShell" if sys.platform == "win32" else "bash",
+        # 必须与实际执行口径一致：execute_command 按选定执行器（core/shells.py）直接启动
+        "shell_hint": _shell_hint(config),
         "model_name": model_name,
         "model_id": model_id,
         "provider_id": provider_id,

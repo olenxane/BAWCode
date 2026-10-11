@@ -184,10 +184,10 @@ def default_config() -> dict:
         # query_subagent 查询其工作过程。enabled=false 不注册工具（模型侧不可见）。
         # 全程轨迹落盘 dir/{project_id}/{session_id}/{id}.json；角色=系统提示词
         # persona（agents_dir 下 <role>.json，内置 universal），模型经角色 model
-        # 字段指定；权限继承主代理（手动模式主代理→auto）且只可收紧不可放宽。
+        # 字段指定；工具权限跟随主代理当前访问模式，子代理无确认通道、可申请提权。
         # max_rounds 单次派发轮次上限（配合 workflow.spin_kill_count 空转计数：
         # 重复输出才计数、全新结果清零，计满终止）；result_char_cap 结果摘要字符上限；
-        # query_default_rounds 查询默认轮数
+        # query_default_rounds 查询默认轮数；max_concurrent 同轮并行派发上限（超出排队等槽）
         "subagent": {
             "enabled": True,
             "dir": "data/subagents",
@@ -195,14 +195,18 @@ def default_config() -> dict:
             "max_rounds": 20,
             "result_char_cap": 3000,
             "query_default_rounds": 3,
+            "max_concurrent": 3,
         },
         # 工具执行层（core/tools.py）：max_timeout 为模型传入 timeout 参数的
         # 钳制上限（execute_command/run_program），防止模型传超大值绕过卡死兜底；
         # ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟；
-        # 数字配置 >0 视为开）
+        # 数字配置 >0 视为开）；default_shell 为 execute_command 默认执行器
+        # （core/shells.py：cmd/git_bash/powershell，执行时可用 shell 参数单次覆盖，
+        # 执行器未安装直接报错不静默切换；默认 cmd 为系统自带，Git Bash 需自行安装）
         "tools": {
             "max_timeout": 600,
             "ask_user_timeout": True,
+            "default_shell": "cmd",
         },
         # MCP 客户端（core/mcp.py）：把外部 MCP 服务器的工具桥接进本机工具循环。
         # enabled=false 不连接不注册（模型侧完全不可见）。servers 每项：stdio 用
@@ -1030,11 +1034,15 @@ class Config:
         切换入口（Shift+Tab、设置页、/mode 命令）均经本属性落盘同步。
         读取时校验合法值，缺失/非法回落 auto。"""
         raw = str(((self.data or {}).get("ui") or {}).get("mode") or "").strip().lower()
+        if raw == "manual":
+            return policy.MODE_CONFIRM
         return raw if raw in policy.MODES else policy.MODE_AUTO
 
     @mode.setter
     def mode(self, value: str) -> None:
         v = str(value or "").strip().lower()
+        if v == "manual":
+            v = policy.MODE_CONFIRM
         if v not in policy.MODES:
             log.warn("忽略非法访问模式: %r（可选 %s）", value, "/".join(policy.MODES))
             return

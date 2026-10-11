@@ -30,6 +30,9 @@ log = get_logger("llm")
 # chat() 取消哨兵：异步回合中断时返回，调用方据此丢弃在途回合
 CANCELLED = "__CANCELLED__"
 
+# 命令审批上下文上限：只给审批模型单条命令的简短文本，避免长命令/参数挤占裁决注意力
+APPROVAL_CONTEXT_CAP = 800
+
 # 可自动重试的 HTTP 状态（限频/服务端瞬态）；其余 4xx（401 鉴权、404 模型不存在、
 # 400 参数等确定性失败）不做自动重试，但同样进入错误态并允许用户 Ctrl+Y 手动重试
 _RETRYABLE_STATUS = {408, 409, 429}
@@ -217,14 +220,18 @@ class LLM:
         self.meter.model = config.model_name
         self.client = None
         self._client_provider_id = None
-        self._inflight_resp = None
+        # 在途流登记册：并发子代理可能同时多条流在飞，取消时逐条关闭
+        self._inflight_resps: set = set()
+        self._inflight_lock = threading.Lock()
         self._cancel = threading.Event()
         self._build_client()
 
     # ----- 取消（异步回合中断） -----
 
     def cancel(self) -> None:
-        """请求中断：置标记并关闭在途连接（openai SDK/httpx 与 urllib SSE 句柄均立即生效）。"""
+        """请求中断：置标记并关闭在途连接（openai SDK/httpx 与 urllib SSE 句柄均立即生效）。
+
+        并发子代理可能同时有多条在途流，全部登记在册、逐个关闭。"""
         self._cancel.set()
         client = self.client
         if client is not None and hasattr(client, "close"):
@@ -234,14 +241,15 @@ class LLM:
                 pass
         self.client = None
         self._client_provider_id = None
-        resp = self._inflight_resp
-        if resp is not None:
+        with self._inflight_lock:
+            resps = list(self._inflight_resps)
+            self._inflight_resps.clear()
+        for resp in resps:
             try:
                 resp.close()
             except Exception:
                 pass
-            self._inflight_resp = None
-        log.info("LLM 请求取消：已关闭在途连接")
+        log.info("LLM 请求取消：已关闭 %d 条在途连接", len(resps))
 
     def cancelled(self) -> bool:
         return self._cancel.is_set()
@@ -407,6 +415,8 @@ class LLM:
         resp = self.client.chat.completions.create(
             **self._sdk_payload(payload, req), stream=True, stream_options={"include_usage": True}
         )
+        with self._inflight_lock:
+            self._inflight_resps.add(resp)
         try:
             for chunk in resp:
                 if self._cancel.is_set():
@@ -417,6 +427,8 @@ class LLM:
         except Exception as e:
             return self._finish_stream(agg, e)
         finally:
+            with self._inflight_lock:
+                self._inflight_resps.discard(resp)
             try:
                 resp.close()
             except Exception:
@@ -433,7 +445,8 @@ class LLM:
             self._chat_url(req), data=body, headers=self._headers(req), method="POST"
         )
         resp = urllib.request.urlopen(request, timeout=120)
-        self._inflight_resp = resp
+        with self._inflight_lock:
+            self._inflight_resps.add(resp)
         try:
             content_type = (resp.headers.get("Content-Type") or "").lower()
             if "text/event-stream" not in content_type:
@@ -460,7 +473,8 @@ class LLM:
         except Exception as e:
             return self._finish_stream(agg, e)
         finally:
-            self._inflight_resp = None
+            with self._inflight_lock:
+                self._inflight_resps.discard(resp)
             try:
                 resp.close()
             except Exception:
@@ -595,7 +609,7 @@ class LLM:
         self.meter.measure_context(messages)
         req = self.resolve_request(model)
         if req.get("error"):
-            return {"content": "", "tool_calls": [], "error": req["error"]}
+            return {"content": "", "tool_calls": [], "error": req["error"], "error_fatal": True}
         advanced = req.get("advanced") if isinstance(req.get("advanced"), dict) else {}
         model_id = req.get("model_id") or req.get("model_name") or ""
         payload = {
@@ -629,13 +643,14 @@ class LLM:
                 "llm_request", {"messages": messages, "tools": tools, "payload": payload}, default=None
             )
             if hooked is None:
-                return {"content": "", "tool_calls": [], "error": "未配置 api_key"}
+                return {"content": "", "tool_calls": [], "error": "未配置 api_key", "error_fatal": True}
             return self._normalize(hooked, keep_reasoning=bool(tools))
 
         retry_times = int(self.config.data.get("llm", {}).get("retry_times", 3))
         retry_delay = float(self.config.data.get("llm", {}).get("retry_delay", 1.0))
         attempt = 0
         last_error = None
+        error_fatal = False
         start = time.monotonic()
         log.debug(
             "LLM 请求 provider=%s model=%s messages=%d tools=%d",
@@ -701,7 +716,9 @@ class LLM:
                 log.warn("LLM 调用失败(第%d/%d次): %s", attempt, max(retry_times, 0) + 1, e)
                 log.debug("异常详情:\n%s", traceback.format_exc())
                 if not _is_retryable_error(e):
-                    # 401/404/400 等确定性失败：不做自动重试，仍可由用户手动重试
+                    # 401/404/400 等确定性失败：不做自动重试；error_fatal 供回合层跳过
+                    # 手动重试等待（重发同一请求必然复现，直接走失败回滚）
+                    error_fatal = True
                     log.error("不可自动重试的错误（%s.%s），终止自动重试", type(e).__module__, type(e).__name__)
                     break
                 if attempt > max(retry_times, 0):
@@ -720,6 +737,7 @@ class LLM:
             "content": "",
             "tool_calls": [],
             "error": f"LLM 调用失败: {last_error}",
+            "error_fatal": error_fatal,
         }
 
     def _normalize(self, data: Any, keep_reasoning: bool = False) -> dict:
@@ -735,9 +753,16 @@ class LLM:
                 "tool_calls": normalized_calls,
                 "raw": data.get("raw", data),
                 "error": data.get("error"),
+                "error_fatal": bool(data.get("error_fatal")),
             }
         if isinstance(data, dict) and data.get("error") and "choices" not in data:
-            return {"content": "", "tool_calls": [], "raw": data, "error": data.get("error")}
+            return {
+                "content": "",
+                "tool_calls": [],
+                "raw": data,
+                "error": data.get("error"),
+                "error_fatal": bool(data.get("error_fatal")),
+            }
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
             return {
@@ -781,6 +806,39 @@ class LLM:
         action, reason = policy.evaluate(tool_name, args, getattr(self.config, "mode", policy.MODE_AUTO))
         log.debug("工具策略 %s -> %s(%s)", tool_name, action, reason)
         return action, reason
+
+    def approve_tool_call(self, call: dict) -> bool:
+        """自动模式的调用审批：只把单条命令/工具调用的简短上下文交给模型裁决，
+        不带对话历史；异常、错误或含糊答复一律拒绝（fail-closed）"""
+        name = str(call.get("name") or "")
+        args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        context = policy.command_text(name, args)
+        if not context.strip():
+            context = f"{name} {json.dumps(args, ensure_ascii=False, sort_keys=True)}"
+        # 附带 execute_command 接收到的 description（模型对命令意图的自述），供审批模型参考
+        description = str(args.get("description") or "").strip()
+        if description and name == "execute_command":
+            context = f"{context}\n说明: {description}"
+        context = context.strip()[:APPROVAL_CONTEXT_CAP]
+        if not context:
+            return False
+        result = self.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是调用安全审批器。只依据给出的单条命令或工具调用判断能否执行："
+                        "破坏性操作、数据外传、凭据访问、持久化、提权、执行下载内容或意图不明的一律拒绝。"
+                        "只允许输出 APPROVE 或 REJECT，不要执行命令，不要调用工具。"
+                    ),
+                },
+                {"role": "user", "content": context},
+            ]
+        )
+        if result.get("error") or result.get("tool_calls"):
+            log.warn("命令审批失败关闭: %s", result.get("error") or "审批模型返回工具调用")
+            return False
+        return str(result.get("content") or "").strip().upper() == "APPROVE"
 
     def execute_approved_tool(self, call: dict) -> dict:
         """确认通过后执行单个工具；before_tool 钩子可改写 args 或拒绝执行"""

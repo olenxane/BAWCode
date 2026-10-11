@@ -5,7 +5,9 @@ import json
 import os
 import re
 from datetime import datetime
+from contextlib import contextmanager
 from pathlib import Path
+import threading
 from typing import Callable, List, Optional, Union
 
 from core import hooks
@@ -20,7 +22,7 @@ log = get_logger("memory")
 _ROOT = Path(__file__).resolve().parent.parent
 
 # 工具结果视为"已是简明记录"的长度阈值：拒绝原因/短错误不再剥离改写
-_CONCISE_CONTENT_CHARS = 200
+_CONCISE_CONTENT_CHARS = 128
 
 # ----- 多模态消息（tool 结果可携带本地图片，content 用 OpenAI 数组形态） -----
 
@@ -35,7 +37,7 @@ _IMAGE_MIME = {
 }
 _IMAGE_MAX_BYTES = 4 * 1024 * 1024  # 单图原始字节上限（base64 后约 5.4MB，兼容主流网关请求体限制）
 _IMAGE_MAX_COUNT = 4                # 单条工具结果最多携带图片数
-# 预算估算时单张图片的粗略 token 计价（token 计数器只认文本，图片按常数计，与 tokens.py 同值）
+# 预算估算时单张图片的粗略 token 计价
 _IMAGE_TOKEN_ESTIMATE = 768
 
 
@@ -132,6 +134,18 @@ def parse_state_snapshot(text: str) -> Optional[dict]:
 
 # 会话级记忆单例，由 main 初始化
 _session: Optional["Memory"] = None
+_SESSION_OVERRIDE = threading.local()
+
+
+@contextmanager
+def bind_session(session):
+    """在后台工具线程内绑定其启动时的会话，避免全局活动会话变化后误写新会话。"""
+    previous = getattr(_SESSION_OVERRIDE, "value", None)
+    _SESSION_OVERRIDE.value = session
+    try:
+        yield
+    finally:
+        _SESSION_OVERRIDE.value = previous
 
 
 def init_session(config, project_identity_data: Optional[dict] = None) -> "Memory":
@@ -151,8 +165,8 @@ def init_session(config, project_identity_data: Optional[dict] = None) -> "Memor
 
 
 def get_session() -> Optional["Memory"]:
-    """获取当前记忆会话"""
-    return _session
+    """获取当前线程绑定的会话，否则返回活动记忆会话"""
+    return getattr(_SESSION_OVERRIDE, "value", None) or _session
 
 
 def conv_block_bounds(messages: List[dict], idx: int) -> tuple:
@@ -846,7 +860,7 @@ class Memory:
     @staticmethod
     def _api_visible(item: dict) -> bool:
         """与 _api_session_item 同规则的可见性判断（UI 专用注入不参与压缩与轮次统计）"""
-        return (item.get("type") or "") not in ("system_prompt", "help", "workflow_node")
+        return (item.get("type") or "") not in ("system_prompt", "help", "workflow_node", "subagent")
 
     def _count_tokens(self, messages: List[dict]) -> int:
         """tiktoken 计消息列表 token；不可用时字符数减半兜底（estimate_context_tokens 共用）"""
@@ -1231,8 +1245,8 @@ class Memory:
         role = item.get("role") or "user"
         content = item.get("content") or ""
         mtype = item.get("type") or ""
-        # UI 专用注入提示不进 API
-        if mtype in ("system_prompt", "help", "workflow_node"):
+        # UI 专用注入不进 API；subagent 节点夹在 tool_calls 与 tool 结果之间属协议错误，结果经完成通知入上下文
+        if mtype in ("system_prompt", "help", "workflow_node", "subagent"):
             return {}
         # content 原样出站：str 或数组形态（多模态图片块）均透传
         out: dict = {"role": role, "content": content if isinstance(content, (str, list)) else str(content)}

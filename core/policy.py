@@ -1,4 +1,4 @@
-#工具访问策略：自动/手动/完全访问
+# 工具访问策略：四级权限（手动确认 / 自动接收编辑 / 自动模式 / 完全访问）
 import hashlib
 import json
 import re
@@ -13,14 +13,17 @@ log = get_logger("policy")
 
 _ROOT = Path(__file__).resolve().parent.parent
 
-# 模式常量
+# 模式常量：从逐次确认到完全放行，权限逐级递增
+MODE_CONFIRM = "confirm"
+MODE_EDIT = "edit"
 MODE_AUTO = "auto"
-MODE_MANUAL = "manual"
 MODE_FULL = "full"
-MODES = (MODE_AUTO, MODE_MANUAL, MODE_FULL)
+MODE_MANUAL = MODE_CONFIRM  # 兼容既有内部引用
+MODES = (MODE_CONFIRM, MODE_EDIT, MODE_AUTO, MODE_FULL)
 MODE_LABELS = {
+    MODE_CONFIRM: "手动确认",
+    MODE_EDIT: "自动接收编辑",
     MODE_AUTO: "自动模式",
-    MODE_MANUAL: "手动模式",
     MODE_FULL: "完全访问",
 }
 
@@ -28,11 +31,12 @@ MODE_LABELS = {
 ALLOW = "allow"
 CONFIRM = "confirm"
 DENY = "deny"
+LLM_APPROVE = "llm_approve"
 
 # 路径类工具：文件系统副作用，通配放行需限定项目边界
 PATH_TOOLS = ("write", "edit_file", "delete_file")
 
-# 只读安全工具（manual 也放行）
+# 只读安全工具：所有访问模式自动放行（手动确认也只读放行）
 SAFE_TOOLS = {
     "read",
     "search",
@@ -58,6 +62,13 @@ SAFE_TOOLS = {
     "update_memory",
     "read_memory",
     "delete_memory",
+    # 子代理编排：自身无副作用（子代理内每次调用各自过门禁），并发派发依赖放行判定
+    "task",
+    "wait_subagent",
+    "cancel_subagent",
+    "query_subagent",
+    # 申请切换模式：纯交互无副作用，实际切换仍由用户批准（模式面板裁决）
+    "request_mode_switch",
 }
 
 # 仅放行明确的只读参数，未识别的选项交由用户确认
@@ -139,24 +150,60 @@ def readonly_simple_cmd(cmd: str) -> bool:
     return False
 
 
-def readonly_compound_cmd(cmd: str) -> bool:
-    """复合命令逐段判定：引号外按 |;& 与换行切分，重定向直接否，每段须为只读简单命令"""
-    segs, cur, in_dq = [], [], False
-    for ch in cmd:
-        if ch == '"':
+def _split_cmd_segments(cmd: str, shell: str = "") -> Optional[List[str]]:
+    """按执行器的引号/转义规则在 |;& 与换行处切分复合命令；含重定向时返回 None
+
+    各执行器的转义不同：bash 用 \\、单引号也是引号；cmd 用 ^；PowerShell 用反引号。"""
+    from core import shells
+
+    name = shells.resolve_name(shell)
+    segs: List[str] = []
+    cur: List[str] = []
+    in_dq = False
+    in_sq = False
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if name == shells.GIT_BASH and ch == "\\" and not in_sq and i + 1 < len(cmd):
+            cur.append(ch)
+            cur.append(cmd[i + 1])
+            i += 2
+            continue
+        if name == shells.CMD and ch == "^" and i + 1 < len(cmd):
+            cur.append(ch)
+            cur.append(cmd[i + 1])
+            i += 2
+            continue
+        if name == shells.POWERSHELL and ch == "`" and in_dq and i + 1 < len(cmd):
+            cur.append(ch)
+            cur.append(cmd[i + 1])
+            i += 2
+            continue
+        if name == shells.GIT_BASH and ch == "'" and not in_dq:
+            in_sq = not in_sq
+            cur.append(ch)
+        elif ch == '"':
             in_dq = not in_dq
             cur.append(ch)
-        elif in_dq:
+        elif in_dq or in_sq:
             cur.append(ch)
         elif ch in "<>":
-            return False
+            return None
         elif ch in "|;&\n":
             segs.append("".join(cur))
             cur = []
         else:
             cur.append(ch)
+        i += 1
     segs.append("".join(cur))
-    segs = [s for s in segs if s.strip()]
+    return [s for s in segs if s.strip()]
+
+
+def readonly_compound_cmd(cmd: str, shell: str = "") -> bool:
+    """复合命令逐段判定：引号外按 |;& 与换行切分，重定向直接否，每段须为只读简单命令"""
+    segs = _split_cmd_segments(cmd, shell)
+    if segs is None:
+        return False
     return bool(segs) and all(readonly_simple_cmd(s) for s in segs)
 _DANGEROUS_CMD_RE = re.compile(
     r"""(?xi)
@@ -181,19 +228,17 @@ _DANGEROUS_CMD_RE = re.compile(
     """
 )
 
-# 删除类命令改为"移入回收站"执行：不再直接拒绝，命令放行到 execute_command，
-# 由工具层把目标静默移入项目回收站，真正删除只由用户 /clear-trash 触发。
+# 删除类命令经工具层移入项目回收站；仍按访问模式审批，不因回收站处理而自动授权。
 # 只匹配命令首词或分隔符（|;& 与换行，shell 下换行即命令分隔）之后的删除词，
 # 避免 "python app.py del" 这类参数误伤
 _DELETE_WORDS = ("rmdir", "rimraf", "deltree", "remove-item", "erase", "rm", "rd", "del")
 _DELETE_CMD_RE = re.compile(
     r"(?ix)(?:^|[|;&\r\n])\s*(?:[a-z]:\S+\s+)?(?:" + "|".join(_DELETE_WORDS) + r")(?:\s|$)"
 )
-_DELETE_TRASH_REASON = "删除类命令改为移入项目回收站执行"
 
 
 def is_delete_command(cmd: str) -> bool:
-    """命令是否命中删除类命令"""
+    """命令是否命中删除类命令；按执行器无关的保守口径先行筛出候选"""
     return bool(_DELETE_CMD_RE.search(str(cmd or "")))
 
 
@@ -201,26 +246,6 @@ def _strip_exe(token: str) -> str:
     """取命令词的可执行名：去路径前缀与 .exe，转小写"""
     name = token.strip().strip('"').replace("\\", "/").rsplit("/", 1)[-1].lower()
     return name[:-4] if name.endswith(".exe") else name
-
-
-def _split_command_segments(cmd: str) -> List[str]:
-    """引号外按 |;& 与换行切分复合命令"""
-    segs: List[str] = []
-    cur: List[str] = []
-    in_dq = False
-    for ch in cmd:
-        if ch == '"':
-            in_dq = not in_dq
-            cur.append(ch)
-        elif in_dq:
-            cur.append(ch)
-        elif ch in "|;&\r\n":
-            segs.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-    segs.append("".join(cur))
-    return [s for s in segs if s.strip()]
 
 
 def _tokenize(seg: str) -> List[str]:
@@ -248,21 +273,28 @@ def _with_cwd(parts: List[str], target: str) -> str:
     return str(Path(*parts) / target)
 
 
-def delete_targets(cmd: str) -> Optional[List[str]]:
-    """解析删除类命令的目标路径；非删除类命令返回 None，命中但目标不可靠时返回空表"""
+def delete_targets(cmd: str, shell: str = "") -> Optional[List[str]]:
+    """解析删除类命令的目标路径（跟随执行器）；非删除类命令返回 None，目标不可靠时返回空表
+
+    PowerShell 交解释器 AST 提取字面路径（不猜动态表达式）；bash/cmd 走分词解析。"""
+    from core import shells
+
     text = str(cmd or "")
+    name = shells.resolve_name(shell)
+    if name == shells.POWERSHELL:
+        if not is_delete_command(text):
+            return None  # 非删除命令交回调用方放行
+        targets, _dynamic = shells.powershell_parse(text)
+        return targets
     if not is_delete_command(text):
         return None
+    segs = _split_cmd_segments(text, name)
     # 重定向会混入与删除无关的 token，目标不可靠时返回空表交由调用方拒绝执行
-    in_dq = False
-    for ch in text:
-        if ch == '"':
-            in_dq = not in_dq
-        elif not in_dq and ch in "<>":
-            return []
+    if segs is None:
+        return []
     targets: List[str] = []
     cwd_parts: List[str] = []
-    for seg in _split_command_segments(text):
+    for seg in segs:
         toks = _tokenize(seg)
         if not toks:
             continue
@@ -355,7 +387,11 @@ def fingerprint(tool_name: str, args: Optional[dict]) -> str:
         parts = cmd.strip().split()
         key = parts[0].lower() if parts else ""
         rest = " ".join(parts[1:3]).lower()
-        return f"execute_command|{key}|{rest}"
+        # 执行器进指纹：同一命令在不同执行器下语义不同，不能跨执行器复用授权
+        from core import shells
+
+        shell_name = shells.resolve_name(args.get("shell"))
+        return f"execute_command|{shell_name}|{key}|{rest}"
     if tool_name == "run_program":
         prog = str(args.get("program") or "").lower()
         return f"run_program|{prog}"
@@ -380,7 +416,10 @@ def similar_fingerprint(tool_name: str, args: Optional[dict]) -> str:
     if tool_name == "execute_command":
         cmd = str(args.get("command") or "")
         parts = cmd.strip().split()
-        return f"execute_command|{(parts[0].lower() if parts else '')}"
+        from core import shells
+
+        shell_name = shells.resolve_name(args.get("shell"))
+        return f"execute_command|{shell_name}|{(parts[0].lower() if parts else '')}"
     return fingerprint(tool_name, args).split("|")[0] + "|*"
 
 
@@ -399,7 +438,9 @@ def path_in_scope(tool_name: str, fp: str, root: Path) -> bool:
         return False
 
 
-def _command_text(tool_name: str, args: dict) -> str:
+def command_text(tool_name: str, args: Optional[dict]) -> str:
+    """命令类工具的可读命令文本（execute_command/run_program）；其余工具空串"""
+    args = args or {}
     if tool_name == "execute_command":
         return str(args.get("command") or "")
     if tool_name == "run_program":
@@ -415,20 +456,22 @@ def is_safe_call(tool_name: str, args: Optional[dict]) -> bool:
     if tool_name in SAFE_TOOLS:
         return True
     if tool_name in ("execute_command", "run_program"):
-        cmd = _command_text(tool_name, args)
+        cmd = command_text(tool_name, args)
         if not cmd.strip():
             return False
         # 危险词全串扫描为独立第二层；复合命令逐段只读判定——"| powershell"、"| nc"
         # 这类外发链因段不只读落回确认，重定向（写文件）同样不放行
         if _DANGEROUS_CMD_RE.search(cmd):
             return False
-        return readonly_compound_cmd(cmd)
+        from core import shells
+
+        return readonly_compound_cmd(cmd, shells.resolve_name(args.get("shell")))
     # 未知工具：保守
     return False
 
 
 def evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Path] = None) -> Tuple[str, str]:
-    """返回 (action, reason)：allow / confirm / deny"""
+    """返回 (action, reason)：allow / confirm / deny / llm_approve"""
     action, reason = _evaluate(tool_name, args, mode, root)
     log.debug("策略判定 %s mode=%s -> %s(%s)", tool_name or "-", mode, action, reason)
     return action, reason
@@ -436,12 +479,9 @@ def evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pat
 
 def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Path] = None) -> Tuple[str, str]:
     root = root or project_root()
-    # 删除类命令不再拒绝：放行到工具层静默移入项目回收站，execute_command 与 run_program 同口径
-    if tool_name in ("execute_command", "run_program") and is_delete_command(_command_text(tool_name, args or {})):
-        return ALLOW, _DELETE_TRASH_REASON
     if mode == MODE_FULL:
         return ALLOW, "full"
-    if not mode:
+    if mode not in MODES:
         # 失效关闭：未知模式不放假放行
         return CONFIRM, "unknown_mode"
     if not tool_name:
@@ -467,15 +507,17 @@ def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pa
         ):
             return ALLOW, f"allowlist:{pattern}"
 
-    if mode == MODE_MANUAL:
-        if is_safe_call(tool_name, args):
-            return ALLOW, "manual_safe"
-        return CONFIRM, "manual_unsafe"
-
-    # 自动模式：安全放行，否则确认
     if is_safe_call(tool_name, args):
-        return ALLOW, "auto_safe"
-    return CONFIRM, "auto_unsafe"
+        return ALLOW, "safe"
+    if mode == MODE_CONFIRM:
+        return CONFIRM, "manual_unsafe"
+    if tool_name in ("write", "edit_file"):
+        # 编辑类工具在自动接收编辑/自动模式下完全放行，不经确认也不经 LLM 裁决
+        return ALLOW, "auto_edit"
+    if mode == MODE_AUTO:
+        # 自动模式：其余不确定的工具调用（含危险/删除类命令）一律交 LLM 裁决
+        return LLM_APPROVE, "auto_approval"
+    return CONFIRM, "mode_requires_confirmation"
 
 
 def add_always_allow(tool_name: str, args: Optional[dict], root: Optional[Path] = None, similar: bool = True) -> dict:

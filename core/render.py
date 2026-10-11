@@ -1512,17 +1512,19 @@ class RenderMixin:
                 _parent().children.append(
                     TreeNode("stream:content", content, "stream_content", default_expanded=True, detail="")
                 )
-        # 子代理直播（纯 UI 状态，不进 session.messages）：头部状态 + 最近输出尾部窗口 + 工具行
-        live = self.subagent_stream if isinstance(self.subagent_stream, dict) else None
-        if live is not None:
+        # 子代理直播：每个在跑的子代理一个节点（纯 UI 状态不进消息；快照迭代防并发增删竞争）
+        slots = self.subagent_stream if isinstance(self.subagent_stream, dict) else None
+        for key, live in list((slots or {}).items()):
+            if not isinstance(live, dict):
+                continue
             text = str(live.get("text") or "")
             tail = [ln for ln in text.splitlines() if ln.strip()][-3:]
-            label = f"子代理 #{live.get('id') or '?'} · {live.get('role') or ''} · {live.get('phase') or ''}"
+            label = f"子代理 #{live.get('id') or key or '?'} · {live.get('role') or ''} · {live.get('phase') or ''}"
             if tail:
                 label += "\n" + "\n".join(tail)
-            live_node = TreeNode("subagent:live", label, "subagent_live", default_expanded=True)
+            live_node = TreeNode(f"subagent:live:{key}", label, "subagent_live", default_expanded=True)
             for i, tline in enumerate(live.get("tools") or []):
-                live_node.children.append(TreeNode(f"subagent:live:t{i}", str(tline), "tool"))
+                live_node.children.append(TreeNode(f"subagent:live:{key}:t{i}", str(tline), "tool"))
             _parent().children.append(live_node)
         # MCP 状态行（进程级常驻，core/mcp.py 后台线程维护；未启用/无配置时为空串不渲染）
         mcp_text = self._mcp_line()
@@ -1670,7 +1672,20 @@ class RenderMixin:
             total += memory_mod.count_image_parts(m.get("content"))  # 图片块计入签名防漏失效
         plan = self.plan or {}
         streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
-        live = self.subagent_stream if isinstance(self.subagent_stream, dict) else None
+        slots = self.subagent_stream if isinstance(self.subagent_stream, dict) else {}
+        # 并发子代理：全部槽计入签名，任一槽状态变化都触发树重建
+        live_sig = tuple(
+            sorted(
+                (
+                    str(key),
+                    str((slot or {}).get("phase") or ""),
+                    len(str((slot or {}).get("text") or "")),
+                    len((slot or {}).get("tools") or []),
+                )
+                for key, slot in list(slots.items())
+                if isinstance(slot, dict)
+            )
+        )
         payload = {"app": self}
         try:
             ui_nodes = hooks_mod.collect_hook("ui_tree_nodes", payload)
@@ -1698,9 +1713,7 @@ class RenderMixin:
             self.collapse_done,
             len(streaming.get("thinking") or "") if streaming else -1,
             len(streaming.get("content") or "") if streaming else -1,
-            len(live.get("text") or "") if live else -1,
-            len(live.get("tools") or []) if live else -1,
-            live.get("phase") or "" if live else "",
+            live_sig,
             self._mcp_line(),
         )
 
@@ -2288,7 +2301,8 @@ class RenderMixin:
         # 底部：项目 · git · 模型 · 模式（同一行；分段配色，模式按语义着色）
         mode_c = {
             policy.MODE_AUTO: self.c("ok"),
-            policy.MODE_MANUAL: self.c("warn"),
+            policy.MODE_EDIT: self.c("warn"),
+            policy.MODE_CONFIRM: self.c("accent"),
             policy.MODE_FULL: self.c("err"),
         }.get(self.mode, self.c("accent"))
         info = (

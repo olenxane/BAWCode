@@ -101,6 +101,9 @@ from core.llm import CANCELLED as CANCEL_RESULT
 _CONSOLE = Console(soft_wrap=True, force_terminal=True) if HAS_RICH else None
 _app: Optional["TuiApp"] = None
 
+# 对话框串行锁：UI 请求槽（app._ui_req）同一时刻只服务一个请求，并发申请排队弹面板（否则先到的永远等不到应答）
+DIALOG_LOCK = threading.Lock()
+
 
 class _LlmRetryGate:
     """LLM 错误手动重试闸：agent 线程在 wait 上阻塞，主线程按键/插件置位放行"""
@@ -186,6 +189,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self._turn_tok_cache = None
         # Esc 打断回滚后的输入回填单槽：agent 线程写、帧尾取回
         self.restore_input: Optional[str] = None
+        # 请求失败回滚后的重发候选（用户原话）：空闲态 Ctrl+Y 直接重发，回合成功后清除
+        self.last_failed_text: Optional[str] = None
         # 主循环注册的 Esc 打断回调，返回是否已触发；None=未注册
         self.interrupt_turn_handler = None
         # 回合中插话队列（普通 Enter 提交）：主线程入队、回合循环取走并入当前回合
@@ -294,7 +299,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.model_name = config.model_name
         self.api_key_set = bool(config.api_key)
         ui_cfg = (config.data or {}).get("ui") or {}
-        self.mode = ui_cfg.get("mode", policy.MODE_AUTO)
+        self.mode = config.mode
         self.load_theme(ui_cfg.get("theme", "dark"))
         # 快捷键（shift+tab 始终可用；switch_mode 为额外可配置键）
         for k in (
@@ -374,9 +379,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.steps = list(getattr(session, "steps", []) or [])
         self._tree_sig = None  # 内容已同步，强制重建树缓存
         msg_n = len(self.messages)
-        if msg_n > self._tree_last_msg_n and not self.confirm_mode:
-            # 会话变长：恢复贴底，避免停在顶部看不到新回复；
-            # 确认面板等待期间不拉底——用户可能正在翻看历史
+        if msg_n > self._tree_last_msg_n and not self.confirm_mode and not self.busy:
+            # 空闲时的新消息恢复贴底；回合中保留用户当前的滚动位置
             self._tree_follow_tail = True
         self._tree_last_msg_n = msg_n
         if task is not None:
@@ -683,7 +687,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.render()
 
     def _tick_restore_input(self) -> None:
-        """帧尾取回 Esc 打断回填的单槽；输入框非空则不覆盖用户新输入"""
+        """帧尾取回 Esc 打断/失败回滚回填的单槽；输入框非空则不覆盖用户新输入"""
         text = self.restore_input
         if text is None:
             return
@@ -692,7 +696,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self.status = "已回滚到回合前（输入框已有内容，未回填原消息）"
             return
         self._buf_set(text, len(text))
-        self.status = "已回滚到回合前，原消息已回到输入框"
+        hint = " · Ctrl+Y 重发" if getattr(self, "last_failed_text", None) else ""
+        self.status = f"已回滚到回合前，原消息已回到输入框{hint}"
         self.render()
 
     def take_injections(self) -> List[str]:
@@ -798,6 +803,25 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             if kind == "escape":
                 gate.give_up.set()
                 return None
+
+        # 空闲态 Ctrl+Y：重发上一条失败回合的用户消息（失败回合已整体回滚出上下文）
+        if (
+            kind == "hotkey"
+            and str(value) == "ctrl+y"
+            and not self.busy
+            and not self._dialog_active
+            and not (self.confirm_mode or self.ask_mode or self.sessions_mode)
+            and self._ui_context() == Context.INPUT
+        ):
+            failed = str(getattr(self, "last_failed_text", "") or "")
+            if failed:
+                if self._buf_text().strip():
+                    self.status = "输入框有未发送内容，未覆盖；发送或清空后可再按 Ctrl+Y"
+                    self.render()
+                    return None
+                self.last_failed_text = None
+                self._buf_set(failed, len(failed))
+                return self._submit_line()
 
         act = self.keymap.resolve(ctx, kind, value)
         # Tab：输入框 complete 优先，再 focus；树上 focus

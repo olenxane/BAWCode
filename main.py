@@ -171,13 +171,15 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         ctx["app"].status = f"已切换 {row['model_name']}"
         return True
 
-    @commands.register("/mode", hint="访问模式 auto|manual|full · 也可按 ~", usage="/mode [auto|manual|full]", source="builtin")
+    @commands.register("/mode", hint="访问模式 confirm|edit|auto|full · 也可按 ~", usage="/mode [confirm|edit|auto|full]", source="builtin")
     def _mode(ctx, args):
         arg = (args or "").strip().lower()
+        if arg == "manual":
+            arg = policy.MODE_CONFIRM
         if not arg:
             arg = ctx["app"].cycle_mode()
         elif arg not in policy.MODES:
-            _echo(ctx, "模式: auto | manual | full")
+            _echo(ctx, "模式: confirm（手动确认）| edit（自动接收编辑）| auto（自动审批）| full（完全访问）")
             return True
         else:
             ctx["app"].mode = arg
@@ -234,15 +236,22 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         records = subagent_mod.list_records(ctx["config"], sess)
         lines = [f"本会话子代理 {len(records)} 个:"]
         for rec in records[-20:]:
-            label = subagent_mod.status_label(str(rec.get("status")))
+            live = subagent_mod.task_status(ctx["config"], sess, str(rec.get("id") or "")) or rec
+            label = subagent_mod.status_label(str(live.get("status") or rec.get("status")))
+            phase = str(live.get("phase") or "").strip()
+            if phase and str(live.get("status") or "") in ("queued", "running", "cancelling"):
+                label = f"{label} · {phase}"
             task_brief = " ".join(str(rec.get("task") or "").split())[:40]
             lines.append(
                 f"  #{rec.get('id')} · {rec.get('role')} · {label}"
-                f" · {rec.get('rounds', 0)}轮 · {task_brief}"
+                f" · {live.get('rounds', rec.get('rounds', 0))}轮 · {task_brief}"
             )
         lines.append("角色:")
         lines.append(subagent_mod.roles_listing())
-        lines.append("提示: /agents reload 重扫 data/agents；子代理经 task 工具派发、query_subagent 查询")
+        lines.append(
+            "提示: 子代理为异步派发——task 立即返回 id，wait_subagent 等待（超时返回进度），"
+            "cancel_subagent 取消，query_subagent 看轨迹，完成时自动注入通知"
+        )
         _echo(ctx, "\n".join(lines))
         return True
 
@@ -480,6 +489,50 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
     commands.load_plugins(str(_ROOT / "data" / "commands"))
 
 
+def _handle_mode_switch(app: "ui.TuiApp", config, payload: dict, cancelled=None) -> dict:
+    """模式切换申请：ask 面板裁决；批准后切换（单一事实源 config.mode）并落盘。
+
+    返回 {"approved": bool, "detail": str}，由 request_mode_switch 工具转成给模型的回执。"""
+    target = str((payload or {}).get("mode") or "").strip().lower()
+    if target not in policy.MODES:
+        return {"approved": False, "detail": f"未知模式: {target}"}
+    label = policy.MODE_LABELS.get(target, target)
+    current_label = policy.MODE_LABELS.get(config.mode, config.mode)
+    reason = str((payload or {}).get("reason") or "").strip()
+    question = f"Agent 申请切换到「{label}」模式（当前：{current_label}）"
+    if reason:
+        question += f" · 理由: {reason}"
+    with ui.DIALOG_LOCK:
+        req = app.request_ui(
+            "ask",
+            {
+                "question": question,
+                "options": [
+                    {"title": f"允许切换到{label}", "description": "立即切换并写入配置"},
+                    {"title": f"保持{current_label}", "description": "拒绝本次申请，模式不变"},
+                ],
+            },
+        )
+        result = app.wait_ui(req, cancelled)
+    if not isinstance(result, dict):
+        return {"approved": False, "detail": "交互中断"}
+    status = str(result.get("status") or "")
+    if status == "cancelled":
+        return {"approved": False, "detail": "回合已中断"}
+    if status == "timeout":
+        return {"approved": False, "detail": "等待超时，按拒绝处理"}
+    if status == "declined":
+        return {"approved": False, "detail": "用户跳过了本次申请"}
+    if str(result.get("answer") or "").strip() != f"允许切换到{label}":
+        return {"approved": False, "detail": "用户选择了拒绝"}
+    app.mode = target
+    config.mode = target  # 单一事实源 data.ui.mode（Config.mode property）
+    config.save()
+    app.status = f"已切换到{label}"
+    log.info("模式切换申请获批: %s -> %s", current_label, target)
+    return {"approved": True, "detail": "配置已保存。"}
+
+
 def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancelled=None) -> dict:
     """工具确认：先经 tool_confirm 扩展点（插件/外部接口可代答），无处理时
     经 UI 请求桥在主线程弹面板（↑↓ 选择）；取消时按默认拒绝回注"""
@@ -511,11 +564,13 @@ def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancel
             }
     app.pending_tool = {"name": call.get("name"), "arguments": call.get("arguments") or {}}
     try:
-        req = app.request_ui(
-            "confirm",
-            {"name": str(call.get("name") or ""), "arguments": call.get("arguments") or {}},
-        )
-        result = app.wait_ui(req, cancelled)
+        # 对话框串行：并发子代理同时请求确认时逐个弹面板（UI 请求槽只有一个）
+        with ui.DIALOG_LOCK:
+            req = app.request_ui(
+                "confirm",
+                {"name": str(call.get("name") or ""), "arguments": call.get("arguments") or {}},
+            )
+            result = app.wait_ui(req, cancelled)
     finally:
         app.pending_tool = None
         closed_payload = {key: value for key, value in confirm_payload.items() if key != "cancelled"}
@@ -546,13 +601,15 @@ def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancel
 
 
 def _bridge_choose(app: "ui.TuiApp", options, prompt: str, cancelled=None):
-    req = app.request_ui("choose", {"options": options, "prompt": prompt})
-    return app.wait_ui(req, cancelled)
+    with ui.DIALOG_LOCK:
+        req = app.request_ui("choose", {"options": options, "prompt": prompt})
+        return app.wait_ui(req, cancelled)
 
 
 def _bridge_line(app: "ui.TuiApp", prompt: str, config, cancelled=None):
-    req = app.request_ui("line", {"prompt": prompt, "config": config})
-    return app.wait_ui(req, cancelled)
+    with ui.DIALOG_LOCK:
+        req = app.request_ui("line", {"prompt": prompt, "config": config})
+        return app.wait_ui(req, cancelled)
 
 
 def _launch_workflow_editor(ctx, name: str = "") -> None:
@@ -574,6 +631,15 @@ def _launch_workflow_editor(ctx, name: str = "") -> None:
     _echo(ctx, f"工作流编辑器已启动: {name or '（新工作流）'}")
 
 
+def _headless_task_wait_seconds(config) -> float:
+    """无头模式等待后台子代理的上限秒数（subagent.headless_wait_timeout，默认 600）"""
+    raw = ((getattr(config, "data", None) or {}).get("subagent") or {}).get("headless_wait_timeout", 600)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 600.0
+
+
 def _before_turn(text: str) -> str:
     """before_turn 变换链：插件可改写本轮输入（返回 {user_text: ...} 生效），不改写则原样返回"""
     before = hooks.call_hook("before_turn", {"user_text": text}, default=None)
@@ -581,14 +647,17 @@ def _before_turn(text: str) -> str:
     return rewritten if isinstance(rewritten, str) and rewritten.strip() else text
 
 
-def _after_turn(session, user_text: str) -> None:
-    """after_turn 观察链：回合结束通知（正常/中断/异常路径都触发），响应取最后一条 assistant 消息"""
-    last = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
+def _after_turn(session, user_text: str, failed: bool = False) -> None:
+    """after_turn 观察链：回合结束通知（正常/中断/异常路径都触发），响应取最后一条 assistant 消息；
+    请求失败回滚的回合上下文已清空，响应置空避免插件（qbridge 等）取到上一回合的旧答复"""
+    last = None
+    if not failed:
+        last = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
     hooks.collect_hook(
         "after_turn",
         {
             "user_text": user_text,
-            "response": (last or {}).get("content", ""),
+            "response": (last or {}).get("content", "") if not failed else "",
             "session_id": getattr(session, "session_id", ""),
         },
     )
@@ -620,6 +689,16 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
                 _rollback_interrupted_turn(session, app, runner, snap)
             except Exception as exc:
                 log.error("回合打断回滚失败: %r", exc)
+        elif runner is not None and getattr(runner, "_failed_rollback", False):
+            # 请求级失败（400 等确定性错误 / 可重试错误放弃）：整体回滚，失败信息不进上下文
+            runner._failed_rollback = False
+            runner.last_turn_failed = True
+            try:
+                _rollback_failed_turn(session, app, runner, snap)
+            except Exception as exc:
+                log.error("回合失败回滚失败: %r", exc)
+        else:
+            app.last_failed_text = None  # 回合正常收尾：清除失败重发候选
         try:
             session.finalize_turn()
         except Exception as exc:
@@ -636,7 +715,8 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
                 log.debug("使用统计更新失败: %r", exc)
         subagent_mod.unbind_runtime()
         app.streaming_msg = None
-        app.subagent_stream = None
+        # 回合结束只保留仍在跑的后台子代理直播槽（异步任务跨回合存活），其余清掉
+        subagent_mod.retain_running_slots(app, session)
         app.phase_hint = ""
         app.turn_start_time = 0.0
 
@@ -683,6 +763,42 @@ def _rollback_interrupted_turn(session, app, runner, snap=None) -> None:
     except Exception:
         pass
     log.info("Esc 打断回滚：移除消息 %d 条%s", removed, file_note)
+
+
+def _rollback_failed_turn(session, app, runner, snap=None) -> None:
+    """请求失败收尾：整个失败回合出上下文（用户消息/工具记录/错误答复一并截断）、
+    文件还原、用户原话回填输入框并记为 Ctrl+Y 重发候选。
+    回填用 turn_user_text（原始输入）而非消息内容——后者经 @ 引用展开，含内联文件正文。"""
+    start = int(getattr(runner, "turn_start_index", -1))
+    removed = 0
+    removed_msgs: list = []
+    if 0 <= start <= len(session.messages):
+        removed_msgs = list(session.messages[start:])
+        removed = len(removed_msgs)
+        del session.messages[start:]
+    file_note = ""
+    if isinstance(snap, dict) and snap.get("seq"):
+        try:
+            res = snapshot_mod.undo(session.config, session.project_id, session.session_id, snap["seq"])
+            if res:
+                file_note = f" · 文件还原{len(res['restored'])} 删除{len(res['deleted'])} 跳过{len(res['skipped'])}"
+        except Exception as exc:
+            log.warn("失败回滚文件还原出错: %r", exc)
+    text = str(getattr(app, "turn_user_text", "") or "")
+    if not text:
+        # 兜底：从被截断的用户消息取任务文本（极窄场景：turn_user_text 未及设置）
+        for m in removed_msgs:
+            if str(m.get("role")) == "user" and isinstance(m.get("content"), str) and m["content"].strip():
+                text = m["content"]
+                break
+    if text:
+        app.restore_input = text
+        app.last_failed_text = text
+    try:
+        _sync(app, session, status=f"请求失败已回滚（移除 {removed} 条消息{file_note}）· Ctrl+Y 重发", render=False)
+    except Exception:
+        pass
+    log.info("请求失败回滚：移除消息 %d 条%s", removed, file_note)
 
 
 def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
@@ -788,14 +904,32 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     turn = loop_mod.TurnContext(
         session=session, llm=llm, app=app, config=llm.config, user_text=expanded_user_text, io=io
     )
-    # 子代理运行时随回合绑定/解绑：task 工具经此取得 llm/io/app/session
-    subagent_mod.bind_runtime(llm=llm, config=llm.config, io=io, app=app, session=session)
+    # 子代理异步派发运行时由工具调用线程捕获为快照，回合末解绑不影响后台任务
+    subagent_mod.bind_runtime(
+        llm=llm,
+        config=llm.config,
+        io=io,
+        app=app,
+        session=session,
+        runner=runner,
+        # 后台任务的提权确认：交给主线程确认面板（对话框锁串行），批准后用任务的 LLM 执行
+        confirm_bridge=(
+            (lambda task_llm, call, cancelled: _handle_tool_confirm(task_llm, app, session, call, cancelled))
+            if runner is not None else None
+        ),
+        # 后台子代理申请切换访问模式：同一用户面板裁决；批准后模式立即生效，其权限随之提升
+        mode_bridge=lambda payload, cancelled: _handle_mode_switch(app, llm.config, payload, cancelled),
+    )
+
 
     def _bridge_ask(payload: dict) -> dict:
         req = app.request_ui("ask", payload)
         return app.wait_ui(req, _cancelled)
 
     tools_mod.set_ask_user_bridge(_bridge_ask)  # ask_user 工具经此弹面板（回合内有效）
+    tools_mod.set_mode_bridge(
+        lambda payload: _handle_mode_switch(app, llm.config, payload, _cancelled)
+    )
     try:
         if ((getattr(llm.config, "data", None) or {}).get("workflow") or {}).get("enabled", False):
             from core import workflow as workflow_mod  # lazy：仅启用工作流时加载编排层
@@ -812,7 +946,10 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         pass
     finally:
         tools_mod.set_ask_user_bridge(None)
+        tools_mod.set_mode_bridge(None)
         app.last_turn_error = turn.captured.pop("turn_error", None)  # 无头 --json 消费
+        if runner is not None and turn.captured.pop("turn_failed", None):
+            runner._failed_rollback = True  # 请求级失败：回合收尾整体回滚（_agent_turn 执行）
 
 
 class _AgentRunner:
@@ -832,6 +969,9 @@ class _AgentRunner:
         self.last_error = None  # 最近回合的异常文本（无头 --json 消费；交互模式仅诊断用）
         # Esc 打断回滚：标记本轮需回滚到回合前（agent 线程收尾时执行）+ 回合起点消息序号
         self._esc_rollback = False
+        # 请求失败回滚：tool_loop 错误出口置位（_agent_turn_impl 捕获），收尾整体出上下文
+        self._failed_rollback = False
+        self.last_turn_failed = False  # 刚结束的回合是否因请求失败回滚（_after_turn 响应置空）
         self.turn_start_index = 0
         self._queue: list = []
         self._lock = threading.Lock()
@@ -871,6 +1011,23 @@ class _AgentRunner:
         self._thread = t
         t.start()
         return True
+
+    def notify_subagent_completion(self, task_id: str, summary: str) -> None:
+        """后台子代理完成：忙时排入当前回合注入队列，空闲时排入新回合。"""
+        text = (
+            f"[子代理完成通知 id={task_id}]\n{summary}\n"
+            f"如需过程细节，请调用 query_subagent(id=\"{task_id}\")。"
+        )
+        with self._lock:
+            if self.busy:
+                with self.app.inject_lock:
+                    self.app.inject_queue.append(text)
+                return
+            self._queue.append({"text": text, "images": []})
+            self._set_busy(True)
+        thread = threading.Thread(target=self._run, args=(None,), daemon=True, name="bawcode-agent")
+        self._thread = thread
+        thread.start()
 
     def notify(self, text: str) -> None:
         """后台事件通知入口（tools.set_background_notifier 注册）：
@@ -948,7 +1105,9 @@ class _AgentRunner:
                 except Exception:
                     pass
             finally:
-                _after_turn(self.session, text)
+                failed = getattr(self, "last_turn_failed", False)
+                self.last_turn_failed = False
+                _after_turn(self.session, text, failed=failed)
                 try:
                     self.session.save_session()
                 except Exception:
@@ -956,7 +1115,8 @@ class _AgentRunner:
             text = None
 
     def cancel_and_join(self, timeout: float = 3.0) -> None:
-        """退出前中止在途请求并等待线程收尾（限时）"""
+        """退出时中止主请求，并取消/限时等待当前进程内的后台子代理。"""
+        subagent_mod.stop_all_tasks(timeout=max(0.0, timeout * 0.5))
         self.llm.cancel()
         with self._lock:
             self._queue.clear()
@@ -981,6 +1141,7 @@ class _HeadlessApp:
         self.turn_start_time = 0.0
         self.turn_user_text = ""
         self.restore_input = None
+        self.last_failed_text = None
         self.interrupt_turn_handler = None
         self.inject_queue = []
         self.inject_lock = threading.Lock()
@@ -1096,7 +1257,23 @@ def main_headless(args) -> int:
         runner = _AgentRunner(llm, session, app, config)
         tools_mod.set_background_notifier(runner.notify)
         plugins_mod.bind_runtime(app=app, runner=runner)
-        runner._run(text)  # 同线程同步执行：内部含 before_turn/回合/保存收尾
+        # busy 置位：无头下同步跑回合，若不置位，后台子代理完成通知会另起线程并发跑回合
+        runner._set_busy(True)
+        try:
+            runner._run(text)  # 同线程同步执行：内部含 before_turn/回合/保存收尾
+        finally:
+            runner._set_busy(False)
+        # 异步子代理收尾：等后台任务结束，再跑通知回合把结果并入最终答复
+        deadline = time.monotonic() + _headless_task_wait_seconds(config)
+        runner._set_busy(True)
+        try:
+            while subagent_mod.pending_task_count() and time.monotonic() < deadline:
+                subagent_mod.wait_tasks(timeout=min(1.0, max(0.1, deadline - time.monotonic())))
+            if time.monotonic() >= deadline and subagent_mod.pending_task_count():
+                log.warn("无头等待后台子代理超时，仍有 %d 个任务在跑", subagent_mod.pending_task_count())
+            runner._run(None)  # 消化完成通知（无待处理项时立即返回）
+        finally:
+            runner._set_busy(False)
     finally:
         try:
             mcp_mod.shutdown()

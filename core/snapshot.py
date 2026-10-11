@@ -19,6 +19,7 @@ import shutil
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -48,11 +49,19 @@ _INVENTORY_SKIP_DIRS = {
 }
 _EXTERNAL_LIST_CAP = 50  # 对账清单最多列出的外部改动条数
 
-# 当前回合缓冲：begin_turn 置入、end_turn 取走；capture_before 从各写入工具调用
-_TURN: Optional[dict] = None
-# 绑定上下文（config/project_id）：与 enabled 无关，delete_file 的回收站定位用
+# 当前回合缓冲（线程本地）：begin_turn 置入、end_turn 取走，capture_before 写入工具落盘前留底
+_CONTEXT = threading.local()
+# 回收站路径的兜底上下文：线程未绑定 bound 时使用
 _BOUND: Dict[str, Any] = {}
 _LOCK = threading.Lock()
+
+
+def _turn() -> Optional[dict]:
+    return getattr(_CONTEXT, "turn", None)
+
+
+def _bound() -> Dict[str, Any]:
+    return getattr(_CONTEXT, "bound", None) or _BOUND
 
 
 def _int(value: Any, default: int) -> int:
@@ -124,33 +133,35 @@ def _walk_inventory(root: Path, cap: int) -> Optional[Dict[str, Tuple[int, int]]
 # 回合生命周期
 
 
-def begin_turn(config, project_id: str, session_id: str, task: str = "", msg_index: int = -1) -> None:
-    """回合开始：绑定上下文 + 开捕获缓冲 + 建轻量清单。每个回合（含中断/异常路径）必须配对 end_turn。
-    msg_index 为本回合用户消息的绝对序号（树模式 Ctrl+Z 按它定位"哪些回合被移除"）"""
-    global _TURN
+def begin_turn(config, project_id: str, session_id: str, task: str = "", msg_index: int = -1, task_id: str = "") -> None:
+    """回合开始：设置线程本地捕获缓冲；子代理可传 task_id 得到独立快照序列。"""
     cfg = snapshot_cfg(config)
+    bound = {"config": config, "project_id": str(project_id or "")}
     with _LOCK:
-        _BOUND["config"] = config
-        _BOUND["project_id"] = str(project_id or "")
-        _TURN = {
-            "cfg": cfg,
-            "project_id": str(project_id or ""),
-            "session_id": str(session_id or ""),
-            "task": " ".join(str(task or "").split())[:120],
-            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "msg_index": _int(msg_index, -1),
-            "files": {},
-            "inventory": _walk_inventory(Path.cwd(), cfg["inventory_max_files"]) if cfg["enabled"] else None,
-            "bytes_total": 0,
-        }
-        if _TURN["inventory"] is None and cfg["enabled"] and cfg["inventory_max_files"]:
-            log.debug("清单超限，本回合跳过外部改动对账")
+        _BOUND.update(bound)
+    _CONTEXT.bound = bound
+    _CONTEXT.turn = {
+        "cfg": cfg,
+        "project_id": str(project_id or ""),
+        "session_id": str(session_id or ""),
+        "task": " ".join(str(task or "").split())[:120],
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "msg_index": _int(msg_index, -1),
+        "task_id": str(task_id or ""),
+        "files": {},
+        "inventory": (
+            _walk_inventory(Path.cwd(), cfg["inventory_max_files"])
+            if cfg["enabled"] and not task_id else None
+        ),
+        "bytes_total": 0,
+    }
+    if _CONTEXT.turn["inventory"] is None and cfg["enabled"] and cfg["inventory_max_files"]:
+        log.debug("清单超限，本回合跳过外部改动对账")
 
 
 def capture_before(path: Path, tool: str = "") -> None:
-    """写入工具落盘前调用：留底原始字节（同回合同文件首次为准，保证还原到回合开始时）。
-    无活动回合/未启用时 no-op；超限文件只记录不复制（undo 时列为无法还原）"""
-    turn = _TURN
+    """写入工具落盘前调用：在线程本地任务中捕获（同任务同文件首次为准）。"""
+    turn = _turn()
     if turn is None or not turn["cfg"]["enabled"]:
         return
     key = _key(path)
@@ -183,17 +194,28 @@ def capture_before(path: Path, tool: str = "") -> None:
         turn["files"][key] = rec
 
 
+@contextmanager
+def bind_context(config, project_id: str, session_id: str, task_id: str = ""):
+    """在工具线程绑定回合快照上下文；子代理任务用独立序列避免混入主回合 /undo。"""
+    previous_bound = getattr(_CONTEXT, "bound", None)
+    _CONTEXT.bound = {"config": config, "project_id": str(project_id or "")}
+    begin_turn(config, project_id, session_id, task=f"后台子代理 {task_id}", task_id=task_id)
+    try:
+        yield
+    finally:
+        end_turn()
+        _CONTEXT.bound = previous_bound
+
+
 def end_turn() -> Optional[dict]:
-    """回合结束（finally 配对调用）：有捕获或外部改动则落盘快照目录，空回合无副作用。
-    返回摘要 dict（seq/files/external_changes），空回合返回 None"""
-    global _TURN
-    with _LOCK:
-        turn = _TURN
-        _TURN = None
+    """结束当前线程快照：有捕获或外部改动则落盘，空回合无副作用。"""
+    turn = _turn()
+    _CONTEXT.turn = None
     if turn is None:
         return None
     cfg = turn["cfg"]
-    seq_dir = _next_seq_dir(cfg, turn["project_id"], turn["session_id"])
+    session_dir = turn.get("task_id") or turn["session_id"]
+    seq_dir = _next_seq_dir(cfg, turn["project_id"], session_dir)
     seq = int(seq_dir.name)
 
     entries: List[dict] = []
@@ -230,7 +252,7 @@ def end_turn() -> Optional[dict]:
             captured = set(turn["files"])
             # 自身产物不算外部改动：本回合刚写的 blob、移入回收站的文件
             # （前缀比对带分隔符边界，防 project_id 互为前缀时误判）
-            snap_prefix = str(_snapshots_dir(cfg, turn["project_id"], turn["session_id"])) + os.sep
+            snap_prefix = str(_snapshots_dir(cfg, turn["project_id"], session_dir)) + os.sep
             trash_prefix = str(_trash_base(cfg, turn["project_id"])) + os.sep
             for key, (mtime, size) in current.items():
                 before = turn["inventory"].get(key)
@@ -264,7 +286,7 @@ def end_turn() -> Optional[dict]:
         "external_changes": external,
     }
     _atomic_write_bytes(seq_dir / "index.json", json.dumps(index, ensure_ascii=False, indent=1).encode("utf-8"))
-    _prune_old_turns(cfg, turn["project_id"], turn["session_id"], cfg["max_turns"])
+    _prune_old_turns(cfg, turn["project_id"], session_dir, cfg["max_turns"])
     log.info("回合快照已落盘: #%d（%d 个文件，外部改动 %d）", seq, len(entries), len(external))
     return {"seq": seq, "files": len(entries), "external_changes": external}
 
@@ -473,8 +495,9 @@ def restore_turn(config, project_id: str, session_id: str, seq: int) -> Optional
 
 
 def _bound_trash_base() -> Path:
-    cfg = snapshot_cfg(_BOUND.get("config")) if _BOUND.get("config") is not None else dict(_SNAPSHOT_DEFAULTS)
-    return _trash_base(cfg, str(_BOUND.get("project_id") or ""))
+    bound = _bound()
+    cfg = snapshot_cfg(bound.get("config")) if bound.get("config") is not None else dict(_SNAPSHOT_DEFAULTS)
+    return _trash_base(cfg, str(bound.get("project_id") or ""))
 
 
 def trash_base() -> Path:
