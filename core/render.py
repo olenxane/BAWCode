@@ -169,6 +169,11 @@ DEFAULT_COLORS = {
     "cmd": (152, 195, 121),          # 98c379 命令
     "url": (86, 182, 194),           # 56b6c2 URL
     "code_string": (152, 195, 121),  # 98c379 代码字符串
+    # diff 行内背景（叠加在语法高亮之上）：绿增/红删，与 diff 行底色区分
+    "diff_add_bg": (30, 74, 50),     # 1e4a32 增行行背景
+    "diff_del_bg": (86, 30, 40),     # 561e28 删行行背景
+    # 命令行工具：$ 提示符颜色
+    "cmd_prompt": (152, 195, 121),   # 98c379 命令提示符
 }
 
 TIPS = [
@@ -1986,16 +1991,18 @@ class RenderMixin:
         ind = "  "
         out: List[str] = []
         if kind == "cmd":
+            # $ 提示符用 cmd_prompt 色，命令文本用 tool_content 色，视觉分层更清晰
             command = str(meta.get("command") or "")
+            prompt_c = self.c("cmd_prompt")
             for k, ln in enumerate(_wrap(command, max(1, body_w - 2)) or [""]):
-                prefix = "$ " if k == 0 else "  "
-                out.append(gseg + self.c("dim") + _clip(ind + prefix + ln, body_w) + self.RESET)
+                prefix = f"{prompt_c}${self.RESET} " if k == 0 else "  "
+                out.append(gseg + self.c("tool_content") + _clip(ind + prefix + ln, body_w) + self.RESET)
             out_lines = str(meta.get("output") or "").strip().splitlines()
             for ln in out_lines[:_TOOL_CMD_OUTPUT_LINES]:
-                out.append(gseg + self.c("tool_content") + _clip(ind + ln, body_w) + self.RESET)
+                out.append(gseg + self.c("dim") + _clip(ind + "│ " + ln, body_w) + self.RESET)
             extra = len(out_lines) - _TOOL_CMD_OUTPUT_LINES
             if extra > 0:
-                out.append(gseg + self.c("dim") + _clip(ind + f"… 还有 {extra} 行输出", body_w) + self.RESET)
+                out.append(gseg + self.c("dim") + _clip(ind + f"│ … 还有 {extra} 行输出", body_w) + self.RESET)
         elif kind == "write":
             path = str(meta.get("path") or "")
             code = str(meta.get("content") or "")
@@ -2018,14 +2025,17 @@ class RenderMixin:
             lead_w = num_w + 5  # "NN │ + "
             pad = " " * lead_w
             code_w = max(1, body_w - len(ind) - lead_w)
+            # diff 行背景色：主题可配置（diff_add_bg / diff_del_bg），回落默认常量
+            add_bg = _bg(self.colors.get("diff_add_bg", _DIFF_ADD_BG))
+            del_bg = _bg(self.colors.get("diff_del_bg", _DIFF_DEL_BG))
             for gi, (old, new) in enumerate(items):
                 if multi:
                     out.append(gseg + self.c("dim") + _clip(ind + f"—— 第 {gi + 1} 处 ——", body_w) + self.RESET)
                 for marker, lineno, pieces in _diff_wrapped(path, str(old), str(new), code_w, self.c("accent"), base_fg, self.c("dim"), self.c("code_string")):
                     if marker == "+":
-                        mcol, bg = self.c("ok"), _bg(_DIFF_ADD_BG)
+                        mcol, bg = self.c("ok"), add_bg
                     elif marker == "-":
-                        mcol, bg = self.c("err"), _bg(_DIFF_DEL_BG)
+                        mcol, bg = self.c("err"), del_bg
                     else:
                         mcol, bg = self.c("dim"), ""
                     for k, piece in enumerate(pieces):

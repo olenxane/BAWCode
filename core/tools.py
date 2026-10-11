@@ -2277,12 +2277,12 @@ def computer_use(action: str, params: Optional[dict] = None, external_handler=No
 
 @register.register(
     name="write_memory",
-    description="Write a new keyword memory file (global or project scope)",
-    usage="write_memory <keyword> <content> <type>",
+    description="Write a memory entry to a function-named global Markdown file, or create a project keyword memory file",
+    usage="write_memory <function_or_keyword> <content> <type>",
     schema={
         "type": "object",
         "properties": {
-            "keyword": {"type": "string", "description": "Memory keyword, a short phrase used as the file name"},
+            "keyword": {"type": "string", "description": "Global: function/category file name such as Agent; project: memory keyword"},
             "content": {"type": "string", "description": "Memory body in markdown"},
             "type": {
                 "type": "string",
@@ -2294,7 +2294,7 @@ def computer_use(action: str, params: Optional[dict] = None, external_handler=No
     },
 )
 def write_memory(keyword: str, content: str, type: str = "project") -> str:
-    """新建关键词记忆文件；同名关键词已存在时报错引导用 update_memory"""
+    """写入全局功能记忆或新建项目关键词记忆"""
     session = _session()
     if session is None:
         return "记忆会话未初始化"
@@ -2302,19 +2302,20 @@ def write_memory(keyword: str, content: str, type: str = "project") -> str:
         return "参数错误: type 必须为 global 或 project"
     status, key = session.write_memory_file(type, keyword, content)
     if status == "exists":
-        return f"写入失败: 关键词「{key}」的记忆已存在，请改用 update_memory 更新内容"
+        return f"写入失败: 项目关键词「{key}」的记忆已存在，请改用 update_memory 更新内容"
     if status == "invalid":
         return "写入失败: keyword 清洗后为空（含非法字符或过长），请换一个简短关键词"
     if status == "error":
         return "写入失败: 文件系统错误，详见日志"
     scope_name = "全局" if type == "global" else "项目"
-    tip = "该记忆正文将随每轮上下文常驻注入。" if type == "global" else "关键词已入索引，正文需 read_memory 按需读取。"
-    return f"已写入{scope_name}记忆「{key}」。{tip}"
+    action = "已追加到" if status == "appended" else "已写入"
+    tip = "该功能文件随每轮上下文常驻注入。" if type == "global" else "关键词已入索引，正文需 read_memory 按需读取。"
+    return f"{action}{scope_name}记忆「{key}」。{tip}"
 
 
 @register.register(
     name="update_memory",
-    description="Update an existing keyword memory (content rewrite, optional rename)",
+    description="Replace a project keyword memory or the full contents of a global function memory file (optional rename)",
     usage="update_memory <keyword> <content> <type> [new_keyword]",
     schema={
         "type": "object",
@@ -2391,7 +2392,7 @@ def read_memory(keywords: Optional[List[str]] = None) -> str:
 
 @register.register(
     name="delete_memory",
-    description="Delete a keyword memory file (global or project scope)",
+    description="Delete a function-named global memory file or project keyword memory file",
     usage="delete_memory <keyword> <type>",
     schema={
         "type": "object",
