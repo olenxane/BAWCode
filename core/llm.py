@@ -30,13 +30,13 @@ log = get_logger("llm")
 # chat() 取消哨兵：异步回合中断时返回，调用方据此丢弃在途回合
 CANCELLED = "__CANCELLED__"
 
-# 可通过等待解除的 HTTP 状态（限频/服务端瞬态）：自动重试；其余 4xx（401 鉴权、
-# 404 模型不存在、400 参数等确定性失败）直接报错
+# 可自动重试的 HTTP 状态（限频/服务端瞬态）；其余 4xx（401 鉴权、404 模型不存在、
+# 400 参数等确定性失败）不做自动重试，但同样进入错误态并允许用户 Ctrl+Y 手动重试
 _RETRYABLE_STATUS = {408, 409, 429}
 
 
 def _is_retryable_error(e: BaseException) -> bool:
-    """判定异常是否属于可通过时间解除的瞬态错误（自动重试与手动重试等待态的依据）"""
+    """判定异常是否属于可通过时间解除的瞬态错误，仅用于自动重试决策"""
     if isinstance(e, urllib.error.HTTPError):
         return e.code in _RETRYABLE_STATUS or 500 <= e.code <= 599
     # openai SDK：APIStatusError 族携带 status_code；超时/连接错误无码但属瞬态
@@ -701,8 +701,8 @@ class LLM:
                 log.warn("LLM 调用失败(第%d/%d次): %s", attempt, max(retry_times, 0) + 1, e)
                 log.debug("异常详情:\n%s", traceback.format_exc())
                 if not _is_retryable_error(e):
-                    # 401/404/400 等确定性失败：重试无意义，直接报错
-                    log.error("不可自动重试的错误（%s.%s），终止重试", type(e).__module__, type(e).__name__)
+                    # 401/404/400 等确定性失败：不做自动重试，仍可由用户手动重试
+                    log.error("不可自动重试的错误（%s.%s），终止自动重试", type(e).__module__, type(e).__name__)
                     break
                 if attempt > max(retry_times, 0):
                     break
@@ -720,8 +720,6 @@ class LLM:
             "content": "",
             "tool_calls": [],
             "error": f"LLM 调用失败: {last_error}",
-            # 瞬态错误（自动重试已耗尽）允许进入手动重试等待态；确定性失败直接报
-            "retryable": _is_retryable_error(last_error) if last_error else False,
         }
 
     def _normalize(self, data: Any, keep_reasoning: bool = False) -> dict:

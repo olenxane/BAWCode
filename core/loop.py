@@ -167,12 +167,8 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 turn.app.token_meter = llm.meter
             if response.get("error") == CANCELLED or io.cancelled():
                 raise TurnInterrupt()
-            if (
-                response.get("error")
-                and response.get("retryable")
-                and io.wait_llm_retry is not None
-            ):
-                # 手动重试等待态：Ctrl+Y 重发同一请求（不计轮次、不写消息），放弃则走错误路径
+            if response.get("error") and io.wait_llm_retry is not None:
+                # 手动重试等待态：任意错误均允许 Ctrl+Y 重发同一请求（不计轮次、不写消息），放弃则走错误路径
                 io.phase("")  # 停掉思考中转轮，状态行交给等待态提示
                 retry_requested = io.wait_llm_retry(str(response["error"]))
                 check_cancel(turn)

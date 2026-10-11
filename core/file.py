@@ -192,6 +192,8 @@ class CandidateScanner:
             with self._lock:
                 epoch, query, workspace = self._epoch, self._query, self._workspace
             if query is None or epoch == served:
+                # 先清再等：Event 已置位时 wait 立即返回，会空转烧 CPU 抢 GIL
+                self._wake.clear()
                 self._wake.wait(0.2)
                 continue
             self._wake.clear()
