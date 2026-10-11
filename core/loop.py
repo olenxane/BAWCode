@@ -91,8 +91,13 @@ def drain_injections(turn: TurnContext) -> int:
     app = turn.app
     take = getattr(app, "take_injections", None)
     pending = take() if callable(take) else []
-    for text in pending:
-        turn.session.add_message("user", text, type="subagent_notice" if str(text).startswith("[子代理完成通知") else "task")
+    for item in pending:
+        text = str(item.get("text") or "") if isinstance(item, dict) else str(item or "")
+        turn.session.add_message(
+            "user",
+            text,
+            type="subagent_notice" if text.startswith("[子代理完成通知") else "task",
+        )
     if pending:
         turn.io.status(f"新消息 {len(pending)} 条 · 并入当前回合")
         log.info("回合注入新消息: %d 条", len(pending))

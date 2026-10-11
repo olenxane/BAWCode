@@ -374,6 +374,12 @@ def execute_command(
 # execute_command 后台执行：监视线程在进程退出后经 main 注册的 runner.notify 发起新回合通知
 
 _bg_notifier = None  # Callable[[str], None]：main.py 启动 _AgentRunner 后注册 runner.notify
+_bg_origin = threading.local()
+
+
+def set_background_origin(turn_id: Optional[str]) -> None:
+    """设置当前工具执行线程的回合来源，后台命令完成通知沿用该标识。"""
+    _bg_origin.turn_id = turn_id
 
 
 def set_background_notifier(fn) -> None:
@@ -409,6 +415,7 @@ def _execute_command_background(command: str, cwd: Optional[str], argv, stdin_te
     except OSError as e:
         return _with_notice(f"后台启动失败（输出文件不可写）: {e}", notice)
     started = time.monotonic()
+    origin_turn_id = getattr(_bg_origin, "turn_id", None)
     proc = None
     try:
         proc = subprocess.Popen(
@@ -435,7 +442,7 @@ def _execute_command_background(command: str, cwd: Optional[str], argv, stdin_te
     task_id = out_file.stem
     threading.Thread(
         target=_bg_watch,
-        args=(proc, fh, command, str(out_file), task_id, started),
+        args=(proc, fh, command, str(out_file), task_id, started, origin_turn_id),
         daemon=True,
         name=f"bawcode-bg-{task_id}",
     ).start()
@@ -448,7 +455,8 @@ def _execute_command_background(command: str, cwd: Optional[str], argv, stdin_te
     )
 
 
-def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: str, started: float) -> None:
+def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: str, started: float,
+              origin_turn_id: Optional[str] = None) -> None:
     """后台监视线程：进程退出后关文件句柄并通知，无通道时仅落日志"""
     try:
         code = proc.wait()
@@ -470,7 +478,13 @@ def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: 
         log.info("后台任务完成（无通知通道，未投递）: id=%s 退出码=%s", task_id, code)
         return
     try:
-        fn(note)
+        fn(note, origin_turn_id)
+    except TypeError:
+        # 兼容历史的一参通知回调。
+        try:
+            fn(note)
+        except Exception as exc:
+            log.error("后台任务通知投递失败 id=%s: %r", task_id, exc)
     except Exception as exc:
         log.error("后台任务通知投递失败 id=%s: %r", task_id, exc)
 

@@ -470,7 +470,17 @@ def _emit_completion(task: dict) -> None:
     notify = getattr(runner, "notify_subagent_completion", None)
     if callable(notify):
         try:
-            notify(task["id"], task.get("summary") or f"子代理 #{task['id']} 状态：{task.get('status')}")
+            notify(
+                task["id"],
+                task.get("summary") or f"子代理 #{task['id']} 状态：{task.get('status')}",
+                origin_turn_id=task.get("origin_turn_id"),
+            )
+        except TypeError:
+            # 兼容只实现旧签名的 runner 测试替身/外部集成。
+            try:
+                notify(task["id"], task.get("summary") or f"子代理 #{task['id']} 状态：{task.get('status')}")
+            except Exception as exc:
+                log.error("子代理完成通知失败 #%s: %r", task["id"], exc)
         except Exception as exc:
             log.error("子代理完成通知失败 #%s: %r", task["id"], exc)
 
@@ -513,7 +523,7 @@ def _background_task_worker(task: dict, record: dict, cfg: dict, directory: Path
     record["artifacts"] = extract_artifacts(messages)
     record["record_path"] = str(record_path or "")
     record_path = _save_record(directory, record) or record_path
-    # 会话树节点（type=subagent，仅 UI 展示，不进 API）：完成后落一条，记录轨迹可展开
+    # 会话树节点（UI）
     session = task.get("session")
     if session is not None:
         try:
@@ -567,6 +577,7 @@ def submit_task(rt: dict, record: dict, cfg: dict, directory: Path, record_path:
         "config": rt["config"],
         "session": rt.get("session"),
         "runner": runner,
+        "origin_turn_id": rt.get("origin_turn_id"),
         "app": rt.get("app"),
         "confirm_bridge": rt.get("confirm_bridge"),
         # 模式切换申请桥（payload, cancelled）-> {"approved", "detail"}；无交互环境为 None

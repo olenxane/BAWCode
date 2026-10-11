@@ -1,4 +1,4 @@
-#该部分为程序的主逻辑，调用各个模块实现完整功能
+"""main.py:程序核心入口"""
 import json
 import os
 import sys
@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -91,6 +91,9 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         if not data:
             _echo(ctx, f"会话加载失败: {result.get('id')}")
             return True
+        runner = getattr(ctx["app"], "agent_runner", None)
+        if runner is not None:
+            runner.discard_pending_turn()
         sess.save_session()
         sess.switch_to(data)
         ctx["app"]._tree_follow_tail = True  # 切换后贴底显示恢复的消息
@@ -100,6 +103,9 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
     @commands.register("/new", hint="新建会话 · 当前会话已保存", source="builtin")
     def _new(ctx, args):
         sess = ctx["session"]
+        runner = getattr(ctx["app"], "agent_runner", None)
+        if runner is not None:
+            runner.discard_pending_turn()
         sess.save_session()
         sess.start_new_session()
         ctx["app"].task = ""
@@ -108,6 +114,9 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
 
     @commands.register("/clear", hint="清空当前会话 · 恢复为空对话", source="builtin")
     def _clear(ctx, args):
+        runner = getattr(ctx["app"], "agent_runner", None)
+        if runner is not None:
+            runner.discard_pending_turn()
         ctx["session"].clear()
         ctx["app"].task = ""
         ctx["app"].status = "会话已清空"
@@ -189,7 +198,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         ctx["app"].status = policy.MODE_LABELS[ctx["app"].mode]
         return True
 
-    @commands.register("/security", hint="删除安全护栏 · /security [on|off]", usage="/security [on|off]", source="builtin")
+    @commands.register("/security", hint="关闭删除安全护栏 · /security [on|off]", usage="/security [on|off]", source="builtin")
     def _security(ctx, args):
         security_cfg = ctx["config"].data.setdefault("security", {})
         arg = (args or "").strip().lower()
@@ -202,7 +211,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         enabled = bool(security_cfg.get("delete_guard", True))
         state = "开启" if enabled else "关闭"
         ctx["app"].status = f"删除安全护栏{state}"
-        _echo(ctx, f"删除安全护栏已{state}：" + ("shell 删除命令会移入项目回收站" if enabled else "shell 删除命令将直接执行"))
+        _echo(ctx, f"删除安全护栏已{state}：" + ("删除命令会移入项目回收站" if enabled else "删除命令将直接执行"))
         return True
 
     @commands.register("/theme", hint="主题 /theme [名称]", usage="/theme [dark|ocean]", source="builtin")
@@ -311,7 +320,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
                     f"  #{t['seq']} · {t['time']} · {t['files']} 文件（可还原 {t['restorable']}）"
                     f" · {t['task'] or '（无任务摘要）'}"
                 )
-            lines.append("提示: /undo 回滚最近回合 · /undo <序号> 回滚指定回合 · 事后改过的文件会跳过")
+            lines.append("提示: /undo 回滚最近回合 · /undo <序号> 回滚指定回合 · 非本回合修改的文件会跳过")
             _echo(ctx, "\n".join(lines))
             return True
         result = snapshot_mod.undo(
@@ -335,13 +344,13 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         _echo(ctx, "\n".join(lines), mtype="help")
         return True
 
-    @commands.register("/clear-trash", hint="清空项目回收站（真正不可逆删除）", source="builtin")
+    @commands.register("/clear-trash", hint="清空项目回收站（不可逆）", source="builtin")
     def _clear_trash(ctx, args):
         count, size = snapshot_mod.clear_trash(ctx["config"], ctx["session"].project_id)
         if count:
             _echo(ctx, f"回收站已清空: {count} 项，释放 {size} 字节")
         else:
-            _echo(ctx, "回收站已是空的")
+            _echo(ctx, "回收站里没有东西")
         ctx["app"].status = "回收站已清空" if count else "回收站为空"
         return True
 
@@ -354,7 +363,8 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         "/workflow", hint="工作流 · 列表/切换/停用/编辑", usage="/workflow [名称|off|edit [名称]]", source="builtin"
     )
     def _workflow(ctx, args):
-        from core import workflow as workflow_mod  # lazy：直接对话路径不加载工作流模块
+        from core import workflow as workflow_mod
+        #直接对话路径不加载工作流模块
 
         arg = (args or "").strip()
         parts = arg.split(maxsplit=1)
@@ -564,7 +574,7 @@ def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancel
             }
     app.pending_tool = {"name": call.get("name"), "arguments": call.get("arguments") or {}}
     try:
-        # 对话框串行：并发子代理同时请求确认时逐个弹面板（UI 请求槽只有一个）
+        # 对话框串行：并发子代理同时请求确认时逐个弹面板
         with ui.DIALOG_LOCK:
             req = app.request_ui(
                 "confirm",
@@ -614,11 +624,7 @@ def _bridge_line(app: "ui.TuiApp", prompt: str, config, cancelled=None):
 
 def _launch_workflow_editor(ctx, name: str = "") -> None:
     """子进程拉起 PySide6 工作流编辑器（独立事件循环，不阻塞 TUI）"""
-    try:
-        import PySide6  # noqa: F401
-    except ImportError:
-        _echo(ctx, "工作流编辑器需要 PySide6：pip install PySide6")
-        return
+    import PySide6#此处不进行错误处理，pyside6作为必须依赖库不会发生不存在的情况，不要过度防御
     import subprocess
 
     kwargs = {}
@@ -649,7 +655,7 @@ def _before_turn(text: str) -> str:
 
 def _after_turn(session, user_text: str, failed: bool = False) -> None:
     """after_turn 观察链：回合结束通知（正常/中断/异常路径都触发），响应取最后一条 assistant 消息；
-    请求失败回滚的回合上下文已清空，响应置空避免插件（qbridge 等）取到上一回合的旧答复"""
+    请求失败时响应置空，避免插件（qbridge 等）误把错误答复当成正常完成内容"""
     last = None
     if not failed:
         last = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
@@ -682,27 +688,108 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
             snap = snapshot_mod.end_turn()  # 回合快照落盘（中断/异常路径同样收尾；空回合无副作用）
         except Exception as exc:
             log.error("回合快照收尾失败: %r", exc)
-        # Esc 打断：回合收尾后按回合起点回滚会话与文件，并把用户输入回填输入框
-        if runner is not None and getattr(runner, "_esc_rollback", False):
-            runner._esc_rollback = False
+        # Esc/用户新消息丢弃挂起上下文；请求失败仅挂起，不立即清理或还原文件。
+        pending_to_discard = None
+        failed_pending = False
+        interrupted = False
+        if runner is not None:
+            with runner._lock:
+                pending = runner.pending_failed_turn
+                interrupted = runner._esc_rollback
+                abandon = runner._abandon_pending
+                failed = runner._failed_rollback
+                runner._esc_rollback = False
+                runner._abandon_pending = False
+                runner._failed_rollback = False
+
+                if interrupted and pending:
+                    if snap:
+                        pending["snapshots"].append(snap)
+                    pending_to_discard = pending
+                    runner._discarded_turn_ids.add(pending.get("turn_id"))
+                    runner.pending_failed_turn = None
+                elif interrupted and abandon:
+                    # 重试等待态按 Esc 放弃：直接丢弃完整失败回合。
+                    pending_to_discard = {
+                        "start_index": runner.turn_start_index,
+                        "snapshots": [snap] if snap else [],
+                    }
+                elif interrupted:
+                    pass  # 普通 Esc 中断仍按当前回合起点回滚
+                elif abandon and pending:
+                    if snap:
+                        pending["snapshots"].append(snap)
+                    pending_to_discard = pending
+                    runner._discarded_turn_ids.update(pending.get("turn_ids") or [pending.get("turn_id")])
+                    runner.pending_failed_turn = None
+                elif abandon:
+                    # 用户在错误重试等待窗口提交新消息：当前错误回合尚未进入挂起态，但仍按原始回合起点一并丢弃。
+                    pending_to_discard = {
+                        "start_index": runner.turn_start_index,
+                        "snapshots": [snap] if snap else [],
+                    }
+                    if runner.active_turn_id:
+                        runner._discarded_turn_ids.add(runner.active_turn_id)
+                elif (
+                    runner._continuing_pending
+                    and pending
+                    and runner._active_same_turn_call
+                    and getattr(app, "_turn_injected_users", None)
+                ):
+                    if snap:
+                        pending["snapshots"].append(snap)
+                    pending_to_discard = pending
+                    runner._discarded_turn_ids.update(pending.get("turn_ids") or [pending.get("turn_id")])
+                    runner.pending_failed_turn = None
+                elif failed:
+                    runner.last_turn_failed = True
+                    failed_pending = True
+                    if pending:
+                        turn_ids = pending.setdefault("turn_ids", [])
+                        if runner.active_turn_id and runner.active_turn_id not in turn_ids:
+                            turn_ids.append(runner.active_turn_id)
+                        if snap:
+                            pending["snapshots"].append(snap)
+                    else:
+                        pending = {
+                            "start_index": runner.turn_start_index,
+                            "turn_ids": [runner.active_turn_id] if runner.active_turn_id else [],
+                            "snapshots": [snap] if snap else [],
+                            "turn_id": runner.active_turn_id,
+                        }
+                        runner.pending_failed_turn = pending
+            if interrupted and pending_to_discard is None:
+                try:
+                    _rollback_interrupted_turn(session, app, runner, snap)
+                except Exception as exc:
+                    log.error("回合打断回滚失败: %r", exc)
+            elif pending_to_discard is not None:
+                try:
+                    _rollback_failed_turn(session, app, runner, pending=pending_to_discard)
+                except Exception as exc:
+                    log.error("挂起回合丢弃失败: %r", exc)
+            elif failed_pending:
+                app.last_failed_text = None
+                try:
+                    _hold_failed_turn(session, app, runner)
+                except Exception as exc:
+                    log.error("失败回合挂起失败: %r", exc)
+            else:
+                app.last_failed_text = None
+        if runner is not None:
+            with runner._lock:
+                runner.active_turn_id = None
+                runner._active_dispatch_origin = None
+                runner._active_is_background_call = False
+                runner._active_same_turn_call = False
+                runner._continuing_pending = False
+
+        # 挂起时不整理上下文：保留完整失败轮次，供命令/模型切换与后台通知后重用。
+        if not failed_pending and pending_to_discard is None:
             try:
-                _rollback_interrupted_turn(session, app, runner, snap)
+                session.finalize_turn()
             except Exception as exc:
-                log.error("回合打断回滚失败: %r", exc)
-        elif runner is not None and getattr(runner, "_failed_rollback", False):
-            # 请求级失败（400 等确定性错误 / 可重试错误放弃）：整体回滚，失败信息不进上下文
-            runner._failed_rollback = False
-            runner.last_turn_failed = True
-            try:
-                _rollback_failed_turn(session, app, runner, snap)
-            except Exception as exc:
-                log.error("回合失败回滚失败: %r", exc)
-        else:
-            app.last_failed_text = None  # 回合正常收尾：清除失败重发候选
-        try:
-            session.finalize_turn()
-        except Exception as exc:
-            log.error("回合末上下文维护失败: %r", exc)
+                log.error("回合末上下文维护失败: %r", exc)
         if stats and stats_handle:
             try:
                 stats.end_turn(
@@ -719,6 +806,9 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
         subagent_mod.retain_running_slots(app, session)
         app.phase_hint = ""
         app.turn_start_time = 0.0
+        if runner is not None:
+            with runner._lock:
+                runner._turn_active = False
 
 
 def _rollback_interrupted_turn(session, app, runner, snap=None) -> None:
@@ -765,40 +855,49 @@ def _rollback_interrupted_turn(session, app, runner, snap=None) -> None:
     log.info("Esc 打断回滚：移除消息 %d 条%s", removed, file_note)
 
 
-def _rollback_failed_turn(session, app, runner, snap=None) -> None:
-    """请求失败收尾：整个失败回合出上下文（用户消息/工具记录/错误答复一并截断）、
-    文件还原、用户原话回填输入框并记为 Ctrl+Y 重发候选。
-    回填用 turn_user_text（原始输入）而非消息内容——后者经 @ 引用展开，含内联文件正文。"""
-    start = int(getattr(runner, "turn_start_index", -1))
-    removed = 0
-    removed_msgs: list = []
-    if 0 <= start <= len(session.messages):
-        removed_msgs = list(session.messages[start:])
-        removed = len(removed_msgs)
-        del session.messages[start:]
-    file_note = ""
-    if isinstance(snap, dict) and snap.get("seq"):
-        try:
-            res = snapshot_mod.undo(session.config, session.project_id, session.session_id, snap["seq"])
-            if res:
-                file_note = f" · 文件还原{len(res['restored'])} 删除{len(res['deleted'])} 跳过{len(res['skipped'])}"
-        except Exception as exc:
-            log.warn("失败回滚文件还原出错: %r", exc)
-    text = str(getattr(app, "turn_user_text", "") or "")
-    if not text:
-        # 兜底：从被截断的用户消息取任务文本（极窄场景：turn_user_text 未及设置）
-        for m in removed_msgs:
-            if str(m.get("role")) == "user" and isinstance(m.get("content"), str) and m["content"].strip():
-                text = m["content"]
-                break
-    if text:
-        app.restore_input = text
-        app.last_failed_text = text
+def _hold_failed_turn(session, app, runner) -> None:
+    """请求失败时保留本轮消息、文件状态与快照，等待用户操作或后台通知唤醒。"""
+    state = runner.pending_failed_turn
+    count = len(session.messages) - int((state or {}).get("start_index", runner.turn_start_index))
     try:
-        _sync(app, session, status=f"请求失败已回滚（移除 {removed} 条消息{file_note}）· Ctrl+Y 重发", render=False)
+        _sync(
+            app,
+            session,
+            status=f"请求失败 · 已挂起本轮上下文（保留 {max(0, count)} 条消息）· 命令/切模型可用；新消息或 Esc 丢弃",
+            render=False,
+        )
     except Exception:
         pass
-    log.info("请求失败回滚：移除消息 %d 条%s", removed, file_note)
+    log.info("请求失败回合已挂起：保留消息 %d 条", max(0, count))
+
+
+def _rollback_failed_turn(session, app, runner, snap=None, pending=None) -> None:
+    """显式丢弃已挂起的失败回合：截断会话并按逆序还原挂起期间的文件快照，不回填输入。"""
+    state = pending or getattr(runner, "pending_failed_turn", None)
+    start = int((state or {}).get("start_index", getattr(runner, "turn_start_index", -1)))
+    removed = 0
+    if 0 <= start <= len(session.messages):
+        removed = len(session.messages) - start
+        del session.messages[start:]
+    file_note = ""
+    snapshots = list((state or {}).get("snapshots") or [])
+    if snap:
+        snapshots.append(snap)
+    for item in reversed(snapshots):
+        if not isinstance(item, dict) or not item.get("seq"):
+            continue
+        try:
+            res = snapshot_mod.undo(session.config, session.project_id, session.session_id, item["seq"])
+            if res:
+                file_note += f" · 文件还原{len(res['restored'])} 删除{len(res['deleted'])} 跳过{len(res['skipped'])}"
+        except Exception as exc:
+            log.warn("挂起回合文件还原出错: %r", exc)
+    app.last_failed_text = None
+    try:
+        _sync(app, session, status=f"已丢弃挂起回合（移除 {removed} 条消息{file_note}）", render=False)
+    except Exception:
+        pass
+    log.info("挂起回合已丢弃：移除消息 %d 条%s", removed, file_note)
 
 
 def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
@@ -833,8 +932,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         _syncq(status="已中断")
 
     def _on_delta(kind: str, piece: str) -> None:
-        # 流式回调（agent 线程）：只改 UI 状态不渲染——流式对象挂在 app.streaming_msg，
-        # 不进 session.messages（半成品不落盘/不进 API），帧循环每帧读它画树尾直播
+        # 流式回调（agent 线程）：只改 UI 状态不渲染——流式对象挂在 app.streaming_msg，不进 session.messages，帧循环每帧读它画树尾直播
         if kind == "reset":
             app.streaming_msg = None
             hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
@@ -855,7 +953,12 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     # 回合起点：消息序号供 Esc 打断回滚切割；时间与 token 基线供提示行显示用时/本轮消耗
     if runner is not None:
         runner.turn_start_index = len(session.messages)
-        runner._esc_rollback = False  # 清掉上一回合竞态残留的打断标记，避免误回滚本轮
+        if runner.pending_failed_turn is not None and runner._continuing_pending:
+            runner.active_turn_id = runner.pending_failed_turn.get("turn_id")
+        else:
+            runner.active_turn_id = uuid.uuid4().hex
+        tools_mod.set_background_origin(runner.active_turn_id)
+        runner._esc_rollback = False
     app.turn_start_time = time.monotonic()
     app.turn_user_text = user_text
     if app.token_meter is not None:
@@ -886,9 +989,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         _aborted()
         return
 
-    # 回合驱动：未启用工作流=直接对话（core/loop 回合运行时）；启用时按
-    # data/workflows/<active>.json 的节点链运行（系统提示词注入/分析/规划/编码
-    # 等均为节点，增删改走编辑器或直接改 JSON）
+    # 回合驱动：未启用工作流=直接对话（core/loop 回合运行时）；启用时按data/workflows/<active>.json 的节点链运行
     retry_wait = getattr(app, "wait_llm_retry", None)  # 无头桩无此方法：不提供手动重试
     io = loop_mod.TurnIO(
         status=_set_status,
@@ -912,7 +1013,8 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         app=app,
         session=session,
         runner=runner,
-        # 后台任务的提权确认：交给主线程确认面板（对话框锁串行），批准后用任务的 LLM 执行
+        origin_turn_id=getattr(runner, "active_turn_id", None),
+        # 后台任务的提权确认：交给主线程确认面板，批准后用任务的 LLM 执行
         confirm_bridge=(
             (lambda task_llm, call, cancelled: _handle_tool_confirm(task_llm, app, session, call, cancelled))
             if runner is not None else None
@@ -947,6 +1049,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     finally:
         tools_mod.set_ask_user_bridge(None)
         tools_mod.set_mode_bridge(None)
+        tools_mod.set_background_origin(None)
         app.last_turn_error = turn.captured.pop("turn_error", None)  # 无头 --json 消费
         if runner is not None and turn.captured.pop("turn_failed", None):
             runner._failed_rollback = True  # 请求级失败：回合收尾整体回滚（_agent_turn 执行）
@@ -969,9 +1072,18 @@ class _AgentRunner:
         self.last_error = None  # 最近回合的异常文本（无头 --json 消费；交互模式仅诊断用）
         # Esc 打断回滚：标记本轮需回滚到回合前（agent 线程收尾时执行）+ 回合起点消息序号
         self._esc_rollback = False
-        # 请求失败回滚：tool_loop 错误出口置位（_agent_turn_impl 捕获），收尾整体出上下文
+        self._turn_active = False
+        self.active_turn_id = None
+        self._active_dispatch_origin = None
+        self._active_is_background_call = False
+        self._active_same_turn_call = False
+        self._discarded_turn_ids: set = set()
+        self._continuing_pending = False
+        # 请求失败待用户决策
+        self.pending_failed_turn = None
+        self._abandon_pending = False
         self._failed_rollback = False
-        self.last_turn_failed = False  # 刚结束的回合是否因请求失败回滚（_after_turn 响应置空）
+        self.last_turn_failed = False
         self.turn_start_index = 0
         self._queue: list = []
         self._lock = threading.Lock()
@@ -993,48 +1105,227 @@ class _AgentRunner:
             pass
 
     def interrupt_for_rollback(self) -> bool:
-        """Esc 打断当前回合：取消在途请求并标记本轮回滚。
-        会话/文件回滚与输入回填由 agent 线程收尾执行（session 写入单写者）。"""
-        if not self.busy:
-            return False
-        self._esc_rollback = True
-        self.llm.cancel()
+        """Esc 丢弃当前/挂起回合；活动回合由 agent 线程收尾，处于错误挂起态立即丢弃。"""
+        with self._lock:
+            if self.busy and self._turn_active:
+                self._esc_rollback = True
+                if getattr(self.app, "_llm_retry_gate", None) is not None:
+                    self._abandon_pending = True
+                self.llm.cancel()
+                return True
+            pending = self.pending_failed_turn
+            if pending is None:
+                return False
+            self.pending_failed_turn = None
+            if self.busy:
+                self._queue.clear()
+            try:
+                _rollback_failed_turn(self.session, self.app, self, pending=pending)
+            except Exception as exc:
+                log.error("Esc 丢弃挂起回合失败: %r", exc)
         return True
+
+    def discard_pending_turn(self) -> bool:
+        """显式清理挂起回合（例如 /clear、/new、/resume 替换会话前）。"""
+        with self._lock:
+            pending = self.pending_failed_turn
+            self.pending_failed_turn = None
+            if pending is None:
+                return False
+            try:
+                _rollback_failed_turn(self.session, self.app, self, pending=pending)
+            except Exception as exc:
+                log.error("清理挂起回合失败: %r", exc)
+            return True
+
+    def _discard_pending_for_user_message(self) -> bool:
+        """新用户请求开始前丢弃失败挂起回合；必须在 agent 接管 session 前执行。"""
+        with self._lock:
+            pending = self.pending_failed_turn
+            self.pending_failed_turn = None
+            if pending is None:
+                return False
+            self._discarded_turn_ids.update(pending.get("turn_ids") or [pending.get("turn_id")])
+            try:
+                _rollback_failed_turn(self.session, self.app, self, pending=pending)
+            except Exception as exc:
+                log.error("新消息丢弃挂起回合失败: %r", exc)
+            return True
+
+    def _drop_injected_calls_for_turn(self, turn_id: str) -> None:
+        with self.app.inject_lock:
+            self.app.inject_queue = [
+                item for item in self.app.inject_queue
+                if not (
+                    isinstance(item, dict)
+                    and item.get("background_call")
+                    and item.get("origin_turn_id") == turn_id
+                )
+            ]
+
+    def _clear_pending_for_recovery(self) -> None:
+        """挂起轮被外部调用成功续跑后仅清状态，不回滚其上下文/文件。"""
+        with self._lock:
+            self.pending_failed_turn = None
 
     def start(self, text: str, images=None) -> bool:
         with self._lock:
             if self.busy:
                 return False
             self._set_busy(True)
-        item = {"text": text, "images": list(images or [])}
-        t = threading.Thread(target=self._run, args=(item,), daemon=True, name="bawcode-agent")
+            item = {"text": text, "images": list(images or [])}
+            if self.pending_failed_turn is not None:
+                item["_user_submission"] = True
+                self._queue.insert(0, item)
+                first = None
+            else:
+                first = item
+        t = threading.Thread(target=self._run, args=(first,), daemon=True, name="bawcode-agent")
         self._thread = t
         t.start()
         return True
 
-    def notify_subagent_completion(self, task_id: str, summary: str) -> None:
+    def notify_subagent_completion(self, task_id: str, summary: str, origin_turn_id: str = None) -> None:
         """后台子代理完成：忙时排入当前回合注入队列，空闲时排入新回合。"""
         text = (
             f"[子代理完成通知 id={task_id}]\n{summary}\n"
             f"如需过程细节，请调用 query_subagent(id=\"{task_id}\")。"
         )
-        with self._lock:
-            if self.busy:
-                with self.app.inject_lock:
-                    self.app.inject_queue.append(text)
-                return
-            self._queue.append({"text": text, "images": []})
-            self._set_busy(True)
-        thread = threading.Thread(target=self._run, args=(None,), daemon=True, name="bawcode-agent")
-        self._thread = thread
-        thread.start()
+        self.notify(text, origin_turn_id=origin_turn_id)
 
-    def notify(self, text: str) -> None:
+    def notify(self, text: str, origin_turn_id: str = None) -> None:
         """后台事件通知入口（tools.set_background_notifier 注册）：
-        idle 直接开新回合，busy 入队接力——不打断在途回合"""
+        idle 开新请求，busy 时并入当前请求；origin_turn_id 标识产生调用的回合。"""
+        item = {
+            "text": text,
+            "images": [],
+            "_background_call": True,
+            "_origin_turn_id": origin_turn_id,
+            "background_call": True,
+            "origin_turn_id": origin_turn_id,
+        }
         with self._lock:
-            self._queue.append(text)
+            if origin_turn_id and origin_turn_id in self._discarded_turn_ids:
+                log.info("忽略已丢弃回合的后台调用通知: origin=%s", origin_turn_id)
+                return
             if self.busy:
+                if self.pending_failed_turn is not None and not self._turn_active:
+                    self._queue.append(item)
+                    return
+                if self._turn_active:
+                    if (
+                        self.pending_failed_turn is not None
+                        and origin_turn_id in set(
+                            self.pending_failed_turn.get("turn_ids") or [self.pending_failed_turn.get("turn_id")]
+                        )
+                    ):
+                        self._active_same_turn_call = True
+                        # 用户已经注入本请求时，本回合派生调用与用户输入冲突：
+                        # 把用户输入留作独立新回合，并丢弃整个挂起回合。
+                        with self.app.inject_lock:
+                            queued_users = [
+                                entry for entry in self.app.inject_queue
+                                if not isinstance(entry, dict) or entry.get("user_submission")
+                            ]
+                            if queued_users:
+                                self.app.inject_queue = [
+                                    entry for entry in self.app.inject_queue
+                                    if entry not in queued_users
+                                ]
+                                self._queue[0:0] = [
+                                    {
+                                        "text": entry.get("text", "") if isinstance(entry, dict) else str(entry),
+                                        "images": [],
+                                        "_user_submission": True,
+                                    }
+                                    for entry in queued_users
+                                ]
+                                self._abandon_pending = True
+                                self.llm.cancel()
+                                return
+                    with self.app.inject_lock:
+                        self.app.inject_queue.append(item)
+                else:
+                    self._queue.append(item)
+                return
+            self._queue.append(item)
+            self._set_busy(True)
+        t = threading.Thread(target=self._run, args=(None,), daemon=True, name="bawcode-agent")
+        self._thread = t
+        t.start()
+
+    @staticmethod
+    def _join_dispatch_text(user_text: str, calls: list) -> str:
+        parts = [str(user_text or "").strip()]
+        parts.extend(str(item.get("text") or "").strip() for item in calls)
+        return "\n\n".join(part for part in parts if part)
+
+    def _prepare_pending_dispatch(self, item: dict) -> dict:
+        """队列尚未启动时仲裁挂起请求、用户输入与后台调用。"""
+        with self._lock:
+            pending = self.pending_failed_turn
+            if pending is None:
+                return item
+            queued = [
+                entry for entry in self._queue
+                if isinstance(entry, dict) and (entry.get("_user_submission") or entry.get("_background_call"))
+            ]
+            candidates = [item, *queued]
+            users = [entry for entry in candidates if entry.get("_user_submission")]
+            calls = [entry for entry in candidates if entry.get("_background_call")]
+            if not users:
+                # 仅后台调用唤醒：无论来源如何均保留挂起上下文。
+                if calls:
+                    self._queue = [entry for entry in self._queue if entry not in queued]
+                    item = dict(calls[0])
+                    item["text"] = self._join_dispatch_text("", calls)
+                    item["_continuing_pending"] = True
+                    pending_ids = set(pending.get("turn_ids") or [pending.get("turn_id")])
+                    item["_has_same_turn_call"] = any(
+                        call.get("_origin_turn_id") in pending_ids for call in calls
+                    )
+                return item
+
+            pending_ids = set(pending.get("turn_ids") or [pending.get("turn_id")])
+            own_calls = [call for call in calls if call.get("_origin_turn_id") in pending_ids]
+            if own_calls:
+                self._queue = [entry for entry in self._queue if entry not in queued]
+                return {
+                    "text": self._join_dispatch_text("", users),
+                    "images": list(users[0].get("images") or []),
+                    "_user_submission": True,
+                    "_discard_pending": True,
+                }
+
+            # 外部/其他回合调用与用户输入合并，挂起的失败轮次继续保留在 payload 中。
+            if not calls:
+                self._queue = [entry for entry in self._queue if entry not in queued]
+                return {
+                    "text": self._join_dispatch_text("", users),
+                    "images": list(users[0].get("images") or []),
+                    "_user_submission": True,
+                    "_discard_pending": True,
+                }
+            self._queue = [entry for entry in self._queue if entry not in queued]
+            return {
+                "text": self._join_dispatch_text("", users + calls),
+                "images": list(users[0].get("images") or []),
+                "_user_submission": True,
+                "_preserve_pending": True,
+                "_continuing_pending": True,
+                "_has_same_turn_call": False,
+            }
+    def _queue_user_message(self, text: str, images=None) -> None:
+        """排入明确由用户提交的新任务。"""
+        user_item = {"text": text, "images": list(images or []), "_user_submission": True}
+        with self._lock:
+            self._queue.append(user_item)
+            if self.busy:
+                if self.pending_failed_turn is not None and self._turn_active:
+                    pending_ids = set(self.pending_failed_turn.get("turn_ids") or [self.pending_failed_turn.get("turn_id")])
+                    if self._active_same_turn_call or self._active_dispatch_origin in pending_ids:
+                        self._abandon_pending = True
+                        self.llm.cancel()
                 return
             self._set_busy(True)
         t = threading.Thread(target=self._run, args=(None,), daemon=True, name="bawcode-agent")
@@ -1042,13 +1333,24 @@ class _AgentRunner:
         t.start()
 
     def inject_turn(self, text: str) -> str:
-        """回合中插话（普通 Enter）：并入当前回合，由回合循环取走作为 user 消息"""
+        """普通 Enter 插话；挂起失败轮时按调用来源与用户输入仲裁。"""
         take = getattr(self.app, "take_injections", None)
         with self._lock:
             if take is not None and self.busy:
+                if self.pending_failed_turn is not None and not self._turn_active:
+                    self._queue.append({"text": text, "images": [], "_user_submission": True})
+                    return "[已排队，等待与后台调用仲裁]"
+                if self.pending_failed_turn is not None and self._turn_active:
+                    pending_ids = set(self.pending_failed_turn.get("turn_ids") or [self.pending_failed_turn.get("turn_id")])
+                    if self._active_dispatch_origin in pending_ids:
+                        self._drop_injected_calls_for_turn(self.pending_failed_turn.get("turn_id"))
+                        self._queue.insert(0, {"text": text, "images": [], "_user_submission": True})
+                        self._abandon_pending = True
+                        self.llm.cancel()
+                        return "[已丢弃本回合调用及挂起上下文，用户消息开始新回合]"
                 with self.app.inject_lock:
                     self.app.inject_queue.append(text)
-                return "[插话已并入当前回合]"
+                return "[插话已并入当前请求]"
         return self.queue_turn(text)
 
     def queue_turn(self, text: str, images=None) -> str:
@@ -1067,7 +1369,7 @@ class _AgentRunner:
 
     def notify_message(self, text: str, images=None) -> None:
         """以通知入口原子接力，避免回合退忙时留下孤立队列。"""
-        self.notify({"text": text, "images": list(images or [])})
+        self._queue_user_message(text, images)
 
     submit_message = submit
 
@@ -1086,20 +1388,56 @@ class _AgentRunner:
                     take = getattr(self.app, "take_injections", None)
                     leftover = take() if callable(take) else []
                     if leftover:
-                        self._queue.extend(leftover)
+                        self._queue.extend(
+                            item if isinstance(item, dict) else {"text": item, "images": []}
+                            for item in leftover
+                            if not (
+                                isinstance(item, dict)
+                                and item.get("background_call")
+                                and item.get("origin_turn_id") in self._discarded_turn_ids
+                            )
+                        )
                     text = self._queue.pop(0) if self._queue else None
                     if text is None:
                         self._set_busy(False)
                         return
+                    self._turn_active = True
+            else:
+                with self._lock:
+                    self._turn_active = True
             try:
                 item = text if isinstance(text, dict) else {"text": text, "images": []}
+                item = self._prepare_pending_dispatch(item)
+                if item.get("_skip_dispatch"):
+                    with self._lock:
+                        self._turn_active = False
+                    text = None
+                    continue
+                with self._lock:
+                    self._active_dispatch_origin = item.get("_origin_turn_id")
+                    self._active_is_background_call = bool(item.get("_background_call"))
+                    pending = self.pending_failed_turn
+                    pending_ids = set((pending or {}).get("turn_ids") or [(pending or {}).get("turn_id")])
+                    self._active_same_turn_call = bool(item.get("_has_same_turn_call")) or (
+                        item.get("_origin_turn_id") in pending_ids
+                    )
+                    self._continuing_pending = bool(item.get("_continuing_pending"))
+                discard_pending = item.pop("_discard_pending", False)
+                is_user_submission = item.pop("_user_submission", False)
+                preserve_pending = item.pop("_preserve_pending", False)
+                if discard_pending or (is_user_submission and not preserve_pending):
+                    self._discard_pending_for_user_message()
                 self.turn_images = list(item.get("images") or [])
+                self.app._turn_injected_users = []
+                self.app._turn_injected_background_calls = []
                 text = _before_turn(item["text"])
                 self.llm.reset_cancel()
                 _agent_turn(self.llm, self.session, text, self.app, runner=self)
+                if not self.last_turn_failed and item.pop("_continuing_pending", False):
+                    self._clear_pending_for_recovery()
             except Exception as exc:
                 log.error("agent 回合异常: %r", exc)
-                self.last_error = str(exc)  # 无头 --json 的 error 字段来源（崩溃类）
+                self.last_error = str(exc)
                 try:
                     self.session.add_message("system", f"回合异常: {exc}", type="help")
                 except Exception:
@@ -1112,6 +1450,9 @@ class _AgentRunner:
                     self.session.save_session()
                 except Exception:
                     pass
+                with self._lock:
+                    self._turn_active = False
+                    self._active_is_background_call = False
             text = None
 
     def cancel_and_join(self, timeout: float = 3.0) -> None:
@@ -1151,7 +1492,7 @@ class _HeadlessApp:
         self.subagent_stream = None
         self._tree_follow_tail = True
         self.tool_count = 0
-        self.ui_requests = []  # (kind, payload) 留档，供诊断/测试断言
+        self.ui_requests = []
         self.config = None
 
     def bind_config(self, config) -> None:
@@ -1184,7 +1525,7 @@ class _HeadlessApp:
     @staticmethod
     def _auto_answer(kind: str, payload: dict):
         if kind == "confirm":
-            return {"action": "deny", "reason": "无头模式无确认通道（需放行请用 --full）"}
+            return {"action": "deny", "reason": "无头模式无确认通道（放行用 --full）"}
         if kind == "choose":
             options = payload.get("options") or []
             first = options[0] if options else ""
@@ -1222,7 +1563,7 @@ def main_headless(args) -> int:
     config = Config(config_path=args.config) if args.config else Config()
     identity = project_identity.ensure_project_identity(Path.cwd())
     log.info(
-        "BAWCode 无头运行 · 配置=%s · 模型=%s · project_id=%s",
+        "无头运行ing · 配置=%s · 模型=%s · project_id=%s",
         config.config_path,
         config.model_name,
         identity.get("project_id"),
@@ -1271,7 +1612,7 @@ def main_headless(args) -> int:
                 subagent_mod.wait_tasks(timeout=min(1.0, max(0.1, deadline - time.monotonic())))
             if time.monotonic() >= deadline and subagent_mod.pending_task_count():
                 log.warn("无头等待后台子代理超时，仍有 %d 个任务在跑", subagent_mod.pending_task_count())
-            runner._run(None)  # 消化完成通知（无待处理项时立即返回）
+            runner._run(None)
         finally:
             runner._set_busy(False)
     finally:
@@ -1287,7 +1628,7 @@ def main_headless(args) -> int:
     elapsed = time.monotonic() - started
     last = next((m for m in reversed(session.messages) if m.get("role") == "assistant"), None)
     response = str((last or {}).get("content") or "").strip()
-    # 错误双来源：回合崩溃（runner.last_error）> 工具循环 LLM 错误（app.last_turn_error）
+    # 双错误来源：回合崩溃（runner.last_error）> 工具循环 LLM 错误（app.last_turn_error）
     error = getattr(runner, "last_error", None) or getattr(app, "last_turn_error", None)
     ok = bool(response) and not error
     log.info("无头运行结束 · %.2fs · 回复 %d 字 · error=%r", elapsed, len(response), error)
@@ -1314,7 +1655,7 @@ def main_headless(args) -> int:
 
 
 def main() -> None:
-    # 尽早开启 Windows 输入/输出 VT，便于 Shift+Tab → ESC [ Z
+    #开启windowsVT以便捕获输入事件
     ui._enable_windows_ansi()
     config = Config()
     if config.load_error:
@@ -1329,7 +1670,7 @@ def main() -> None:
     plugins_mod.load(config, workspace=Path.cwd())  # 外部插件装载（先于会话初始化，插件可收到 session_start）
     session = memory_mod.init_session(config, project_identity_data=identity)
     tools_mod.webfetch_gc()
-    pasteboard_mod.gc_temp_images()  # 启动回收 data/temp 过期剪贴板图片（7 天封顶）
+    pasteboard_mod.gc_temp_images()  #启动回收data/temp过期剪贴板图片（7 天封顶）
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
@@ -1344,6 +1685,7 @@ def main() -> None:
     app.enter()
     try:
         runner = _AgentRunner(llm, session, app, config)
+        app.agent_runner = runner
         tools_mod.set_background_notifier(runner.notify)  # 后台命令完成 → runner.notify 自动开新回合
         plugins_mod.bind_runtime(app=app, runner=runner)  # 插件类用户操作 API（submit_turn/notify/ctx.ui）载体
         app.interrupt_turn_handler = runner.interrupt_for_rollback  # Esc 打断当前回合并回滚
