@@ -38,7 +38,9 @@ import queue
 import re
 import secrets
 import socket
+import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -95,6 +97,7 @@ except ImportError:
 
 KEY_VALID_DAYS = 7
 SSE_HEARTBEAT = 10  # 秒；顺带用于探测死连接与退出检查
+CLIENT_TTL = 60  # 秒；窗口内有鉴权请求即视为浏览器在线（刷新/休眠会断 SSE，页面轮询仍在）
 
 # ---- 渲染辅助：与 TUI core/render.py 对齐的工具分类 / pygments 高亮 / diff ----
 # 分类口径与 TUI 的 _tool_display_meta 保持一致；插件不依赖宿主内部实现，逻辑在此独立实现
@@ -353,6 +356,18 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = True  # 需在 server_bind 前生效，故写在类属性上
     daemon_threads = True
 
+    def __init__(self, addr, handler, log):  # 类在模块级，logger 由 setup 显式注入
+        self._log = log
+        super().__init__(addr, handler)
+
+    def handle_error(self, request, client_address):
+        """客户端中途断开（刷新/关页/网络抖动）属常态：不向 stderr 打 traceback 污染 TUI"""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)):
+            self._log.debug("http 客户端断开: %r", exc)
+            return
+        self._log.error("http 处理异常: %r", exc)
+
 
 class _State:
     """单个插件实例的运行态（reload 后随新模块重建，线程经 teardown 停止）"""
@@ -367,6 +382,7 @@ class _State:
         self.link_shown = False
         self.key_data = {}        # {"key", "created_at", "expires_at"}
         self.key_epoch = 0        # revoke 时 +1，踢掉旧密钥建立的 SSE 连接
+        self.last_client_seen = 0.0  # 最近一次通过密钥校验的请求时刻（浏览器在线判定，见 CLIENT_TTL）
         self.shutdown_flag = threading.Event()
         self.httpd = None
         self.thread = None
@@ -537,7 +553,7 @@ def setup(ctx):
         if not remote_confirm:
             return None
         with st.lock:
-            online = bool(st.clients)
+            online = bool(st.clients) or (time.monotonic() - st.last_client_seen) < CLIENT_TTL
         if not online:
             return None  # 无浏览器在线：立即交回 TUI 确认面板，不空等
         name = str(payload.get("name") or "")
@@ -619,6 +635,11 @@ def setup(ctx):
         return out
 
     # ---- 快照 ----
+
+    def _pending_confirms() -> list:
+        with st.lock:
+            return [{"id": c["id"], "name": c["name"], "arguments": _trunc_args(c["arguments"], 500)}
+                    for c in list(st.confirms)]
 
     def _snapshot() -> dict:
         messages = []
@@ -712,9 +733,8 @@ def setup(ctx):
             except Exception:
                 pass
         info["tokens"] = _tokens_info()
+        pending = _pending_confirms()
         with st.lock:
-            pending = [{"id": c["id"], "name": c["name"], "arguments": _trunc_args(c["arguments"], 500)}
-                       for c in list(st.confirms)]
             clients_n = len(st.clients)
         return {
             "ok": True,
@@ -1485,7 +1505,10 @@ def setup(ctx):
         given = (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
         real = str(st.key_data.get("key") or "")
         # compare_digest 对非 ASCII str 抛 TypeError，统一按字节比较
-        return bool(real) and hmac.compare_digest(real.encode("utf-8"), given.encode("utf-8"))
+        ok = bool(real) and hmac.compare_digest(real.encode("utf-8"), given.encode("utf-8"))
+        if ok:
+            st.last_client_seen = time.monotonic()  # 鉴权请求即在线证据：SSE 断流时确认仍能推到页面
+        return ok
 
     def _make_handler():
         class Handler(BaseHTTPRequestHandler):
@@ -1494,12 +1517,15 @@ def setup(ctx):
 
             def _json(self, code, obj):
                 body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+                    pass  # 客户端中途断开（刷新/关页）：响应无处可送，静默丢弃
 
             def _deny(self):
                 self._json(403, {"ok": False, "message": "无效密钥或链接已过期"})
@@ -1573,6 +1599,8 @@ def setup(ctx):
                     return
                 if path == "/api/state":
                     self._json(200, _snapshot())
+                elif path == "/api/confirms":
+                    self._json(200, {"ok": True, "pending": _pending_confirms()})
                 elif path == "/api/hlcss":
                     body = _hl_css().encode("utf-8")
                     self.send_response(200)
@@ -1754,7 +1782,7 @@ def setup(ctx):
         if st.httpd is not None:
             return "远程控制服务已在运行"
         try:
-            st.httpd = _Server((bind, port), _make_handler())
+            st.httpd = _Server((bind, port), _make_handler(), ctx.log)
         except OSError as e:
             st.httpd = None
             ctx.log.warn("HTTP 服务启动失败: %s", e)

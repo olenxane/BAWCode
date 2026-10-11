@@ -1036,8 +1036,12 @@ function liveSeal() {
 /* ================= 工具确认卡片 ================= */
 let confirmQueue = [];
 let confirmActive = null;
+let confirmRenderSig = "";
 function refreshConfirmCard() {
   if (!confirmActive && confirmQueue.length) confirmActive = confirmQueue[0];
+  const sig = (confirmActive ? confirmActive.id : "") + "|" + confirmQueue.map(c => c.id).join(",");
+  if (sig === confirmRenderSig) return;  // 无变化不动 DOM：对账轮询不反复贴底
+  confirmRenderSig = sig;
   if (!confirmActive) { $("confirm-card").hidden = true; return; }
   $("confirm-name").textContent = confirmActive.name || "";
   $("confirm-args").textContent = JSON.stringify(confirmActive.arguments || {}, null, 2);
@@ -1053,6 +1057,14 @@ function showConfirm(p) {
 function dropConfirm(id) {
   confirmQueue = confirmQueue.filter(c => c.id !== id);
   if (confirmActive && confirmActive.id === id) confirmActive = null;
+  refreshConfirmCard();
+}
+/* 与服务端待确认列表对账：补上 SSE 丢掉的卡，清掉别端已答/超时的卡 */
+function syncConfirms(pending) {
+  const serverIds = new Set((pending || []).map(p => p.id));
+  confirmQueue = confirmQueue.filter(c => serverIds.has(c.id));
+  if (confirmActive && !serverIds.has(confirmActive.id)) confirmActive = null;
+  (pending || []).forEach(p => { if (!confirmQueue.some(c => c.id === p.id)) confirmQueue.push(p); });
   refreshConfirmCard();
 }
 async function answerConfirm(action, reason) {
@@ -1152,11 +1164,7 @@ async function fetchState(force) {
         stick();
       }
       // 确认队列与快照对账（别的端答过的自动消失）
-      const serverIds = new Set((s.pending || []).map(p => p.id));
-      confirmQueue = confirmQueue.filter(c => serverIds.has(c.id));
-      if (confirmActive && !serverIds.has(confirmActive.id)) confirmActive = null;
-      (s.pending || []).forEach(p => { if (!confirmQueue.some(c => c.id === p.id)) confirmQueue.push(p); });
-      refreshConfirmCard();
+      syncConfirms(s.pending || []);
     } catch (e) {
       setConn("err");
     } finally {
@@ -2050,7 +2058,7 @@ function buildPluginConfigRow(pid, cfg) {
   const row = el("div", "st-cfg-row");
   row.append(el("label", "", cfg.label || cfg.key));
   if (cfg.type === "bool") {
-    const cur = cfg.current in (true, "true", "1", 1) || cfg.current === true;
+    const cur = [true, "true", "1", 1].includes(cfg.current);
     const tog = stToggle(cur);
     tog.onclick = async () => {
       tog.classList.toggle("on");
@@ -2273,6 +2281,11 @@ $("cmd-btn").onclick = openPalette;
 /* ================= 启动 ================= */
 document.addEventListener("visibilitychange", () => { if (!document.hidden) fetchState(); });
 setInterval(() => { if (!document.hidden && !state.busy) fetchState(); }, 25000);
+/* 确认卡兜底轮询：SSE 断流/丢事件（页面刷新、网络抖动）时仍能在 5s 内弹卡 */
+setInterval(async () => {
+  if (document.hidden) return;
+  try { const r = await api("/api/confirms"); if (r.ok) syncConfirms(r.pending || []); } catch (e) {}
+}, 5000);
 if (KEY) {
   loadHlCss();
   fetchState(true).then(connect);
