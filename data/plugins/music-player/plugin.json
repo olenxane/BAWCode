@@ -1,0 +1,8 @@
+{
+  "id": "music-player",
+  "name": "终端音乐播放器",
+  "version": "0.1.0",
+  "description": "本地音乐播放器插件：底部实时显示歌曲/进度/歌词/频谱，用 /music 指令代替原来的键盘操作",
+  "author": "BAWCode",
+  "entry": "main.py"
+}

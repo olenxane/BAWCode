@@ -1,0 +1,382 @@
+music_dirs:
+- E:\音画集\#新
+- E:\音画集\嘤乐
+lyrics_dir: E:/音画集/lyrics
+lyrics:
+  fuzzy_match: true
+  fuzzy_threshold: 0.55
+  offset_ms: 0
+  context_lines: 2
+equalizer:
+  enabled: true
+  preset: custom
+  bands:
+    31Hz: 0
+    62Hz: 0
+    125Hz: 0
+    250Hz: -1
+    500Hz: -2
+    1kHz: 0
+    2kHz: 1
+    4kHz: 0
+    8kHz: -1
+    16kHz: -2
+  q_values:
+    31Hz: 1.0
+    62Hz: 1.0
+    125Hz: 1.0
+    250Hz: 1.0
+    500Hz: 1.5
+    1kHz: 1.0
+    2kHz: 1.0
+    4kHz: 1.0
+    8kHz: 2.5
+    16kHz: 1.0
+  presets:
+    flat:
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    bass_boost:
+    - 7
+    - 6
+    - 4
+    - 1
+    - 0
+    - 0
+    - 0
+    - 0
+    - 1
+    - 2
+    vocal_boost:
+    - -2
+    - -2
+    - 0
+    - 1
+    - 3
+    - 4
+    - 3
+    - 2
+    - 1
+    - 0
+    treble_boost:
+    - 0
+    - 0
+    - 0
+    - -1
+    - 0
+    - 1
+    - 2
+    - 4
+    - 5
+    - 6
+    rock:
+    - 4
+    - 3
+    - 1
+    - -2
+    - -1
+    - 0
+    - 2
+    - 3
+    - 3
+    - 3
+    pop:
+    - 3
+    - 2
+    - 0
+    - -1
+    - 0
+    - 0
+    - 1
+    - 2
+    - 2
+    - 2
+spectrum:
+  bars: 50
+  fft_size: 2048
+  smoothing: 0.6
+  min_db: -60
+  max_db: 0
+  style: blocks
+  height: 4
+  enabled: true
+  height_scale: 1.6
+  zhanwei_char: ' '
+theme: mint_soda
+themes:
+  neon:
+    name: 霓虹夜
+    primary: '#ff2ec4'
+    secondary: '#00e5ff'
+    accent: '#ffe600'
+    text: '#e8e8e8'
+    dim: '#5a5a6e'
+    bg_bar: '#241b2f'
+    spectrum_gradient:
+    - '#00e5ff'
+    - '#7b2ff7'
+    - '#ff2ec4'
+    lyric_current: 'bold #ffe600'
+    lyric_context: '#8888a0'
+  sunset:
+    name: 日落余晖
+    primary: '#ff6b35'
+    secondary: '#f7c59f'
+    accent: '#ffd23f'
+    text: '#fff1e6'
+    dim: '#8c6a5a'
+    bg_bar: '#3d2b2b'
+    spectrum_gradient:
+    - '#ffd23f'
+    - '#ff6b35'
+    - '#c81d25'
+    lyric_current: 'bold #ffd23f'
+    lyric_context: '#a08070'
+  forest:
+    name: 森林绿意
+    primary: '#4caf50'
+    secondary: '#8bc34a'
+    accent: '#cddc39'
+    text: '#e8f5e9'
+    dim: '#5c6b5c'
+    bg_bar: '#1b2b1e'
+    spectrum_gradient:
+    - '#cddc39'
+    - '#8bc34a'
+    - '#2e7d32'
+    lyric_current: 'bold #cddc39'
+    lyric_context: '#6e8a6e'
+  mono:
+    name: 极简黑白
+    primary: '#ffffff'
+    secondary: '#bdbdbd'
+    accent: '#ffffff'
+    text: '#e0e0e0'
+    dim: '#666666'
+    bg_bar: '#1a1a1a'
+    spectrum_gradient:
+    - '#666666'
+    - '#bdbdbd'
+    - '#ffffff'
+    lyric_current: 'bold #ffffff'
+    lyric_context: '#777777'
+  ocean:
+    name: 深海蓝调
+    primary: '#0077b6'
+    secondary: '#00b4d8'
+    accent: '#90e0ef'
+    text: '#caf0f8'
+    dim: '#4a6a78'
+    bg_bar: '#03045e'
+    spectrum_gradient:
+    - '#90e0ef'
+    - '#00b4d8'
+    - '#0077b6'
+    lyric_current: 'bold #90e0ef'
+    lyric_context: '#5a8a9a'
+  cyber_sakura:
+    name: 樱夜霓虹
+    primary: '#ff7ab8'
+    secondary: '#7afcff'
+    accent: '#fff3a6'
+    text: '#f9f2ff'
+    dim: '#7d6a86'
+    bg_bar: '#241426'
+    spectrum_gradient:
+    - '#7afcff'
+    - '#ff7ab8'
+    - '#b45bff'
+    lyric_current: 'bold #fff3a6'
+    lyric_context: '#9d88a8'
+  starfield:
+    name: 星河漫游
+    primary: '#8ec5ff'
+    secondary: '#b18cff'
+    accent: '#ffd97a'
+    text: '#eaf2ff'
+    dim: '#5c6b8f'
+    bg_bar: '#0c1022'
+    spectrum_gradient:
+    - '#8ec5ff'
+    - '#b18cff'
+    - '#5b6cff'
+    lyric_current: 'bold #ffd97a'
+    lyric_context: '#7d8ab0'
+  lava_fm:
+    name: 熔岩电台
+    primary: '#ff5e3a'
+    secondary: '#ff9f1c'
+    accent: '#ffd166'
+    text: '#fff0e6'
+    dim: '#8a5a4a'
+    bg_bar: '#24100c'
+    spectrum_gradient:
+    - '#ffd166'
+    - '#ff9f1c'
+    - '#d7263d'
+    lyric_current: 'bold #ffd166'
+    lyric_context: '#a87b6b'
+  mint_soda:
+    name: 薄荷汽水
+    primary: '#35d0a5'
+    secondary: '#1d7a5f'
+    accent: '#4bdbfa'
+    text: '#eafff7'
+    dim: '#5f7d74'
+    bg_bar: '#0f221d'
+    spectrum_gradient:
+    - '#9ef01a'
+    - '#35d0a5'
+    - '#0aa1a1'
+    lyric_current: '#74fc69'
+    lyric_context: '#7ba79a'
+  violet_night:
+    name: 紫雾夜航
+    primary: '#a855f7'
+    secondary: '#6366f1'
+    accent: '#f0abfc'
+    text: '#f4efff'
+    dim: '#6f6690'
+    bg_bar: '#180f24'
+    spectrum_gradient:
+    - '#f0abfc'
+    - '#a855f7'
+    - '#4f46e5'
+    lyric_current: 'bold #f0abfc'
+    lyric_context: '#8f84ad'
+  amber_radio:
+    name: 琥珀收音机
+    primary: '#ffb454'
+    secondary: '#ff7d54'
+    accent: '#ffe3a3'
+    text: '#fff6e8'
+    dim: '#8d6f52'
+    bg_bar: '#22140a'
+    spectrum_gradient:
+    - '#ffe3a3'
+    - '#ffb454'
+    - '#ff5d3a'
+    lyric_current: 'bold #ffe3a3'
+    lyric_context: '#a3866a'
+  glacier_echo:
+    name: 冰川回声
+    primary: '#9be7ff'
+    secondary: '#5aa9e6'
+    accent: '#e0fbfc'
+    text: '#f0fbff'
+    dim: '#5f7e93'
+    bg_bar: '#081b2b'
+    spectrum_gradient:
+    - '#e0fbfc'
+    - '#9be7ff'
+    - '#3d7ea6'
+    lyric_current: 'bold #e0fbfc'
+    lyric_context: '#7fa3b8'
+  midnight_jazz:
+    name: 午夜爵士
+    primary: '#e0a458'
+    secondary: '#7d5ba6'
+    accent: '#f4d58d'
+    text: '#f2ebdd'
+    dim: '#74655a'
+    bg_bar: '#171017'
+    spectrum_gradient:
+    - '#7d5ba6'
+    - '#e0a458'
+    - '#f4d58d'
+    lyric_current: 'bold #f4d58d'
+    lyric_context: '#8d7f72'
+  retro_arcade:
+    name: 复古街机
+    primary: '#00ff88'
+    secondary: '#00c3ff'
+    accent: '#ffee32'
+    text: '#f2fff9'
+    dim: '#4e7a6a'
+    bg_bar: '#0b0f14'
+    spectrum_gradient:
+    - '#00ff88'
+    - '#00c3ff'
+    - '#ff2079'
+    lyric_current: 'bold #ffee32'
+    lyric_context: '#729c8d'
+  tea_paper:
+    name: 暖茶纸页
+    primary: '#b08968'
+    secondary: '#ddb892'
+    accent: '#e6ccb2'
+    text: '#faf5ef'
+    dim: '#8a7364'
+    bg_bar: '#2a211b'
+    spectrum_gradient:
+    - '#e6ccb2'
+    - '#ddb892'
+    - '#b08968'
+    lyric_current: 'bold #e6ccb2'
+    lyric_context: '#a08b7b'
+playback:
+  default_volume: 1.0
+  fade_ms: 150
+  playlist_mode: shuffle
+  ui_fps: 24
+  ui_width: 160
+  marquee:
+    enabled: true
+    hold_secs: 5.0
+    step_interval: 0.3
+    gap_cols: 4
+dsp:
+  chain:
+  - eq
+  - vbe
+  - exciter
+  - widener
+  - loudness
+  - limiter
+  loudness:
+    enabled: true
+    target_lufs: -16.0
+  vbe:
+    enabled: true
+    gain_db: -3.0
+  limiter:
+    enabled: true
+    threshold_db: -0.5
+    release_ms: 150.0
+  exciter:
+    enabled: true
+    freq_hz: 3500.0
+    mix: 0.15
+  widener:
+    enabled: true
+    width: 1.3
+    hp_freq_hz: 250.0
+    room_mix: 0.0
+online_music:
+  qq_quality: 320
+  wy_quality: exhigh
+  bi_quality: 320
+  download_dir: download_musics
+keybindings:
+  quit: q
+  selector: tab
+  online: o
+  play_pause: space
+  next: n
+  prev: p
+  spectrum: s
+  theme: t
+  mode: m
+  reload: r
+  download: d
+  dir_setup: u
+  exciter: e
+  widener: w

@@ -1,0 +1,9 @@
+# 本地播放所需依赖；均随主程序环境一般已具备，缺失时插件装载会自动补装
+numpy
+scipy
+sounddevice
+mutagen
+pyyaml
+rich
+# 未安装系统 ffmpeg 时可补装 imageio-ffmpeg 作为内置二进制回退
+# imageio-ffmpeg
