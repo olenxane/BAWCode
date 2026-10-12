@@ -73,7 +73,7 @@ def _complete_theme(config, arg: str) -> List[dict]:
 def _complete_model(config, arg: str) -> List[dict]:
     if config is None:
         return []
-    rows = config.match_models(arg or "", limit=20) if hasattr(config, "match_models") else []
+    rows = config.match_models(arg or "", limit=220) if hasattr(config, "match_models") else []
     items = []
     for row in rows:
         items.append(
@@ -272,7 +272,7 @@ def remove_source(source: str) -> List[str]:
     return removed
 
 
-def complete(prefix: str, limit: int = 12, config: Any = None) -> List[dict]:
+def complete(prefix: str, limit: int = 220, config: Any = None) -> List[dict]:
     """命令名 + 参数补全
 
     - `/mo` → 命令名补全
@@ -326,7 +326,7 @@ def complete(prefix: str, limit: int = 12, config: Any = None) -> List[dict]:
             fn = _ARG_COMPLETERS.get(resolve(name)) or _ARG_COMPLETERS.get(name)
             if fn:
                 try:
-                    suggestions = fn(config, "")[:2]
+                    suggestions = fn(config, "")
                 except Exception:
                     suggestions = []
                 expanded.extend(suggestions)
