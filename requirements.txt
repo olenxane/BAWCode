@@ -16,6 +16,7 @@ lxml>=5.0.0
 # RAG 插件结构索引（data/plugins/rag；缺失时插件降级为手动文档模式）
 tree_sitter>=0.26,<0.27
 tree-sitter-language-pack>=1.20,<1.21
-# QQ 桥接插件（data/plugins/qbridge；OneBot 正向 WS 客户端，缺失时插件降级提示）
+# QQ 桥接插件（OneBot 正向 WS 客户端及文本改动预览图片）
 websockets>=13
+Pillow>=10
 pygments

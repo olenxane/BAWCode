@@ -2329,16 +2329,17 @@ class RenderMixin:
             lines = lines[: h - 1] + lines[-1:]
         while len(lines) < h:
             lines.append(" ")
-        # 记录输入/状态行号，供局部重绘
+        # 记录输入框/状态行号：输入框占 [input_start, input_start + input_h)，
+        # 鼠标右键按该区间判定粘贴（ui._on_mouse）
         input_start = None
-        # 从后往前找「→项目」信息行，其前为输入区
+        # 从后往前找「→项目」信息行，其上为分隔线 + 输入框
         for i, ln in enumerate(lines):
             plain = _ANSI_RE.sub("", ln)
             if plain.startswith("→"):
                 self._row_meta["info"] = i
                 self._row_meta["status"] = min(h - 1, i + 3)
                 self._row_meta["tip"] = min(h - 1, i + 1)
-                input_start = max(0, i - input_zone_h - 2)
+                input_start = max(0, i - input_zone_h - 1)
                 break
         if input_start is None:
             input_start = max(0, h - input_zone_h - 5)

@@ -683,6 +683,14 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
     api_tokens_before = getattr(meter, "api_total_tokens", 0)
     try:
         _agent_turn_impl(llm, session, user_text, app, runner=runner)
+    except Exception as exc:
+        app.last_turn_error = str(exc)
+        log.error("回合执行异常: %r", exc)
+        if runner is not None:
+            runner.last_error = str(exc)
+            runner._failed_rollback = True
+        else:
+            raise
     finally:
         try:
             snap = snapshot_mod.end_turn()  # 回合快照落盘（中断/异常路径同样收尾；空回合无副作用）
@@ -744,6 +752,7 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
                 elif failed:
                     runner.last_turn_failed = True
                     failed_pending = True
+                    app.last_failed_text = str(getattr(app, "turn_user_text", "") or user_text)
                     if pending:
                         turn_ids = pending.setdefault("turn_ids", [])
                         if runner.active_turn_id and runner.active_turn_id not in turn_ids:
@@ -863,7 +872,7 @@ def _hold_failed_turn(session, app, runner) -> None:
         _sync(
             app,
             session,
-            status=f"请求失败 · 已挂起本轮上下文（保留 {max(0, count)} 条消息）· 命令/切模型可用；新消息或 Esc 丢弃",
+            status=f"请求失败 · 已挂起本轮上下文（保留 {max(0, count)} 条消息）· Ctrl+Y 重试；新消息将保留上下文续跑，Esc 丢弃",
             render=False,
         )
     except Exception:
@@ -1304,7 +1313,9 @@ class _AgentRunner:
                     "text": self._join_dispatch_text("", users),
                     "images": list(users[0].get("images") or []),
                     "_user_submission": True,
-                    "_discard_pending": True,
+                    "_preserve_pending": True,
+                    "_continuing_pending": True,
+                    "_has_same_turn_call": False,
                 }
             self._queue = [entry for entry in self._queue if entry not in queued]
             return {
@@ -1349,7 +1360,11 @@ class _AgentRunner:
                         self.llm.cancel()
                         return "[已丢弃本回合调用及挂起上下文，用户消息开始新回合]"
                 with self.app.inject_lock:
-                    self.app.inject_queue.append(text)
+                    self.app.inject_queue.append({
+                        "text": text,
+                        "_user_submission": True,
+                        "user_submission": True,
+                    })
                 return "[插话已并入当前请求]"
         return self.queue_turn(text)
 
@@ -1432,6 +1447,7 @@ class _AgentRunner:
                 self.app._turn_injected_background_calls = []
                 text = _before_turn(item["text"])
                 self.llm.reset_cancel()
+                self.last_error = None
                 _agent_turn(self.llm, self.session, text, self.app, runner=self)
                 if not self.last_turn_failed and item.pop("_continuing_pending", False):
                     self._clear_pending_for_recovery()

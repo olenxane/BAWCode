@@ -59,7 +59,7 @@ class TurnIO:
         self.clear_stream = clear_stream or (lambda: None)
         self.tool_confirm = tool_confirm
         self.phase = phase or (lambda text: None)
-        # API 错误手动重试闸：瞬态错误自动重试耗尽后调用，返回 True 重发同一请求
+        # API 错误手动重试闸：错误等待用户操作，返回 True 重发同一请求
         self.wait_llm_retry = wait_llm_retry
 
 
@@ -173,10 +173,9 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 turn.app.token_meter = llm.meter
             if response.get("error") == CANCELLED or io.cancelled():
                 raise TurnInterrupt()
-            if response.get("error") and not response.get("error_fatal") and io.wait_llm_retry is not None:
-                # 手动重试等待态：可重试错误（超时/5xx 等自动重试耗尽）允许 Ctrl+Y 重发同一请求，
-                # 不计轮次、不写消息；error_fatal=确定性失败（400 等重发必现）跳过等待直接走错误回滚；
-                # 放弃（Esc/提交新消息）同样落入错误路径
+            if response.get("error") and io.wait_llm_retry is not None:
+                # 自动重试耗尽或确定性错误均允许用户 Ctrl+Y 手动重发同一请求；
+                # 不计轮次、不写消息；放弃（Esc/提交新消息）落入错误路径
                 io.phase("")  # 停掉思考中转轮，状态行交给等待态提示
                 retry_requested = io.wait_llm_retry(str(response["error"]))
                 check_cancel(turn)

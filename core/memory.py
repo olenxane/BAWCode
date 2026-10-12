@@ -378,6 +378,21 @@ class Memory:
 
     def add_message(self, role: str, content: str, **extra) -> dict:
         """追加一条消息，extra 可含 type/tool_name/tool_call_id/tool_calls"""
+        is_first_user_message = role == "user" and not any(
+            item.get("role") == "user" for item in self.messages
+        )
+        if is_first_user_message and not self.session_title:
+            if isinstance(content, str):
+                title_text = content
+            elif isinstance(content, list):
+                title_text = " ".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            else:
+                title_text = ""
+            self.session_title = self._clip_title(" ".join(title_text.split()))
         message = {"role": role, "content": content}
         message.update(extra)
         self.messages.append(message)
@@ -1329,7 +1344,7 @@ class Memory:
         return self.session_title
 
     def save_session(self) -> Optional[Path]:
-        """自动保存当前会话；空会话不写盘（避免堆积空文件）；标题仅取手动命名"""
+        """自动保存当前会话；空会话不写盘（避免堆积空文件）"""
         if not self.messages:
             return None
         data = {

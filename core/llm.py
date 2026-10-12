@@ -19,6 +19,7 @@ except ImportError:
 
 from core import hooks
 from core import policy
+from core import proc
 from core import prompt_loader
 from core import register
 from core import tokens as tokenmod
@@ -869,6 +870,8 @@ class LLM:
             output = f"工具不存在: {name}"
             log.warn("调用未注册工具: %s", name)
         else:
+            # 工具执行期下发本 LLM 的取消事件：命令等待据此提前终止（子代理各持独立事件）
+            proc.set_cancel(getattr(self, "_cancel", None))
             try:
                 output = register.call(name, **args)
                 log.debug("工具 %s 完成，用时 %.2fs", name, time.monotonic() - started)
@@ -878,6 +881,8 @@ class LLM:
             except Exception as e:
                 output = f"工具执行错误: {e}"
                 log.error("工具 %s 执行错误: %s", name, e)
+            finally:
+                proc.clear_cancel()
         # 多模态约定：工具返回 dict 可带 "images"（本地图片路径列表），摘出随消息携带，
         # 由 add_tool_result 落为 API 数组形态 content；正文取 content 键，无则序列化其余键
         images = None

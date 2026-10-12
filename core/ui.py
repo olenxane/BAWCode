@@ -634,7 +634,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self._handle_clipboard_paste(data)
 
     def _handle_clipboard_paste(self, data=None) -> None:
-        """应用侧读剪贴板（Ctrl+V 热键）：文件列表/文本同步插入；纯图片后台落盘
+        """应用侧读剪贴板（Ctrl+V 热键/输入框右键）：文件列表/文本同步插入；纯图片后台落盘
         （PowerShell 0.5~1s，不阻帧循环），完成结果经 _paste_async 单槽由帧尾取回；
         非视觉模型纯图片分支不落盘不插入（状态行提示）"""
         supports = bool(getattr(self.config, "supports_vision", True)) if self.config else True
@@ -685,6 +685,22 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         else:
             self.status = "剪贴板图片保存失败（详见日志）"
         self.render()
+
+    def _paste_in_input_zone(self, y: int) -> bool:
+        """鼠标右键粘贴：输入焦点下右键落在输入框行区间时走 Ctrl+V 同一条通路。
+
+        行区间取每帧渲染快照（input_start 起 input_h 行）；确认/询问/对话框面板
+        占用输入区时不触发，交回右键复制选区。返回是否已按粘贴处理。"""
+        if self.focus != "input" or self.confirm_mode or self.ask_mode or self._dialog_active:
+            return False
+        meta = self._row_meta
+        if "input_start" not in meta:
+            return False
+        top = int(meta["input_start"])
+        if not top <= y < top + int(meta.get("input_h") or 0):
+            return False
+        self._handle_clipboard_paste()
+        return True
 
     def _tick_restore_input(self) -> None:
         """帧尾取回 Esc 打断/失败回滚回填的单槽；输入框非空则不覆盖用户新输入"""
@@ -978,6 +994,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
 
         坐标为控制台 0-based 单元格，几何换算基于 _row_meta 每帧快照；
         mouse_down 的 value 自 keyinput 起携带按键前缀（"left:x,y"/"right:x,y"）。
+        右键在输入框行区间内且输入焦点时为粘贴（同 Ctrl+V），其余位置为复制选区。
         选区锚定文档行（_tree_rows 缓存行号），滚动时选区随内容移动；
         内容变化（签名改变）后选区自动失效。"""
         meta = self._row_meta
@@ -998,7 +1015,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         scrollbar_x = int(meta.get("scrollbar_x") or -1)
         if kind == "mouse_down":
             if btn == "right":
-                self._copy_selection()
+                if not self._paste_in_input_zone(y):
+                    self._copy_selection()
                 return
             if scrollbar_on and x == scrollbar_x:
                 y_rel = y - body_top

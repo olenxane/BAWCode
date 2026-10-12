@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -20,6 +19,7 @@ from typing import List, Optional, Tuple, Union
 from core import hooks
 from core import memory as memory_mod
 from core import policy
+from core import proc
 from core import register
 from core import shells
 from core import snapshot
@@ -69,46 +69,6 @@ def _console_output_encoding() -> str:
         except Exception:
             pass
     return "utf-8"
-
-
-def _terminate_command_tree(proc: subprocess.Popen, command: str) -> None:
-    """超时后终止本次命令进程树，并以有界时间回收 shell 进程"""
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
-        else:
-            os.killpg(proc.pid, signal.SIGKILL)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.warn("命令进程树终止失败 pid=%s: %s", proc.pid, exc)
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        log.warn("命令 shell 进程未在清理期限内退出 pid=%s: %s", proc.pid, command)
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            log.warn("命令 shell 进程回收超时 pid=%s", proc.pid)
-    try:
-        proc.communicate(timeout=2)
-    except subprocess.TimeoutExpired:
-        log.warn("命令输出管道回收超时 pid=%s", proc.pid)
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
 
 
 def _session():
@@ -337,38 +297,32 @@ def execute_command(
     if str(mode or "").strip().lower() == "background":
         return _execute_command_background(command, cwd, argv, stdin_text, use_shell, shell_name, fallback_notice)
     log.info("执行命令[%s]: %s（cwd=%s timeout=%ds）", shell_name, command, cwd or "-", timeout)
-    proc = None
     try:
-        proc = subprocess.Popen(
+        status, code, output = proc.run_capture(
             argv,
-            shell=use_shell,
             cwd=cwd,
-            stdin=subprocess.PIPE if stdin_text else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding=_console_output_encoding(),
-            errors="replace",
-            start_new_session=sys.platform != "win32",
             env=shells.build_env(shell_name),
+            use_shell=use_shell,
+            stdin_text=stdin_text or "",
+            timeout=timeout,
+            cancel=proc.cancel_event(),
+            encoding=_console_output_encoding(),
         )
-        output, _ = proc.communicate(input=stdin_text or None, timeout=timeout)
-        if proc.returncode != 0:
-            log.warn("命令退出码 %d: %s", proc.returncode, command)
-            return _with_notice(f"命令退出码 {proc.returncode}\n{output or ''}".strip(), fallback_notice)
-        log.debug("命令完成，输出 %d 字符", len(output or ""))
-        # 无输出也要明说，便于模型与真失败（退出码非 0）区分
-        return _with_notice((output or "").strip() or "命令完成，无输出（退出码 0）。", fallback_notice)
-    except subprocess.TimeoutExpired:
-        if proc is not None:
-            _terminate_command_tree(proc, command)
-        log.warn("命令超时（>%ds）: %s", timeout, command)
-        return _with_notice(f"命令超时（>{timeout}s）", fallback_notice)
     except OSError as e:
-        if proc is not None and proc.poll() is None:
-            _terminate_command_tree(proc, command)
         log.error("命令执行失败: %s（%s）", e, command)
         return _with_notice(f"执行失败: {e}", fallback_notice)
+    if status == "cancelled":
+        log.warn("命令被回合中断: %s", command)
+        return _with_notice("命令已被中断（进程树已终止）", fallback_notice)
+    if status == "timeout":
+        log.warn("命令超时（>%ds）: %s", timeout, command)
+        return _with_notice(f"命令超时（>{timeout}s）", fallback_notice)
+    if code != 0:
+        log.warn("命令退出码 %d: %s", code, command)
+        return _with_notice(f"命令退出码 {code}\n{output or ''}".strip(), fallback_notice)
+    log.debug("命令完成，输出 %d 字符", len(output or ""))
+    # 无输出也要明说，便于模型与真失败（退出码非 0）区分
+    return _with_notice((output or "").strip() or "命令完成，无输出（退出码 0）。", fallback_notice)
 
 
 # execute_command 后台执行：监视线程在进程退出后经 main 注册的 runner.notify 发起新回合通知
@@ -1802,27 +1756,28 @@ def run_program(
     cmd = [program] + list(args or [])
     log.info("运行程序: %s（cwd=%s timeout=%ds）", " ".join(cmd), cwd or "-", timeout)
     try:
-        result = subprocess.run(
+        status, code, output = proc.run_capture(
             cmd,
             cwd=cwd,
-            capture_output=True,
-            text=True,
             timeout=timeout,
+            cancel=proc.cancel_event(),
+            merge_stderr=False,
             encoding=_console_output_encoding(),
-            errors="replace",
         )
-        output = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0:
-            log.warn("程序退出码 %d: %s", result.returncode, " ".join(cmd))
-            # 退出码进返回值：与 execute_command 同口径，供失败启发式与模型感知
-            return f"命令退出码 {result.returncode}\n{output}".strip()
-        return output.strip() or "命令退出码 0"
-    except subprocess.TimeoutExpired:
-        log.warn("程序超时（>%ds）: %s", timeout, " ".join(cmd))
-        return f"程序超时（>{timeout}s）"
     except OSError as e:
         log.error("程序启动失败: %s（%s）", e, " ".join(cmd))
         return f"启动失败: {e}"
+    if status == "cancelled":
+        log.warn("程序被回合中断: %s", " ".join(cmd))
+        return "程序已被中断（进程树已终止）"
+    if status == "timeout":
+        log.warn("程序超时（>%ds）: %s", timeout, " ".join(cmd))
+        return f"程序超时（>{timeout}s）"
+    if code != 0:
+        log.warn("程序退出码 %d: %s", code, " ".join(cmd))
+        # 退出码进返回值：与 execute_command 同口径，供失败启发式与模型感知
+        return f"命令退出码 {code}\n{output}".strip()
+    return output.strip() or "命令退出码 0"
 
 
 # ----- webfetch：以真实浏览器头抓取页面，剥离脚本/导航/广告等噪音，
