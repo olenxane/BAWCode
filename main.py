@@ -1812,8 +1812,13 @@ def main() -> None:
         log.info("BAWCode 已退出")
 
 
-if __name__ == "__main__":
-    _cli_args = _parse_args()
-    if _cli_args.prompt is not None:
-        sys.exit(main_headless(_cli_args))
+def cli() -> None:
+    """命令行入口：-p 走无头模式，缺省进入交互 TUI"""
+    args = _parse_args()
+    if args.prompt is not None:
+        sys.exit(main_headless(args))
     main()
+
+
+if __name__ == "__main__":
+    cli()
