@@ -397,13 +397,29 @@ class LLM:
         raise exc
 
     def _sdk_payload(self, payload: dict, req: Optional[dict] = None) -> dict:
-        """把 OpenAI SDK 不认识的思考参数键移入 extra_body，保持线上的 JSON 键名不变"""
+        """把 OpenAI SDK 不认识的请求体键移入 extra_body"""
         body = dict(payload)
         advanced = (req or {}).get("advanced") or {}
-        extension_keys = {
+        sdk_fields = {
+            "model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "n",
+            "stream", "stop", "presence_penalty", "frequency_penalty", "logit_bias", "user",
+            "response_format", "seed", "tools", "tool_choice", "parallel_tool_calls", "functions",
+            "function_call", "stream_options", "service_tier", "reasoning_effort", "extra_body",
+            "logprobs", "top_logprobs", "modalities", "prediction", "audio", "metadata", "store",
+            "prompt_cache_key", "safety_identifier",
+        }
+        thinking_keys = {
             str(advanced.get("thinking_effort_field") or "reasoning_effort").strip() or "reasoning_effort",
             str(advanced.get("thinking_enabled_field") or "enable_thinking").strip() or "enable_thinking",
         }
+        custom_body = advanced.get("custom_body")
+        custom_body = custom_body if isinstance(custom_body, list) else []
+        custom_keys = {
+            str(item.get("key") or "").strip()
+            for item in custom_body
+            if isinstance(item, dict) and item.get("enabled", True)
+        }
+        extension_keys = thinking_keys | (custom_keys - sdk_fields)
         extra = {key: body.pop(key) for key in extension_keys if key in body}
         if extra:
             existing = body.pop("extra_body", None)
@@ -637,6 +653,40 @@ class LLM:
             payload["tools"] = tools
             # DeepSeek 思考模式不支持 required/指定 function，固定 auto
             payload["tool_choice"] = "auto"
+        custom_body = advanced.get("custom_body")
+        custom_body = custom_body if isinstance(custom_body, list) else []
+        preset_items = {
+            preset: next(
+                (row for row in custom_body if isinstance(row, dict) and row.get("preset") == preset),
+                None,
+            )
+            for preset in ("thinking_effort", "thinking_enabled")
+        }
+        preset_values = {
+            preset: payload.pop(default_key, None)
+            for preset, default_key in (
+                ("thinking_effort", effort_field),
+                ("thinking_enabled", enabled_field),
+            )
+            if preset_items[preset] is not None
+        }
+        for preset, default_key in (
+            ("thinking_effort", effort_field),
+            ("thinking_enabled", enabled_field),
+        ):
+            item = preset_items[preset]
+            if not item or not item.get("enabled", True):
+                continue
+            key = str(item.get("key") or default_key).strip()
+            if not key:
+                continue
+            payload[key] = preset_values[preset] if item.get("inherit", True) else item.get("value")
+        for item in custom_body:
+            if not isinstance(item, dict) or item.get("preset") or not item.get("enabled", True):
+                continue
+            key = str(item.get("key") or "").strip()
+            if key:
+                payload[key] = item.get("value")
         streaming = bool(on_delta) and bool((self.config.data or {}).get("llm", {}).get("stream", True))
         if not req.get("api_key"):
             log.warn("未配置可用 api_key，LLM 请求被拒绝 model=%s", model_id)

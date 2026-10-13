@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 from core import keyinput
@@ -105,6 +106,9 @@ class SettingsPanelMixin:
         self.settings_edit: Optional[dict] = None
         # 提供商页「高级设置」折叠区状态（默认折叠）
         self._provider_adv_expanded = False
+        self._provider_body_expanded = False
+        self._provider_body_items_expanded: set = set()
+        self._provider_body_by_provider: Dict[str, List[dict]] = {}
 
     def _compose_settings(self, w: int, h: int) -> List[str]:
         """设置：标签页 + 表单；choice 用 ←→，text 直接键入"""
@@ -159,10 +163,28 @@ class SettingsPanelMixin:
                 elif ftype == "ptext":
                     show = self._edit_caret_text(edit) if editing else ("" if field.get("current") is None else str(field.get("current")))
                     display = _clip(f"    {label:18} {show}", w - 4)
-                elif ftype == "section":
-                    # 折叠区域标题行：Enter/←→ 展开或收起
+                elif ftype in ("section", "body_item_section"):
                     arrow = "▾" if field.get("expanded") else "▸"
                     display = _clip(f"{arrow} {label} · Enter{'收起' if field.get('expanded') else '展开'}", w - 4)
+                elif ftype == "body_enabled":
+                    item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+                    mark = "[x]" if item.get("enabled", True) else "[ ]"
+                    display = _clip(f"    {mark} 启用", w - 4)
+                elif ftype == "body_text":
+                    item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+                    show = self._edit_caret_text(edit) if editing else str(item.get("key") or "")
+                    display = _clip(f"      键名：{show}", w - 4)
+                elif ftype == "body_json":
+                    item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+                    if editing:
+                        show = self._edit_caret_text(edit)
+                    elif item.get("inherit"):
+                        config = getattr(self, "config", None)
+                        inherited = self._settings_body_value_text(item, config) if config is not None else "跟随思考设置"
+                        show = f"继承（当前 {inherited}）"
+                    else:
+                        show = json.dumps(item.get("value"), ensure_ascii=False)
+                    display = _clip(f"      值：{show}", w - 4)
                 elif ftype in ("advbool", "check"):
                     mark = "[x]" if value in (True, "true", "1", 1) else "[ ]"
                     display = _clip(f"    {mark} {label}", w - 4)
@@ -292,8 +314,6 @@ class SettingsPanelMixin:
             "adv_send_temperature": bool(adv.get("send_temperature", False)),
             "adv_thinking_enabled": "开" if mode is True else ("关" if mode is False else "跟随"),
             "adv_thinking_effort": effort if effort in THINKING_OPTIONS else "跟随",
-            "adv_thinking_effort_field": str(adv.get("thinking_effort_field") or "").strip(),
-            "adv_thinking_enabled_field": str(adv.get("thinking_enabled_field") or "").strip(),
         }
 
     @staticmethod
@@ -302,56 +322,135 @@ class SettingsPanelMixin:
         mode = str(scratch.get("adv_thinking_enabled") or "跟随")
         effort = str(scratch.get("adv_thinking_effort") or "跟随").strip().lower()
         raw = scratch.get("adv_send_temperature")
+        body = [dict(item) for item in scratch.get("adv_custom_body", []) if isinstance(item, dict)]
+        default_keys = {"thinking_enabled": "enable_thinking", "thinking_effort": "reasoning_effort"}
+        preset_keys = {}
+        for preset, default_key in default_keys.items():
+            item = next((row for row in body if row.get("preset") == preset), None)
+            if item is None:
+                item = {"preset": preset, "enabled": True, "key": default_key, "inherit": True}
+                body.append(item)
+            else:
+                item["key"] = str(item.get("key") or default_key).strip()
+                item["enabled"] = bool(item.get("enabled", True))
+                item["inherit"] = bool(item.get("inherit", True))
+            preset_keys[preset] = item["key"]
+        effort_field = "" if preset_keys["thinking_effort"] == default_keys["thinking_effort"] else preset_keys["thinking_effort"]
+        enabled_field = "" if preset_keys["thinking_enabled"] == default_keys["thinking_enabled"] else preset_keys["thinking_enabled"]
         return {
             "send_temperature": bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw)),
             "thinking_enabled": {"开": True, "关": False}.get(mode),
             "thinking_effort": effort if effort in THINKING_OPTIONS else "",
-            "thinking_effort_field": str(scratch.get("adv_thinking_effort_field") or "").strip(),
-            "thinking_enabled_field": str(scratch.get("adv_thinking_enabled_field") or "").strip(),
+            "thinking_effort_field": effort_field,
+            "thinking_enabled_field": enabled_field,
+            "custom_body": body,
         }
 
-    def _provider_advanced_fields(self, provider: Optional[dict]) -> List[dict]:
-        """展开态下的高级设置子行：勾选框/选择/文本各一"""
-        cur = self._provider_advanced_display(provider)
-        return [
-            {
-                "key": "adv_send_temperature",
-                "label": "携带温度",
-                "type": "advbool",
-                "current": cur["adv_send_temperature"],
-                "hint": "勾选后请求才携带 temperature 参数（默认不携带）",
-            },
-            {
-                "key": "adv_thinking_enabled",
-                "label": "启用思考",
-                "type": "advchoice",
-                "options": list(self._ADV_THINKING_MODES),
-                "current": cur["adv_thinking_enabled"],
-                "hint": "覆盖模型思考开关 · 跟随=不改",
-            },
-            {
-                "key": "adv_thinking_effort",
-                "label": "思考强度",
-                "type": "advchoice",
-                "options": list(self._ADV_THINKING_EFFORTS),
-                "current": cur["adv_thinking_effort"],
-                "hint": "覆盖模型思考强度 · 跟随=用模型值",
-            },
-            {
-                "key": "adv_thinking_effort_field",
-                "label": "向提供商发送的思考字段",
-                "type": "text",
-                "current": cur["adv_thinking_effort_field"],
-                "hint": "发送思考强度的请求键名 · 空=reasoning_effort",
-            },
-            {
-                "key": "adv_thinking_enabled_field",
-                "label": "向提供商发送的思考开关",
-                "type": "text",
-                "current": cur["adv_thinking_enabled_field"],
-                "hint": "发送思考开关的请求键名 · 空=enable_thinking",
-            },
-        ]
+    @staticmethod
+    def _provider_custom_body(provider: Optional[dict]) -> List[dict]:
+        """provider.advanced.custom_body → 含固定思考预置项的可编辑副本"""
+        advanced = (provider or {}).get("advanced") or {}
+        advanced = advanced if isinstance(advanced, dict) else {}
+        rows = advanced.get("custom_body")
+        if isinstance(rows, list):
+            body = [dict(row) for row in rows if isinstance(row, dict)]
+        else:
+            body = []
+        presets = {
+            "thinking_enabled": str(advanced.get("thinking_enabled_field") or "enable_thinking").strip(),
+            "thinking_effort": str(advanced.get("thinking_effort_field") or "reasoning_effort").strip(),
+        }
+        for preset, default_key in presets.items():
+            row = next((item for item in body if item.get("preset") == preset), None)
+            if row is None:
+                body.append({"preset": preset, "enabled": True, "key": default_key, "inherit": True})
+            else:
+                row.setdefault("enabled", True)
+                row.setdefault("key", default_key)
+                row.setdefault("inherit", True)
+        return body
+
+    def _settings_body_value_text(self, item: dict, config) -> str:
+        if not item.get("inherit"):
+            return json.dumps(item.get("value"), ensure_ascii=False)
+        if item.get("preset") == "thinking_effort":
+            from core.llm import _thinking_effort_of
+
+            provider = config.find_provider(self.settings_provider_id) or {}
+            advanced = dict(provider.get("advanced") or {})
+            enabled = self.settings_scratch.get("adv_thinking_enabled", "跟随")
+            effort = self.settings_scratch.get("adv_thinking_effort", "跟随")
+            advanced["thinking_enabled"] = {"开": True, "关": False}.get(enabled)
+            advanced["thinking_effort"] = "" if effort == "跟随" else effort
+            model = next((
+                row for row in config.list_models()
+                if row.get("provider_id") == self.settings_provider_id
+                and row.get("model_id") == provider.get("default_model_id")
+            ), None)
+            if model is None:
+                model = next((
+                    row for row in config.list_models()
+                    if row.get("provider_id") == self.settings_provider_id
+                ), {})
+            value = _thinking_effort_of(
+                model.get("thinking_effort"), advanced,
+                model_override=bool(model.get("thinking_effort_explicit", False)),
+            )
+        else:
+            effort = json.loads(self._settings_body_value_text({"preset": "thinking_effort", "inherit": True}, config))
+            value = effort != "none"
+        return json.dumps(value, ensure_ascii=False)
+
+    def _provider_advanced_fields(self, provider: Optional[dict], scratch=None) -> List[dict]:
+        """展开态下的高级设置子行及自定义请求体编辑行"""
+        fields = [{
+            "key": "adv_send_temperature",
+            "label": "携带温度",
+            "type": "advbool",
+            "current": self._provider_advanced_display(provider)["adv_send_temperature"],
+            "hint": "勾选后请求才携带 temperature 参数（默认不携带）",
+        }, {
+            "key": "_provider_custom_body",
+            "label": "自定义请求体",
+            "type": "body_item_section",
+            "expanded": self._provider_body_expanded,
+            "hint": "启用项会覆盖或扩展 LLM 请求 payload",
+        }]
+        if not self._provider_body_expanded:
+            return fields
+        body = (scratch or self.settings_scratch).get("adv_custom_body") or []
+        expanded = getattr(self, "_provider_body_items_expanded", set())
+        for index, item in enumerate(body):
+            preset = item.get("preset")
+            label = {"thinking_enabled": "启用思考", "thinking_effort": "思考强度"}.get(preset, f"自定义键 {index - 1}")
+            is_expanded = index in expanded
+            fields.append({
+                "key": f"body_item_{index}", "label": f"{label}（{'预置' if preset else '自定义'}）",
+                "type": "body_item_section", "expanded": is_expanded, "body_index": index,
+                "hint": "Enter 展开/收起 · 预置值默认继承思考设置",
+            })
+            if not is_expanded:
+                continue
+            fields.extend(({
+                "key": f"body_enabled_{index}", "label": "启用", "type": "body_enabled",
+                "body_index": index, "current": item.get("enabled", True),
+                "hint": "关闭后该键不会进入请求 payload",
+            }, {
+                "key": f"body_key_{index}", "label": "键名", "type": "body_text",
+                "body_index": index, "current": item.get("key", ""),
+                "hint": "Enter 编辑请求体键名",
+            }, {
+                "key": f"body_value_{index}", "label": "值", "type": "body_json",
+                "body_index": index, "current": item.get("value"),
+                "hint": "Enter 编辑 JSON 值；预置项输入 inherit 可恢复继承",
+            }))
+            if not preset:
+                fields.append({
+                    "key": f"body_delete_{index}", "label": "删除此键", "type": "action",
+                    "body_index": index, "hint": "Enter 删除此自定义键",
+                })
+        fields.append({"key": "body_add", "label": "+ 添加键", "type": "action", "hint": "Enter 添加自定义请求体键值"})
+        return fields
 
     @classmethod
     def _model_modalities_values(cls, scratch: dict) -> List[str]:
@@ -399,8 +498,7 @@ class SettingsPanelMixin:
             "adv_send_temperature": s.get("adv_send_temperature"),
             "adv_thinking_enabled": s.get("adv_thinking_enabled"),
             "adv_thinking_effort": s.get("adv_thinking_effort"),
-            "adv_thinking_effort_field": s.get("adv_thinking_effort_field"),
-            "adv_thinking_enabled_field": s.get("adv_thinking_enabled_field"),
+            "adv_custom_body": repr(s.get("adv_custom_body", [])),
             **{key: s.get(key) for key in self._MODEL_MODALITIES},
             "model_id": s.get("model_id"),
             "context_window": s.get("context_window"),
@@ -471,8 +569,18 @@ class SettingsPanelMixin:
             # 高级设置显示态始终进 scratch：未展开时保存/脏值比对也不丢原配置
             for adv_key, adv_value in self._provider_advanced_display(provider).items():
                 scratch_keep.setdefault(adv_key, adv_value)
-            scratch_keep["adv_thinking_effort_field"] = str(provider.get("advanced", {}).get("thinking_effort_field") or "").strip()
-            scratch_keep["adv_thinking_enabled_field"] = str(provider.get("advanced", {}).get("thinking_enabled_field") or "").strip()
+            if self.settings_provider_id != getattr(self, "_settings_body_provider_id", ""):
+                old_pid = getattr(self, "_settings_body_provider_id", "")
+                if old_pid and isinstance(self.settings_scratch.get("adv_custom_body"), list):
+                    self._provider_body_by_provider[old_pid] = [dict(row) for row in self.settings_scratch["adv_custom_body"]]
+                scratch_keep["adv_custom_body"] = [
+                    dict(row) for row in self._provider_body_by_provider.get(
+                        pid, self._provider_custom_body(provider)
+                    )
+                ]
+                self._settings_body_provider_id = pid
+            elif "adv_custom_body" not in scratch_keep:
+                scratch_keep["adv_custom_body"] = self._provider_custom_body(provider)
             # 实时模型列表 = 配置中已有 + 本页/模型页工作副本
             live_models = self._provider_live_models(config, pid)
             live_mids = [m.get("model_id") for m in live_models]
@@ -488,7 +596,18 @@ class SettingsPanelMixin:
             if not live_mids:
                 default_id = ""
             adv_expanded = bool(getattr(self, "_provider_adv_expanded", False))
-            adv_fields = self._provider_advanced_fields(provider) if adv_expanded else []
+            body = scratch_keep.get("adv_custom_body") or []
+            preset_fields = []
+            for preset, label, key, value in (
+                ("thinking_enabled", "启用思考", "adv_thinking_enabled", scratch_keep.get("adv_thinking_enabled", "跟随")),
+                ("thinking_effort", "思考强度", "adv_thinking_effort", scratch_keep.get("adv_thinking_effort", "跟随")),
+            ):
+                options = self._ADV_THINKING_MODES if preset == "thinking_enabled" else self._ADV_THINKING_EFFORTS
+                preset_fields.append({
+                    "key": key, "label": label, "type": "choice", "options": list(options),
+                    "current": value, "hint": "思考请求默认值 · 可在高级设置自定义请求体中覆盖",
+                })
+            adv_fields = self._provider_advanced_fields(provider, scratch_keep) if adv_expanded else []
             fields = [
                 # —— 切换与激活（置顶，与下方配置隔离）——
                 {
@@ -549,12 +668,13 @@ class SettingsPanelMixin:
                     "current": scratch_keep.get("provider_temperature", provider.get("temperature", 1.0)),
                     "hint": "高级设置勾选「携带温度」后才随请求发送",
                 },
+                *preset_fields,
                 {
                     "key": "_provider_advanced",
                     "label": "高级设置",
                     "type": "section",
                     "expanded": adv_expanded,
-                    "hint": "Enter 展开/收起 · 请求携带温度与思考参数覆盖",
+                    "hint": "Enter 展开/收起 · 请求携带温度与自定义请求体",
                 },
                 *adv_fields,
                 {
@@ -761,7 +881,7 @@ class SettingsPanelMixin:
         self.settings_fields = fields
         # 初始化 scratch：保留同 key 已编辑值（插件页字段写透持久化，不经 scratch）
         for field in fields:
-            if field.get("type") in ("plugin", "pbool", "pchoice", "ptext"):
+            if field.get("type") in ("plugin", "pbool", "pchoice", "ptext", "body_enabled", "body_text", "body_json", "body_item_section"):
                 scratch_keep.pop(field["key"], None)
                 continue
             if field.get("type") in ("bool", "advbool", "check"):
@@ -806,6 +926,10 @@ class SettingsPanelMixin:
         self.settings_scratch = {}
         self._plugin_expanded = set()
         self._provider_adv_expanded = False   # 高级设置每次打开都回到折叠态
+        self._provider_body_expanded = False
+        self._provider_body_items_expanded = set()
+        self._provider_body_by_provider = {}
+        self._settings_body_provider_id = ""
         self.settings_provider_id = config.data.get("active_provider_id", "")
         self.settings_model_name = config.model_name
         self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
@@ -832,10 +956,14 @@ class SettingsPanelMixin:
             # 行内编辑态：按键全部交给编辑器（走 pt 管线，中文 IME 上屏可用）
             if self.settings_edit is not None:
                 navigation = _key_direction(kind, value) in ("up", "down")
-                field_edit = self.settings_edit["kind"] in ("text", "plugin")
+                field_edit = self.settings_edit["kind"] in ("text", "plugin", "body_text", "body_json")
                 if field_edit and (navigation or kind in ("tab", "escape", "interrupt", "submit", "submit_ctrl")):
+                    edit_kind = self.settings_edit["kind"]
                     self._settings_edit_commit(config)
                     if kind in ("submit", "submit_ctrl"):
+                        if edit_kind in ("body_text", "body_json"):
+                            self.render()
+                            continue
                         updates = self._settings_apply(config)
                         self.settings_mode = False
                         self.bind_config(config)
@@ -906,10 +1034,19 @@ class SettingsPanelMixin:
                     self._settings_plugin_edit_text(config, field)
                     self.render()
                     continue
-                # 高级设置：标题行展开/收起
-                if ftype == "section":
-                    self._provider_adv_expanded = not bool(getattr(self, "_provider_adv_expanded", False))
-                    self.settings_notice = f"高级设置已{'展开' if self._provider_adv_expanded else '收起'}"
+                if ftype in ("section", "body_item_section"):
+                    if field.get("key") == "_provider_advanced":
+                        self._provider_adv_expanded = not self._provider_adv_expanded
+                        self.settings_notice = f"高级设置已{'展开' if self._provider_adv_expanded else '收起'}"
+                    elif field.get("key") == "_provider_custom_body":
+                        self._provider_body_expanded = not self._provider_body_expanded
+                        self.settings_notice = f"自定义请求体已{'展开' if self._provider_body_expanded else '收起'}"
+                    else:
+                        index = field.get("body_index")
+                        if index in self._provider_body_items_expanded:
+                            self._provider_body_items_expanded.discard(index)
+                        else:
+                            self._provider_body_items_expanded.add(index)
                     self._immediate_settings_refresh(config)
                     self._clamp_settings_index()
                     self.render()
@@ -923,7 +1060,31 @@ class SettingsPanelMixin:
                         self._clamp_settings_index()
                         self.render()
                         continue
+                    if field.get("key") == "body_add":
+                        body = self.settings_scratch.setdefault("adv_custom_body", [])
+                        body.append({"enabled": True, "key": "", "value": None, "inherit": False})
+                        self._provider_body_items_expanded.add(len(body) - 1)
+                        self._immediate_settings_refresh(config)
+                        self.settings_index = next(i for i, row in enumerate(self.settings_fields) if row.get("key") == f"body_key_{len(body) - 1}")
+                        self.settings_notice = "已添加自定义键 · 请填写键名和值"
+                        self.render()
+                        continue
+                    if field.get("key", "").startswith("body_delete_"):
+                        index = field["body_index"]
+                        del self.settings_scratch["adv_custom_body"][index]
+                        self._provider_body_items_expanded = set()
+                        self._immediate_settings_refresh(config)
+                        self._clamp_settings_index()
+                        self.settings_notice = "已删除自定义键"
+                        self.render()
+                        continue
                     self._settings_run_action(config, field.get("key"))
+                    self.render()
+                    continue
+                if ftype in ("body_text", "body_json"):
+                    item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+                    initial = str(item.get("key") or "") if ftype == "body_text" else self._settings_body_value_text(item, config)
+                    self._settings_begin_edit(kind=ftype, label=field.get("label", field["key"]), initial=initial, field=field)
                     self.render()
                     continue
                 if ftype in ("text", "advtext"):
@@ -938,9 +1099,13 @@ class SettingsPanelMixin:
                     )
                     self.render()
                     continue
-                if ftype in ("bool", "advbool", "check"):
-                    cur = self.settings_scratch.get(field["key"], field.get("current"))
-                    self.settings_scratch[field["key"]] = not bool(cur in (True, "true", "1", 1))
+                if ftype in ("bool", "advbool", "check", "body_enabled"):
+                    if ftype == "body_enabled":
+                        item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+                        item["enabled"] = not bool(item.get("enabled", True))
+                    else:
+                        cur = self.settings_scratch.get(field["key"], field.get("current"))
+                        self.settings_scratch[field["key"]] = not bool(cur in (True, "true", "1", 1))
                     self.render()
                     continue
                 # choice / 其它：Enter = 保存并退出设置
@@ -1017,6 +1182,10 @@ class SettingsPanelMixin:
             return
         ftype = field.get("type")
         key = field["key"]
+        if ftype == "body_enabled":
+            item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+            item["enabled"] = not bool(item.get("enabled", True))
+            return
         if ftype in ("bool", "advbool", "check"):
             cur = self.settings_scratch.get(key, field.get("current"))
             self.settings_scratch[key] = not bool(cur in (True, "true", "1", 1))
@@ -1046,8 +1215,6 @@ class SettingsPanelMixin:
                 s["balance_url"] = provider.get("balance_url", "")
                 s["provider_temperature"] = provider.get("temperature", 1.0)
                 s.update(self._provider_advanced_display(provider))
-                s["adv_thinking_effort_field"] = str(provider.get("advanced", {}).get("thinking_effort_field") or "").strip()
-                s["adv_thinking_enabled_field"] = str(provider.get("advanced", {}).get("thinking_enabled_field") or "").strip()
                 s["default_model_id"] = provider.get("default_model_id", "")
                 s["provider_models_list"] = ",".join(
                     m.get("model_id") for m in provider.get("models") or []
@@ -1062,8 +1229,7 @@ class SettingsPanelMixin:
                 s["balance_url"] = ""
                 s["provider_temperature"] = 1.0
                 s.update(self._provider_advanced_display({}))
-                s["adv_thinking_effort_field"] = ""
-                s["adv_thinking_enabled_field"] = ""
+                s["adv_custom_body"] = self._provider_custom_body({})
                 s["default_model_id"] = ""
                 s["provider_models_list"] = "（暂无）"
             # 切换提供商属于明确操作，立即刷新列表
@@ -1176,8 +1342,6 @@ class SettingsPanelMixin:
             "default_model_id": s.get("default_model_id", ""),
             "advanced": self._provider_advanced_form(s),
         }
-        form["advanced"]["thinking_effort_field"] = str(s.get("adv_thinking_effort_field") or "").strip()
-        form["advanced"]["thinking_enabled_field"] = str(s.get("adv_thinking_enabled_field") or "").strip()
         if form["default_model_id"] in ("（无模型）", "-", ""):
             form["default_model_id"] = live_models[0].get("model_id", "") if live_models else ""
         # 与保存前列表 diff
@@ -1198,8 +1362,8 @@ class SettingsPanelMixin:
         s["balance_url"] = provider.get("balance_url", form["balance_url"])
         s["provider_temperature"] = provider.get("temperature", form["temperature"])
         s.update(self._provider_advanced_display(provider))
-        s["adv_thinking_effort_field"] = str(provider.get("advanced", {}).get("thinking_effort_field") or "").strip()
-        s["adv_thinking_enabled_field"] = str(provider.get("advanced", {}).get("thinking_enabled_field") or "").strip()
+        s["adv_custom_body"] = self._provider_custom_body(provider)
+        self._provider_body_by_provider[pid] = [dict(row) for row in s["adv_custom_body"]]
         live_ids = [m.get("model_id") for m in self._provider_live_models(config, pid)]
         s["default_model_id"] = provider.get("default_model_id") or (live_ids[0] if live_ids else "")
         s["provider_models_list"] = ",".join(live_ids) if live_ids else "（暂无）"
@@ -1227,9 +1391,23 @@ class SettingsPanelMixin:
         处理了插件类字段返回 True（调用方跳过通用 choice 循环并重建字段）。"""
         field = self._plugin_current_field()
         ftype = field.get("type")
-        if ftype == "section":
-            self._provider_adv_expanded = not bool(getattr(self, "_provider_adv_expanded", False))
-            self.settings_notice = f"高级设置已{'展开' if self._provider_adv_expanded else '收起'}"
+        if ftype in ("section", "body_item_section"):
+            if field.get("key") == "_provider_advanced":
+                self._provider_adv_expanded = not self._provider_adv_expanded
+                self.settings_notice = f"高级设置已{'展开' if self._provider_adv_expanded else '收起'}"
+            elif field.get("key") == "_provider_custom_body":
+                self._provider_body_expanded = not self._provider_body_expanded
+                self.settings_notice = f"自定义请求体已{'展开' if self._provider_body_expanded else '收起'}"
+            else:
+                index = field.get("body_index")
+                if index in self._provider_body_items_expanded:
+                    self._provider_body_items_expanded.discard(index)
+                else:
+                    self._provider_body_items_expanded.add(index)
+            return True
+        if ftype == "body_enabled":
+            item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+            item["enabled"] = not bool(item.get("enabled", True))
             return True
         if ftype == "plugin":
             self._settings_plugin_toggle_enable(config, field)
@@ -1495,8 +1673,6 @@ class SettingsPanelMixin:
             "balance_url": str(s.get("balance_url", "")),
             "advanced": self._provider_advanced_form(s),
         }
-        provider["advanced"]["thinking_effort_field"] = str(s.get("adv_thinking_effort_field") or "").strip()
-        provider["advanced"]["thinking_enabled_field"] = str(s.get("adv_thinking_enabled_field") or "").strip()
         try:
             provider["temperature"] = float(s.get("provider_temperature", 1.0))
         except (TypeError, ValueError):
@@ -1687,15 +1863,20 @@ class SettingsPanelMixin:
             return False
         field = fields[self.settings_index]
         ftype = field.get("type")
-        if ftype in ("text", "advtext"):
-            key_name = field.get("key")
-            cur = self.settings_scratch.get(key_name, field.get("current"))
-            self._settings_begin_edit(
-                kind="text",
-                label=field.get("label", key_name),
-                initial="" if cur is None else str(cur),
-                key=key_name,
-            )
+        if ftype in ("text", "advtext", "body_text", "body_json"):
+            if ftype in ("body_text", "body_json"):
+                item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+                initial = str(item.get("key") or "") if ftype == "body_text" else self._settings_body_value_text(item, config)
+                self._settings_begin_edit(kind=ftype, label=field.get("label", field["key"]), initial=initial, field=field)
+            else:
+                key_name = field.get("key")
+                cur = self.settings_scratch.get(key_name, field.get("current"))
+                self._settings_begin_edit(
+                    kind="text",
+                    label=field.get("label", key_name),
+                    initial="" if cur is None else str(cur),
+                    key=key_name,
+                )
         elif ftype == "ptext":
             self._settings_plugin_edit_text(config, field)
         else:
@@ -1747,7 +1928,26 @@ class SettingsPanelMixin:
         raw = edit["buf"].to_text()
         kind = edit["kind"]
         self.settings_edit = None
-        if kind == "text":
+        if kind in ("body_text", "body_json"):
+            field = edit.get("field") or {}
+            item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+            if kind == "body_text":
+                item["key"] = raw.strip()
+                self.settings_notice = "键名已更新 · Enter 保存退出"
+            elif item.get("preset") and raw.strip().lower() == "inherit":
+                item["inherit"] = True
+                item.pop("value", None)
+                self.settings_notice = "已恢复继承思考默认值 · Enter 保存退出"
+            else:
+                try:
+                    item["value"] = json.loads(raw)
+                except json.JSONDecodeError:
+                    self.settings_notice = "值不是合法 JSON · 已保留原值"
+                else:
+                    item["inherit"] = False
+                    self.settings_notice = "JSON 值已更新 · Enter 保存退出"
+            self._build_settings_fields(config)
+        elif kind == "text":
             key_name = edit.get("key")
             label = edit["label"]
             self.settings_scratch[key_name] = raw
