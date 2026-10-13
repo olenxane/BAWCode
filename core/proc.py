@@ -1,5 +1,6 @@
 #进程执行底层：输出落临时文件并轮询等待，超时/取消时按进程树整体终止（Windows 走 Job Object）
 import ctypes
+import locale
 import os
 import signal
 import subprocess
@@ -126,13 +127,27 @@ def _wait(proc: subprocess.Popen, timeout: Optional[float], cancel) -> str:
             return "timeout"
 
 
+def _decode_output(raw: bytes, encoding: str) -> str:
+    """子进程输出解码：UTF-8 优先，其次调用方给的编码与本地编码，都解不开再有损兜底
+
+    子进程输出的编码不跟随调用方控制台代码页：Python 等按本地编码（中文 Windows 为 GBK）
+    书写被重定向的标准输出，多数命令行工具固定输出 UTF-8，按单一编码解码必有一类中文乱码。
+    UTF-8 严格可校验，且中文 GBK 文本极难通过校验，故先试它。"""
+    for enc in dict.fromkeys(("utf-8", encoding, locale.getpreferredencoding(False))):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def _read_output(out, err, encoding: str) -> str:
     """读回输出文件；合并模式 err 即 out，只读一份"""
     out.seek(0)
-    text = out.read().decode(encoding, errors="replace")
+    text = _decode_output(out.read(), encoding)
     if err is not out:
         err.seek(0)
-        text += err.read().decode(encoding, errors="replace")
+        text += _decode_output(err.read(), encoding)
     return text
 
 
@@ -182,7 +197,8 @@ def run_capture(
     """执行命令并收集输出，返回 (status, returncode, output)，status 为 ok/timeout/cancelled
 
     输出落临时文件而非管道：后代继承输出句柄不会挂住调用方，也没有读线程与关流互锁；
-    stdin_text 写临时脚本文件送入（多行命令走 stdin 的解释器）。"""
+    stdin_text 写临时脚本文件送入（多行命令走 stdin 的解释器）。encoding 用于书写该脚本，
+    并作为输出解码的候选编码（输出解码见 _decode_output）。"""
     out_path = _temp_path(".out")
     err_path = out_path if merge_stderr else _temp_path(".err")
     script_path = None

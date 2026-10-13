@@ -58,7 +58,10 @@ def _clamp_timeout(value) -> int:
 
 
 def _console_output_encoding() -> str:
-    """控制台输出代码页；子进程输出按它解码"""
+    """控制台输出代码页（非 win32 回落 utf-8）
+
+    子进程凭什么编码写标准输出与它无关（见 proc._decode_output）；本函数只反映当前控制台
+    的代码页，供输出解码与送入子进程的脚本文本编码取用。"""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -1759,6 +1762,7 @@ def run_program(
         status, code, output = proc.run_capture(
             cmd,
             cwd=cwd,
+            env=shells.build_env(),
             timeout=timeout,
             cancel=proc.cancel_event(),
             merge_stderr=False,

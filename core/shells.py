@@ -187,12 +187,13 @@ def available(name: str) -> bool:
     return _resolve_process(resolve_name(name)) is not None
 
 
-def build_env(name: str) -> dict:
-    """子进程环境：清理其它解释器遗留的启动参数，避免互相干扰"""
+def build_env(name: Optional[str] = None) -> dict:
+    """子进程环境：清理旧代码页设置并统一 Python 标准输出为 UTF-8"""
     env = dict(os.environ)
     for key in code_pages():
         env.pop(key, None)
-    if resolve_name(name) == GIT_BASH:
+    env["PYTHONIOENCODING"] = "utf-8"
+    if name and resolve_name(name) == GIT_BASH:
         env["CHERE_INVOKING"] = "1"  # bash 从当前目录启动，不跳到用户主目录
         env["MSYS_NO_PATHCONV"] = "1"  # 不做 Windows/Unix 路径自动转换，路径原样传入
     return env
