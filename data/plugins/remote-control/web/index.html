@@ -237,6 +237,29 @@
   }
   #confirm-card .deny-row input:focus { border-color: var(--red); }
 
+  /* ============ 询问卡片 ============ */
+  #ask-card {
+    margin: 0 12px; padding: 12px 14px calc(12px + env(safe-area-inset-bottom) * 0);
+    background: var(--card); border: 1px solid #cddff5; border-bottom: none;
+    border-radius: 16px 16px 0 0; box-shadow: 0 -4px 18px rgba(23,32,42,.08); z-index: 30;
+  }
+  #ask-card .c-head { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--blue); font-weight: 600; }
+  #ask-card .c-count { margin-left: auto; font-size: 11px; color: var(--faint); font-weight: 400; }
+  #ask-card .q { margin: 8px 0; font-size: 13.5px; white-space: pre-wrap; word-break: break-word; }
+  #ask-card .opts { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+  #ask-card .opt {
+    text-align: left; padding: 8px 12px; border-radius: 10px; font-size: 13px;
+    background: var(--bg); border: 1px solid var(--line); transition: border-color .15s;
+  }
+  #ask-card .opt:active { border-color: var(--blue); }
+  #ask-card .opt .o-desc { display: block; font-size: 11.5px; color: var(--faint); margin-top: 2px; }
+  #ask-card .ask-input-row { display: flex; gap: 8px; margin: 8px 0; }
+  #ask-card .ask-input-row input {
+    flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px;
+    font: inherit; font-size: 13px; outline: none; background: var(--bg);
+  }
+  #ask-card .ask-input-row input:focus { border-color: var(--blue); }
+
   /* ============ 按钮 ============ */
   .btn {
     padding: 7px 16px; border-radius: 10px; font-size: 13px; background: var(--bg);
@@ -440,6 +463,25 @@
   #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
   #toast.err { background: rgba(190,30,40,.94); }
 
+  /* 登录界面 */
+  #login-screen {
+    position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center;
+    padding: 24px; background: var(--bg);
+  }
+  #login-card {
+    width: min(100%, 380px); padding: 26px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 18px; box-shadow: 0 10px 36px rgba(23,32,42,.1);
+  }
+  #login-card h1 { margin: 0 0 5px; font-size: 20px; }
+  #login-card p { margin: 0 0 18px; color: var(--dim); font-size: 13px; }
+  #login-password {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px;
+    outline: none; background: var(--bg); font: inherit;
+  }
+  #login-password:focus { border-color: var(--accent); background: #fff; }
+  #login-submit { width: 100%; margin-top: 12px; }
+  #login-error { min-height: 20px; margin-top: 8px; color: var(--red); font-size: 12px; }
+
   /* 无效密钥 */
   #banner {
     position: fixed; inset: 0; z-index: 70; background: var(--bg);
@@ -491,8 +533,9 @@
       <div class="d-sec">
         <div class="s-head">访问模式</div>
         <div class="seg" id="mode-seg">
+          <button data-mode="confirm">确认</button>
+          <button data-mode="edit">编辑</button>
           <button data-mode="auto">自动</button>
-          <button data-mode="manual">手动</button>
           <button data-mode="full">完全访问</button>
         </div>
         <div class="seg-note" id="mode-note"></div>
@@ -516,7 +559,10 @@
       <div class="d-sec">
         <div class="s-head">账户</div>
         <div class="d-card" id="token-card"><div class="empty-note">—</div></div>
-        <div class="btn-row"><button class="btn small" data-act="balance">查询余额</button></div>
+        <div class="btn-row">
+          <button class="btn small" data-act="balance">查询余额</button>
+          <button class="btn small danger" data-act="logout">退出登录</button>
+        </div>
       </div>
     </div>
     <!-- 信息 -->
@@ -553,6 +599,16 @@
     <span id="s-meta"></span>
   </div>
   <main id="log"></main>
+  <div id="ask-card" hidden>
+    <div class="c-head">❓ 询问请求<span class="c-count" id="ask-count"></span></div>
+    <div class="q" id="ask-question"></div>
+    <div class="opts" id="ask-options"></div>
+    <div class="ask-input-row">
+      <input id="ask-input" placeholder="或自行输入回答…">
+      <button class="btn primary small" id="ask-input-ok">提交</button>
+    </div>
+    <div class="btns"><button class="btn small" id="ask-skip">跳过本次询问</button></div>
+  </div>
   <div id="confirm-card" hidden>
     <div class="c-head">⚠ 工具确认请求 · <span class="cname" id="confirm-name"></span><span class="c-count" id="confirm-count"></span></div>
     <pre id="confirm-args"></pre>
@@ -578,6 +634,15 @@
   </footer>
 </div>
 
+<div id="login-screen">
+  <form id="login-card">
+    <h1>BAWCode 远程控制</h1>
+    <p>请输入访问密码以继续</p>
+    <input id="login-password" type="password" autocomplete="current-password" placeholder="访问密码" required>
+    <button class="btn primary" id="login-submit" type="submit">登录</button>
+    <div id="login-error" role="alert"></div>
+  </form>
+</div>
 <div id="banner" hidden>
   <div class="bad">链接无效或已过期</div>
   <div>请使用终端 /remote 命令显示的最新链接重新打开。</div>
@@ -592,15 +657,17 @@ const logEl = $("log"), input = $("input"), fileInput = $("file-input");
 const coarse = matchMedia("(pointer: coarse)").matches;
 const desktopMQ = matchMedia("(min-width: 960px)");
 
-/* ================= 密钥：URL 携带 → sessionStorage，随后清洗地址栏 ================= */
-let KEY = new URLSearchParams(location.search).get("key") || sessionStorage.getItem("rc_key") || "";
-if (KEY) {
-  sessionStorage.setItem("rc_key", KEY);
+/* ================= 鉴权凭据：链接密钥或登录 token ================= */
+const urlParams = new URLSearchParams(location.search);
+let CRED = urlParams.get("key") || urlParams.get("token")
+  || sessionStorage.getItem("rc_cred") || sessionStorage.getItem("rc_key") || "";
+if (CRED) {
+  sessionStorage.setItem("rc_cred", CRED);
+  sessionStorage.removeItem("rc_key");
   if (location.search) history.replaceState(null, "", location.pathname);
-} else {
-  $("banner").hidden = false;
 }
-const qs = () => `?key=${encodeURIComponent(KEY)}`;
+let AUTHED = false;  // 链接密钥或登录 cookie 之一有效即 true（cookie 无 CRED 也能通过）
+const qs = () => CRED ? `?token=${encodeURIComponent(CRED)}` : "";
 
 async function api(path, body) {
   const opt = body === undefined ? {} : {
@@ -613,10 +680,26 @@ async function api(path, body) {
   return j;
 }
 function showBanner(text) {
+  AUTHED = false;
+  $("login-screen").hidden = true;
   $("banner").hidden = false;
   if (text) $("banner").querySelector(".bad").textContent = text;
   if (es) { es.close(); es = null; }
   setConn("err");
+}
+function showLogin(message) {
+  AUTHED = false;
+  $("banner").hidden = true;
+  $("login-screen").hidden = false;
+  $("login-error").textContent = message || "";
+  if (es) { es.close(); es = null; }
+  setConn("err", "需要登录");
+}
+function clearCredential() {
+  CRED = "";
+  AUTHED = false;
+  sessionStorage.removeItem("rc_cred");
+  sessionStorage.removeItem("rc_key");
 }
 
 /* 语法高亮样式：monokai 词法配色，作用域 .hl，启动时一次性注入 */
@@ -1082,6 +1165,68 @@ $("c-deny").onclick = () => { $("deny-row").hidden = false; $("deny-reason").foc
 $("deny-cancel").onclick = () => { $("deny-row").hidden = true; };
 $("deny-ok").onclick = () => answerConfirm("deny", $("deny-reason").value);
 
+/* ================= 询问卡片（ask_user 工具，经 ui_request 扩展点远程代答） ================= */
+let askQueue = [];
+let askActive = null;
+let askRenderSig = "";
+function refreshAskCard() {
+  if (!askActive && askQueue.length) askActive = askQueue[0];
+  const sig = (askActive ? askActive.id : "") + "|" + askQueue.map(a => a.id).join(",");
+  if (sig === askRenderSig) return;  // 无变化不动 DOM：对账轮询不反复贴底
+  askRenderSig = sig;
+  if (!askActive) { $("ask-card").hidden = true; return; }
+  $("ask-count").textContent = askQueue.length > 1 ? `共 ${askQueue.length} 个待回答` : "";
+  $("ask-question").textContent = askActive.question || "";
+  $("ask-input").value = "";
+  const box = $("ask-options");
+  box.replaceChildren();
+  (askActive.options || []).forEach((o, i) => {
+    const btn = el("button", "opt");
+    btn.append(el("span", "", o.title || ""));
+    if (o.description) btn.append(el("span", "o-desc", o.description));
+    btn.onclick = () => answerAsk({ status: "answer", index: i, answer: o.title || "" });
+    box.append(btn);
+  });
+  $("ask-card").hidden = false;
+  stick();
+}
+function showAsk(p) {
+  if (!askQueue.some(a => a.id === p.id)) askQueue.push(p);
+  refreshAskCard();
+}
+function dropAsk(id) {
+  askQueue = askQueue.filter(a => a.id !== id);
+  if (askActive && askActive.id === id) askActive = null;
+  refreshAskCard();
+}
+/* 与服务端待回答列表对账：补上 SSE 丢掉的卡，清掉别端已答/超时的卡 */
+function syncAsks(pending) {
+  const serverIds = new Set((pending || []).map(a => a.id));
+  askQueue = askQueue.filter(a => serverIds.has(a.id));
+  if (askActive && !serverIds.has(askActive.id)) askActive = null;
+  (pending || []).forEach(a => { if (!askQueue.some(x => x.id === a.id)) askQueue.push(a); });
+  refreshAskCard();
+}
+async function answerAsk(payload) {
+  const item = askActive;
+  if (!item) return;
+  dropAsk(item.id);
+  try {
+    const r = await api("/api/ask", { id: item.id, ...payload });
+    if (!r.ok) toast(r.message || "回答发送失败", true);
+  } catch (e) { toast("网络错误: " + e, true); }
+}
+$("ask-input-ok").onclick = () => {
+  const text = $("ask-input").value.trim();
+  if (!text) { toast("请输入回答内容", true); return; }
+  answerAsk({ status: "answer", answer: text });
+};
+$("ask-input").addEventListener("keydown", e => {
+  if (e.isComposing) return;
+  if (e.key === "Enter") { e.preventDefault(); $("ask-input-ok").click(); }
+});
+$("ask-skip").onclick = () => answerAsk({ status: "declined" });
+
 /* ================= 顶栏状态 ================= */
 const state = { phase: "", busy: false, data: null };
 function setConn(cls, meta) {
@@ -1132,7 +1277,14 @@ async function fetchState(force) {
   fetching = (async () => {
     try {
       const s = await api("/api/state");
-      if (s.__status === 403) { showBanner("密钥无效或链接已过期"); return; }
+      if (s.__status === 403) {
+        AUTHED = false;
+        clearCredential();
+        const auth = await api("/api/auth");
+        if (auth.password_required) showLogin("凭据无效或已过期，请输入访问密码");
+        else showLogin("密码登录尚未配置，请先在终端 /settings → 插件中设置登录密码");
+        return;
+      }
       if (!s.ok) { setConn("err"); return; }
       state.data = s;
       state.phase = s.phase || "";
@@ -1163,8 +1315,9 @@ async function fetchState(force) {
         }
         stick();
       }
-      // 确认队列与快照对账（别的端答过的自动消失）
+      // 确认/询问队列与快照对账（别的端答过的自动消失）
       syncConfirms(s.pending || []);
+      syncAsks(s.asks || []);
     } catch (e) {
       setConn("err");
     } finally {
@@ -1283,8 +1436,8 @@ async function refreshInputCompletions() {
   } catch (e) { if (epoch === completionEpoch) clearInputCompletions(); }
 }
 async function fetchFiles(query, depth) {
-  const url = "/api/files?key=" + encodeURIComponent(KEY)
-    + "&prefix=" + encodeURIComponent(query) + "&depth=" + depth;
+  const url = "/api/files" + qs() + (CRED ? "&" : "?")
+    + "prefix=" + encodeURIComponent(query) + "&depth=" + depth;
   return await fetch(url).then(x => x.json());
 }
 function mergeCompletions(items, more) {
@@ -1360,7 +1513,7 @@ $("stop").onclick = async () => {
 /* ================= SSE 实时事件 ================= */
 let es = null;
 function connect() {
-  if (!KEY || !$("banner").hidden) return;
+  if (!AUTHED || !$("banner").hidden || !$("login-screen").hidden) return;
   if (es) es.close();
   es = new EventSource("/api/events" + qs());
   es.onopen = () => { setConn("on"); fetchState(); };
@@ -1405,6 +1558,8 @@ function connect() {
       case "reset": fetchState(true); break;
       case "confirm": showConfirm(p); break;
       case "confirm_done": dropConfirm(p.id); break;
+      case "ask": showAsk(p); break;
+      case "ask_done": dropAsk(p.id); break;
       case "kick":
         sysLine("链接已重置，请使用终端 /remote 显示的新链接。");
         showBanner("密钥已失效");
@@ -1513,9 +1668,10 @@ async function loadControl() {
   loadUndo();
 }
 const MODE_NOTES = {
-  auto: "自动模式：安全操作自动批准，危险操作弹确认",
-  manual: "手动模式：每个工具调用都需要确认",
-  full: "完全访问：不再逐个确认（谨慎使用）",
+  confirm: "手动确认：安全调用自动放行，其余逐次确认",
+  edit: "自动接收编辑：自动放行文件写入/编辑，其余逐次确认",
+  auto: "自动模式：安全调用与编辑自动放行，其余由 LLM 审批",
+  full: "完全访问：全部放行（谨慎使用）",
 };
 function renderModeSeg() {
   const mode = (state.data && state.data.mode) || "auto";
@@ -1897,7 +2053,7 @@ function buildSystemTab(body, data) {
   const s = data.system || {};
   const card = el("div", "st-card");
   const themeSel = stSelect(s.themes || ["dark"], s.theme);
-  const modeSel = stSelect(["auto", "manual", "full"], s.mode);
+  const modeSel = stSelect(["confirm", "edit", "auto", "full"], s.mode);
   const logoTog = stToggle(s.logo);
   const fontInput = stInput(s.font_size, "number");
   const tipInput = stInput(s.tip_interval, "number");
@@ -2080,7 +2236,9 @@ function buildPluginConfigRow(pid, cfg) {
     row.append(sel);
   } else {
     // str / int / float：文本输入 + 失焦保存
-    const inp = stInput(cfg.current ?? cfg.default ?? "", cfg.type === "int" || cfg.type === "float" ? "number" : "text");
+    const inputType = cfg.key === "login_password" ? "password"
+      : cfg.type === "int" || cfg.type === "float" ? "number" : "text";
+    const inp = stInput(cfg.current ?? cfg.default ?? "", inputType);
     if (cfg.type === "float") inp.step = "0.1";
     if (cfg.min !== undefined && cfg.min !== null) inp.min = cfg.min;
     if (cfg.max !== undefined && cfg.max !== null) inp.max = cfg.max;
@@ -2227,6 +2385,12 @@ document.querySelector(".d-body").addEventListener("click", async e => {
       fetchState(true);
       renderTokenCard();
     }
+    else if (act === "logout") twoTap(btn, async () => {
+      try { await fetch("/api/logout", { method: "POST" }); } catch (e) {}
+      sessionStorage.removeItem("rc_cred");
+      sessionStorage.removeItem("rc_key");
+      location.reload();
+    });
   } catch (e) { toast("网络错误: " + e, true); }
 });
 
@@ -2279,20 +2443,61 @@ function openPalette() {
 $("cmd-btn").onclick = openPalette;
 
 /* ================= 启动 ================= */
-document.addEventListener("visibilitychange", () => { if (!document.hidden) fetchState(); });
-setInterval(() => { if (!document.hidden && !state.busy) fetchState(); }, 25000);
-/* 确认卡兜底轮询：SSE 断流/丢事件（页面刷新、网络抖动）时仍能在 5s 内弹卡 */
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && AUTHED && $("login-screen").hidden && $("banner").hidden) fetchState();
+});
+setInterval(() => {
+  if (!document.hidden && AUTHED && $("login-screen").hidden && $("banner").hidden && !state.busy) fetchState();
+}, 25000);
+/* 确认/询问卡兜底轮询：SSE 断流/丢事件（页面刷新、网络抖动）时仍能在 5s 内弹卡 */
 setInterval(async () => {
-  if (document.hidden) return;
-  try { const r = await api("/api/confirms"); if (r.ok) syncConfirms(r.pending || []); } catch (e) {}
+  if (document.hidden || !AUTHED || !$("login-screen").hidden || !$("banner").hidden) return;
+  try {
+    const [c, a] = await Promise.all([api("/api/confirms"), api("/api/asks")]);
+    if (c.ok) syncConfirms(c.pending || []);
+    if (a.ok) syncAsks(a.asks || []);
+  } catch (e) {}
 }, 5000);
-if (KEY) {
+function startWebUI() {
+  $("login-screen").hidden = true;
+  $("banner").hidden = true;
   loadHlCss();
   fetchState(true).then(connect);
   if (desktopMQ.matches) loadSessions();
-} else {
-  setConn("err", "缺少密钥");
 }
+$("login-card").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = $("login-submit");
+  button.disabled = true;
+  $("login-error").textContent = "";
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: $("login-password").value }),
+    });
+    const result = await res.json();
+    if (!result.ok) { $("login-error").textContent = result.message || "登录失败"; return; }
+    CRED = result.token;
+    AUTHED = true;
+    sessionStorage.setItem("rc_cred", CRED);
+    $("login-password").value = "";
+    startWebUI();
+  } catch (e) {
+    $("login-error").textContent = "网络错误，请稍后重试";
+  } finally {
+    button.disabled = false;
+  }
+});
+api("/api/auth").then(auth => {
+  if (auth.authed) {
+    AUTHED = true;
+    startWebUI();
+  } else {
+    clearCredential();
+    if (auth.password_required) showLogin("凭据无效或已过期，请输入访问密码");
+    else showLogin("密码登录尚未配置，请先在终端 /settings → 插件中设置登录密码");
+  }
+}).catch(() => showBanner("无法连接到远程控制服务"));
 </script>
 </body>
 </html>

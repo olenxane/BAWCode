@@ -5,32 +5,41 @@
     （未过期跨重启复用，链接稳定；过期或 /remote revoke 时重新生成）
   - 链接形如 http://<局域网IP>:<端口>/?key=<密钥>，session_start 时经 notify
     展示一次；/remote 随时可查
-浏览器打开链接后进入远程控制页（web/index.html，SSE 实时事件流 + 快照拉取）：
+浏览器打开页面进入远程控制页（web/index.html，SSE 实时事件流 + 快照拉取）：
+  - 进入方式：链接带密钥直进；无密钥直接访问先到登录页，密码校验通过后进入
   - 实时观看：流式输出增量（含思考链）、工具活动、计划/步骤、回合状态
   - 远程控制：代发消息（ctx.submit_turn，busy 时按设置排队/中断）、停止按钮、
-    工具确认远程代答（tool_confirm 扩展点：有浏览器在线时把确认请求推给浏览器，
-    confirm_timeout 内未响应则交回终端面板）
+    工具确认与询问远程代答（tool_confirm / ui_request 扩展点：有浏览器在线时把确认请求
+    或 ask_user 询问推给浏览器，confirm_timeout 内未响应则交回终端面板）
   - 会话管理：历史会话列表/切换/删除、新建/清空/重命名（busy 时拒绝，
     与主循环 /new /clear /resume 同规则）
-  - 运行控制：切换模型、访问模式（auto/manual/full）、工作流、回合快照回滚
+  - 运行控制：切换模型、访问模式（confirm/edit/auto/full）、工作流、回合快照回滚
     （/undo）、清空回收站、查余额
   - 信息面板：计划与步骤、工具/子代理/技能/MCP/插件清单
   - 远程斜杠命令：/api/command 执行非交互命令（/settings /resume /refine /run
     /exit 等需终端交互或同步跑回合的命令被拦截；输出取命令写入会话的反馈文本）
-安全模型：面向受信局域网（无 TLS，密钥经 URL 携带）。所有端点校验密钥
-（hmac.compare_digest）；/remote revoke 重置密钥并踢掉已在线浏览器。
+安全模型：面向受信局域网（无 TLS）。两种进入方式：
+  - 链接密钥：http://<局域网IP>:<端口>/?key=<密钥> 打开即进入；?token= 也接受密钥或登录 token
+  - 密码登录：无密钥直接访问走登录页，密码取配置 login_password（留空即关闭密码登录），
+    成功后下发 HttpOnly cookie（值 = 过期时间戳.HMAC-SHA256(密码+链接密钥)：
+    无服务端会话表，reload 后登录态不丢；改密码或 /remote revoke 即令旧登录失效）
+所有端点由链接密钥或登录 cookie 之一放行（hmac.compare_digest），页面本身静态放行；
+密码连续错误 LOGIN_MAX_FAILS 次后短暂锁定。
 
 私有配置（config.plugins_config["remote-control"]，均可缺省）：
   {"enabled": true, "port": 8399, "bind": "0.0.0.0",
-   "remote_confirm": true, "confirm_timeout": 90, "max_history": 80}
+   "remote_confirm": true, "confirm_timeout": 90, "max_history": 80,
+   "login_password": ""}
+  （remote_confirm / confirm_timeout 同时管辖工具确认与 ask_user 询问的远程代答）
 
 依赖的宿主扩展（若宿主较旧则相应能力降级，插件仍可装载）：
-  hooks 事件 stream_delta / turn_status（collect）；
+  hooks 事件 ui_request（询问面板代答）/ stream_delta / turn_status（collect）；
   plugins.runtime() 只读运行时载体；ctx.register_teardown 卸载回调。
 """
 import copy
 import difflib
 import functools
+import hashlib
 import hmac
 import html
 import json
@@ -96,6 +105,10 @@ except ImportError:
     HAS_PYGMENTS = False
 
 KEY_VALID_DAYS = 7
+LOGIN_TTL = KEY_VALID_DAYS * 24 * 3600  # 秒；登录 cookie 有效期（与链接密钥同期）
+LOGIN_COOKIE = "rc_session"  # 登录态 cookie 名
+LOGIN_MAX_FAILS = 5          # 连续密码错误次数上限，达到即短暂锁定
+LOGIN_BLOCK_SECONDS = 60     # 触发上限后的锁定时长（秒）
 SSE_HEARTBEAT = 10  # 秒；顺带用于探测死连接与退出检查
 CLIENT_TTL = 60  # 秒；窗口内有鉴权请求即视为浏览器在线（刷新/休眠会断 SSE，页面轮询仍在）
 
@@ -376,13 +389,16 @@ class _State:
         self.lock = threading.RLock()
         self.clients = set()      # {{"q": Queue, "epoch": int}}
         self.confirms = []        # 待远程确认：{id, name, arguments, event, response}
+        self.asks = []            # 待远程回答的询问：{id, question, options, event, response}
         self.busy = False         # hook 观察的回合忙标志（与 runner.busy 合并取真）
         self.status = ""
         self.phase = ""
         self.link_shown = False
         self.key_data = {}        # {"key", "created_at", "expires_at"}
         self.key_epoch = 0        # revoke 时 +1，踢掉旧密钥建立的 SSE 连接
-        self.last_client_seen = 0.0  # 最近一次通过密钥校验的请求时刻（浏览器在线判定，见 CLIENT_TTL）
+        self.last_client_seen = 0.0  # 最近一次通过鉴权的请求时刻（浏览器在线判定，见 CLIENT_TTL）
+        self.login_fails = []     # 近期密码错误时刻（达 LOGIN_MAX_FAILS 即短暂锁定）
+        self.login_block_until = 0.0  # 密码登录锁定截止时刻（time.monotonic 口径）
         self.shutdown_flag = threading.Event()
         self.httpd = None
         self.thread = None
@@ -402,6 +418,10 @@ def setup(ctx):
     root_workspace = Path(getattr(ctx, "workspace", Path.cwd())).resolve()
     attachment_dir = root_workspace / ".bawcode" / "attachments" / "remote"
     attachment_dir.mkdir(parents=True, exist_ok=True)
+
+    def _login_password() -> str:
+        """登录密码：取自插件配置，逐次读取（设置面板改动即时生效）；留空即关闭密码登录"""
+        return str(ctx.settings.get("login_password") or "")
 
     # ---- 密钥 ----
 
@@ -446,11 +466,14 @@ def setup(ctx):
 
     def _status_line() -> str:
         exp = str(st.key_data.get("expires_at", "")).replace("T", " ")
+        pwd_state = "已启用（无密钥直接访问进入登录页）" if _login_password() else "未设置（/settings → 插件 可配置）"
         if st.httpd is None:
-            return f"远程控制服务未运行（/remote on 启动）\n密钥有效期至 {exp}"
+            return (f"远程控制服务未运行（/remote on 启动）\n"
+                    f"密钥有效期至 {exp}\n密码登录: {pwd_state}")
         return (
             f"远程控制链接: {_link()}\n"
             f"服务 {bind}:{port} · 浏览器在线 {len(st.clients)} · 密钥有效期至 {exp}\n"
+            f"密码登录: {pwd_state}\n"
             "（同一局域网的手机/电脑浏览器打开即可远程查看与控制）"
         )
 
@@ -530,6 +553,12 @@ def setup(ctx):
                 f"密钥有效期至 {exp} · 详情见 /remote"
             )
 
+    def _on_message_added(payload):
+        """空闲期新增消息（如命令写入的进度节点）即时推给网页；回合中由流式事件覆盖，不重复广播"""
+        if _busy():
+            return None
+        _broadcast({"t": "reset"})
+
     ctx.register_hook("before_turn", _on_before_turn)
     ctx.register_hook("after_turn", _on_after_turn)
     ctx.register_hook("stream_delta", _on_stream_delta)
@@ -537,9 +566,15 @@ def setup(ctx):
     ctx.register_hook("before_tool", _on_before_tool)
     ctx.register_hook("after_tool", _on_after_tool)
     ctx.register_hook("step_update", _on_step_update)
+    ctx.register_hook("message_added", _on_message_added)
     ctx.register_hook("session_start", _on_session_start)
 
     # ---- 工具确认远程代答（tool_confirm 变换链：返回 dict 生效，None 交回终端面板）----
+
+    def _browser_online() -> bool:
+        """浏览器在线判定：有 SSE 连接，或 CLIENT_TTL 内有鉴权请求（刷新/休眠只断 SSE）"""
+        with st.lock:
+            return bool(st.clients) or (time.monotonic() - st.last_client_seen) < CLIENT_TTL
 
     def _on_tool_confirm(payload):
         if payload.get("phase") == "closed":
@@ -550,11 +585,7 @@ def setup(ctx):
             for item in pending:
                 _broadcast({"t": "confirm_done", "id": item["id"], "action": "closed"})
             return None
-        if not remote_confirm:
-            return None
-        with st.lock:
-            online = bool(st.clients) or (time.monotonic() - st.last_client_seen) < CLIENT_TTL
-        if not online:
+        if not remote_confirm or not _browser_online():
             return None  # 无浏览器在线：立即交回 TUI 确认面板，不空等
         name = str(payload.get("name") or "")
         arguments = payload.get("arguments") or {}
@@ -590,6 +621,54 @@ def setup(ctx):
 
     ctx.register_hook("tool_confirm", _on_tool_confirm, priority=50)
     ctx.register_hook("tool_confirm_closed", _on_tool_confirm)
+
+    # ---- 询问面板远程代答（ui_request 变换链：返回 show_ask_form 同语义结构，None 交回终端面板）----
+
+    def _on_ui_request(payload):
+        """ask_user 询问面板推给浏览器：选项回答回填 index，自由输入只给 answer；跳过=declined"""
+        if str(payload.get("kind") or "") != "ask":
+            return None  # 工具确认由 tool_confirm 扩展点覆盖，其余弹窗无远程通道
+        if not remote_confirm or not _browser_online():
+            return None  # 无浏览器在线：立即交回 TUI 询问面板，不空等
+        question = str(payload.get("question") or "")
+        options = [
+            {"title": str(o.get("title") or ""), "description": str(o.get("description") or "")}
+            for o in (payload.get("options") or [])
+            if isinstance(o, dict) and str(o.get("title") or "").strip()
+        ]
+        item = {
+            "id": uuid.uuid4().hex,
+            "question": question,
+            "options": options,
+            "event": threading.Event(),
+            "response": None,
+        }
+        with st.lock:
+            st.asks.append(item)
+        _broadcast({"t": "ask", "id": item["id"], "question": question, "options": options})
+        ctx.notify(f"[远程控制] 询问已推送浏览器等待回答（{confirm_timeout:.0f}s 内未响应将转回终端面板）")
+        try:
+            answered = item["event"].wait(timeout=confirm_timeout)
+        finally:
+            with st.lock:
+                st.asks.remove(item)
+        resp = item["response"]
+        if answered and isinstance(resp, dict):
+            if str(resp.get("status") or "") == "declined":
+                ctx.notify("[远程控制] 浏览器已跳过本次询问")
+                return {"status": "declined"}
+            answer = str(resp.get("answer") or "").strip()
+            if answer:
+                ctx.notify(f"[远程控制] 浏览器已回答: {answer}")
+                out = {"status": "answer", "answer": answer}
+                index = resp.get("index")
+                if isinstance(index, int):
+                    out["index"] = index
+                return out
+        _broadcast({"t": "ask_done", "id": item["id"], "action": "timeout"})
+        return None
+
+    ctx.register_hook("ui_request", _on_ui_request, priority=50)
 
     # ---- 宿主运行时访问（缺载体/缺属性时降级为 None，端点各自兜底）----
 
@@ -640,6 +719,11 @@ def setup(ctx):
         with st.lock:
             return [{"id": c["id"], "name": c["name"], "arguments": _trunc_args(c["arguments"], 500)}
                     for c in list(st.confirms)]
+
+    def _pending_asks() -> list:
+        with st.lock:
+            return [{"id": a["id"], "question": a["question"], "options": a["options"]}
+                    for a in list(st.asks)]
 
     def _snapshot() -> dict:
         messages = []
@@ -734,6 +818,7 @@ def setup(ctx):
                 pass
         info["tokens"] = _tokens_info()
         pending = _pending_confirms()
+        asks = _pending_asks()
         with st.lock:
             clients_n = len(st.clients)
         return {
@@ -745,6 +830,7 @@ def setup(ctx):
             "streaming": streaming,
             "messages": messages,
             "pending": pending,
+            "asks": asks,
             "clients": clients_n,
             "expires_at": st.key_data.get("expires_at", ""),
             **info,
@@ -920,8 +1006,10 @@ def setup(ctx):
         if policy_mod is None:
             return {"ok": False, "message": "宿主缺少 policy 模块"}
         mode = (mode or "").strip().lower()
+        if mode == "manual":  # 旧值兼容：manual 已更名 confirm（与 /mode 命令同映射）
+            mode = policy_mod.MODE_CONFIRM
         if mode not in policy_mod.MODES:
-            return {"ok": False, "message": "模式: auto | manual | full"}
+            return {"ok": False, "message": "模式: " + " | ".join(policy_mod.MODES)}
         app = _app()
         if app is not None:
             app.mode = mode
@@ -1361,10 +1449,7 @@ def setup(ctx):
             if "theme" in values:
                 ui_cfg["theme"] = str(values["theme"])
             if "mode" in values:
-                mode = str(values["mode"])
-                if mode in ("auto", "manual", "full"):
-                    ui_cfg["mode"] = mode
-                    cfg.mode = mode
+                cfg.mode = str(values["mode"])  # 属性 setter 校验、旧值 manual 映射 confirm 并落盘 ui.mode
             if "logo" in values:
                 ui_cfg["logo"] = bool(values["logo"])
             if "font_size" in values:
@@ -1478,14 +1563,21 @@ def setup(ctx):
         app = _app()
         cctx = {"llm": getattr(runner, "llm", None), "session": session, "config": ctx.config, "app": app}
         before = len(session.messages)
+        origin_id = str(getattr(session, "session_id", "") or "")
         try:
             result = commands_mod.execute(line, cctx)
         except Exception as e:
             return {"ok": False, "message": f"命令执行异常: {e}"}
         # 命令反馈多数经 _echo 写入会话 system 消息；部分 handler 返回说明文本
-        echoed = [str(m.get("content") or "") for m in session.messages[before:]
-                  if m.get("role") == "system"]
-        payload = {"ok": True, "output": "\n".join(t for t in echoed if t)}
+        payload = {"ok": True}
+        if str(getattr(session, "session_id", "") or "") == origin_id:
+            echoed = [str(m.get("content") or "") for m in session.messages[before:]
+                      if m.get("role") == "system"]
+            payload["output"] = "\n".join(t for t in echoed if t)
+        else:
+            # 执行期间切换过会话：旧切片已指向别的会话，结果只走 result 不回读会话
+            ctx.log.info("命令 %s 执行期间会话已切换（%s → %s），跳过输出回读",
+                         head, origin_id, getattr(session, "session_id", ""))
         if isinstance(result, str) and result.strip() and result != "EXIT":
             payload["result"] = result
         elif isinstance(result, dict):
@@ -1501,11 +1593,42 @@ def setup(ctx):
 
     # ---- HTTP 服务 ----
 
-    def _check_key(self) -> bool:
-        given = (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+    def _make_login_token(expires: int, password: str) -> str:
+        secret = str(st.key_data.get("key") or "").encode("utf-8")
+        message = f"remote-login:{password}:{expires}".encode("utf-8")
+        signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
+        return f"{expires}.{signature}"
+
+    def _login_token_valid(token: str) -> bool:
+        password = _login_password()
+        if not password:
+            return False
+        expires_text, separator, signature = token.partition(".")
+        if not separator or not expires_text.isdigit() or len(signature) != 64:
+            return False
+        expires = int(expires_text)
+        if expires <= int(time.time()):
+            return False
+        expected = _make_login_token(expires, password)
+        return hmac.compare_digest(expected.encode("ascii"), token.encode("utf-8"))
+
+    def _credential_valid(value: str) -> bool:
         real = str(st.key_data.get("key") or "")
-        # compare_digest 对非 ASCII str 抛 TypeError，统一按字节比较
-        ok = bool(real) and hmac.compare_digest(real.encode("utf-8"), given.encode("utf-8"))
+        if real and hmac.compare_digest(real.encode("utf-8"), value.encode("utf-8")):
+            return True
+        return _login_token_valid(value)
+
+    def _check_auth(self) -> bool:
+        params = parse_qs(urlparse(self.path).query)
+        given = [value for name in ("key", "token") for value in params.get(name, [])]
+        # 登录 cookie（HttpOnly，密码登录成功后下发；reload/重启后仍有效，改密码或 revoke 即失效）
+        cookie_hdr = self.headers.get("Cookie", "")
+        for part in cookie_hdr.split(";"):
+            part = part.strip()
+            if part.startswith(LOGIN_COOKIE + "="):
+                given.append(part[len(LOGIN_COOKIE) + 1:])
+                break
+        ok = any(value and _credential_valid(value) for value in given)
         if ok:
             st.last_client_seen = time.monotonic()  # 鉴权请求即在线证据：SSE 断流时确认仍能推到页面
         return ok
@@ -1515,20 +1638,56 @@ def setup(ctx):
             def log_message(self, fmt, *args):  # 静默：默认写 stderr 会刷 TUI；query 含密钥不落日志
                 ctx.log.debug("http %s", (fmt % args).split("?", 1)[0])
 
-            def _json(self, code, obj):
+            def _json(self, code, obj, extra_headers=None):
                 body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
                 try:
                     self.send_response(code)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
                     self.send_header("Cache-Control", "no-store")
+                    for k, v in (extra_headers or ()):
+                        self.send_header(k, v)
                     self.end_headers()
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
                     pass  # 客户端中途断开（刷新/关页）：响应无处可送，静默丢弃
 
             def _deny(self):
-                self._json(403, {"ok": False, "message": "无效密钥或链接已过期"})
+                self._json(403, {"ok": False, "message": "鉴权 token 无效或已过期"})
+
+            def _login(self):
+                data = self._body()
+                if data is None:
+                    self._json(400, {"ok": False, "message": "请求体不是合法 JSON"})
+                    return
+                now = time.monotonic()
+                with st.lock:
+                    if now < st.login_block_until:
+                        wait = int(st.login_block_until - now) + 1
+                        self._json(429, {"ok": False, "message": f"尝试次数过多，请 {wait} 秒后重试"})
+                        return
+                password = _login_password()
+                if not password:
+                    self._json(403, {"ok": False, "message": "尚未配置登录密码"})
+                    return
+                given = str(data.get("password") or "")
+                if not hmac.compare_digest(password.encode("utf-8"), given.encode("utf-8")):
+                    with st.lock:
+                        st.login_fails = [t for t in st.login_fails if now - t < LOGIN_BLOCK_SECONDS]
+                        st.login_fails.append(now)
+                        if len(st.login_fails) >= LOGIN_MAX_FAILS:
+                            st.login_block_until = now + LOGIN_BLOCK_SECONDS
+                            st.login_fails.clear()
+                    self._json(403, {"ok": False, "message": "密码错误"})
+                    return
+                with st.lock:
+                    st.login_fails.clear()
+                    st.login_block_until = 0.0
+                token = _make_login_token(int(time.time()) + LOGIN_TTL, password)
+                cookie = (f"{LOGIN_COOKIE}={token}; HttpOnly; Path=/; "
+                          f"Max-Age={LOGIN_TTL}; SameSite=Lax")
+                self._json(200, {"ok": True, "token": token},
+                           extra_headers=[("Set-Cookie", cookie)])
 
             def _body(self):
                 try:
@@ -1579,6 +1738,13 @@ def setup(ctx):
                 if path == "/favicon.ico":
                     self._json(404, {"ok": False})
                     return
+                if path == "/api/auth":
+                    self._json(200, {
+                        "ok": True,
+                        "authed": _check_auth(self),
+                        "password_required": bool(_login_password()),
+                    })
+                    return
                 if path == "/" or path == "/index.html":
                     # 页面静态放行（地址栏清洗/刷新后 URL 无密钥）：密钥门禁在 JS 启动时
                     # 经 /api/state 校验，无效则页内横幅提示；全部 API/SSE 仍强制校验
@@ -1594,13 +1760,15 @@ def setup(ctx):
                     self.end_headers()
                     self.wfile.write(html)
                     return
-                if not _check_key(self):
+                if not _check_auth(self):
                     self._deny()
                     return
                 if path == "/api/state":
                     self._json(200, _snapshot())
                 elif path == "/api/confirms":
                     self._json(200, {"ok": True, "pending": _pending_confirms()})
+                elif path == "/api/asks":
+                    self._json(200, {"ok": True, "asks": _pending_asks()})
                 elif path == "/api/hlcss":
                     body = _hl_css().encode("utf-8")
                     self.send_response(200)
@@ -1682,7 +1850,14 @@ def setup(ctx):
                         st.clients.discard(client)
             def do_POST(self):
                 path = urlparse(self.path).path
-                if not _check_key(self):
+                if path == "/api/login":
+                    self._login()
+                    return
+                if path == "/api/logout":
+                    cookie = f"{LOGIN_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"
+                    self._json(200, {"ok": True}, extra_headers=[("Set-Cookie", cookie)])
+                    return
+                if not _check_auth(self):
                     self._deny()
                     return
                 if path == "/api/upload":
@@ -1739,6 +1914,42 @@ def setup(ctx):
                         item["response"] = {"action": action, "reason": str(data.get("reason") or "")}
                         item["event"].set()
                     _broadcast({"t": "confirm_done", "id": cid, "action": action})
+                    self._json(200, {"ok": True})
+                elif path == "/api/ask":
+                    aid = str(data.get("id") or "")
+                    status = str(data.get("status") or "answer").lower()
+                    with st.lock:
+                        item = next((a for a in st.asks if a["id"] == aid), None)
+                    if item is None or item["event"].is_set():
+                        self._json(200, {"ok": False, "message": "询问请求不存在或已回答"})
+                        return
+                    if status == "declined":
+                        response = {"status": "declined"}
+                    elif status == "answer":
+                        index = data.get("index")
+                        titles = [str(o.get("title") or "") for o in item["options"]]
+                        answer = str(data.get("answer") or "").strip()
+                        if isinstance(index, int) and 0 <= index < len(titles):
+                            response = {"status": "answer", "index": index, "answer": titles[index]}
+                        elif answer:
+                            response = {"status": "answer", "answer": answer}
+                        else:
+                            self._json(400, {"ok": False, "message": "回答内容不能为空"})
+                            return
+                    else:
+                        self._json(400, {"ok": False, "message": "status 须为 answer/declined"})
+                        return
+                    with st.lock:
+                        if item["event"].is_set():  # 别的端同时回答：后到者不覆盖
+                            taken = False
+                        else:
+                            item["response"] = response
+                            item["event"].set()
+                            taken = True
+                    if not taken:
+                        self._json(200, {"ok": False, "message": "询问请求不存在或已回答"})
+                        return
+                    _broadcast({"t": "ask_done", "id": aid, "action": status})
                     self._json(200, {"ok": True})
                 elif path == "/api/session/new":
                     self._json(200, _op_session_new())
