@@ -264,11 +264,47 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         _echo(ctx, "\n".join(lines))
         return True
 
-    @commands.register("/skill", hint="技能系统 · 列表/查看/重载", usage="/skill [名称|reload]", source="builtin")
+    @commands.register(
+        "/skill", hint="技能系统 · 列表/查看/重载/生成", usage="/skill [名称|reload|summon [global|project]]", source="builtin"
+    )
     def _skill(ctx, args):
         from core import skills as skills_mod
 
         arg = (args or "").strip()
+        parts = arg.split(maxsplit=1)
+        if parts and parts[0].lower() == "summon":
+            runner = getattr(ctx["app"], "agent_runner", None)
+            if runner is not None and runner.busy:
+                _echo(ctx, "本轮对话进行中：请等待完成后再生成技能")
+                return True
+            scope = (parts[1].strip().lower() if len(parts) > 1 else "") or "global"
+            sess = ctx["session"]
+            origin_id = getattr(sess, "session_id", "")
+            # 生成期间先立一个可见节点（type=help 不进 API，故不影响请求上下文与缓存前缀）
+            node = sess.add_message(
+                "system",
+                f"[技能生成中] 正在按当前对话生成技能（落盘 {scope}）…本条完成后更新为结果",
+                type="help",
+            )
+            ctx["app"].status = f"技能生成中（{scope}）"
+            info = skills_mod.summon(sess, ctx["llm"], ctx["config"], scope=scope)
+            if info.get("ok"):
+                text = (
+                    f"技能已生成: {info['name']}（落盘 {info['scope']}）\n{info['path']}\n"
+                    f"重扫后可用技能 {info.get('total', 0)} 个 · 任务匹配时经 load_skill 加载"
+                )
+                if info.get("duplicate"):
+                    text = f"重复提交，未再次请求 API：{text}"
+                ctx["app"].status = f"技能已生成: {info['name']}"
+            else:
+                text = f"技能生成失败: {info.get('error')}"
+                ctx["app"].status = "技能生成失败"
+            if getattr(sess, "session_id", "") != origin_id:
+                # 生成期间用户切换了会话：不把反馈写进新会话，结果经命令返回值回给调用方
+                log.info("技能生成完成时会话已切换（%s → %s），反馈不写入会话", origin_id, sess.session_id)
+                return text
+            node["content"] = text
+            return text
         loader = skills_mod.get_loader(ctx["config"])
         if loader is None:
             _echo(ctx, "技能系统未启用（config.skills.enabled 或缺少 pyyaml）")

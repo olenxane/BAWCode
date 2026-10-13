@@ -340,3 +340,28 @@ def get_compress_prompt(
             "信息密度优先，省略寒暄。只输出摘要本身。"
         )
     return join_segments(segs)
+
+
+def skill_prompt_files(config=None) -> List[str]:
+    return _prompt_files(config, "skill_files", ["skill.md"])
+
+
+def get_skill_prompt(
+    config=None,
+    extra_variables: Optional[Dict[str, Any]] = None,
+    **ctx_kwargs,
+) -> str:
+    """供 skills.summon 使用：渲染技能生成提示词
+
+    该提示词作为末条普通用户消息拼接（不进系统提示词），
+    以免改动系统提示词前缀、破坏提示词缓存命中。
+    """
+    variables = build_variable_context(config=config, extra=extra_variables, **ctx_kwargs)
+    segs = load_prompt_bundle(skill_prompt_files(config), variables, config=config)
+    if not segs:
+        return (
+            "请把上面的完整上下文提炼为一份可复用的 SKILL.md：YAML frontmatter 含 name"
+            "（英文小写中划线）与 description（一句话用途），正文写按序步骤、命令与验证方式。"
+            "只输出文件内容本身。"
+        )
+    return join_segments(segs)

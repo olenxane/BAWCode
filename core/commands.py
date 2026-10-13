@@ -116,6 +116,20 @@ def _complete_skill(config, arg: str) -> List[dict]:
         for name, meta in loader._metadata.items()
     ]
     items.append({"name": "/skill reload", "hint": "重扫技能目录", "source": "arg", "callable": True})
+    summon_items = [
+        {"name": "/skill summon", "hint": "按当前上下文生成技能（默认落全局）", "source": "arg", "callable": True}
+    ]
+    for scope, hint in (("global", "全局技能目录"), ("project", "项目 .bawcode/skills")):
+        summon_items.append(
+            {"name": f"/skill summon {scope}", "hint": f"生成技能并落盘到{hint}", "source": "arg", "callable": True}
+        )
+    parts = (arg or "").strip().lower().split(maxsplit=1)
+    if parts and parts[0] == "summon":
+        scope_prefix = parts[1].strip() if len(parts) > 1 else ""
+        if scope_prefix:
+            return [item for item in summon_items[1:] if item["name"].split()[-1].startswith(scope_prefix)]
+        return summon_items
+    items.extend(summon_items)
     return _filter_arg_items(items, arg)
 
 

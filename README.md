@@ -68,7 +68,7 @@ python main.py                    # 进入 TUI
 /plan /steps /refine  计划与步骤              /undo             回滚上一回合文件快照
 /new /resume /rename  会话管理                /agents           子代理记录
 /plugin               插件管理（reload/启停） /mcp              MCP 服务器状态与重连
-/workflow             工作流切换与编辑         /skill            技能查看与重扫
+/workflow             工作流切换与编辑         /skill            技能查看/重扫/生成
 /rag                  RAG 状态 / 建索引 / 开关（插件）
 ```
 
