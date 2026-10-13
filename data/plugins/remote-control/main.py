@@ -725,10 +725,57 @@ def setup(ctx):
             return [{"id": a["id"], "question": a["question"], "options": a["options"]}
                     for a in list(st.asks)]
 
+    def _status_fields(session) -> dict:
+        """实时状态字段（顶栏/会话条/计划条）：/api/state 与 /api/status 共用，不含消息列表"""
+        app = _app()
+        queue_len = len(getattr(_runner(), "_queue", None) or [])
+        mode = str(getattr(app, "mode", "") or getattr(ctx.config, "mode", "") or "auto")
+        info = {}
+        if session is not None:
+            info = {
+                "session": {
+                    "id": session.session_id,
+                    "title": session.session_title,
+                    "created_at": session.session_created_at,
+                    "message_count": len(session.messages),
+                    "project_id": session.project_id,
+                },
+                "plan": dict(session.plan or {}),
+                "steps": [
+                    {"id": s.get("id"), "title": str(s.get("title") or "")[:120],
+                     "status": str(s.get("status") or ""), "detail": str(s.get("detail") or "")[:200]}
+                    for s in list(session.steps or [])
+                ],
+            }
+        try:
+            info["model"] = ctx.config.active_model_name()
+        except Exception:
+            info["model"] = ""
+        info["mode"] = mode
+        if policy_mod is not None:
+            info["mode_label"] = policy_mod.MODE_LABELS.get(mode, mode)
+        if workflow_mod is not None:
+            try:
+                info["workflow"] = workflow_mod.active_name(ctx.config)
+            except Exception:
+                pass
+        info["tokens"] = _tokens_info()
+        with st.lock:
+            clients_n = len(st.clients)
+        return {
+            "busy": _busy(),
+            "queue": queue_len,
+            "status": st.status,
+            "phase": st.phase,
+            "clients": clients_n,
+            "expires_at": st.key_data.get("expires_at", ""),
+            **info,
+        }
+
     def _snapshot() -> dict:
-        messages = []
         session = _session()
         raw = list(session.messages)[-max_history:] if session is not None else []
+        messages = []
         # 工具调用索引：结果消息不带参数，按 tool_call_id 关联到 tool_call 信封（与 TUI 同法）
         call_info: dict = {}
         for m in raw:
@@ -779,61 +826,18 @@ def setup(ctx):
                     "status": str(m.get("status") or ""),
                 }
             messages.append(entry)
-        runner = _runner()
         app = _app()
         streaming = None
         sm = getattr(app, "streaming_msg", None) if app is not None else None
         if sm:
             streaming = {"content": str(sm.get("content") or ""), "thinking": str(sm.get("thinking") or "")}
-        queue_len = len(getattr(runner, "_queue", None) or [])
-        mode = str(getattr(app, "mode", "") or getattr(ctx.config, "mode", "") or "auto")
-        info = {}
-        if session is not None:
-            info = {
-                "session": {
-                    "id": session.session_id,
-                    "title": session.session_title,
-                    "created_at": session.session_created_at,
-                    "message_count": len(session.messages),
-                    "project_id": session.project_id,
-                },
-                "plan": dict(session.plan or {}),
-                "steps": [
-                    {"id": s.get("id"), "title": str(s.get("title") or "")[:120],
-                     "status": str(s.get("status") or ""), "detail": str(s.get("detail") or "")[:200]}
-                    for s in list(session.steps or [])
-                ],
-            }
-        try:
-            info["model"] = ctx.config.active_model_name()
-        except Exception:
-            info["model"] = ""
-        info["mode"] = mode
-        if policy_mod is not None:
-            info["mode_label"] = policy_mod.MODE_LABELS.get(mode, mode)
-        if workflow_mod is not None:
-            try:
-                info["workflow"] = workflow_mod.active_name(ctx.config)
-            except Exception:
-                pass
-        info["tokens"] = _tokens_info()
-        pending = _pending_confirms()
-        asks = _pending_asks()
-        with st.lock:
-            clients_n = len(st.clients)
         return {
             "ok": True,
-            "busy": _busy(),
-            "queue": queue_len,
-            "status": st.status,
-            "phase": st.phase,
             "streaming": streaming,
             "messages": messages,
-            "pending": pending,
-            "asks": asks,
-            "clients": clients_n,
-            "expires_at": st.key_data.get("expires_at", ""),
-            **info,
+            "pending": _pending_confirms(),
+            "asks": _pending_asks(),
+            **_status_fields(session),
         }
 
     # ---- 远程操作：会话管理 / 运行控制 / 信息面板 / 斜杠命令 ----
@@ -1765,6 +1769,9 @@ def setup(ctx):
                     return
                 if path == "/api/state":
                     self._json(200, _snapshot())
+                elif path == "/api/status":
+                    # 轻量状态快照：页面高频轮询用（回合进行中也能刷新顶栏/会话条）
+                    self._json(200, {"ok": True, **_status_fields(_session())})
                 elif path == "/api/confirms":
                     self._json(200, {"ok": True, "pending": _pending_confirms()})
                 elif path == "/api/asks":

@@ -1327,6 +1327,29 @@ async function fetchState(force) {
   return fetching;
 }
 
+/* 会话条/顶栏实时轮询：/api/status 只回状态字段（不含消息列表，比 /api/state 轻得多），
+   回合进行中也能看到条数/上下文/计费/排队持续变化，不必等回合结束或手动刷新页面 */
+let statusPolling = false;
+async function pollStatus() {
+  if (statusPolling || document.hidden || !AUTHED || !$("login-screen").hidden || !$("banner").hidden) return;
+  statusPolling = true;
+  try {
+    const s = await api("/api/status");
+    if (s.__status === 403) { fetchState(); return; }  // 凭据失效：交给 fetchState 统一走登录/横幅
+    if (!s.ok) return;
+    const wasBusy = state.busy;
+    if (state.data) Object.assign(state.data, s);  // 字段回填：侧栏/设置面板读到的也是最新值
+    setBusy(!!s.busy);
+    renderHeader(s);
+    if (wasBusy && !state.busy) fetchState(true);  // 漏收 turn_end：补一次全量刷新
+  } catch (e) {
+    /* 单次轮询失败忽略：下一轮重试，SSE 与 25s 全量拉取仍在兜底 */
+  } finally {
+    statusPolling = false;
+  }
+}
+setInterval(pollStatus, 2000);
+
 /* ================= 计划横幅 ================= */
 function renderPlanBanner(s) {
   const old = $("plan-banner");
@@ -1528,6 +1551,7 @@ function connect() {
         renderMessage({ role: "user", content: p.user_text });
         stick();
         setBusy(true);
+        pollStatus();
         break;
       case "delta": liveAppend(p.kind, p.piece); break;
       case "tool_before":
@@ -1539,6 +1563,7 @@ function connect() {
         liveSeal();
         appendToolResult({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render });
         stick();
+        pollStatus();
         break;
       case "step":
         state.phase = "步骤更新";
@@ -1549,6 +1574,7 @@ function connect() {
         state.phase = p.phase || state.phase;
         state.statusText = p.status || state.statusText;
         renderPhase();
+        pollStatus();
         break;
       case "turn_end":
         liveDrop();
