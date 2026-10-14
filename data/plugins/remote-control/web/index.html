@@ -286,13 +286,14 @@
     font: inherit; max-height: 140px; outline: none; min-height: 38px;
   }
   #input:focus { border-color: var(--accent); background: #fff; }
-  #send, #stop {
+  #send, #stop, #queue-send {
     flex: none; width: 38px; height: 38px; border-radius: 12px; font-size: 16px;
     display: flex; align-items: center; justify-content: center;
   }
   #send { background: var(--accent); color: #fff; }
   #send:active { background: var(--accent-deep); }
   #stop { background: #fdecec; color: var(--red); }
+  #queue-send { background: var(--accent-soft); color: var(--accent-deep); font-size: 11px; }
   #queue-chip {
     position: absolute; right: 14px; top: -30px; font-size: 11px; color: var(--dim);
     background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px;
@@ -629,6 +630,7 @@
     <button id="file-btn" title="上传文件">+</button>
     <input id="file-input" type="file" hidden>
     <textarea id="input" rows="1" placeholder="发送消息给 BAWCode…（@ 引用文件，/ 开头为命令）"></textarea>
+    <button id="queue-send" hidden title="排队发送（当前回合结束后作为新回合）">排队</button>
     <button id="stop" hidden title="停止当前回合">■</button>
     <button id="send" title="发送">↑</button>
   </footer>
@@ -930,7 +932,8 @@ function toolBody(o) {
     b.append(el("pre", "", JSON.stringify(o.args, null, 2)));
   }
   if (o.output) {
-    b.append(el("div", "label", "输出（截断）"));
+    // 输出预览被截断时（实时事件只带前若干字符）明确提示，避免误以为已完整
+    b.append(el("div", "label", "输出" + (o.truncated ? "（预览，回合结束后显示完整输出）" : "")));
     b.append(el("pre", "", o.output));
   }
   return b;
@@ -1254,9 +1257,17 @@ function renderHeader(s) {
   $("queue-chip").hidden = !q;
   $("queue-chip").textContent = `排队 ${q} 条`;
 }
+const PLACEHOLDER_IDLE = input.placeholder;
+const PLACEHOLDER_BUSY = coarse
+  ? "插话并入当前回合…（右下「排队」改为当前回合之后发送）"
+  : "插话并入当前回合…（Ctrl+Enter 排队为当前回合之后发送）";
 function setBusy(v) {
   state.busy = v;
   $("stop").hidden = !v;
+  // 排队入口只在回合进行中与插话区分；空闲时两种发送都开新回合
+  $("queue-send").hidden = !v;
+  $("send").title = v ? "插话发送（并入当前回合）" : "发送";
+  input.placeholder = v ? PLACEHOLDER_BUSY : PLACEHOLDER_IDLE;
   renderPhase();
 }
 function renderPhase() {
@@ -1369,7 +1380,8 @@ function renderPlanBanner(s) {
 }
 
 /* ================= 发送 / 停止 ================= */
-async function send() {
+/* mode=inject：回合中插话并入本回合（TUI 普通 Enter 同语义）；mode=queue：排队为新回合（TUI Ctrl+Q 同语义） */
+async function send(mode) {
   const text = input.value.trim();
   if (!text) return;
   clearInputCompletions();
@@ -1384,13 +1396,17 @@ async function send() {
       else if (!r.output) toast("已执行");
       // 输出经广播 reset 全量刷新呈现（已写入会话）
     } else {
-      const r = await api("/api/send", { text });
-      if (r.ok && r.result) toast(r.result.replace(/^\[|\]$/g, ""));
-      else if (!r.ok) { toast(r.message || "发送失败", true); sysLine("发送失败: " + (r.message || "未知错误")); }
+      const r = await api("/api/send", { text, mode: mode || "inject" });
+      if (!r.ok) { toast(r.message || "发送失败", true); sysLine("发送失败: " + (r.message || "未知错误")); return; }
+      if (r.result) toast(r.result.replace(/^\[|\]$/g, ""));
+      // 插话并入的是进行中的回合，没有 turn_start 事件回带文本，故本地先上屏（随后的全量重绘会以会话为准）
+      if (r.injected) { renderMessage({ role: "user", content: text }); stick(); }
+      pollStatus();
     }
   } catch (e) { toast("网络错误: " + e, true); }
 }
-$("send").onclick = send;
+$("send").onclick = () => send("inject");
+$("queue-send").onclick = () => send("queue");
 const completionBox = el("div");
 completionBox.id = "input-completions";
 completionBox.hidden = true;
@@ -1497,7 +1513,10 @@ input.addEventListener("keydown", e => {
     return;
   }
   if (e.key === "Escape") clearInputCompletions();
-  if (e.key === "Enter" && !e.shiftKey && !coarse) { e.preventDefault(); send(); }
+  if (e.key === "Enter" && !e.shiftKey && !coarse) {
+    e.preventDefault();
+    send(e.ctrlKey || e.metaKey ? "queue" : "inject");
+  }
 });
 input.addEventListener("input", () => {
   input.style.height = "auto";
@@ -1561,7 +1580,7 @@ function connect() {
         break;
       case "tool_after":
         liveSeal();
-        appendToolResult({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render });
+        appendToolResult({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render, truncated: p.truncated });
         stick();
         pollStatus();
         break;

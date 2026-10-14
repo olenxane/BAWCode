@@ -1,7 +1,7 @@
 {
   "id": "remote-control",
   "name": "远程控制",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "浏览器远程查看与控制终端：密钥链接或密码登录、实时流式视图、代发消息、文件引用与上传、远程工具确认与询问代答、会话管理、模型/模式/工作流切换、回合回滚、远程斜杠命令",
   "author": "BAWCode",
   "entry": "main.py",

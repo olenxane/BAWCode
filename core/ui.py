@@ -801,7 +801,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 return self._submit_line()
             return None
 
-        # Esc：活动/挂起回合交由 runner 丢弃；没有回合时保持输入框清空语义。
+        # Esc：活动回合打断并保留其已记录上下文，挂起失败回合收束保留；没有回合时保持输入框清空语义。
         # 弹窗（含嵌套 line 输入）期间 _dialog_active 为真，Esc 语义交给弹窗自身。
         if kind == "escape" and not self._dialog_active:
             handler = self.interrupt_turn_handler

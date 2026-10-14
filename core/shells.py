@@ -74,8 +74,39 @@ def code_pages() -> set:
     return {"CHCP", "PYTHONIOENCODING"}
 
 
+def _git_install_roots() -> list:
+    """Git for Windows 安装根目录：注册表 InstallPath、PATH 上 git.exe 反推
+
+    Git 允许装到任意目录，只按 Program Files 之类的固定位置猜不到；注册表 InstallPath
+    与 git.exe 的上溯目录是可靠旁证（git.exe 位于 <root>\\cmd、<root>\\bin 或
+    <root>\\mingw64\\bin 三种层级）。"""
+    roots = []
+    if sys.platform == "win32":
+        import winreg
+
+        for hive, path in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\GitForWindows"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\GitForWindows"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\GitForWindows"),
+        ):
+            try:
+                with winreg.OpenKey(hive, path) as key:
+                    root = winreg.QueryValueEx(key, "InstallPath")[0]
+            except OSError:
+                continue
+            if root:
+                roots.append(str(root))
+    found = shutil.which("git")
+    if found:
+        root = Path(found).resolve().parent.parent
+        if root.name.lower() in ("mingw32", "mingw64"):
+            root = root.parent
+        roots.append(str(root))
+    return roots
+
+
 def _git_bash_candidates() -> list:
-    """Git Bash 候选路径：环境变量 > 常见安装位置 > PATH"""
+    """Git Bash 候选路径：环境变量 > 常见安装位置 > 注册表/PATH 反推的安装根 > PATH"""
     out = []
     for env_name in ("BAWCODE_GIT_BASH", "GIT_BASH"):
         value = os.environ.get(env_name)
@@ -91,6 +122,9 @@ def _git_bash_candidates() -> list:
         if root:
             out.append(str(Path(root) / "Git" / "bin" / "bash.exe"))
             out.append(str(Path(root) / "Git" / "usr" / "bin" / "bash.exe"))
+    for root in _git_install_roots():
+        out.append(str(Path(root) / "bin" / "bash.exe"))
+        out.append(str(Path(root) / "usr" / "bin" / "bash.exe"))
     which = shutil.which("bash")
     if which:
         out.append(which)
@@ -402,10 +436,14 @@ def _powershell_syntax_issue(binary: str, command: str) -> str:
 
 
 def _cmd_syntax_issue(command: str) -> str:
-    """cmd.exe 没有可靠的完整语法预检接口，只拦可确定会截断命令的换行"""
-    if "\n" in command or "\r" in command:
+    """cmd.exe 没有可靠的完整语法预检接口，只拦可确定会截断命令的换行
+
+    cmd /c 只执行首个换行之前的内容，其余行连同其报错被静默丢弃、退出码仍为 0；
+    换行之后没有非空白内容时（纯尾随换行）执行结果不受影响，放行。"""
+    if any(line.strip() for line in command.splitlines()[1:]):
         return (
-            "命令未执行：cmd.exe 不支持多行命令（换行会截断命令，只执行到第一个换行）。"
+            "命令未执行：cmd.exe 不支持多行命令——首个换行之后还有内容，"
+            "只会执行第一行并静默丢弃其余行（退出码仍为 0）。"
             "请写成单行；多行脚本先写入临时 .py/.ps1 文件，再用单行命令运行该文件，"
             "或在设置中改用 Git Bash / PowerShell 执行器。"
         )

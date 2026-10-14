@@ -8,7 +8,8 @@
 浏览器打开页面进入远程控制页（web/index.html，SSE 实时事件流 + 快照拉取）：
   - 进入方式：链接带密钥直进；无密钥直接访问先到登录页，密码校验通过后进入
   - 实时观看：流式输出增量（含思考链）、工具活动、计划/步骤、回合状态
-  - 远程控制：代发消息（ctx.submit_turn，busy 时按设置排队/中断）、停止按钮、
+  - 远程控制：代发消息（与 TUI 同口径：空闲提交新回合；回合进行中按客户端 mode
+    inject 插话并入本回合 / queue 排队为新回合）、停止按钮、
     工具确认与询问远程代答（tool_confirm / ui_request 扩展点：有浏览器在线时把确认请求
     或 ask_user 询问推给浏览器，confirm_timeout 内未响应则交回终端面板）
   - 会话管理：历史会话列表/切换/删除、新建/清空/重命名（busy 时拒绝，
@@ -128,6 +129,7 @@ _PLAN_TOOLS = {"write_plan", "update_plan", "generate_steps", "update_step_statu
 _WRITE_MAX_LINES = 500         # 写入高亮行数上限，防大文件拖垮网页
 _READ_MAX_LINES = 500          # 读取高亮行数上限（结果带行号前缀时按行剥离再高亮）
 _DIFF_MAX_LINES = 600          # 单处 diff 行数上限
+_TOOL_OUT_PREVIEW = 2000       # 工具输出实时预览字符上限（完整输出随回合结束的快照下发）
 
 def _as_text(value) -> str:
     """工具参数取值转文本：数组形态 content 优先取文本部分"""
@@ -530,9 +532,12 @@ def setup(ctx):
         output = str(payload.get("output") or "")
         failed = bool(tool_failure_hint(output)) if tool_failure_hint else False
         render = _plan_render(name, output) or _tool_render(name, args, output, failed)
+        # 实时事件只带输出预览（完整输出随回合结束的快照下发）；截断时显式标记，页面据此提示
         evt = {"t": "tool_after", "name": payload.get("name"),
                "arguments": _trunc_args(payload.get("args")),
-               "output": output[:2000], "elapsed": payload.get("elapsed"), "failed": failed}
+               "output": output[:_TOOL_OUT_PREVIEW], "elapsed": payload.get("elapsed"), "failed": failed}
+        if len(output) > _TOOL_OUT_PREVIEW:
+            evt["truncated"] = True
         if render:
             evt["render"] = render
         _broadcast(evt)
@@ -689,6 +694,17 @@ def setup(ctx):
         runner = _runner()
         return bool(st.busy or getattr(runner, "busy", False))
 
+    def _send_message(text: str, mode: str) -> dict:
+        """代发用户消息，返回 {result, injected}。
+
+        与 TUI 主循环同口径：空闲时提交新回合；回合进行中 mode=inject 走插话
+        （并入当前回合，下一轮模型即看到），其余走排队（当前回合结束后作为新回合发送）。"""
+        runner = _runner()
+        inject = getattr(runner, "inject_turn", None)
+        if mode == "inject" and callable(inject) and getattr(runner, "busy", False):
+            return {"result": inject(text), "injected": True}
+        return {"result": ctx.submit_turn(text), "injected": False}
+
     def _app_refresh(session) -> None:
         """会话状态变更后刷新 UI 缓存（只改不渲染，帧循环统一上屏）"""
         app = _app()
@@ -791,7 +807,9 @@ def setup(ctx):
             # 数组形态 content 取文本部分（防 base64 图片块灌进网页）；附图片计数
             text = memory_mod.content_text(m.get("content")) if memory_mod else str(m.get("content") or "")
             n_imgs = memory_mod.count_image_parts(m.get("content")) if memory_mod else 0
-            entry = {"role": m.get("role"), "content": text[:2000]}
+            # 消息正文/思考链不做字符截断：截断会丢信息且网页无法还原（工具载荷另有行数上限，
+            # 且都带 truncated 标记让页面提示）；总量由 max_history 的条数上限约束
+            entry = {"role": m.get("role"), "content": text}
             if n_imgs:
                 entry["images"] = n_imgs
             if m.get("tool_name"):
@@ -802,7 +820,7 @@ def setup(ctx):
                 entry["description"] = str(m.get("description"))[:200]
             thinking = m.get("thinking")
             if thinking and not m.get("thinking_stripped"):
-                entry["thinking"] = str(thinking)[:2000]
+                entry["thinking"] = str(thinking)
             # 工具结果：附与 TUI 对齐的分类渲染载荷（命令/写入/编辑/计划四件套）
             if m.get("role") == "tool" or m.get("type") == "tool":
                 info = call_info.get(str(m.get("tool_call_id") or ""))
@@ -1880,8 +1898,8 @@ def setup(ctx):
                     if not text:
                         self._json(400, {"ok": False, "message": "空消息"})
                         return
-                    result = ctx.submit_turn(text)  # 返回状态说明（提交/排队/中断）
-                    self._json(200, {"ok": True, "result": result})
+                    mode = str(data.get("mode") or "").strip().lower()
+                    self._json(200, {"ok": True, **_send_message(text, mode)})
                 elif path == "/api/stop":
                     runner = _runner()
                     if runner is None:

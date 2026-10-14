@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -732,34 +732,23 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
             snap = snapshot_mod.end_turn()  # 回合快照落盘（中断/异常路径同样收尾；空回合无副作用）
         except Exception as exc:
             log.error("回合快照收尾失败: %r", exc)
-        # Esc/用户新消息丢弃挂起上下文；请求失败仅挂起，不立即清理或还原文件。
+        # Esc 打断保留本轮上下文；用户新消息丢弃挂起上下文；请求失败仅挂起，不立即清理或还原文件。
         pending_to_discard = None
         failed_pending = False
         interrupted = False
         if runner is not None:
             with runner._lock:
                 pending = runner.pending_failed_turn
-                interrupted = runner._esc_rollback
+                interrupted = runner._esc_interrupt
                 abandon = runner._abandon_pending
                 failed = runner._failed_rollback
-                runner._esc_rollback = False
+                runner._esc_interrupt = False
                 runner._abandon_pending = False
                 runner._failed_rollback = False
 
-                if interrupted and pending:
-                    if snap:
-                        pending["snapshots"].append(snap)
-                    pending_to_discard = pending
-                    runner._discarded_turn_ids.add(pending.get("turn_id"))
+                if interrupted:
+                    # Esc 打断：本轮消息全部留在上下文，此前挂起的失败轮次随之收束为普通历史
                     runner.pending_failed_turn = None
-                elif interrupted and abandon:
-                    # 重试等待态按 Esc 放弃：直接丢弃完整失败回合。
-                    pending_to_discard = {
-                        "start_index": runner.turn_start_index,
-                        "snapshots": [snap] if snap else [],
-                    }
-                elif interrupted:
-                    pass  # 普通 Esc 中断仍按当前回合起点回滚
                 elif abandon and pending:
                     if snap:
                         pending["snapshots"].append(snap)
@@ -803,11 +792,11 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
                             "turn_id": runner.active_turn_id,
                         }
                         runner.pending_failed_turn = pending
-            if interrupted and pending_to_discard is None:
+            if interrupted:
                 try:
-                    _rollback_interrupted_turn(session, app, runner, snap)
+                    _keep_interrupted_turn(session, app, runner)
                 except Exception as exc:
-                    log.error("回合打断回滚失败: %r", exc)
+                    log.error("回合打断收尾失败: %r", exc)
             elif pending_to_discard is not None:
                 try:
                     _rollback_failed_turn(session, app, runner, pending=pending_to_discard)
@@ -856,48 +845,19 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
                 runner._turn_active = False
 
 
-def _rollback_interrupted_turn(session, app, runner, snap=None) -> None:
-    """Esc 打断收尾：会话回滚到回合起点、本回合文件还原、用户输入回填输入框。"""
-    start = int(getattr(runner, "turn_start_index", -1))
-    removed_msgs = []
-    removed = 0
-    if 0 <= start <= len(session.messages):
-        removed_msgs = list(session.messages[start:])
-        removed = len(removed_msgs)
-        del session.messages[start:]
-    # 文件：仅当本回合确实落了快照才还原，避免误伤上一回合的快照
-    file_note = ""
-    if isinstance(snap, dict) and snap.get("seq"):
-        try:
-            res = snapshot_mod.undo(session.config, session.project_id, session.session_id, snap["seq"])
-            if res:
-                file_note = f" · 文件还原{len(res['restored'])} 删除{len(res['deleted'])} 跳过{len(res['skipped'])}"
-        except Exception as exc:
-            log.warn("打断回滚文件失败: %r", exc)
-    # 回填：本轮的用户消息（含回合中插话）逐条取回；多模态取首个 text 片段
-    texts: List[str] = []
-    for m in removed_msgs:
-        if str(m.get("role")) != "user":
-            continue
-        content = m.get("content")
-        if isinstance(content, str) and content.strip():
-            texts.append(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text" and str(part.get("text") or "").strip():
-                    texts.append(str(part["text"]))
-                    break
-    if not texts:
-        fallback = str(getattr(app, "turn_user_text", "") or "")
-        if fallback:
-            texts = [fallback]
-    if texts:
-        app.restore_input = "\n".join(texts)
+def _keep_interrupted_turn(session, app, runner) -> None:
+    """Esc 打断收尾：本轮已记录的消息留在上下文，不还原文件、不回填输入框。
+
+    文件快照保持可用（/undo 与树模式 Ctrl+Z 仍可回退本轮改动）；用户输入不回填，
+    避免与上下文里的同一条消息重复发送。"""
+    start = int(getattr(runner, "turn_start_index", 0))
+    kept = max(0, len(session.messages) - start)
+    app.last_failed_text = None
     try:
-        _sync(app, session, status=f"已打断并回滚到回合前（移除 {removed} 条消息{file_note}）", render=False)
+        _sync(app, session, status=f"已打断 · 保留本轮上下文（{kept} 条消息）", render=False)
     except Exception:
         pass
-    log.info("Esc 打断回滚：移除消息 %d 条%s", removed, file_note)
+    log.info("Esc 打断：保留本轮消息 %d 条", kept)
 
 
 def _hold_failed_turn(session, app, runner) -> None:
@@ -908,7 +868,7 @@ def _hold_failed_turn(session, app, runner) -> None:
         _sync(
             app,
             session,
-            status=f"请求失败 · 已挂起本轮上下文（保留 {max(0, count)} 条消息）· Ctrl+Y 重试；新消息将保留上下文续跑，Esc 丢弃",
+            status=f"请求失败 · 已挂起本轮上下文（保留 {max(0, count)} 条消息）· Ctrl+Y 重试；新消息将保留上下文续跑，Esc 收束",
             render=False,
         )
     except Exception:
@@ -945,9 +905,22 @@ def _rollback_failed_turn(session, app, runner, snap=None, pending=None) -> None
     log.info("挂起回合已丢弃：移除消息 %d 条%s", removed, file_note)
 
 
+def _keep_pending_turn(session, app, pending=None) -> None:
+    """Esc 收束挂起失败回合：消息留在上下文，仅清挂起态；不还原文件、不回填输入。"""
+    state = pending or {}
+    start = int(state.get("start_index", 0))
+    kept = max(0, len(session.messages) - start)
+    app.last_failed_text = None
+    try:
+        _sync(app, session, status=f"已收束挂起回合 · 保留本轮上下文（{kept} 条消息）", render=False)
+    except Exception:
+        pass
+    log.info("挂起回合已收束：保留消息 %d 条", kept)
+
+
 def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
     """一个 agent 回合；runner 存在时在后台线程运行——交互弹窗经 UI 请求桥
-    移交主线程执行，取消检查贯穿各检查点（中断=丢弃在途回合）。"""
+    移交主线程执行，取消检查贯穿各检查点（中断=结束在途回合并保留其已记录消息）。"""
 
     def _cancelled() -> bool:
         return runner is not None and llm.cancelled()
@@ -973,7 +946,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         hooks.collect_hook("turn_status", {"phase": text})
 
     def _aborted():
-        session.add_message("system", "[本轮已被新消息中断]", type="help")
+        session.add_message("system", "[本轮已被用户打断]", type="help")
         _syncq(status="已中断")
 
     def _on_delta(kind: str, piece: str) -> None:
@@ -995,7 +968,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
 
     log.info("任务开始: %s", user_text)
-    # 回合起点：消息序号供 Esc 打断回滚切割；时间与 token 基线供提示行显示用时/本轮消耗
+    # 回合起点：消息序号供 Esc 打断时统计保留条数；时间与 token 基线供提示行显示用时/本轮消耗
     if runner is not None:
         runner.turn_start_index = len(session.messages)
         if runner.pending_failed_turn is not None and runner._continuing_pending:
@@ -1003,7 +976,7 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         else:
             runner.active_turn_id = uuid.uuid4().hex
         tools_mod.set_background_origin(runner.active_turn_id)
-        runner._esc_rollback = False
+        runner._esc_interrupt = False
     app.turn_start_time = time.monotonic()
     app.turn_user_text = user_text
     if app.token_meter is not None:
@@ -1115,8 +1088,8 @@ class _AgentRunner:
         self.config = config
         self.busy = False
         self.last_error = None  # 最近回合的异常文本（无头 --json 消费；交互模式仅诊断用）
-        # Esc 打断回滚：标记本轮需回滚到回合前（agent 线程收尾时执行）+ 回合起点消息序号
-        self._esc_rollback = False
+        # Esc 打断：标记本轮由 agent 线程收尾（保留已记录上下文）+ 回合起点消息序号
+        self._esc_interrupt = False
         self._turn_active = False
         self.active_turn_id = None
         self._active_dispatch_origin = None
@@ -1149,11 +1122,11 @@ class _AgentRunner:
         except Exception:
             pass
 
-    def interrupt_for_rollback(self) -> bool:
-        """Esc 丢弃当前/挂起回合；活动回合由 agent 线程收尾，处于错误挂起态立即丢弃。"""
+    def interrupt_turn(self) -> bool:
+        """Esc 打断：活动回合由 agent 线程收尾（保留已记录上下文）；挂起失败回合就此收束。"""
         with self._lock:
             if self.busy and self._turn_active:
-                self._esc_rollback = True
+                self._esc_interrupt = True
                 if getattr(self.app, "_llm_retry_gate", None) is not None:
                     self._abandon_pending = True
                 self.llm.cancel()
@@ -1162,12 +1135,10 @@ class _AgentRunner:
             if pending is None:
                 return False
             self.pending_failed_turn = None
-            if self.busy:
-                self._queue.clear()
             try:
-                _rollback_failed_turn(self.session, self.app, self, pending=pending)
+                _keep_pending_turn(self.session, self.app, pending)
             except Exception as exc:
-                log.error("Esc 丢弃挂起回合失败: %r", exc)
+                log.error("Esc 收束挂起回合失败: %r", exc)
         return True
 
     def discard_pending_turn(self) -> bool:
@@ -1740,7 +1711,7 @@ def main() -> None:
         app.agent_runner = runner
         tools_mod.set_background_notifier(runner.notify)  # 后台命令完成 → runner.notify 自动开新回合
         plugins_mod.bind_runtime(app=app, runner=runner)  # 插件类用户操作 API（submit_turn/notify/ctx.ui）载体
-        app.interrupt_turn_handler = runner.interrupt_for_rollback  # Esc 打断当前回合并回滚
+        app.interrupt_turn_handler = runner.interrupt_turn  # Esc 打断当前回合并保留其已记录上下文
         llm.query_balance()
         app.token_meter = llm.meter
         _sync(app, session, status="就绪")
