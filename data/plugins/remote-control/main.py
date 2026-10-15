@@ -1148,11 +1148,19 @@ def setup(ctx):
         if snapshot_mod is None:
             return {"ok": False, "message": "宿主缺少 snapshot 模块"}
         turns = snapshot_mod.list_turns(ctx.config, session.project_id, session.session_id)
-        trash = snapshot_mod.trash_count(ctx.config, session.project_id)
-        return {"ok": True, "turns": turns, "trash": trash}
+        keep = snapshot_mod.snapshot_cfg(ctx.config)["max_turns"]
+        return {
+            "ok": True,
+            "turns": turns,
+            "total": len(turns),
+            "has_more": False,
+            "keep": keep,
+            "session_id": session.session_id,
+            "trash": snapshot_mod.trash_count(ctx.config, session.project_id),
+        }
 
     @_idle_operation
-    def _op_undo(which) -> dict:
+    def _op_undo(which, checkpoint=None) -> dict:
         err = _session_op_guard()
         if err:
             return err
@@ -1161,10 +1169,14 @@ def setup(ctx):
             return err
         if snapshot_mod is None:
             return {"ok": False, "message": "宿主缺少 snapshot 模块"}
-        result = snapshot_mod.undo(ctx.config, session.project_id, session.session_id, which)
+        result = snapshot_mod.undo(
+            ctx.config, session.project_id, session.session_id, which, checkpoint=checkpoint
+        )
         if result is None:
-            return {"ok": False, "message": "没有可回滚的回合快照"}
+            return {"ok": False, "message": "没有可回滚的回合快照或检查点"}
         lines = [f"已回滚回合 #{result['seq']}（{result['task'] or '（无任务摘要）'}）:"]
+        if checkpoint is not None:
+            lines.append(f"  检查点 #{checkpoint}")
         for p in result["restored"]:
             lines.append(f"  还原 {p}")
         for p in result["deleted"]:
@@ -1179,10 +1191,23 @@ def setup(ctx):
         session.add_message("system", text, type="help")
         app = _app()
         if app is not None:
-            app.status = f"已回滚回合 #{result['seq']}"
+            status_text = "部分回滚" if result["status"] == "partial" else "已回滚"
+            app.status = f"{status_text}回合 #{result['seq']}"
         _app_refresh(session)
         _broadcast({"t": "reset"})
-        return {"ok": True, "result": text}
+        return {
+            "ok": result["status"] == "complete",
+            "result": text,
+            "status": result["status"],
+            "skipped": result["skipped"],
+            "external_changes": result["external_changes"],
+            "external_changes_action": result["external_changes_action"],
+            "turn_id": result["turn_id"],
+            "session_id": result["session_id"],
+            "revision": result["revision"],
+            "task_messages": result["task_messages"],
+            "checkpoint": result["checkpoint"],
+        }
 
     def _tools_listing() -> dict:
         if register_mod is None:
@@ -2108,9 +2133,24 @@ def setup(ctx):
                     self._json(200, _op_workflow_switch(str(data.get("name") or "")))
                 elif path == "/api/undo":
                     which = data.get("which", "last")
-                    if isinstance(which, str) and which.isdigit():
+                    checkpoint = data.get("checkpoint")
+                    if which != "last":
+                        if isinstance(which, bool) or not (type(which) is int or isinstance(which, str) and which.isdigit()):
+                            self._json(400, {"ok": False, "message": "which 须为 last 或正整数"})
+                            return
                         which = int(which)
-                    self._json(200, _op_undo(which))
+                        if which <= 0:
+                            self._json(400, {"ok": False, "message": "which 须为 last 或正整数"})
+                            return
+                    if checkpoint is not None:
+                        if isinstance(checkpoint, bool) or not (type(checkpoint) is int or isinstance(checkpoint, str) and checkpoint.isdigit()):
+                            self._json(400, {"ok": False, "message": "checkpoint 须为正整数"})
+                            return
+                        checkpoint = int(checkpoint)
+                        if checkpoint <= 0:
+                            self._json(400, {"ok": False, "message": "checkpoint 须为正整数"})
+                            return
+                    self._json(200, _op_undo(which, checkpoint))
                 elif path == "/api/command":
                     self._json(200, _op_command(str(data.get("line") or "")))
                 elif path == "/api/settings":

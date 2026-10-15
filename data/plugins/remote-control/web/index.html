@@ -1834,21 +1834,31 @@ async function loadUndo() {
     if (!turns.length) box.append(el("div", "empty-note", "暂无回合快照（文件改动回合结束时自动生成）"));
     for (const t of turns.slice().reverse()) {
       const row = rowHtml(`#${t.seq} · ${t.task || "（无任务摘要）"}`,
-        `${t.time} · ${t.files} 文件（可还原 ${t.restorable}）`);
-      const btn = el("button", "link-danger", "回滚");
+        `${t.time} · 修订 ${t.revision || 0} · ${t.files} 文件（可还原 ${t.restorable}）`);
+      const btn = el("button", "link-danger", "回滚起点");
       btn.style.color = "var(--accent-deep)";
       btn.onclick = () => twoTap(btn, () => doUndo(t.seq));
       row.append(btn);
+      const checkpointIds = [...new Set((t.checkpoints || []).filter(cp => cp.restorable).map(cp => cp.id))];
+      for (const checkpoint of checkpointIds) {
+        const cpBtn = el("button", "link-danger", `检查点 ${checkpoint}`);
+        cpBtn.style.color = "var(--accent-deep)";
+        cpBtn.onclick = () => twoTap(cpBtn, () => doUndo(t.seq, checkpoint));
+        row.append(cpBtn);
+      }
       box.append(row);
     }
     if (r.trash) box.append(el("div", "empty-note", `回收站 ${r.trash} 个文件待处理`));
   } catch (e) { box.innerHTML = ""; box.append(el("div", "empty-note", "网络错误: " + e)); }
 }
-async function doUndo(which) {
+async function doUndo(which, checkpoint) {
   try {
-    const r = await api("/api/undo", { which });
-    if (r.ok) { toast("已回滚"); sysLine(r.result); loadUndo(); }
-    else toast(r.message || "无法回滚", true);
+    const r = await api("/api/undo", { which, ...(checkpoint === undefined ? {} : { checkpoint }) });
+    if (r.ok || r.status === "partial") {
+      toast(r.status === "partial" ? "部分回滚完成，存在未处理项" : "已回滚", r.status === "partial");
+      sysLine(r.result);
+      loadUndo();
+    } else toast(r.message || "无法回滚", true);
   } catch (e) { toast("网络错误: " + e, true); }
 }
 

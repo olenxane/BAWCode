@@ -165,7 +165,10 @@ def _walk_inventory(root: Path, cap: int) -> Optional[Dict[str, Tuple[int, int]]
 # 回合生命周期
 
 
-def begin_turn(config, project_id: str, session_id: str, task: str = "", msg_index: int = -1, task_id: str = "") -> None:
+def begin_turn(
+    config, project_id: str, session_id: str, task: str = "", msg_index: int = -1,
+    task_id: str = "", turn_id: str = "", revision: int = 0,
+) -> None:
     """回合开始：设置线程本地捕获缓冲；子代理可传 task_id 得到独立快照序列。"""
     cfg = snapshot_cfg(config)
     bound = {"config": config, "project_id": str(project_id or "")}
@@ -176,7 +179,10 @@ def begin_turn(config, project_id: str, session_id: str, task: str = "", msg_ind
         "cfg": cfg,
         "project_id": str(project_id or ""),
         "session_id": str(session_id or ""),
+        "turn_id": str(turn_id or ""),
+        "revision": _int(revision, 0),
         "task": " ".join(str(task or "").split())[:120],
+        "task_messages": [{"source": "initial", "text": str(task or "")}],
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "msg_index": _int(msg_index, -1),
         "task_id": str(task_id or ""),
@@ -191,14 +197,69 @@ def begin_turn(config, project_id: str, session_id: str, task: str = "", msg_ind
         log.debug("清单超限，本回合跳过外部改动对账")
 
 
+def add_task_message(text: str, source: str = "inject") -> None:
+    """记录实际并入当前回合的用户消息，不改写快照归属。"""
+    turn = _turn()
+    if turn is not None:
+        turn["task_messages"].append({"source": str(source or "inject"), "text": str(text or "")})
+
+
+def _capture_checkpoint(turn: dict, rec: dict, path: Path, tool: str) -> None:
+    existed = path.exists()
+    data = None
+    size = 0
+    skip_reason = ""
+    if existed:
+        try:
+            stat = path.stat()
+            size = stat.st_size
+        except OSError as exc:
+            rec["checkpoints"].append({"skip_reason": f"读取失败: {exc}"})
+            return
+        limit = turn["cfg"]["max_file_bytes"]
+        if size > limit or turn["bytes_total"] + size > _TURN_BYTES_TOTAL_MAX:
+            signature = (True, f"oversize:{stat.st_mtime_ns}:{size}")
+            skip_reason = f"检查点文件 {size} 字节超限未留底"
+        else:
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                rec["checkpoints"].append({"skip_reason": f"读取失败: {exc}"})
+                return
+            signature = (True, hashlib.md5(data).hexdigest())
+    else:
+        signature = (False, "")
+    if signature == rec["checkpoint_signature"]:
+        return
+    before_signature = rec["checkpoint_signature"]
+    checkpoint = {
+        "existed": existed,
+        "before_existed": before_signature[0],
+        "before_md5": before_signature[1] if len(before_signature[1]) == 32 else "",
+        "after_md5": signature[1] if len(signature[1]) == 32 else "",
+        "bytes": data,
+        "md5": signature[1] if len(signature[1]) == 32 else "",
+        "size": size,
+        "tool": str(tool or ""),
+        "time": time.strftime("%H:%M:%S"),
+        "skip_reason": skip_reason,
+    }
+    if data is not None:
+        turn["bytes_total"] += size
+    rec["checkpoints"].append(checkpoint)
+    rec["checkpoint_signature"] = signature
+
+
 def capture_before(path: Path, tool: str = "") -> None:
-    """写入工具落盘前调用：在线程本地任务中捕获（同任务同文件首次为准）。"""
+    """写入工具落盘前调用：首份原始字节作为回合起点，后续版本形成有界检查点。"""
     turn = _turn()
     if turn is None or not turn["cfg"]["enabled"]:
         return
     key = _key(path)
     with _LOCK:
-        if key in turn["files"]:
+        existing = turn["files"].get(key)
+        if existing is not None:
+            _capture_checkpoint(turn, existing, path, tool)
             return
         rec: Dict[str, Any] = {
             "path": key,
@@ -207,22 +268,33 @@ def capture_before(path: Path, tool: str = "") -> None:
             "tool": str(tool or ""),
             "time": time.strftime("%H:%M:%S"),
             "skip_reason": "",
+            "checkpoints": [],
+            "checkpoint_signature": (False, ""),
         }
         if path.exists():
             rec["existed_before"] = True
             try:
-                size = path.stat().st_size
-            except OSError:
+                stat = path.stat()
+                size = stat.st_size
+            except OSError as exc:
                 size = 0
+                rec["skip_reason"] = f"读取失败: {exc}"
             limit = turn["cfg"]["max_file_bytes"]
-            if size > limit or turn["bytes_total"] + size > _TURN_BYTES_TOTAL_MAX:
+            if rec["skip_reason"]:
+                rec["checkpoint_signature"] = (True, f"unreadable:{size}")
+            elif size > limit or turn["bytes_total"] + size > _TURN_BYTES_TOTAL_MAX:
                 rec["skip_reason"] = f"文件 {size} 字节超限未留底"
+                rec["checkpoint_signature"] = (True, f"oversize:{stat.st_mtime_ns}:{size}")
             else:
                 try:
-                    rec["bytes"] = path.read_bytes()
+                    data = path.read_bytes()
+                except OSError as exc:
+                    data = None
+                    rec["skip_reason"] = f"读取失败: {exc}"
+                if data is not None:
+                    rec["checkpoint_signature"] = (True, hashlib.md5(data).hexdigest())
+                    rec["bytes"] = data
                     turn["bytes_total"] += size
-                except OSError as e:
-                    rec["skip_reason"] = f"读取失败: {e}"
         turn["files"][key] = rec
 
 
@@ -264,6 +336,7 @@ def end_turn() -> Optional[dict]:
             "md5_after": "",
             "size_after": 0,
             "existed_after": path.exists(),
+            "checkpoints": [],
         }
         if rec["bytes"] is not None:
             entry["blob"] = f"{i:03d}.bin"
@@ -276,6 +349,24 @@ def end_turn() -> Optional[dict]:
         entries.append(entry)
         if entry["blob"]:
             _atomic_write_bytes(seq_dir / entry["blob"], rec["bytes"])
+        for checkpoint_id, checkpoint in enumerate(rec["checkpoints"], start=1):
+            checkpoint_entry = {
+                "id": checkpoint_id,
+                "existed": checkpoint.get("existed", False),
+                "before_existed": checkpoint.get("before_existed", False),
+                "before_md5": checkpoint.get("before_md5", ""),
+                "after_md5": checkpoint.get("after_md5", checkpoint.get("md5", "")),
+                "md5": checkpoint.get("md5", ""),
+                "size": checkpoint.get("size", 0),
+                "tool": checkpoint.get("tool", ""),
+                "time": checkpoint.get("time", ""),
+                "skip_reason": checkpoint.get("skip_reason", ""),
+                "blob": "",
+            }
+            if checkpoint.get("bytes") is not None:
+                checkpoint_entry["blob"] = f"checkpoints/{i:03d}-{checkpoint_id:03d}.bin"
+                _atomic_write_bytes(seq_dir / checkpoint_entry["blob"], checkpoint["bytes"])
+            entry["checkpoints"].append(checkpoint_entry)
 
     external: List[str] = []
     if turn["inventory"] is not None:
@@ -284,8 +375,8 @@ def end_turn() -> Optional[dict]:
             captured = set(turn["files"])
             # 自身产物不算外部改动：本回合刚写的 blob、移入回收站的文件
             # （前缀比对带分隔符边界，防 project_id 互为前缀时误判）
-            snap_prefix = str(_snapshots_dir(cfg, turn["project_id"], session_dir)) + os.sep
-            trash_prefix = str(_trash_base(cfg, turn["project_id"])) + os.sep
+            snap_prefix = _key(_snapshots_dir(cfg, turn["project_id"], session_dir)) + os.sep
+            trash_prefix = _key(_trash_base(cfg, turn["project_id"])) + os.sep
             for key, (mtime, size) in current.items():
                 before = turn["inventory"].get(key)
                 if key in captured or before == (mtime, size):
@@ -309,10 +400,14 @@ def end_turn() -> Optional[dict]:
         return None  # 空回合不产生任何文件
 
     index = {
-        "version": 1,
+        "version": 2,
         "seq": seq,
         "time": turn["time"],
         "task": turn["task"],
+        "task_messages": turn["task_messages"],
+        "turn_id": turn["turn_id"],
+        "session_id": turn["session_id"],
+        "revision": turn["revision"],
         "msg_index": turn["msg_index"],
         "files": entries,
         "external_changes": external,
@@ -320,7 +415,15 @@ def end_turn() -> Optional[dict]:
     _atomic_write_bytes(seq_dir / "index.json", json.dumps(index, ensure_ascii=False, indent=1).encode("utf-8"))
     _prune_old_turns(cfg, turn["project_id"], session_dir, cfg["max_turns"])
     log.info("回合快照已落盘: #%d（%d 个文件，外部改动 %d）", seq, len(entries), len(external))
-    return {"seq": seq, "files": len(entries), "external_changes": external}
+    return {
+        "seq": seq,
+        "session_id": turn["session_id"],
+        "turn_id": turn["turn_id"],
+        "revision": turn["revision"],
+        "task_messages": list(turn["task_messages"]),
+        "files": len(entries),
+        "external_changes": external,
+    }
 
 
 def _next_seq_dir(cfg: dict, project_id: str, session_id: str) -> Path:
@@ -374,24 +477,59 @@ def list_turns(config, project_id: str, session_id: str) -> List[dict]:
                 index = json.loads(index_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            restorable = sum(1 for f in index.get("files") or [] if f.get("captured"))
+            files = index.get("files") or []
+            restorable = sum(
+                1 for f in files
+                if f.get("captured") or any(
+                    not cp.get("skip_reason") and (not cp.get("existed") or cp.get("blob"))
+                    for cp in f.get("checkpoints") or []
+                )
+            )
+            checkpoint_details = [
+                {
+                    "id": cp.get("id"),
+                    "path": str(file.get("path") or ""),
+                    "tool": str(cp.get("tool") or ""),
+                    "time": str(cp.get("time") or ""),
+                    "restorable": not cp.get("skip_reason") and (not cp.get("existed") or bool(cp.get("blob"))),
+                    "skip_reason": str(cp.get("skip_reason") or ""),
+                }
+                for file in files for cp in file.get("checkpoints") or []
+            ]
             turns.append(
                 {
                     "seq": int(child.name),
                     "time": str(index.get("time") or ""),
                     "task": str(index.get("task") or ""),
-                    "files": len(index.get("files") or []),
+                    "turn_id": str(index.get("turn_id") or ""),
+                    "session_id": str(index.get("session_id") or session_id),
+                    "revision": _int(index.get("revision"), 0),
+                    "task_messages": list(index.get("task_messages") or []),
+                    "files": len(files),
                     "restorable": restorable,
+                    "checkpoints": checkpoint_details,
                     "dir": str(child),
                 }
             )
     return turns
 
 
-def undo(config, project_id: str, session_id: str, which: Any = "last") -> Optional[dict]:
-    """回滚指定回合（缺省最近一个）：新文件删除、旧文件字节还原；用户事后改过
-    （md5 与回合末不符）的文件跳过。完成后 ledger_reset 强制模型重读。
-    无可回滚内容返回 None"""
+def undo(
+    config, project_id: str, session_id: str, which: Any = "last", checkpoint: Optional[int] = None
+) -> Optional[dict]:
+    """回滚指定回合；可选 checkpoint 恢复同回合中间版本，默认恢复回合起点。"""
+    if which != "last":
+        if isinstance(which, bool) or not (isinstance(which, int) or isinstance(which, str) and which.isdigit()):
+            return None
+        which = int(which)
+        if which <= 0:
+            return None
+    if checkpoint is not None:
+        if isinstance(checkpoint, bool) or not (isinstance(checkpoint, int) or isinstance(checkpoint, str) and checkpoint.isdigit()):
+            return None
+        checkpoint = int(checkpoint)
+        if checkpoint <= 0:
+            return None
     cfg = snapshot_cfg(config)
     base = _snapshots_dir(cfg, project_id, session_id)
     if which == "last":
@@ -408,16 +546,30 @@ def undo(config, project_id: str, session_id: str, which: Any = "last") -> Optio
     except (OSError, json.JSONDecodeError) as e:
         log.warn("快照索引读取失败 %s: %s", turn_dir, e)
         return None
+    if checkpoint is not None and not any(
+        _int(item.get("id"), 0) == checkpoint
+        for entry in index.get("files") or []
+        for item in entry.get("checkpoints") or []
+    ):
+        return None
 
-    restored, deleted, skipped = _restore_entries(turn_dir, index)
+    restored, deleted, skipped = _restore_entries(turn_dir, index, checkpoint=checkpoint)
     toolstore.ledger_reset()
+    external_changes = list(index.get("external_changes") or [])
     result = {
         "seq": int(turn_dir.name),
         "task": str(index.get("task") or ""),
+        "turn_id": str(index.get("turn_id") or ""),
+        "session_id": str(index.get("session_id") or session_id),
+        "revision": _int(index.get("revision"), 0),
+        "task_messages": list(index.get("task_messages") or []),
+        "checkpoint": checkpoint,
+        "status": "partial" if skipped or external_changes else "complete",
+        "external_changes_action": "not_rolled_back",
         "restored": restored,
         "deleted": deleted,
         "skipped": skipped,
-        "external_changes": list(index.get("external_changes") or []),
+        "external_changes": external_changes,
     }
     log.info(
         "回滚回合 #%d: 还原%d 删除%d 跳过%d", result["seq"], len(restored), len(deleted), len(skipped)
@@ -425,14 +577,46 @@ def undo(config, project_id: str, session_id: str, which: Any = "last") -> Optio
     return result
 
 
-def _restore_entries(turn_dir: Path, index: dict) -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
-    """按 index.json 还原单个回合的文件改动（后写先回）；不做 ledger_reset（调用方统一）。
-    md5 门禁：当前磁盘 md5 ≠ 回合末 md5（用户事后改过）的文件跳过"""
+def _restore_entries(
+    turn_dir: Path, index: dict, checkpoint: Optional[int] = None
+) -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
+    """按 index.json 还原单个回合；不做 ledger_reset（调用方统一）。"""
     restored: List[str] = []
     deleted: List[str] = []
     skipped: List[Tuple[str, str]] = []
     for entry in reversed(index.get("files") or []):
         path = Path(entry["path"])
+        if checkpoint is not None:
+            checkpoint_entry = next(
+                (item for item in entry.get("checkpoints") or [] if _int(item.get("id"), 0) == checkpoint),
+                None,
+            )
+            if checkpoint_entry is None:
+                continue
+            existed_after = entry.get("existed_after", bool(entry.get("md5_after")))
+            if path.exists() != existed_after or path.exists() and _file_md5(path) != entry.get("md5_after"):
+                skipped.append((entry["path"], "事后已修改或删除，未还原"))
+                continue
+            if checkpoint_entry.get("skip_reason"):
+                skipped.append((entry["path"], checkpoint_entry["skip_reason"]))
+                continue
+            if not checkpoint_entry.get("existed"):
+                if not path.exists():
+                    skipped.append((entry["path"], "已处于该检查点状态"))
+                else:
+                    try:
+                        path.unlink()
+                        deleted.append(entry["path"])
+                    except OSError as exc:
+                        skipped.append((entry["path"], f"检查点删除失败: {exc}"))
+                continue
+            try:
+                checkpoint_bytes = (turn_dir / checkpoint_entry["blob"]).read_bytes()
+                _atomic_write_bytes(path, checkpoint_bytes)
+                restored.append(entry["path"])
+            except (OSError, KeyError) as exc:
+                skipped.append((entry["path"], f"检查点读取或还原失败: {exc}"))
+            continue
         if not entry.get("captured"):
             skipped.append((entry["path"], entry.get("skip_reason") or "未留底"))
             continue

@@ -1018,6 +1018,8 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
     snapshot_mod.begin_turn(
         llm.config, session.project_id, session.session_id, user_text,
         msg_index=len(session.messages) - 1,
+        turn_id=getattr(runner, "active_turn_id", "") or "",
+        revision=getattr(session, "revision", 0),
     )
     mode = app.mode
     _syncq(task=user_text, status=f"{policy.MODE_LABELS.get(mode, mode)} · 分析")

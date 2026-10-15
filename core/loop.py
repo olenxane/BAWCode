@@ -20,6 +20,7 @@ from typing import Callable, Dict, Optional
 from core import policy
 from core import prompt_loader
 from core import register
+from core import snapshot as snapshot_mod
 from core import subagent as subagent_mod
 from core.llm import CANCELLED, get_system_prompt
 from core.log import get_logger
@@ -94,6 +95,7 @@ def drain_injections(turn: TurnContext) -> int:
     pending.sort(key=lambda item: item.get("_submission_seq", 0) if isinstance(item, dict) else 0)
     for item in pending:
         text = str(item.get("text") or "") if isinstance(item, dict) else str(item or "")
+        snapshot_mod.add_task_message(text, source="background" if isinstance(item, dict) and item.get("background_call") else "inject")
         turn.session.add_message(
             "user",
             text,
