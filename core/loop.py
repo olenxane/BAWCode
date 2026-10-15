@@ -189,11 +189,29 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             turn.captured["turn_error"] = response["error"]  # 无头 --json 的 error 字段来源
             io.status("出错")
             return {"status": "error", "content": ""}
-        if (response.get("content") or response.get("reasoning")) and not response.get("tool_calls"):
-            # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
-            extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
-            session.add_message("assistant", response["content"], **extra)
+        content = response.get("content") or ""
+        reasoning = response.get("reasoning") or ""
         tool_calls = response.get("tool_calls") or []
+        empty_reply = not content.strip() and not reasoning.strip() and not tool_calls
+        if empty_reply:
+            # 模型返回空响应（无正文/思考/工具调用）：最多补试 2 次，仍空记 empty_response 失败
+            empty_retries = turn.captured.get("_empty_retries", 0)
+            if empty_retries < 2:
+                turn.captured["_empty_retries"] = empty_retries + 1
+                io.status(f"空回复补试 {empty_retries + 1}/2")
+                log.warn("第%d轮模型空回复，补试", round_no)
+                continue
+            reason = "[回合异常：模型未返回有效内容]"
+            session.add_message("assistant", reason, type="error")
+            turn.captured["turn_error"] = "empty_response"
+            turn.captured["turn_failed"] = True
+            io.status("出错")
+            log.error("第%d轮模型空回复，放弃回合", round_no)
+            return {"status": "error", "content": ""}
+        if content or reasoning:
+            # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
+            extra = {"thinking": reasoning} if reasoning else {}
+            session.add_message("assistant", content, **extra)
         if not tool_calls:
             if drain_injections(turn):
                 # 回合收尾前有用户插话或后台子代理完成通知：不结束，下一轮回应
@@ -208,7 +226,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     finalize()
                 session.maybe_compress(llm_fn=lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
             io.status("就绪")
-            return {"status": "complete", "content": response.get("content") or ""}
+            return {"status": "complete", "content": content}
 
         # description 是调用意图的简明说明（回合末剥离后的留档记录）：
         # 提取后从 arguments 剔除，策略判定/指纹白名单/确认面板/工具执行均不可见
