@@ -803,7 +803,7 @@ def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None
                 except Exception as exc:
                     log.error("挂起回合丢弃失败: %r", exc)
             elif failed_pending:
-                app.last_failed_text = None
+                # 挂起态保留 last_failed_text：空闲 Ctrl+Y 可将失败任务重发续跑
                 try:
                     _hold_failed_turn(session, app, runner)
                 except Exception as exc:
@@ -1123,12 +1123,11 @@ class _AgentRunner:
             pass
 
     def interrupt_turn(self) -> bool:
-        """Esc 打断：活动回合由 agent 线程收尾（保留已记录上下文）；挂起失败回合就此收束。"""
+        """Esc 打断：活动回合由 agent 线程收尾（保留已记录上下文）；挂起失败回合就此收束。
+        LLM 重试等待态同样打断：cancelled() 让等待桥以打断收尾（非挂起）。"""
         with self._lock:
             if self.busy and self._turn_active:
                 self._esc_interrupt = True
-                if getattr(self.app, "_llm_retry_gate", None) is not None:
-                    self._abandon_pending = True
                 self.llm.cancel()
                 return True
             pending = self.pending_failed_turn
@@ -1339,6 +1338,10 @@ class _AgentRunner:
         with self._lock:
             self._queue.append(user_item)
             if self.busy:
+                # 任何渠道发来的新对话消息都放弃 LLM 重试等待（与输入框提交同语义）
+                gate = getattr(self.app, "_llm_retry_gate", None)
+                if gate is not None:
+                    gate.give_up.set()
                 if self.pending_failed_turn is not None and self._turn_active:
                     pending_ids = set(self.pending_failed_turn.get("turn_ids") or [self.pending_failed_turn.get("turn_id")])
                     if self._active_same_turn_call or self._active_dispatch_origin in pending_ids:
@@ -1355,6 +1358,12 @@ class _AgentRunner:
         take = getattr(self.app, "take_injections", None)
         with self._lock:
             if take is not None and self.busy:
+                # LLM 错误等待闸：插话与队列/新消息同语义，视为用户放弃等待并作为新任务投递
+                gate = getattr(self.app, "_llm_retry_gate", None)
+                if gate is not None:
+                    gate.give_up.set()
+                    self._queue.append({"text": text, "images": [], "_user_submission": True})
+                    return "[已排队，等待错误回合收束后作为新回合发送]"
                 if self.pending_failed_turn is not None and not self._turn_active:
                     self._queue.append({"text": text, "images": [], "_user_submission": True})
                     return "[已排队，等待与后台调用仲裁]"

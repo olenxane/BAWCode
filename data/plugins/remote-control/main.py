@@ -508,6 +508,8 @@ def setup(ctx):
 
     def _on_after_turn(payload):
         st.busy = False
+        st.status = ""
+        st.phase = ""
         _broadcast({"t": "turn_end"})
 
     def _on_stream_delta(payload):
@@ -744,7 +746,15 @@ def setup(ctx):
     def _status_fields(session) -> dict:
         """实时状态字段（顶栏/会话条/计划条）：/api/state 与 /api/status 共用，不含消息列表"""
         app = _app()
-        queue_len = len(getattr(_runner(), "_queue", None) or [])
+        runner = _runner()
+        queue_len = len(getattr(runner, "_queue", None) or [])
+        inject_pending = 0
+        if app is not None:
+            try:
+                inject_pending = len(getattr(app, "inject_queue", None) or [])
+            except Exception:
+                inject_pending = 0
+        retry_wait = bool(getattr(app, "_llm_retry_gate", None) is not None)
         mode = str(getattr(app, "mode", "") or getattr(ctx.config, "mode", "") or "auto")
         info = {}
         if session is not None:
@@ -781,6 +791,10 @@ def setup(ctx):
         return {
             "busy": _busy(),
             "queue": queue_len,
+            "inject_pending": inject_pending,
+            "retry_wait": retry_wait,
+            "turn_id": str(getattr(runner, "active_turn_id", "") or ""),
+            "last_error": str(getattr(runner, "last_error", "") or ""),
             "status": st.status,
             "phase": st.phase,
             "clients": clients_n,
@@ -1900,31 +1914,39 @@ def setup(ctx):
                         return
                     mode = str(data.get("mode") or "").strip().lower()
                     self._json(200, {"ok": True, **_send_message(text, mode)})
-                elif path == "/api/stop":
+                elif path in ("/api/stop", "/api/turn/interrupt"):
                     runner = _runner()
                     if runner is None:
                         self._json(200, {"ok": False, "message": "调度器未就绪"})
                         return
-                    if not getattr(runner, "busy", False):
-                        self._json(200, {"ok": False, "message": "当前空闲，无需停止"})
-                        return
-                    llm = getattr(runner, "llm", None)
-                    cancel = getattr(llm, "cancel", None)
-                    if not callable(cancel):
+                    interrupt = getattr(runner, "interrupt_turn", None)
+                    if not callable(interrupt):
                         self._json(200, {"ok": False, "message": "运行时不支持中断"})
                         return
-                    cancel()
-                    self._json(200, {"ok": True, "result": "已请求中断在途回合"})
+                    if not interrupt():
+                        self._json(200, {"ok": False, "message": "当前空闲，无在途回合"})
+                        return
+                    self._json(200, {"ok": True, "result": "已请求中断在途回合（保留已记录上下文）"})
                 elif path == "/api/turn/retry":
                     app = _app()
-                    fn = getattr(app, "request_llm_retry", None) if app is not None else None
-                    if not callable(fn):
-                        self._json(200, {"ok": False, "message": "运行时不支持重试"})
+                    retry_gate = getattr(app, "request_llm_retry", None) if app is not None else None
+                    runner = _runner()
+                    # 忙态：错误等待闸正在等待，触发重试同一请求
+                    if runner is not None and getattr(runner, "busy", False):
+                        if callable(retry_gate) and retry_gate():
+                            self._json(200, {"ok": True, "result": "已触发重试"})
+                        else:
+                            self._json(200, {"ok": False, "message": "当前无等待重试的错误"})
                         return
-                    if fn():
-                        self._json(200, {"ok": True, "result": "已触发重试"})
-                    else:
-                        self._json(200, {"ok": False, "message": "当前无等待重试的错误"})
+                    # 空闲但存在失败挂起回合：用保留的原任务重发新回合
+                    pending = getattr(runner, "pending_failed_turn", None) if runner is not None else None
+                    failed_text = str(getattr(app, "last_failed_text", "") or "") if app is not None else ""
+                    if pending and failed_text:
+                        start = getattr(runner, "start", None)
+                        if callable(start) and start(failed_text):
+                            self._json(200, {"ok": True, "result": "已用保留的任务重发新回合"})
+                            return
+                    self._json(200, {"ok": False, "message": "当前无可重试的失败回合"})
                 elif path == "/api/confirm":
                     cid = str(data.get("id") or "")
                     action = str(data.get("action") or "").lower()

@@ -161,7 +161,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             io.status(f"轮次续期 · 空转计数 {spin.count}/{spin.kill_count}")
         round_no += 1
         check_cancel(turn)
-        io.status(f"推理 · 第{round_no + 1}轮")
+        io.status(f"推理 · 第{round_no}轮")
         while True:
             io.phase("思考中")
             drain_injections(turn)  # 回合中插话：并入本回合，下一轮模型即看到
@@ -180,11 +180,11 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 retry_requested = io.wait_llm_retry(str(response["error"]))
                 check_cancel(turn)
                 if retry_requested:
-                    io.status(f"重试 · 第{round_no + 1}轮")
+                    io.status(f"重试 · 第{round_no}轮")
                     continue
             break
         if response.get("error"):
-            log.error("第%d轮推理返回错误: %s", round_no + 1, response["error"])
+            log.error("第%d轮推理返回错误: %s", round_no, response["error"])
             session.add_message("assistant", response["error"])
             turn.captured["turn_error"] = response["error"]  # 无头 --json 的 error 字段来源
             io.status("出错")
@@ -200,7 +200,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 io.status("新消息并入 · 继续")
                 continue
             io.phase("")  # 回合完成：状态行空行占位
-            log.info("任务完成（共%d轮推理）", round_no + 1)
+            log.info("任务完成（共%d轮推理）", round_no)
             if not io.cancelled():
                 # 先收敛工具记录，再压缩，避免摘要模型看到尚未外置的原始大输出
                 finalize = getattr(session, "finalize_turn", None)
@@ -238,7 +238,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         )
         registered = 0
         round_results = []
-        log.debug("第%d轮返回 %d 个工具调用", round_no + 1, len(tool_calls))
+        log.debug("第%d轮返回 %d 个工具调用", round_no, len(tool_calls))
         # task 工具自身已立即提交后台任务；同轮多个 task 自然连续返回，不在此 join
         try:
             for call in tool_calls:
