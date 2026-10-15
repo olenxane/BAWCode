@@ -754,7 +754,19 @@ def setup(ctx):
                 inject_pending = len(getattr(app, "inject_queue", None) or [])
             except Exception:
                 inject_pending = 0
-        retry_wait = bool(getattr(app, "_llm_retry_gate", None) is not None)
+        retry_gate = getattr(app, "_llm_retry_gate", None)
+        retry_wait = retry_gate is not None
+        pending_retry = bool(
+            getattr(runner, "pending_failed_turn", None)
+            and getattr(app, "last_failed_text", None)
+        )
+        last_error = str(
+            getattr(runner, "last_error", None)
+            or getattr(app, "last_turn_error", None)
+            or ""
+        )
+        if retry_wait and retry_gate.error:
+            last_error = retry_gate.error
         mode = str(getattr(app, "mode", "") or getattr(ctx.config, "mode", "") or "auto")
         info = {}
         if session is not None:
@@ -793,10 +805,11 @@ def setup(ctx):
             "queue": queue_len,
             "inject_pending": inject_pending,
             "retry_wait": retry_wait,
+            "can_retry": pending_retry,
             "turn_id": str(getattr(runner, "active_turn_id", "") or ""),
-            "last_error": str(getattr(runner, "last_error", "") or ""),
-            "status": st.status,
-            "phase": st.phase,
+            "last_error": last_error,
+            "status": st.status or str(getattr(app, "status", "") or ""),
+            "phase": st.phase or str(getattr(app, "phase_hint", "") or ""),
             "clients": clients_n,
             "expires_at": st.key_data.get("expires_at", ""),
             **info,

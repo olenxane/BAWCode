@@ -294,6 +294,13 @@
   #send:active { background: var(--accent-deep); }
   #stop { background: #fdecec; color: var(--red); }
   #queue-send { background: var(--accent-soft); color: var(--accent-deep); font-size: 11px; }
+  #retry-panel {
+    display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+    background: var(--amber-soft); border-top: 1px solid #f3e2bd; color: #7c5a17;
+    font-size: 12px;
+  }
+  #retry-error { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #retry-panel button { flex: none; }
   #queue-chip {
     position: absolute; right: 14px; top: -30px; font-size: 11px; color: var(--dim);
     background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px;
@@ -623,6 +630,11 @@
       <button class="btn danger small" id="deny-ok">确认拒绝</button>
       <button class="btn small" id="deny-cancel">取消</button>
     </div>
+  </div>
+  <div id="retry-panel" hidden>
+    <span>请求失败</span>
+    <span id="retry-error"></span>
+    <button class="btn primary small" id="retry-turn">重试</button>
   </div>
   <footer>
     <div id="queue-chip" hidden></div>
@@ -1279,6 +1291,15 @@ function renderPhase() {
     pill.classList.remove("show");
   }
 }
+function renderRetry(s) {
+  const waiting = !!s.retry_wait;
+  const canRetry = !!s.can_retry;
+  const panel = $("retry-panel");
+  panel.hidden = !waiting && !canRetry;
+  $("retry-error").textContent = s.last_error || (waiting ? "等待重试" : "失败回合已挂起");
+  $("retry-turn").textContent = waiting ? "重试" : "重新发送";
+  $("retry-turn").disabled = !waiting && !canRetry;
+}
 
 /* ================= 快照 ================= */
 let fetching = null;
@@ -1302,6 +1323,7 @@ async function fetchState(force) {
       state.statusText = s.status || "";
       setBusy(!!s.busy);
       renderHeader(s);
+      renderRetry(s);
       const exp = (s.expires_at || "").replace("T", " ").slice(0, 16);
       setConn("on");
       // 消息区全量重绘带签名门禁：无变化不动 DOM（保滚动与展开态）
@@ -1352,6 +1374,7 @@ async function pollStatus() {
     if (state.data) Object.assign(state.data, s);  // 字段回填：侧栏/设置面板读到的也是最新值
     setBusy(!!s.busy);
     renderHeader(s);
+    renderRetry(s);
     if (wasBusy && !state.busy) fetchState(true);  // 漏收 turn_end：补一次全量刷新
   } catch (e) {
     /* 单次轮询失败忽略：下一轮重试，SSE 与 25s 全量拉取仍在兜底 */
@@ -1550,6 +1573,19 @@ $("stop").onclick = async () => {
     const r = await api("/api/stop", {});
     toast(r.ok ? (r.result || "已请求停止") : (r.message || "无法停止"), !r.ok);
   } catch (e) { toast("网络错误: " + e, true); }
+};
+$("retry-turn").onclick = async () => {
+  const button = $("retry-turn");
+  button.disabled = true;
+  try {
+    const r = await api("/api/turn/retry", {});
+    toast(r.ok ? (r.result || "已触发重试") : (r.message || "当前不可重试"), !r.ok);
+    if (r.ok) {
+      await pollStatus();
+      if (!state.busy) await fetchState(true);
+    }
+  } catch (e) { toast("网络错误: " + e, true); }
+  finally { button.disabled = false; }
 };
 
 /* ================= SSE 实时事件 ================= */
