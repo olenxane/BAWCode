@@ -164,6 +164,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         round_no += 1
         check_cancel(turn)
         io.status(f"推理 · 第{round_no}轮")
+        empty_retries = 0
         while True:
             io.phase("思考中")
             drain_injections(turn)  # 回合中插话：并入本回合，下一轮模型即看到
@@ -184,31 +185,30 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 if retry_requested:
                     io.status(f"重试 · 第{round_no}轮")
                     continue
+            if response.get("error"):
+                break
+            content = response.get("content") or ""
+            reasoning = response.get("reasoning") or ""
+            tool_calls = response.get("tool_calls") or []
+            if not content.strip() and not reasoning.strip() and not tool_calls:
+                if empty_retries < 2:
+                    empty_retries += 1
+                    io.status(f"空回复补试 {empty_retries}/2")
+                    log.warn("第%d轮模型空回复，补试", round_no)
+                    continue
+                reason = "[回合异常：模型未返回有效内容]"
+                session.add_message("assistant", reason, type="error")
+                turn.captured["turn_error"] = "empty_response"
+                turn.captured["turn_failed"] = True
+                io.status("出错")
+                log.error("第%d轮模型空回复，放弃回合", round_no)
+                return {"status": "error", "content": ""}
             break
         if response.get("error"):
             log.error("第%d轮推理返回错误: %s", round_no, response["error"])
             session.add_message("assistant", response["error"])
             turn.captured["turn_error"] = response["error"]  # 无头 --json 的 error 字段来源
             io.status("出错")
-            return {"status": "error", "content": ""}
-        content = response.get("content") or ""
-        reasoning = response.get("reasoning") or ""
-        tool_calls = response.get("tool_calls") or []
-        empty_reply = not content.strip() and not reasoning.strip() and not tool_calls
-        if empty_reply:
-            # 模型返回空响应（无正文/思考/工具调用）：最多补试 2 次，仍空记 empty_response 失败
-            empty_retries = turn.captured.get("_empty_retries", 0)
-            if empty_retries < 2:
-                turn.captured["_empty_retries"] = empty_retries + 1
-                io.status(f"空回复补试 {empty_retries + 1}/2")
-                log.warn("第%d轮模型空回复，补试", round_no)
-                continue
-            reason = "[回合异常：模型未返回有效内容]"
-            session.add_message("assistant", reason, type="error")
-            turn.captured["turn_error"] = "empty_response"
-            turn.captured["turn_failed"] = True
-            io.status("出错")
-            log.error("第%d轮模型空回复，放弃回合", round_no)
             return {"status": "error", "content": ""}
         if content or reasoning:
             # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
