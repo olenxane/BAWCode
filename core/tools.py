@@ -1132,6 +1132,7 @@ _TOOL_FAILURE_PATTERNS = (
     "old_str 与 new_str 相同",
     "删除命令已被安全策略拦截",
     "已拒绝",
+    "审批器拒绝执行",
     "拒绝写入",
     "命令未执行",  # shell 语法在 cmd.exe 下会静默错跑，前置拦下
     # MCP 工具的 isError 结果与调用失败统一前缀

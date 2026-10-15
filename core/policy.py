@@ -543,3 +543,10 @@ def default_reject_message(reason: str = "") -> str:
     if reason:
         return f"用户拒绝执行该指令: {reason}"
     return "用户拒绝执行该指令"
+
+
+def approval_reject_message(reason: str = "") -> str:
+    reason = (reason or "").strip()
+    if reason:
+        return f"审批器拒绝执行该指令: {reason}"
+    return "审批器拒绝执行该指令"

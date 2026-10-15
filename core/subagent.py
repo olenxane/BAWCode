@@ -773,7 +773,7 @@ def _handle_elevation(rt: dict, call: dict) -> dict:
         # 自动模式：不确定的命令（含危险类）由 LLM 裁决
         if llm.approve_tool_call(target):
             return _elevation_execute(llm, call, target)
-        return _normalize_tool_msg(call, f"提权请求被拒绝: {tool}（LLM 裁决）")
+        return _normalize_tool_msg(call, policy.approval_reject_message(f"提权请求被拒绝: {tool}（LLM 裁决）"))
     # confirm/edit：交用户裁决，批准时确认桥已完成执行；理由经 description 传面板（执行前由执行层剥离）
     if getattr(io, "tool_confirm", None) is None:
         return _normalize_tool_msg(call, f"提权请求被拒绝: {tool}（无确认通道）")
@@ -814,8 +814,10 @@ def _execute_one(rt: dict, call: dict, permission: str) -> dict:
             return _with_images(item) if isinstance(item, dict) and "content" in item else _normalize_tool_msg(call, item)
         return _normalize_tool_msg(
             call,
-            f"权限不足被拒绝（LLM 审批未通过）: {name}。如该调用为任务所必需，"
-            f"可调用 {_MODE_SWITCH_TOOL} 说明理由申请切换访问模式（用户裁决）。",
+            policy.approval_reject_message(
+                f"权限不足: {name}。如该调用为任务所必需，可调用 {_MODE_SWITCH_TOOL} "
+                "说明理由申请切换访问模式（用户裁决）。"
+            ),
         )
     return _denied(call, reason)
 

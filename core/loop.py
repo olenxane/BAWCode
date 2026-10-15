@@ -275,7 +275,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     if llm.approve_tool_call(call):
                         result = llm.execute_approved_tool(call)
                     else:
-                        result = {"content": policy.default_reject_message("LLM 审批拒绝或失败")}
+                        result = {"content": policy.approval_reject_message("LLM 审批拒绝或失败")}
                 elif action == policy.CONFIRM:
                     io.phase(f"待确认 · {call.get('name')}")
                     check_cancel(turn)
