@@ -93,6 +93,37 @@ class TextBuffer:
             i += 1
         self.set_cursor(i)
 
+    def move_up(self) -> bool:
+        """光标上移一条逻辑行，尽量保持列偏移；已在首行返回 False。"""
+        text = self.to_text()
+        start, _ = self.line_bounds()
+        if start == 0:
+            return False
+        col = self._gap_start - start
+        prev_end = start - 1
+        prev_start = prev_end
+        while prev_start > 0 and text[prev_start - 1] != "\n":
+            prev_start -= 1
+        prev_len = prev_end - prev_start
+        self.set_cursor(prev_start + min(col, prev_len))
+        return True
+
+    def move_down(self) -> bool:
+        """光标下移一条逻辑行，尽量保持列偏移；已在末行返回 False。"""
+        text = self.to_text()
+        start, end = self.line_bounds()
+        n = self.length
+        if end >= n:
+            return False
+        col = self._gap_start - start
+        next_start = end + 1
+        next_end = next_start
+        while next_end < n and text[next_end] != "\n":
+            next_end += 1
+        next_len = next_end - next_start
+        self.set_cursor(next_start + min(col, next_len))
+        return True
+
     def word_left(self) -> None:
         text = self.to_text()
         i = self._gap_start

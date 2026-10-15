@@ -161,6 +161,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.buffer = TextBuffer()
         self.input_history: List[str] = []
         self.hist_index = -1
+        # 历史浏览前的草稿暂存：浏览中 ↓ 回到底部时还原，避免误清空当前输入
+        self._hist_draft = ""
         self.candidates: List[dict] = []
         self.candidate_index = 0
         # 文件候选后台扫描：输入停止 SCAN_INTERVAL 后扫第一层，之后每 interval 下钻一层
@@ -506,11 +508,12 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
 
     def wait_llm_retry(self, error_text: str, cancelled) -> bool:
         """API 错误等待态（TurnIO 桥，agent 线程调用）：状态行显示错误与按键提示。
-        返回 True=用户按 Ctrl+Y 重试；Esc 放弃、提交消息自动放弃、回合取消或
-        llm.retry_wait_seconds 超时（0=无限等待）亦放弃。等待期间其余交互不受影响。"""
+        返回 True=用户按 Ctrl+Y 重试；放弃方式=Esc 打断回合，或提交一条新对话
+        消息（/ 命令与其他操作一律保留等待态）；llm.retry_wait_seconds 超时
+        （0=无限等待）亦放弃。等待期间其余交互不受影响。"""
         gate = _LlmRetryGate(_oneline(str(error_text or ""), 200))
         self._llm_retry_gate = gate
-        self.status = f"API 错误 · {gate.error} · Ctrl+Y 重试 / Esc 放弃"
+        self.status = f"API 错误 · {gate.error} · Ctrl+Y 重试 / Esc 打断"
         timeout = 0.0
         cfg = getattr(self, "config", None)
         if cfg is not None:
@@ -756,8 +759,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self._submit_has_images = bool(images)
         if line.strip():
             self.input_history.append(line)
-            if self._llm_retry_gate is not None:
-                # 等待重试时提交新消息：自动放弃当前错误
+            # 等待重试时提交新对话消息自动放弃当前错误；/ 命令只是操作，不破坏等待态
+            if self._llm_retry_gate is not None and not line.lstrip().startswith("/"):
                 self._llm_retry_gate.give_up.set()
         self.hist_index = len(self.input_history)
         self._buf_clear()
@@ -801,7 +804,9 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 return self._submit_line()
             return None
 
-        # Esc：活动回合打断并保留其已记录上下文，挂起失败回合收束保留；没有回合时保持输入框清空语义。
+        # Esc：活动回合打断并保留其已记录上下文（LLM 重试等待态同样打断——
+        # 等待桥经 cancelled() 走打断收尾而非挂起）；挂起失败回合收束保留；
+        # 没有回合时保持输入框清空语义。
         # 弹窗（含嵌套 line 输入）期间 _dialog_active 为真，Esc 语义交给弹窗自身。
         if kind == "escape" and not self._dialog_active:
             handler = self.interrupt_turn_handler
@@ -810,15 +815,12 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 self.render()
                 return None
 
-        # LLM 错误重试闸激活时：Ctrl+Y 放行重试、Esc 放弃；其余按键照常分发
+        # LLM 错误重试闸激活时：Ctrl+Y 放行重试；其余按键照常分发。
+        # 放弃只发生在提交新对话消息（_submit_line），命令/按键操作均不破坏等待态。
         gate = self._llm_retry_gate
-        if gate is not None:
-            if kind == "hotkey" and str(value) == "ctrl+y":
-                gate.retry.set()
-                return None
-            if kind == "escape":
-                gate.give_up.set()
-                return None
+        if gate is not None and kind == "hotkey" and str(value) == "ctrl+y":
+            gate.retry.set()
+            return None
 
         # 空闲态 Ctrl+Y：重发上一条失败回合的用户消息（失败回合已整体回滚出上下文）
         if (
@@ -1248,9 +1250,13 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self.tree_cursor = max(0, min(len(flat) - 1, self.tree_cursor - step))
             self._tree_follow_tail = False
             self.render()
+        elif self.focus == "input" and "\n" in self._buf_text():
+            # 多行输入：↑ 在逻辑行间移动光标；已在首行则回落历史切换
+            if not self.buffer.move_up():
+                self._history_up()
+            self.render()
         elif self.input_history:
-            self.hist_index = max(0, self.hist_index - 1)
-            self._buf_set(self.input_history[self.hist_index], len(self.input_history[self.hist_index]))
+            self._history_up()
             self.render()
 
     def _on_down(self) -> None:
@@ -1264,15 +1270,35 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self.tree_cursor = min(last, self.tree_cursor + step)
             self._tree_follow_tail = self.tree_cursor >= last
             self.render()
-        else:
-            if self.hist_index < len(self.input_history) - 1:
-                self.hist_index += 1
-                line = self.input_history[self.hist_index]
-                self._buf_set(line, len(line))
-            else:
-                self.hist_index = len(self.input_history)
-                self._buf_clear()
+        elif self.focus == "input" and "\n" in self._buf_text():
+            # 多行输入：↓ 在逻辑行间移动光标；已在末行则回落历史切换
+            if not self.buffer.move_down():
+                self._history_down()
             self.render()
+        else:
+            self._history_down()
+            self.render()
+
+    def _history_up(self) -> None:
+        """input 焦点、单行或已到首行顶时：↑ 上翻历史；首次进入浏览态暂存草稿"""
+        if not self.input_history:
+            return
+        # 进入历史浏览前暂存当前草稿，便于 ↓ 回到底部时还原（而非清空）
+        if not (0 <= self.hist_index < len(self.input_history)):
+            self._hist_draft = self._buf_text()
+        self.hist_index = max(0, self.hist_index - 1)
+        self._buf_set(self.input_history[self.hist_index], len(self.input_history[self.hist_index]))
+
+    def _history_down(self) -> None:
+        """input 焦点、单行或已到末行底时：↓ 下翻历史；到底还原进入浏览前的草稿"""
+        if not (0 <= self.hist_index < len(self.input_history)):
+            return  # 未在浏览历史（正在编辑草稿）：↓ 不清空当前输入
+        self.hist_index += 1
+        if self.hist_index < len(self.input_history):
+            line = self.input_history[self.hist_index]
+            self._buf_set(line, len(line))
+        else:
+            self._buf_set(getattr(self, "_hist_draft", ""), len(getattr(self, "_hist_draft", "")))
 
     # ----- UI 请求桥：agent 线程经此把交互弹窗移交主线程执行 -----
 
