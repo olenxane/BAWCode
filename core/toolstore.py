@@ -130,29 +130,56 @@ def pointer_line(path: Optional[Path], total_lines: int) -> str:
     )
 
 
-def clear_session(config, project_id: str, session_id: str) -> int:
-    """清理会话对应的全部外置记录，/clear 用，返回删除文件数"""
+def clear_session(config, project_id: str, session_id: str, detailed: bool = False):
+    """清理单个会话的全部外置记录，详细模式返回逐项结果。"""
     directory = store_dir(config, project_id, session_id)
-    if not directory.exists():
-        return 0
-    removed = 0
-    for path in directory.glob("*.txt"):
+    if directory.is_symlink():
         try:
-            path.unlink()
-            removed += 1
-        except OSError as e:
-            log.warn("外置记录删除失败 %s: %s", path, e)
+            directory.unlink()
+            return {"ok": True, "removed": 0, "errors": []} if detailed else 0
+        except OSError as exc:
+            result = {"ok": False, "removed": 0, "errors": [str(exc)]}
+            return result if detailed else 0
+    if not directory.exists():
+        return {"ok": True, "removed": 0, "errors": []} if detailed else 0
+    removed = 0
+    errors = []
+
+    def on_walk_error(exc):
+        errors.append(str(exc))
+
+    for root, dirs, files in os.walk(directory, topdown=False, onerror=on_walk_error):
+        for name in files:
+            path = Path(root) / name
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                errors.append(f"{path.name}: {exc}")
+        for name in dirs:
+            path = Path(root) / name
+            try:
+                if path.is_symlink():
+                    path.unlink()
+                else:
+                    path.rmdir()
+            except OSError as exc:
+                errors.append(f"{path.name}: {exc}")
     try:
         directory.rmdir()
-    except OSError:
-        pass
-    try:
-        directory.parent.rmdir()  # 项目目录空了也顺手清掉
-    except OSError:
-        pass
+    except OSError as exc:
+        errors.append(f"目录: {exc}")
+    if not errors:
+        try:
+            directory.parent.rmdir()
+        except OSError:
+            pass
     if removed:
         log.info("已清理会话外置记录: %s (%d个文件)", directory, removed)
-    return removed
+    result = {"ok": not errors, "removed": removed, "errors": errors}
+    if errors:
+        log.warn("外置记录清理不完整 %s: %s", directory, errors)
+    return result if detailed else removed
 
 
 # ----- 文件状态台账，edit/位置写入门禁 -----

@@ -69,6 +69,13 @@ def save_session_data(directory: Path, data: dict) -> Path:
     return path
 
 
+def revision_of(data: dict) -> int:
+    try:
+        return max(0, int(data.get("revision") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def list_sessions(directory: Path) -> List[dict]:
     """扫描目录返回会话元信息，按 updated_at 倒序（损坏文件跳过，不阻塞面板）"""
     items: List[dict] = []
@@ -89,6 +96,8 @@ def list_sessions(directory: Path) -> List[dict]:
                 "created_at": data.get("created_at") or "",
                 "updated_at": data.get("updated_at") or "",
                 "message_count": data.get("message_count") or len(data.get("messages") or []),
+                "revision": revision_of(data),
+                "cleared_at": str(data.get("cleared_at") or ""),
                 "path": path,
             }
         )
@@ -182,3 +191,40 @@ def delete_session_data(directory: Path, session_id: str) -> bool:
     except OSError as e:
         log.error("会话删除失败 %s: %s", path, e)
         return False
+
+
+def clear_session_artifacts(config, project_id: str, session_id: str) -> dict:
+    """清理单个项目会话的持久化内容并逐项返回结果。"""
+    directory = sessions_dir(config, project_id)
+    path = session_path(directory, session_id)
+    if path is None:
+        return {"ok": False, "message": "会话标识非法", "resources": {}}
+
+    resources = {}
+    try:
+        existed = path.exists()
+        path.unlink(missing_ok=True)
+        resources["session"] = {"ok": True, "removed": int(existed), "errors": []}
+    except OSError as exc:
+        resources["session"] = {"ok": False, "removed": 0, "errors": [str(exc)]}
+
+    from core import snapshot as snapshot_mod
+    from core import toolstore
+
+    resources["toolcalls"] = toolstore.clear_session(config, project_id, session_id, detailed=True)
+
+    archives = []
+    errors = []
+    for archive in directory.glob(f"{session_id}-precompact-*.json"):
+        try:
+            archive.unlink()
+            archives.append(archive.name)
+        except OSError as exc:
+            errors.append(f"{archive.name}: {exc}")
+    resources["precompact"] = {"ok": not errors, "removed": len(archives), "errors": errors}
+    resources["snapshots"] = snapshot_mod.clear_session(config, project_id, session_id)
+    return {
+        "ok": all(item.get("ok") for item in resources.values()),
+        "session_id": session_id,
+        "resources": resources,
+    }

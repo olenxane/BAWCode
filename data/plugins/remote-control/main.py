@@ -725,6 +725,8 @@ def setup(ctx):
             "context_tokens": int(getattr(meter, "context_tokens", 0) or 0),
             "context_window": int(getattr(meter, "context_window", 0) or 0),
             "billed_tokens": int(getattr(meter, "billed_tokens", 0) or 0),
+            "context_scope": "current_session",
+            "billed_scope": "llm_instance",
         }
         if getattr(meter, "balance", None) is not None:
             out["balance"] = meter.balance
@@ -777,6 +779,8 @@ def setup(ctx):
                     "created_at": session.session_created_at,
                     "message_count": len(session.messages),
                     "project_id": session.project_id,
+                    "revision": getattr(session, "revision", 0),
+                    "cleared_at": getattr(session, "cleared_at", ""),
                 },
                 "plan": dict(session.plan or {}),
                 "steps": [
@@ -923,22 +927,41 @@ def setup(ctx):
         _broadcast({"t": "reset"})
         return {"ok": True, "result": "新会话已开启"}
 
-    @_idle_operation
     def _op_session_clear() -> dict:
-        err = _session_op_guard()
-        if err:
-            return err
         session, err = _require_session()
         if err:
             return err
-        session.clear()
+        runner = _runner()
+        clear_idle = getattr(runner, "clear_session_when_idle", None)
+        if callable(clear_idle):
+            idle, cleanup = clear_idle()
+            if not idle:
+                return {"ok": False, "message": "回合进行中：请先停止后再清空会话"}
+        else:
+            cleanup = ctx.run_when_idle(session.clear)
+            if not isinstance(cleanup, dict) or "resources" not in cleanup:
+                return cleanup if isinstance(cleanup, dict) else {
+                    "ok": False, "message": "会话调度器不可用"
+                }
         app = _app()
         if app is not None:
             app.task = ""
             app.status = "会话已清空"
         _app_refresh(session)
-        _broadcast({"t": "reset"})
-        return {"ok": True, "result": "会话已清空"}
+        _broadcast({"t": "reset", "revision": session.revision})
+        _broadcast({"t": "session_cleared", "session_id": session.session_id, "revision": session.revision})
+        complete = cleanup.get("ok", False) and cleanup.get("persisted", False)
+        result = "会话已清空"
+        if not cleanup.get("ok"):
+            result = "会话已清空，但部分衍生记录清理失败"
+        elif not cleanup.get("persisted"):
+            result = "会话已清空，但 revision 未能持久化"
+        return {
+            "ok": complete,
+            "result": result,
+            "revision": session.revision,
+            "cleanup": cleanup.get("resources", {}),
+        }
 
     @_idle_operation
     def _op_session_rename(title: str) -> dict:
@@ -993,10 +1016,13 @@ def setup(ctx):
         sid = (sid or "").strip()
         if sid == session.session_id:
             return {"ok": False, "message": "不能删除当前会话（可用清空/新建）"}
-        directory = session_store_mod.sessions_dir(ctx.config, session.project_id)
-        if session_store_mod.delete_session_data(directory, sid):
-            return {"ok": True, "result": f"会话已删除: {sid}"}
-        return {"ok": False, "message": f"会话不存在: {sid}"}
+        result = session_store_mod.clear_session_artifacts(ctx.config, session.project_id, sid)
+        if result.get("ok") and result["resources"]["session"]["removed"]:
+            _broadcast({"t": "sessions_changed", "id": sid})
+            return {"ok": True, "result": f"会话及衍生记录已删除: {sid}", "cleanup": result["resources"]}
+        if result.get("ok"):
+            return {"ok": False, "message": f"会话不存在: {sid}"}
+        return {"ok": False, "message": "会话删除不完整", "cleanup": result.get("resources", {})}
 
     def _sessions_listing() -> dict:
         session, err = _require_session()
@@ -1013,7 +1039,20 @@ def setup(ctx):
                 "created_at": row.get("created_at") or "",
                 "updated_at": row.get("updated_at") or "",
                 "message_count": row.get("message_count") or 0,
+                "revision": row.get("revision") or 0,
+                "cleared_at": row.get("cleared_at") or "",
                 "current": row.get("id") == session.session_id,
+            })
+        if not any(item["current"] for item in items):
+            items.insert(0, {
+                "id": session.session_id,
+                "title": session.session_title or "（无标题会话）",
+                "created_at": session.session_created_at,
+                "updated_at": "",
+                "message_count": len(session.messages),
+                "revision": getattr(session, "revision", 0),
+                "cleared_at": getattr(session, "cleared_at", ""),
+                "current": True,
             })
         return {"ok": True, "sessions": items}
 

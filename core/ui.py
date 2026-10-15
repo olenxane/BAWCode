@@ -1645,10 +1645,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
     # ----- 历史会话面板 -----
 
 
-    def show_sessions_form(self, items: List[dict], current_id: str = "", directory=None) -> Optional[dict]:
-        """历史会话面板（阻塞）：{"action":"switch","id","title"} / {"action":"new"}；Esc 返回 None"""
-        from core import session_store as _store
-
+    def show_sessions_form(self, items: List[dict], current_id: str = "", delete_session=None) -> Optional[dict]:
+        """历史会话面板（阻塞）：切换/新建/删除返回动作，由宿主执行持久化操作。"""
         self.sessions_mode = True
         self.sessions_items = list(items)
         self.sessions_index = 0
@@ -1696,16 +1694,23 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                     self.sessions_notice = f"确认删除「{_oneline(str(item.get('title') or ''))}」？再按 d 确认，其它键取消"
                     self.render()
                     continue
-                removed = False
-                if directory is not None and item.get("id"):
-                    removed = _store.delete_session_data(directory, item["id"])
+                result = delete_session(item.get("id")) if callable(delete_session) else None
+                resources = (result or {}).get("resources") or {}
+                removed = bool(result and result.get("ok") and resources.get("session", {}).get("removed"))
                 if removed:
                     self.sessions_items.pop(self.sessions_index)
                     if self.sessions_index >= len(self.sessions_items):
                         self.sessions_index = max(0, len(self.sessions_items) - 1)
-                    self.sessions_notice = "会话已删除"
-                else:
+                    summary = " ".join(f"{name} {row.get('removed', 0)}" for name, row in resources.items())
+                    self.sessions_notice = f"会话及衍生记录已删除 · {summary}"
+                elif result is None:
                     self.sessions_notice = "删除失败"
+                else:
+                    details = "；".join(
+                        f"{name}: {'、'.join(row.get('errors') or [])}"
+                        for name, row in resources.items() if not row.get("ok")
+                    )
+                    self.sessions_notice = "会话删除不完整" + (f" · {details}" if details else "")
                 self._sessions_confirm_delete = False
                 self.render()
                 continue

@@ -91,6 +91,38 @@ def _snapshots_dir(cfg: dict, project_id: str, session_id: str) -> Path:
     return _base_dir(cfg, "dir") / (project_id or "_default") / (session_id or "_default")
 
 
+def clear_session(config, project_id: str, session_id: str) -> dict:
+    """清理当前项目/会话的回合快照，不触碰项目回收站。"""
+    directory = _snapshots_dir(snapshot_cfg(config), project_id, session_id)
+    if directory.is_symlink():
+        try:
+            directory.unlink()
+            return {"ok": True, "removed": 1, "errors": []}
+        except OSError as exc:
+            return {"ok": False, "removed": 0, "errors": [str(exc)]}
+    if not directory.exists():
+        return {"ok": True, "removed": 0, "errors": []}
+    removed = 0
+    errors = []
+    for path in list(directory.iterdir()):
+        try:
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed += 1
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+    try:
+        directory.rmdir()
+    except OSError as exc:
+        if directory.exists():
+            errors.append(f"目录: {exc}")
+    return {"ok": not errors, "removed": removed, "errors": errors}
+
+
 def _trash_base(cfg: dict, project_id: str) -> Path:
     return _base_dir(cfg, "trash_dir") / (project_id or "_default")
 

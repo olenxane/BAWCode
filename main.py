@@ -82,11 +82,25 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
     def _resume(ctx, args):
         sess = ctx["session"]
         directory = session_store.sessions_dir(ctx["config"], sess.project_id)
+        runner = getattr(ctx["app"], "agent_runner", None)
+
+        def delete_session(sid):
+            if runner is None:
+                return session_store.clear_session_artifacts(ctx["config"], sess.project_id, sid)
+            ok, cleanup = runner.run_when_idle(
+                lambda: session_store.clear_session_artifacts(ctx["config"], sess.project_id, sid)
+            )
+            return cleanup if ok else {"ok": False, "resources": {}}
+
         result = ctx["app"].show_sessions_form(
-            session_store.list_sessions(directory), current_id=sess.session_id, directory=directory
+            session_store.list_sessions(directory),
+            current_id=sess.session_id,
+            delete_session=delete_session,
         )
         if not result:
             return True
+        if result.get("action") == "new":
+            return _new(ctx, args)
         data = session_store.load_session_data(directory, result.get("id"))
         if not data:
             _echo(ctx, f"会话加载失败: {result.get('id')}")
@@ -116,10 +130,16 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
     def _clear(ctx, args):
         runner = getattr(ctx["app"], "agent_runner", None)
         if runner is not None:
-            runner.discard_pending_turn()
-        ctx["session"].clear()
+            idle, cleanup = runner.clear_session_when_idle()
+            if not idle:
+                _echo(ctx, "回合进行中：请先停止后再清空会话")
+                return True
+        else:
+            cleanup = ctx["session"].clear()
         ctx["app"].task = ""
         ctx["app"].status = "会话已清空"
+        if cleanup and not cleanup.get("ok"):
+            _echo(ctx, "会话已清空，但部分衍生记录清理失败")
         return True
 
     @commands.register("/rename", hint="重命名当前会话 /rename <标题>", usage="/rename <标题>", source="builtin")
@@ -1141,7 +1161,7 @@ class _AgentRunner:
         return True
 
     def discard_pending_turn(self) -> bool:
-        """显式清理挂起回合（例如 /clear、/new、/resume 替换会话前）。"""
+        """显式清理挂起回合（例如 /new、/resume 替换会话前）。"""
         with self._lock:
             pending = self.pending_failed_turn
             self.pending_failed_turn = None
@@ -1152,6 +1172,19 @@ class _AgentRunner:
             except Exception as exc:
                 log.error("清理挂起回合失败: %r", exc)
             return True
+
+    def clear_session_when_idle(self):
+        """在 busy 锁内清空当前会话并收束失败挂起状态，不回滚工作区文件。"""
+        with self._lock:
+            if self.busy:
+                return False, None
+            pending = self.pending_failed_turn
+            if pending:
+                self._discarded_turn_ids.update(pending.get("turn_ids") or [pending.get("turn_id")])
+            self.pending_failed_turn = None
+            self._failed_rollback = False
+            self.app.last_failed_text = None
+            return True, self.session.clear()
 
     def _discard_pending_for_user_message(self) -> bool:
         """新用户请求开始前丢弃失败挂起回合；必须在 agent 接管 session 前执行。"""
@@ -1606,6 +1639,7 @@ def main_headless(args) -> int:
     pasteboard_mod.gc_temp_images()
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
+    session.set_context_reset(llm.meter.reset_context)
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     subagent_mod.register_tools(config)
     mcp_mod.register_tools(config)  # MCP 后台连接发现；退出时统一 shutdown
@@ -1705,6 +1739,7 @@ def main() -> None:
     pasteboard_mod.gc_temp_images()  #启动回收data/temp过期剪贴板图片（7 天封顶）
     llm = LLM(config)
     session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
+    session.set_context_reset(llm.meter.reset_context)
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     subagent_mod.register_tools(config)
     mcp_mod.register_tools(config)  # MCP 服务器后台连接发现，工具随注册进度逐个可见

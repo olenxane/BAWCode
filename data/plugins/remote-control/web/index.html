@@ -1257,9 +1257,9 @@ function renderHeader(s) {
   const bits = [];
   bits.push(`${sess.message_count ?? 0} 条`);
   if (t.context_tokens) {
-    bits.push(t.context_window ? `上下文 ${t.context_tokens}/${t.context_window}` : `上下文 ${t.context_tokens}`);
+    bits.push(t.context_window ? `当前会话上下文 ${t.context_tokens}/${t.context_window}` : `当前会话上下文 ${t.context_tokens}`);
   }
-  if (t.billed_tokens) bits.push(`计费 ${t.billed_tokens}`);
+  if (t.billed_tokens) bits.push(`LLM实例累计计费 ${t.billed_tokens}`);
   if (t.balance !== undefined) bits.push(`余额 ${t.balance}${t.balance_currency || ""}`);
   const exp = (s.expires_at || "").replace("T", " ").slice(0, 16);
   bits.push(`密钥至 ${exp}`);
@@ -1691,14 +1691,14 @@ async function loadSessions() {
     const current = items.find(i => i.current);
     cur.innerHTML = "";
     if (current) {
-      cur.append(rowHtml(current.title, `${current.id} · ${current.message_count} 条 · ${fmtTime(current.created_at)}`, true));
+      cur.append(rowHtml(current.title, `${current.id} · ${current.message_count} 条 · 修订 ${current.revision || 0} · ${fmtTime(current.created_at)}`, true));
     } else {
       cur.append(el("div", "empty-note", "当前会话尚未保存"));
     }
     list.innerHTML = "";
     if (!items.length) { list.append(el("div", "empty-note", "暂无历史会话")); return; }
     for (const it of items) {
-      const row = rowHtml(it.title, `${fmtTime(it.updated_at)} · ${it.message_count} 条`, it.current);
+      const row = rowHtml(it.title, `${fmtTime(it.updated_at)} · ${it.message_count} 条 · 修订 ${it.revision || 0}`, it.current);
       row.style.cursor = "pointer";
       row.onclick = e => {
         if (e.target.closest(".link-danger")) return;
@@ -1773,8 +1773,8 @@ function renderTokenCard() {
   card.innerHTML = "";
   const t = (state.data && state.data.tokens) || {};
   const lines = [];
-  if (t.context_tokens) lines.push(`上下文 ${t.context_tokens}${t.context_window ? " / " + t.context_window : ""} tokens`);
-  if (t.billed_tokens) lines.push(`会话累计计费 ${t.billed_tokens} tokens`);
+  if (t.context_tokens) lines.push(`当前会话上下文 ${t.context_tokens}${t.context_window ? " / " + t.context_window : ""} tokens`);
+  if (t.billed_tokens) lines.push(`LLM实例累计计费 ${t.billed_tokens} tokens`);
   if (t.balance !== undefined) lines.push(`余额 ${t.balance} ${t.balance_currency || ""}`);
   card.append(el("div", "empty-note", lines.length ? lines.join("\n") : "暂无计量数据"));
 }

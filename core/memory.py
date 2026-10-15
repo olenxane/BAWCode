@@ -235,6 +235,9 @@ class Memory:
         self.session_id = session_store.new_session_id()
         self.session_created_at = datetime.now().isoformat(timespec="seconds")
         self.session_title = ""
+        self.revision = 0
+        self.cleared_at = ""
+        self._context_reset = None
         self._llm_fn: Optional[Callable[[str], str]] = None
         self.messages: List[dict] = []
         self.plan = {
@@ -1014,17 +1017,6 @@ class Memory:
             log.warn("压缩归档写入失败（压缩继续）: %s", e)
             return None
 
-    def _delete_precompact_archives(self) -> None:
-        """删除本会话压缩归档（与 /clear 同步，防 /resume 复活旧内容，同 toolstore.clear_session 范式）"""
-        if not self.sessions_dir.exists():
-            return
-        for path in self.sessions_dir.glob(f"{self.session_id}-precompact-*.json"):
-            try:
-                path.unlink()
-                log.debug("压缩归档已删除: %s", path.name)
-            except OSError as e:
-                log.warn("压缩归档删除失败 %s: %s", path.name, e)
-
     def compress(self, llm_fn: Optional[Callable[[str], str]] = None, external_handler=None) -> str:
         """上下文压缩：旧段 LLM 结构化摘要 + 保留预算内最近轮次原文
 
@@ -1344,8 +1336,8 @@ class Memory:
         return self.session_title
 
     def save_session(self) -> Optional[Path]:
-        """自动保存当前会话；空会话不写盘（避免堆积空文件）"""
-        if not self.messages:
+        """自动保存当前会话；未清空的空会话不写盘。"""
+        if not self.messages and not self.revision:
             return None
         data = {
             "version": session_store.SESSION_VERSION,
@@ -1358,6 +1350,8 @@ class Memory:
             "messages": self.messages,
             "plan": self.plan,
             "steps": self.steps,
+            "revision": self.revision,
+            "cleared_at": self.cleared_at,
         }
         try:
             path = session_store.save_session_data(self.sessions_dir, data)
@@ -1373,6 +1367,8 @@ class Memory:
         self.session_id = data.get("id") or session_store.new_session_id()
         self.session_created_at = data.get("created_at") or datetime.now().isoformat(timespec="seconds")
         self.session_title = data.get("title") or ""
+        self.revision = session_store.revision_of(data)
+        self.cleared_at = str(data.get("cleared_at") or "")
         messages = data.get("messages")
         self.messages = list(messages) if isinstance(messages, list) else []
         plan = data.get("plan")
@@ -1380,6 +1376,8 @@ class Memory:
         steps = data.get("steps")
         self.steps = list(steps) if isinstance(steps, list) else []
         toolstore.ledger_reset()  # 台账不跨会话：resume 后首次 edit 需重新 read（安全优先）
+        if callable(self._context_reset):
+            self._context_reset()
         self.ensure_memory_notice()
         log.info("会话已切换: %s · id=%s · %d条消息", self.session_title, self.session_id, len(self.messages))
 
@@ -1388,22 +1386,36 @@ class Memory:
         self.session_id = session_store.new_session_id()
         self.session_created_at = datetime.now().isoformat(timespec="seconds")
         self.session_title = ""
+        self.revision = 0
+        self.cleared_at = ""
         self.messages.clear()
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []
         toolstore.ledger_reset()
+        if callable(self._context_reset):
+            self._context_reset()
         self.ensure_memory_notice()
         log.info("已开启新会话: %s", self.session_id)
 
-    def clear(self) -> None:
-        """清空当前会话内容：原地恢复为空对话（保留 id），并删除落盘文件、外置工具记录与压缩归档防 /resume 复活旧内容"""
-        session_store.delete_session_data(self.sessions_dir, self.session_id)
-        toolstore.clear_session(self.config, self.project_id, self.session_id)
-        self._delete_precompact_archives()
+    def set_context_reset(self, callback) -> None:
+        """绑定宿主当前上下文计量重置回调。"""
+        self._context_reset = callback
+
+    def clear(self) -> dict:
+        """清空当前会话内容并清理会话级衍生存储，保留 ID 与创建时间。"""
+        result = session_store.clear_session_artifacts(self.config, self.project_id, self.session_id)
         toolstore.ledger_reset()
         self.messages.clear()
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []
         self.session_title = ""
+        self.revision += 1
+        self.cleared_at = datetime.now().isoformat(timespec="seconds")
+        if callable(self._context_reset):
+            self._context_reset()
         self.ensure_memory_notice()
-        log.info("会话已清空: %s", self.session_id)
+        saved = self.save_session()
+        result["revision"] = self.revision
+        result["persisted"] = saved is not None
+        log.info("会话已清空: %s revision=%d", self.session_id, self.revision)
+        return result

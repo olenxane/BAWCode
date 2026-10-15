@@ -75,7 +75,7 @@ def count_message_tokens(messages: Iterable[dict], model: str = "") -> int:
 
 
 class TokenMeter:
-    """会话 token 计量：优先记录 API usage，否则用分词器累计上下文"""
+    """LLM 实例 token 计量：优先记录 API usage，否则用分词器测量上下文"""
 
     def __init__(self, model: str = ""):
         self.model = model
@@ -97,6 +97,14 @@ class TokenMeter:
         """回合开始：复位本轮输出 token 累计"""
         self.turn_output_tokens = 0
         self.turn_peak_context_tokens = 0
+
+    def reset_context(self) -> None:
+        """清空当前上下文计量，保留实例累计 API 用量。"""
+        self.last_context_tokens = 0
+        self.turn_output_tokens = 0
+        self.turn_peak_context_tokens = 0
+        self.source = "none"
+        self.last_error = ""
 
     def count_text(self, text: str) -> int:
         """本地分词计数；tiktoken 不可用返回 0"""
@@ -149,7 +157,7 @@ class TokenMeter:
 
     @property
     def billed_tokens(self) -> int:
-        """会话累计 API 用量（计费展示，不参与 usage_ratio）"""
+        """LLM 实例累计 API 用量（计费展示，不参与 usage_ratio）"""
         return self.api_total_tokens
 
     @property
