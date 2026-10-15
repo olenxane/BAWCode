@@ -1124,6 +1124,7 @@ class _AgentRunner:
         self.last_turn_failed = False
         self.turn_start_index = 0
         self._queue: list = []
+        self._submission_seq = 0
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
 
@@ -1141,6 +1142,15 @@ class _AgentRunner:
             self.app.busy = value
         except Exception:
             pass
+
+    def _stamp_submission(self, item: dict) -> dict:
+        self._submission_seq += 1
+        item["_submission_seq"] = self._submission_seq
+        return item
+
+    @staticmethod
+    def _submission_order(item: dict) -> int:
+        return int(item.get("_submission_seq", 0))
 
     def interrupt_turn(self) -> bool:
         """Esc 打断：活动回合由 agent 线程收尾（保留已记录上下文）；挂起失败回合就此收束。
@@ -1221,7 +1231,7 @@ class _AgentRunner:
             if self.busy:
                 return False
             self._set_busy(True)
-            item = {"text": text, "images": list(images or [])}
+            item = self._stamp_submission({"text": text, "images": list(images or [])})
             if self.pending_failed_turn is not None:
                 item["_user_submission"] = True
                 self._queue.insert(0, item)
@@ -1256,6 +1266,7 @@ class _AgentRunner:
             if origin_turn_id and origin_turn_id in self._discarded_turn_ids:
                 log.info("忽略已丢弃回合的后台调用通知: origin=%s", origin_turn_id)
                 return
+            self._stamp_submission(item)
             if self.busy:
                 if self.pending_failed_turn is not None and not self._turn_active:
                     self._queue.append(item)
@@ -1335,6 +1346,9 @@ class _AgentRunner:
                 return item
 
             pending_ids = set(pending.get("turn_ids") or [pending.get("turn_id")])
+            ordered = sorted(users + calls, key=self._submission_order)
+            users = [entry for entry in ordered if entry.get("_user_submission")]
+            calls = [entry for entry in ordered if entry.get("_background_call")]
             own_calls = [call for call in calls if call.get("_origin_turn_id") in pending_ids]
             if own_calls:
                 self._queue = [entry for entry in self._queue if entry not in queued]
@@ -1357,9 +1371,10 @@ class _AgentRunner:
                     "_has_same_turn_call": False,
                 }
             self._queue = [entry for entry in self._queue if entry not in queued]
+            first_user = next(entry for entry in ordered if entry.get("_user_submission"))
             return {
-                "text": self._join_dispatch_text("", users + calls),
-                "images": list(users[0].get("images") or []),
+                "text": self._join_dispatch_text("", ordered),
+                "images": list(first_user.get("images") or []),
                 "_user_submission": True,
                 "_preserve_pending": True,
                 "_continuing_pending": True,
@@ -1369,6 +1384,7 @@ class _AgentRunner:
         """排入明确由用户提交的新任务。"""
         user_item = {"text": text, "images": list(images or []), "_user_submission": True}
         with self._lock:
+            self._stamp_submission(user_item)
             self._queue.append(user_item)
             if self.busy:
                 # 任何渠道发来的新对话消息都放弃 LLM 重试等待（与输入框提交同语义）
@@ -1395,26 +1411,29 @@ class _AgentRunner:
                 gate = getattr(self.app, "_llm_retry_gate", None)
                 if gate is not None:
                     gate.give_up.set()
-                    self._queue.append({"text": text, "images": [], "_user_submission": True})
+                    item = self._stamp_submission({"text": text, "images": [], "_user_submission": True})
+                    self._queue.append(item)
                     return "[已排队，等待错误回合收束后作为新回合发送]"
                 if self.pending_failed_turn is not None and not self._turn_active:
-                    self._queue.append({"text": text, "images": [], "_user_submission": True})
+                    item = self._stamp_submission({"text": text, "images": [], "_user_submission": True})
+                    self._queue.append(item)
                     return "[已排队，等待与后台调用仲裁]"
                 if self.pending_failed_turn is not None and self._turn_active:
                     pending_ids = set(self.pending_failed_turn.get("turn_ids") or [self.pending_failed_turn.get("turn_id")])
                     if self._active_dispatch_origin in pending_ids:
                         self._drop_injected_calls_for_turn(self.pending_failed_turn.get("turn_id"))
-                        self._queue.insert(0, {"text": text, "images": [], "_user_submission": True})
+                        self._queue.insert(0, self._stamp_submission({"text": text, "images": [], "_user_submission": True}))
                         self._abandon_pending = True
                         self.llm.cancel()
                         return "[已丢弃本回合调用及挂起上下文，用户消息开始新回合]"
+                item = self._stamp_submission({
+                    "text": text,
+                    "_user_submission": True,
+                    "user_submission": True,
+                })
                 with self.app.inject_lock:
-                    self.app.inject_queue.append({
-                        "text": text,
-                        "_user_submission": True,
-                        "user_submission": True,
-                    })
-                return "[插话已并入当前请求]"
+                    self.app.inject_queue.append(item)
+                return "[已接收，待本轮工具批次完成后、下一次模型请求前并入]"
         return self.queue_turn(text)
 
     def queue_turn(self, text: str, images=None) -> str:
@@ -1461,6 +1480,14 @@ class _AgentRunner:
                                 and item.get("origin_turn_id") in self._discarded_turn_ids
                             )
                         )
+                    self._queue = [
+                        queued if isinstance(queued, dict) else {"text": str(queued), "images": []}
+                        for queued in self._queue
+                    ]
+                    for queued in self._queue:
+                        if "_submission_seq" not in queued:
+                            self._stamp_submission(queued)
+                    self._queue.sort(key=self._submission_order)
                     text = self._queue.pop(0) if self._queue else None
                     if text is None:
                         self._set_busy(False)

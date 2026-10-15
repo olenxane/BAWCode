@@ -561,7 +561,13 @@ def setup(ctx):
             )
 
     def _on_message_added(payload):
-        """空闲期新增消息（如命令写入的进度节点）即时推给网页；回合中由流式事件覆盖，不重复广播"""
+        """把回合中并入的插话广播到所有网页客户端。"""
+        if payload.get("injected") and payload.get("role") == "user":
+            content = payload.get("content")
+            text = memory_mod.content_text(content) if memory_mod else str(content or "")
+            _broadcast({"t": "message_added", "role": "user", "content": text,
+                        "injected": True, "turn_id": str(getattr(_runner(), "active_turn_id", "") or "")})
+            return None
         if _busy():
             return None
         _broadcast({"t": "reset"})
@@ -700,11 +706,12 @@ def setup(ctx):
         """代发用户消息，返回 {result, injected}。
 
         与 TUI 主循环同口径：空闲时提交新回合；回合进行中 mode=inject 走插话
-        （并入当前回合，下一轮模型即看到），其余走排队（当前回合结束后作为新回合发送）。"""
+        （工具批次完成后、下一次模型请求前并入），mode=queue 排队为后续新回合。"""
         runner = _runner()
         inject = getattr(runner, "inject_turn", None)
         if mode == "inject" and callable(inject) and getattr(runner, "busy", False):
-            return {"result": inject(text), "injected": True}
+            result = inject(text)
+            return {"result": result, "injected": result.startswith("[已接收，")}
         return {"result": ctx.submit_turn(text), "injected": False}
 
     def _app_refresh(session) -> None:
@@ -1987,6 +1994,9 @@ def setup(ctx):
                         self._json(400, {"ok": False, "message": "空消息"})
                         return
                     mode = str(data.get("mode") or "").strip().lower()
+                    if mode not in ("", "inject", "queue"):
+                        self._json(400, {"ok": False, "message": "mode 须为 inject 或 queue"})
+                        return
                     self._json(200, {"ok": True, **_send_message(text, mode)})
                 elif path in ("/api/stop", "/api/turn/interrupt"):
                     runner = _runner()

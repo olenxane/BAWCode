@@ -1422,8 +1422,6 @@ async function send(mode) {
       const r = await api("/api/send", { text, mode: mode || "inject" });
       if (!r.ok) { toast(r.message || "发送失败", true); sysLine("发送失败: " + (r.message || "未知错误")); return; }
       if (r.result) toast(r.result.replace(/^\[|\]$/g, ""));
-      // 插话并入的是进行中的回合，没有 turn_start 事件回带文本，故本地先上屏（随后的全量重绘会以会话为准）
-      if (r.injected) { renderMessage({ role: "user", content: text }); stick(); }
       pollStatus();
     }
   } catch (e) { toast("网络错误: " + e, true); }
@@ -1607,6 +1605,14 @@ function connect() {
         stick();
         setBusy(true);
         pollStatus();
+        break;
+      case "message_added":
+        if (p.injected && p.role === "user") {
+          liveSeal();
+          renderMessage({ role: "user", content: p.content || "" });
+          stick();
+          pollStatus();
+        }
         break;
       case "delta": liveAppend(p.kind, p.piece); break;
       case "tool_before":
