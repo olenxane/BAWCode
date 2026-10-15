@@ -12,7 +12,7 @@ MAX_CONTEXT_BYTES = 1024 * 1024
 MAX_CANDIDATES = 100
 MAX_SCAN_DEPTH = 32
 SCAN_INTERVAL = 1.0
-IGNORED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+IGNORED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules", ".bawcode"}
 _REFERENCE_RE = re.compile(r'@("[^"]+"|\'[^\']+\'|[^\s]+)')
 
 
@@ -78,7 +78,7 @@ def _scan_dir(folder: Path, root: Path, query: str, items: List[dict], limit: in
             if not entry.is_file(follow_symlinks=False):
                 continue
             if limit and len(items) >= limit:
-                break
+                continue  # 已截断：不再收文件，但目录仍计入待展开（more 为真）
             if entry.stat().st_size > MAX_FILE_BYTES:
                 continue
         except OSError:

@@ -1245,8 +1245,21 @@ def setup(ctx):
             return {"ok": False, "message": "宿主缺少 file 模块"}
         session = _session()
         selected_workspace = getattr(session, "workspace", root_workspace)
+        depth = max(1, int(depth))
+        depth = min(depth, getattr(file_mod, "MAX_SCAN_DEPTH", 32))
         result = file_mod.scan_candidates(str(prefix or ""), selected_workspace, depth=depth)
-        return {"ok": True, "items": result["items"], "more": result["more"], "depth": max(1, int(depth))}
+        items = result["items"]
+        return {
+            "ok": True,
+            "items": [
+                {**item, "path": item["path"], "referable": True}
+                for item in items
+            ],
+            "more": result["more"],
+            "depth": depth,
+            "max_depth": getattr(file_mod, "MAX_SCAN_DEPTH", 32),
+            "count": len(items),
+        }
 
     @_idle_operation
     def _provider_refill(provider_id: str) -> dict:
@@ -1840,6 +1853,15 @@ def setup(ctx):
                     self._json(200, _commands_listing())
                 elif path == "/api/files":
                     params = parse_qs(urlparse(self.path).query)
+                    allowed = {"prefix", "depth", "key", "token"}
+                    unknown = [k for k in params if k not in allowed]
+                    if unknown:
+                        self._json(400, {
+                            "ok": False,
+                            "code": "unknown_param",
+                            "message": f"未知参数: {', '.join(sorted(unknown))}（支持: prefix, depth）",
+                        })
+                        return
                     query = (params.get("prefix") or [""])[0]
                     try:
                         depth = int((params.get("depth") or ["1"])[0])
