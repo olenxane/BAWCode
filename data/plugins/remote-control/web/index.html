@@ -1934,6 +1934,8 @@ function buildProviderTab(body, data) {
   const modelList = el("div", "st-note", modelIds.join(", ") || "（暂无模型）");
   const activeSel = stSelect(providers.map(x => x.provider_id), p.active_provider_id);
   const fetchBtn = el("button", "btn small", "获取模型列表");
+  const pruneBtn = el("button", "btn small", "清理过时模型");
+  pruneBtn.title = "拉取远端模型列表，移除本地已下架的模型；保存后生效";
   const refillBtn = el("button", "btn small", "重填预置参数");
   refillBtn.title = "未手动配置的模型按内置预置表重填参数；手动配置的保留";
   const deleteBtn = el("button", "btn small danger", "删除提供商");
@@ -1976,6 +1978,36 @@ function buildProviderTab(body, data) {
     } catch (e) { toast("获取模型列表网络错误", true); }
     finally { fetchBtn.disabled = false; editSel.disabled = false; fetchBtn.textContent = "获取模型列表"; }
   };
+  pruneBtn.onclick = async () => {
+    const pid = pidInput.value.trim(), base = urlInput.value.trim();
+    if (!pid || !base) { toast("请先填写提供商ID和 Base URL", true); return; }
+    const target = editSel.value;
+    fetchBtn.disabled = true;
+    pruneBtn.disabled = true;
+    editSel.disabled = true;
+    pruneBtn.textContent = "正在清理…";
+    try {
+      const r = await api("/api/provider/models", { provider_id: pid, base_url: base, api_key: keyInput.value });
+      if (!r.ok) { toast(r.message || "获取失败", true); return; }
+      if (target !== editSel.value || pid !== pidInput.value.trim() || base !== urlInput.value.trim()) return;
+      const remote = r.models || [];
+      if (!remote.length) { toast("远端未返回任何模型，已取消清理", true); return; }
+      const remoteSet = new Set(remote);
+      const stale = modelIds.filter(id => !remoteSet.has(id));
+      if (!stale.length) { toast("没有过时模型"); return; }
+      const preview = stale.slice(0, 8).join(", ") + (stale.length > 8 ? ` 等 ${stale.length} 个` : "");
+      if (!confirm(`以下 ${stale.length} 个模型远端未返回，确认移除？\n${preview}\n保存后生效`)) return;
+      modelIds = modelIds.filter(id => remoteSet.has(id));
+      syncModels();
+      toast(`已移除 ${stale.length} 个过时模型；保存后生效`);
+    } catch (e) { toast("清理过时模型网络错误", true); }
+    finally {
+      fetchBtn.disabled = false;
+      pruneBtn.disabled = false;
+      editSel.disabled = false;
+      pruneBtn.textContent = "清理过时模型";
+    }
+  };
   refillBtn.onclick = async () => {
     const pid = pidInput.value.trim();
     if (!pid) { toast("请先填写提供商ID", true); return; }
@@ -2013,6 +2045,7 @@ function buildProviderTab(body, data) {
     stRow("默认模型", defModelSel),
     stRow("模型列表", modelList),
     stRow("", fetchBtn),
+    stRow("", pruneBtn),
     stRow("", refillBtn),
   );
   card.append(el("div", "st-note", "获取的模型保存后生效；API Key 明文存储于本地配置文件"));

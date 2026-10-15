@@ -19,6 +19,7 @@ from core.config import (
     is_auto_filled_model,
     make_model_name,
     model_preset_defaults,
+    normalize_base_url,
     refill_model_entry,
 )
 from core.log import get_logger
@@ -85,6 +86,11 @@ def _binding_value(value: Any) -> Any:
     return str(value).lower()
 
 
+def _remote_model_scope(provider_id: str, base_url: str) -> str:
+    """远端模型列表的归属标识：提供商 + 规范化 Base URL"""
+    return f"{provider_id}\n{normalize_base_url(base_url)}"
+
+
 class SettingsPanelMixin:
     """设置面板状态与方法（由 TuiApp 继承）。"""
 
@@ -100,6 +106,8 @@ class SettingsPanelMixin:
         self._settings_scroll = 0
         self.settings_notice = ""
         self.settings_model_work: Dict[str, List[dict]] = {}
+        # 已标记清理的过时模型：provider_id -> model_id 集合，保存提供商时删除
+        self.settings_model_removed: Dict[str, set] = {}
         self._settings_model_scratch_name = ""
         self._settings_baseline: Dict[str, Any] = {}
         self._settings_esc_stage = 0
@@ -264,8 +272,14 @@ class SettingsPanelMixin:
     }
 
     def _settings_model_names(self, config) -> List[str]:
-        names = config.list_model_names() or [config.model_name]
-        return names
+        """模型页可选模型名：排除已标记清理的模型"""
+        removed_names = {
+            make_model_name(pid, mid)
+            for pid, mids in self.settings_model_removed.items()
+            for mid in mids
+        }
+        names = [name for name in config.list_model_names() if name not in removed_names]
+        return names or [config.model_name]
 
     @staticmethod
     def _settings_workflow_names(config) -> List[str]:
@@ -506,6 +520,7 @@ class SettingsPanelMixin:
             "model_temperature": s.get("model_temperature"),
             "thinking_effort": s.get("thinking_effort"),
             "model_work": repr(self.settings_model_work),
+            "model_removed": repr({pid: sorted(mids) for pid, mids in self.settings_model_removed.items()}),
             "theme": s.get("theme", getattr(config, "theme", "")),
             "mode": s.get("mode", getattr(config, "mode", "")),
             "log_level": s.get("log_level"),
@@ -699,6 +714,12 @@ class SettingsPanelMixin:
                     "hint": "Enter 拉取模型并一键添加 · 未手动配置的存量模型顺带重填预置",
                 },
                 {
+                    "key": "prune_stale",
+                    "label": "清理过时模型",
+                    "type": "action",
+                    "hint": "Enter：移除最近一次拉取未返回的本地模型 · 保存提供商后生效",
+                },
+                {
                     "key": "refill_presets",
                     "label": "重填预置参数",
                     "type": "action",
@@ -724,9 +745,12 @@ class SettingsPanelMixin:
                     scratch_keep.pop(key, None)
                 self._settings_model_scratch_name = current_model
                 scratch_keep["select_model"] = current_model
+                # 仅切换模型时从持久化行回填模态勾选；同模型重建须保留 scratch
+                # 中已编辑的勾选态（勾选只写 scratch、未进 model_work，回读会盖掉）
+                row = self._settings_model_row(config, current_model)
+                for key, modality in self._MODEL_MODALITIES.items():
+                    scratch_keep[key] = modality in set(row.get("modalities") or ["text"])
             row = self._settings_model_row(config, current_model)
-            for key, modality in self._MODEL_MODALITIES.items():
-                scratch_keep[key] = modality in set(row.get("modalities") or ["text"])
             pids = [p.get("provider_id", "") for p in config.providers()] or ["-"]
             edit_pid = row.get("provider_id") or self.settings_provider_id or config.data.get("active_provider_id")
             live = self._provider_live_models(config, edit_pid)
@@ -934,6 +958,7 @@ class SettingsPanelMixin:
         self.settings_model_name = config.model_name
         self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
         self.settings_model_work = getattr(self, "settings_model_work", {}) or {}
+        self.settings_model_removed = getattr(self, "settings_model_removed", {}) or {}
         self._settings_model_scratch_name = ""
         self.settings_edit = None
         self._build_settings_fields(config)
@@ -1259,16 +1284,18 @@ class SettingsPanelMixin:
                 self.config.mode = str(self.settings_scratch[key])
 
     def _provider_live_models(self, config, pid: str) -> List[dict]:
-        """提供商实时模型列表：config + 工作副本（模型页增改）"""
+        """提供商实时模型列表：config + 工作副本（模型页增改）－已标记清理的模型"""
+        removed = self.settings_model_removed.get(pid) or set()
         by_id = {}
         provider = config.find_provider(pid) if pid else None
         if provider:
             for m in provider.get("models") or []:
-                if m.get("model_id"):
-                    by_id[m["model_id"]] = dict(m)
+                mid = m.get("model_id")
+                if mid and mid not in removed:
+                    by_id[mid] = dict(m)
         for m in self.settings_model_work.get(pid, []) or []:
             mid = m.get("model_id")
-            if mid:
+            if mid and mid not in removed:
                 by_id[mid] = dict(m)
         return list(by_id.values())
 
@@ -1319,6 +1346,9 @@ class SettingsPanelMixin:
         work = self.settings_model_work.setdefault(pid, [])
         work[:] = [m for m in work if m.get("model_id") not in {old_mid, new_mid}]
         work.append(entry)
+        removed = self.settings_model_removed.get(pid)
+        if removed:
+            removed.discard(new_mid)
         if new_mid != old_mid:
             self.settings_model_name = make_model_name(pid, new_mid)
             self.settings_scratch["select_model"] = self.settings_model_name
@@ -1354,6 +1384,7 @@ class SettingsPanelMixin:
         config.save()
         self.settings_provider_id = pid
         self.settings_model_work.pop(pid, None)
+        self.settings_model_removed.pop(pid, None)
         provider = config.find_provider(pid) or {}
         s["provider_id"] = pid
         s["provider_name"] = provider.get("name", form["name"])
@@ -1514,6 +1545,8 @@ class SettingsPanelMixin:
         """添加提供商/模型：进入行内编辑读入 id（提交在 _settings_edit_commit 完成）"""
         if action == "fetch_models":
             self._settings_fetch_models(config)
+        elif action == "prune_stale":
+            self._settings_prune_stale_models(config)
         elif action == "refill_presets":
             pid = str(
                 self.settings_scratch.get("provider_id") or self.settings_provider_id or ""
@@ -1539,7 +1572,6 @@ class SettingsPanelMixin:
 
     def _settings_fetch_models(self, config) -> None:
         from openai import OpenAI
-        from core.config import normalize_base_url
 
         s = self.settings_scratch
         pid = str(s.get("provider_id") or "").strip()
@@ -1563,13 +1595,21 @@ class SettingsPanelMixin:
             status = getattr(exc, "status_code", None)
             self.settings_notice = f"获取模型列表失败 · HTTP {status}" if status else "获取模型列表失败 · 请检查地址、网络和 API Key"
             return
-        existing = {m["model_id"] for m in self._provider_live_models(config, pid)}
+        live_ids = [m.get("model_id") for m in self._provider_live_models(config, pid)]
+        live_set = set(live_ids)
+        remote_set = set(ids)
+        stale = [mid for mid in live_ids if mid and mid not in remote_set]
+        s["remote_model_ids"] = list(ids)
+        s["remote_model_scope"] = _remote_model_scope(pid, base_url)
+        removed = self.settings_model_removed.get(pid)
+        if removed:
+            removed.difference_update(ids)
         # 存量模型：未手动配置（参数仍为自动填充特征）的按预置表重填
         updated, manual, _ = self._settings_refill_auto_models(config, pid)
         work = self.settings_model_work.setdefault(pid, [])
         added = 0
         for mid in ids:
-            if mid not in existing:
+            if mid not in live_set:
                 preset = model_preset_defaults(mid)
                 work.append({
                     "model_id": mid,
@@ -1583,12 +1623,46 @@ class SettingsPanelMixin:
         self.settings_provider_id = pid
         self._immediate_settings_refresh(config)
         parts = [f"已获取 {len(ids)} 个模型", f"新增 {added} 个"]
+        if stale and ids:
+            parts.append(f"远端未返回 {len(stale)} 个，可清理")
         if updated:
             parts.append(f"重填预置 {len(updated)} 个")
         if manual:
             parts.append(f"保留手动 {len(manual)} 个")
         parts.append("保存提供商后生效")
         self.settings_notice = " · ".join(parts)
+
+    def _settings_prune_stale_models(self, config) -> None:
+        """移除最近一次拉取未返回的本地模型（标记待删除，保存提供商后生效）。"""
+        s = self.settings_scratch
+        pid = str(s.get("provider_id") or "").strip()
+        base_url = str(s.get("base_url") or "").strip()
+        remote = s.get("remote_model_ids")
+        if not pid or not isinstance(remote, list):
+            self.settings_notice = "请先获取模型列表，再清理过时模型"
+            return
+        if not remote:
+            self.settings_notice = "远端未返回任何模型，已取消清理"
+            return
+        if s.get("remote_model_scope") != _remote_model_scope(pid, base_url):
+            self.settings_notice = "提供商ID或 Base URL 已变化，请重新获取模型列表后再清理"
+            return
+        remote_set = set(remote)
+        live_ids = [m.get("model_id") for m in self._provider_live_models(config, pid)]
+        stale = [mid for mid in live_ids if mid and mid not in remote_set]
+        if not stale:
+            self.settings_notice = "没有过时模型"
+            return
+        removed = self.settings_model_removed.setdefault(pid, set())
+        removed.update(stale)
+        work = self.settings_model_work.get(pid)
+        if work:
+            work[:] = [m for m in work if m.get("model_id") not in removed]
+        if str(s.get("default_model_id") or "") in removed:
+            s.pop("default_model_id", None)
+        self._immediate_settings_refresh(config)
+        preview = ",".join(stale[:5]) + ("…" if len(stale) > 5 else "")
+        self.settings_notice = f"已移除 {len(stale)} 个过时模型 · 保存提供商后生效: {preview}"
 
     def _settings_refill_auto_models(self, config, pid: str) -> tuple:
         """按预置表重填该提供商未手动配置的模型（写入工作副本，保存后生效）。
@@ -1653,6 +1727,9 @@ class SettingsPanelMixin:
         work = self.settings_model_work.setdefault(pid, [])
         work[:] = [m for m in work if m.get("model_id") != mid]
         work.append(entry)
+        removed = self.settings_model_removed.get(pid)
+        if removed:
+            removed.discard(mid)
         if config.find_provider(pid):
             config.add_model(pid, entry)
         self.settings_model_name = make_model_name(pid, mid)
