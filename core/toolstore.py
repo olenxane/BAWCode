@@ -118,6 +118,24 @@ def header_line_count() -> int:
     return 10
 
 
+def read_persisted_content(config, project_id: str, session_id: str, path: str) -> str:
+    """读取当前会话工具外置记录正文；拒绝越出会话目录的路径。"""
+    directory = store_dir(config, project_id, session_id).resolve()
+    candidate = Path(path)
+    try:
+        if candidate.parent.resolve() != directory:
+            return ""
+        resolved = candidate.resolve(strict=True)
+        if resolved.parent != directory or not resolved.is_file():
+            return ""
+        text = resolved.read_text(encoding="utf-8")
+    except (OSError, RuntimeError):
+        return ""
+    marker = "\n--- content ---\n"
+    _, found, content = text.partition(marker)
+    return content if found else ""
+
+
 def pointer_line(path: Optional[Path], total_lines: int) -> str:
     """行内消息中的落盘指针，模型据此用 read offset/limit 分批回读"""
     if path is None:

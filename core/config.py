@@ -139,6 +139,8 @@ def default_config() -> dict:
             "inline_limit_tokens_large": 32768,
             "persist_dir": "data/toolcalls",
             "strip_keep_recent": 6,
+            "aggressive_optimization": False,
+            "aggressive_keep_tool_rounds": 12,
         },
         # 技能加载系统（core/skills.py + tools.load_skill）：SKILL.md+YAML frontmatter，
         # 双层目录 全局 dir + 项目 {workspace}/.bawcode/skills（项目级同名覆盖全局）；

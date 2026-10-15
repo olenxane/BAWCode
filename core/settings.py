@@ -890,6 +890,7 @@ class SettingsPanelMixin:
                 {"key": "compress_keep_recent_tokens", "label": "压缩保留尾段token", "type": "text", "current": mem_cfg.get("compress_keep_recent_tokens", 16384)},
                 {"key": "compress_summary_max_tokens", "label": "摘要上限token", "type": "text", "current": mem_cfg.get("compress_summary_max_tokens", 1024)},
                 {"key": "tool_whitelist", "label": "工具白名单", "type": "text", "current": ", ".join(str(x) for x in (ctx_cfg.get("tool_whitelist") or [])), "hint": "逗号分隔 · 白名单工具结果跨回合保留"},
+                {"key": "aggressive_optimization", "label": "激进上下文优化", "type": "bool", "current": bool(ctx_cfg.get("aggressive_optimization", False)), "hint": "←→ 开/关 · 回合末按工具类型整理，保留最近12轮调用"},
                 {"key": "max_tool_rounds", "label": "最大工具轮数", "type": "text", "current": wf_cfg.get("max_rounds", 0), "hint": "0=用工作流文件值 · 超限后仍有进展会自动续期"},
                 {"key": "spin_kill_count", "label": "空转计数上限", "type": "text", "current": wf_cfg.get("spin_kill_count", 12), "hint": "重复输出计满即终止回合；未满期间续期不限次"},
                 {"key": "default_shell", "label": "默认命令执行器", "type": "choice", "options": list(shells.SHELL_NAMES), "current": tools_cfg.get("default_shell", shells.DEFAULT_SHELL), "hint": "←→ 切换 · " + _shell_availability_hint()},
@@ -1128,11 +1129,13 @@ class SettingsPanelMixin:
                     if ftype == "body_enabled":
                         item = self.settings_scratch["adv_custom_body"][field["body_index"]]
                         item["enabled"] = not bool(item.get("enabled", True))
-                    else:
-                        cur = self.settings_scratch.get(field["key"], field.get("current"))
-                        self.settings_scratch[field["key"]] = not bool(cur in (True, "true", "1", 1))
+                        self.render()
+                        continue
+                    updates = self._settings_apply(config)
+                    self.settings_mode = False
+                    self.bind_config(config)
                     self.render()
-                    continue
+                    return updates
                 # choice / 其它：Enter = 保存并退出设置
                 updates = self._settings_apply(config)
                 self.settings_mode = False
@@ -1853,10 +1856,13 @@ class SettingsPanelMixin:
                 mem_cfg["compress_summary_max_tokens"] = max(100, int(float(s["compress_summary_max_tokens"])))
             except (TypeError, ValueError):
                 pass
+        ctx_cfg = config.data.setdefault("context", {})
         if "tool_whitelist" in s:
-            ctx_cfg = config.data.setdefault("context", {})
             names = [p.strip() for p in str(s["tool_whitelist"] or "").split(",") if p.strip()]
             ctx_cfg["tool_whitelist"] = names
+        if "aggressive_optimization" in s:
+            raw = s["aggressive_optimization"]
+            ctx_cfg["aggressive_optimization"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
         wf_cfg = config.data.setdefault("workflow", {})
         if "workflow_enabled" in s:
             raw = s["workflow_enabled"]

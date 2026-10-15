@@ -156,6 +156,13 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         # 会话树是否贴底：新消息/内容变长时自动下滑到最新行
         self._tree_follow_tail = True
         self._tree_last_msg_n = 0
+        self._tree_generation = 0
+        self._tree_archive_cache_key = None
+        self._tree_archive_signature = ()
+        self._tree_archive_messages = []
+        self._tree_session = None
+        self._tree_archive_session_id = ""
+        self._tree_last_state = None
         self.expanded: Set[str] = set()
         self.collapse_done = True
         self.buffer = TextBuffer()
@@ -375,11 +382,77 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         sys.stdout.flush()
         self._entered = False
 
+    def _load_tree_archive_messages(self, session) -> None:
+        directory = getattr(session, "sessions_dir", None)
+        session_id = str(getattr(session, "session_id", "") or "")
+        if directory is None or not session_id:
+            self._tree_archive_cache_key = None
+            self._tree_archive_signature = ()
+            self._tree_archive_messages = []
+            return
+        directory = Path(directory)
+        paths = sorted(directory.glob(f"{session_id}-precompact-*.json"))
+        signature = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+        cache_key = (str(directory), session_id, tuple(signature))
+        if cache_key == self._tree_archive_cache_key:
+            return
+        archived = []
+        for path, _, _ in signature:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            for index, item in enumerate(data.get("messages") or []):
+                if isinstance(item, dict) and item.get("type") != "summary":
+                    archived.append((Path(path).stem, index, item))
+        self._tree_archive_cache_key = cache_key
+        self._tree_archive_signature = tuple(signature)
+        self._tree_archive_messages = archived
+
     def refresh_from_session(self, session, task: Optional[str] = None, render: bool = True) -> None:
         self.messages = list(getattr(session, "messages", []) or [])
         self.plan = dict(getattr(session, "plan", {}) or {})
         self.steps = list(getattr(session, "steps", []) or [])
-        self._tree_sig = None  # 内容已同步，强制重建树缓存
+        self._tree_session = session
+        # 仅当消息/计划/步骤内容确有变化才推进代数：状态行刷新不必重建整棵树
+        session_id = str(getattr(session, "session_id", "") or "")
+        content_total = 0
+        for message in self.messages:
+            content_total += len(memory_mod.content_text(message.get("content")))
+        state = (
+            session_id,
+            len(self.messages),
+            content_total,
+            str(self.plan.get("status") or ""),
+            str(self.plan.get("complexity") or ""),
+            len(str(self.plan.get("title") or "")),
+            len(str(self.plan.get("content") or "")),
+            tuple(
+                (str(s.get("id") or ""), str(s.get("status") or ""), len(str(s.get("title") or "")), len(str(s.get("detail") or "")))
+                for s in self.steps
+                if isinstance(s, dict)
+            ),
+        )
+        if state != getattr(self, "_tree_last_state", None):
+            self._tree_generation += 1
+            self._tree_last_state = state
+            self._tree_sig = None  # 内容确有变化才失效树缓存，状态行刷新复用上次结果
+        # 归档只在首次 / 切换会话 / 消息数回落（压缩发生）时重扫，避免每次状态刷新都 glob+stat
+        if (
+            getattr(self, "_tree_archive_cache_key", None) is None
+            or session_id != getattr(self, "_tree_archive_session_id", "")
+            or len(self.messages) < self._tree_last_msg_n
+        ):
+            self._load_tree_archive_messages(session)
+            self._tree_archive_session_id = session_id
         msg_n = len(self.messages)
         if msg_n > self._tree_last_msg_n and not self.confirm_mode and not self.busy:
             # 空闲时的新消息恢复贴底；回合中保留用户当前的滚动位置
@@ -1159,12 +1232,10 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 return
             self._conv_stash = None  # 失效（已有新消息/切换会话），静默丢弃
 
-        # 解析锚点消息绝对序号（msg:{i} / call:{i} 相对 messages[-200:] 窗口）
+        # 当前上下文消息保留真实序号；归档历史节点只读，不作为回退锚点。
         if node.id.startswith("msg:") or node.id.startswith("call:"):
-            tail = session.messages[-200:]
-            offset = len(session.messages) - len(tail)
             try:
-                idx = offset + int(node.id.split(":")[1])
+                idx = int(node.id.split(":")[1])
             except (IndexError, ValueError):
                 self.status = "节点锚点解析失败"
                 self.render()

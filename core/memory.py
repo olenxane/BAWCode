@@ -230,6 +230,8 @@ class Memory:
         self.large_tools = set(ctx_cfg.get("large_tools") or ["read", "write", "edit_file"])
         self.inline_limit_tokens_large = int(ctx_cfg.get("inline_limit_tokens_large", 32768))
         self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", 6))
+        self.aggressive_optimization = bool(ctx_cfg.get("aggressive_optimization", False))
+        self.aggressive_keep_tool_rounds = int(ctx_cfg.get("aggressive_keep_tool_rounds", 12))
         toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
@@ -738,6 +740,21 @@ class Memory:
             args = {}
         if not isinstance(content, str):
             content = content_text(content)
+        read_fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest() if tool_name == "read" else ""
+        timeline_snapshot = None
+        if tool_name in ("write_plan", "update_plan", "generate_steps", "update_step_status"):
+            try:
+                snapshot = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                snapshot = None
+            if tool_name in ("write_plan", "update_plan") and isinstance(snapshot, dict):
+                timeline_snapshot = snapshot
+            elif tool_name == "generate_steps" and isinstance(snapshot, list) and all(
+                isinstance(step, dict) for step in snapshot
+            ):
+                timeline_snapshot = snapshot
+            elif tool_name == "update_step_status" and isinstance(snapshot, dict):
+                timeline_snapshot = snapshot
         image_parts, image_notes = build_image_parts(images)
         if image_notes:
             content = (content.rstrip() + "\n" if content.strip() else "") + "[图片说明] " + "；".join(image_notes)
@@ -762,10 +779,15 @@ class Memory:
             "tool_call_id": call_id,
             "description": description,
         }
+        if timeline_snapshot is not None:
+            extra["timeline_snapshot"] = timeline_snapshot
         if tool_name == "read":
             file_path = str((args or {}).get("file_path") or "")
             if file_path:
                 extra["file_path"] = file_path  # 随消息留档，供回合末剥离记录附新鲜度状态
+                extra["read_offset"] = (args or {}).get("offset") or 0
+                extra["read_limit"] = (args or {}).get("limit") or 0
+                extra["read_fingerprint"] = read_fingerprint
                 if image_parts:
                     extra["image_read"] = True  # 图片读取不进台账，剥离时不附编辑新鲜度提示
         message = self.add_message("tool", message_content, **extra)
@@ -776,25 +798,50 @@ class Memory:
         return message
 
     def finalize_turn(self) -> None:
-        """回合末上下文维护：非白名单工具记录剥离为简明记录（保护最近 strip_keep_recent 条），
-        白名单历史累计超预算时最老的先外置，思维链（thinking 字段）打标剥离——回合内已并回
-        content 拼接，下一轮对话起不再出站（会话记录保留）。幂等；在 _agent_turn 的 finally
-        调用，覆盖正常结束/出错/中断全部路径。tool 消息本体保留以维持 tool_call/tool_result 配对。"""
+        """回合末工具结果维护：普通模式按白名单/最近消息规则剥离；激进模式额外按
+        工具轮次、read 文件路径和本轮 write 规则整理。thinking 字段同样在回合末剥离。"""
         if not self.messages:
             return
+        ctx_cfg = (getattr(self.config, "data", None) or {}).get("context") or {}
+        self.aggressive_optimization = bool(ctx_cfg.get("aggressive_optimization", False))
+        self.aggressive_keep_tool_rounds = int(ctx_cfg.get("aggressive_keep_tool_rounds", 12))
+        self.tool_whitelist = set(ctx_cfg.get("tool_whitelist", self.tool_whitelist) or [])
+        self.whitelist_budget_tokens = int(ctx_cfg.get("whitelist_budget_tokens", self.whitelist_budget_tokens))
+        self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", self.strip_keep_recent))
         model = getattr(self.config, "model_name", "")
         tool_indexes = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
-        protected = set(tool_indexes[-self.strip_keep_recent:]) if self.strip_keep_recent > 0 else set()
+        recent_tool_indexes = tool_indexes[-self.strip_keep_recent:] if self.strip_keep_recent > 0 else []
+        protected = {
+            index for index in recent_tool_indexes
+            if not self.aggressive_optimization
+            or self.messages[index].get("tool_name") not in ("read", "write")
+        }
+        aggressive_protected = set()
+        if self.aggressive_optimization:
+            aggressive_protected = self._aggressive_protected_tool_indexes(tool_indexes)
         stripped = 0
         for index in tool_indexes:
-            if index in protected:
-                continue
             message = self.messages[index]
-            if message.get("stripped") or message.get("tool_name") in self.tool_whitelist:
+            if message.get("stripped"):
+                continue
+            tool_name = message.get("tool_name")
+            if self.aggressive_optimization and tool_name in ("read", "write"):
+                if index in aggressive_protected:
+                    continue
+                prefix = "已省略·较早读取" if tool_name == "read" else "已省略·较早写入"
+                if self._strip_tool_message(message, prefix=prefix, force=True):
+                    stripped += 1
+                continue
+            if index in protected or index in aggressive_protected:
+                continue
+            if tool_name in self.tool_whitelist:
                 continue
             if self._strip_tool_message(message, prefix="已省略"):
                 stripped += 1
-        evicted = self._evict_whitelist_overflow(model)
+        evicted = self._evict_whitelist_overflow(
+            model,
+            protected_indexes=protected | aggressive_protected,
+        )
         think_stripped = 0
         for message in self.messages:
             if (
@@ -806,16 +853,56 @@ class Memory:
                 think_stripped += 1
         if stripped or evicted or think_stripped:
             log.info(
-                "回合末维护: 剥离工具记录%d条 白名单外置%d条 思维链剥离%d条（保护最近%d条）",
+                "回合末维护: 剥离工具记录%d条 白名单外置%d条 思维链剥离%d条（保护最近%d条；激进保护%d轮）",
                 stripped, evicted, think_stripped, self.strip_keep_recent,
+                self.aggressive_keep_tool_rounds if self.aggressive_optimization else 0,
             )
 
-    def _strip_tool_message(self, message: dict, prefix: str) -> bool:
+    def _aggressive_protected_tool_indexes(self, tool_indexes: List[int]) -> set:
+        """保护最近工具调用轮、本轮 write，以及每个文件最新一次 read。"""
+        if not tool_indexes:
+            return set()
+        round_indexes = []
+        tool_to_round = {}
+        current_round = None
+        last_user_index = max(
+            (i for i, message in enumerate(self.messages) if message.get("role") == "user"),
+            default=-1,
+        )
+        current_write_indexes = set()
+        last_read_by_path = {}
+        for index, message in enumerate(self.messages):
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                current_round = len(round_indexes)
+                round_indexes.append(index)
+            elif message.get("role") == "tool":
+                if current_round is not None:
+                    tool_to_round[index] = current_round
+                if index > last_user_index and message.get("tool_name") == "write":
+                    current_write_indexes.add(index)
+                if message.get("tool_name") == "read" and message.get("file_path"):
+                    path = os.path.normcase(os.path.normpath(str(message["file_path"])))
+                    last_read_by_path[path] = index
+        keep_rounds = max(0, self.aggressive_keep_tool_rounds)
+        recent_rounds = set(range(max(0, len(round_indexes) - keep_rounds), len(round_indexes)))
+        protected = {
+            index for index, round_index in tool_to_round.items()
+            if round_index in recent_rounds
+        }
+        protected = {
+            index for index in protected
+            if self.messages[index].get("tool_name") not in ("read", "write")
+        }
+        protected.update(current_write_indexes)
+        protected.update(last_read_by_path.values())
+        return protected
+
+    def _strip_tool_message(self, message: dict, prefix: str, force: bool = False) -> bool:
         """把单条 tool 消息改写为简明记录（description+call_id+落盘路径）；返回是否改写"""
         content = message.get("content") or ""
         text = content_text(content)
         # 带图片的记录不受短文本守卫保护：图片滞留上下文的代价远高于一条短记录
-        if len(text) < _CONCISE_CONTENT_CHARS and not count_image_parts(content):
+        if not force and len(text) < _CONCISE_CONTENT_CHARS and not count_image_parts(content):
             return False
         if not message.get("persisted"):
             path = toolstore.persist(
@@ -843,8 +930,9 @@ class Memory:
         message["stripped"] = True
         return True
 
-    def _evict_whitelist_overflow(self, model: str) -> int:
-        """白名单工具历史会话累计超预算时，最老的先外置为占位，直至回到预算内"""
+    def _evict_whitelist_overflow(self, model: str, protected_indexes=None) -> int:
+        """白名单工具历史会话累计超预算时，最老的未保护结果先外置"""
+        protected_indexes = protected_indexes or set()
         budget = self.whitelist_budget_tokens
         if budget <= 0:
             return 0
@@ -854,12 +942,22 @@ class Memory:
                 message.get("role") == "tool"
                 and message.get("tool_name") in self.tool_whitelist
                 and not message.get("stripped")
+                and index not in protected_indexes
             ):
                 # 图片块 token 计数器看不见，按常数计入预算防图片记录挤占上下文
                 tokens = toolstore.count_tokens_safe(content_text(message.get("content") or ""), model)
                 tokens += _IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
                 entries.append((index, tokens))
-        total = sum(tokens for _, tokens in entries)
+        protected_total = sum(
+            toolstore.count_tokens_safe(content_text(message.get("content") or ""), model)
+            + _IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
+            for index, message in enumerate(self.messages)
+            if index in protected_indexes
+            and message.get("role") == "tool"
+            and message.get("tool_name") in self.tool_whitelist
+            and not message.get("stripped")
+        )
+        total = sum(tokens for _, tokens in entries) + protected_total
         if total <= budget:
             return 0
         evicted = 0
@@ -999,7 +1097,7 @@ class Memory:
         """旧段原文归档落盘（内存替换后原文仅存于此）；失败不阻塞压缩"""
         try:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             path = self.sessions_dir / f"{self.session_id}-precompact-{ts}.json"
             data = {
                 "version": session_store.SESSION_VERSION,

@@ -127,7 +127,7 @@ def ensure_system_prompt(turn: TurnContext, files=None) -> None:
 def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, model: Optional[str]) -> dict:
     """工具调用循环：返回 {"status", "content"}
 
-    status: complete（模型不再调用工具，回合完成）/ error / max_rounds。
+    status: complete（模型本轮不再调用工具）/ error / max_rounds。
     取消/中断抛 TurnInterrupt。轮次用尽且空转计数未满时续期（续期总量受
     config.workflow.max_total_rounds 兜底保险丝约束，默认 100，正常任务碰不到）：
     空转计数器（SpinGuard——重复/近似重复输出才开始计数，整轮全新结果清零）计满
@@ -212,7 +212,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             turn.captured["turn_error"] = response["error"]  # 无头 --json 的 error 字段来源
             io.status("出错")
             return {"status": "error", "content": ""}
-        if content or reasoning:
+        if (content or reasoning) and not tool_calls:
             # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
             extra = {"thinking": reasoning} if reasoning else {}
             session.add_message("assistant", content, **extra)
@@ -221,8 +221,8 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 # 回合收尾前有用户插话或后台子代理完成通知：不结束，下一轮回应
                 io.status("新消息并入 · 继续")
                 continue
-            io.phase("")  # 回合完成：状态行空行占位
-            log.info("任务完成（共%d轮推理）", round_no)
+            io.phase("")  # 本轮结束：状态行空行占位
+            log.info("模型本轮未请求更多工具，回合结束（共%d轮推理）", round_no)
             if not io.cancelled():
                 # 先收敛工具记录，再压缩，避免摘要模型看到尚未外置的原始大输出
                 finalize = getattr(session, "finalize_turn", None)

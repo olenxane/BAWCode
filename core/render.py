@@ -406,8 +406,12 @@ def _wrap_keep_ansi(text: str, width: int) -> List[str]:
     rows.append("".join(cur))
     return rows or [""]
 
+@functools.lru_cache(maxsize=256)
 def _lexer_for(filename: str):
-    """按文件名/扩展名取 pygments 词法；无 pygments 或未知类型返回 None（降级纯文本）"""
+    """按文件名/扩展名取 pygments 词法；无 pygments 或未知类型返回 None（降级纯文本）
+
+    选择结果按文件名缓存：pygments 每次查找都会重新发现插件词法器（扫描已安装包的
+    entry points，单次数十毫秒），历史会话逐节点高亮同一文件名会被反复查询。"""
     if not HAS_PYGMENTS or not filename:
         return None
     try:
@@ -417,8 +421,11 @@ def _lexer_for(filename: str):
     except Exception:
         return None
 
+@functools.lru_cache(maxsize=128)
 def _lexer_by_name(lang: str):
-    """按围栏语言名取 pygments 词法；无 pygments 或未知语言返回 None（降级纯文本）"""
+    """按围栏语言名取 pygments 词法；无 pygments 或未知语言返回 None（降级纯文本）
+
+    与 _lexer_for 同理缓存选择结果：围栏语言名在会话内高度重复。"""
     if not HAS_PYGMENTS or not lang:
         return None
     try:
@@ -1204,9 +1211,19 @@ class RenderMixin:
     # ----- 树 -----
     def _build_tree(self) -> List[TreeNode]:
         roots = []
-        # 根节点标题：取「首次」用户消息，避免被新一轮输入替换掉
+        timeline = [
+            (f"archive:{archive_id}:{index}", item, True)
+            for archive_id, index, item in self._tree_archive_messages
+            if item.get("type") != "summary"
+        ]
+        timeline.extend(
+            (f"msg:{index}", item, False)
+            for index, item in enumerate(self.messages)
+            if item.get("type") != "summary"
+        )
+        # 根节点标题取完整历史中的首次用户消息，避免被新一轮输入替换掉。
         first_user = ""
-        for m in self.messages:
+        for _, m, _ in timeline:
             first_content = memory_mod.content_text(m.get("content"))
             if m.get("role") == "user" and first_content.strip():
                 first_user = first_content
@@ -1225,6 +1242,23 @@ class RenderMixin:
         current_turn: Optional[TreeNode] = None
         rendered_plan = False
         rendered_steps = False
+        plan_state = self.plan or {}
+        last_plan_event = next(
+            (
+                message_id
+                for message_id, item, _ in reversed(timeline)
+                if item.get("role") == "tool" and item.get("tool_name") in ("write_plan", "update_plan")
+            ),
+            None,
+        )
+        last_steps_event = next(
+            (
+                message_id
+                for message_id, item, _ in reversed(timeline)
+                if item.get("role") == "tool" and item.get("tool_name") == "generate_steps"
+            ),
+            None,
+        )
 
         def _parent() -> TreeNode:
             return current_turn if current_turn is not None else task_node
@@ -1234,7 +1268,7 @@ class RenderMixin:
         # call_info：完整参数（命令/写入内容/编辑 old-new），供命令/写入/编辑类渲染正文
         cmd_heads: Dict[str, str] = {}
         call_info: Dict[str, dict] = {}
-        for item in self.messages[-200:]:
+        for _, item, _ in timeline:
             if item.get("type") != "tool_call":
                 continue
             for c in item.get("tool_calls") or []:
@@ -1257,22 +1291,26 @@ class RenderMixin:
                 if head:
                     cmd_heads[cid] = head
 
-        window = self.messages[-200:]
         # 最新一轮起点：最后一条用户消息之后的消息属于「本轮」，工具节点据此自动展开
-        turn_start = max((i for i, m in enumerate(window) if m.get("role") == "user"), default=-1)
-        for index, item in enumerate(window):
+        turn_start = max(
+            (i for i, (_, item, _) in enumerate(timeline) if item.get("role") == "user"),
+            default=-1,
+        )
+        for index, (message_id, item, archived) in enumerate(timeline):
             role = item.get("role")
+            node_id = message_id
+            call_node_id = f"call:{message_id.split(':', 1)[1]}" if message_id.startswith("msg:") else f"{message_id}:call"
             content = memory_mod.content_text(item.get("content"))
             n_imgs = memory_mod.count_image_parts(item.get("content"))
             image_note = f" 🖼×{n_imgs}" if n_imgs else ""
             msg_type = item.get("type") or ""
             tool_name = item.get("tool_name") or ""
-            is_latest = index > turn_start
+            is_latest = index > turn_start and not archived
             pending_extra: List[TreeNode] = []  # type=plan 快照等附加节点（排在 node 之后）
             if role == "user":
                 # 正文写入节点 label 折行展示；超 3 行默认收起，树内手动展开
                 node = TreeNode(
-                    f"msg:{index}",
+                    message_id,
                     f"用户 · {content}",
                     "user",
                     default_expanded=False,
@@ -1283,12 +1321,22 @@ class RenderMixin:
                 continue
             if role == "tool" or msg_type == "tool":
                 # 计划四件套：结果消息自带 JSON 快照 → 冻结的时间线节点（计划/步骤/步骤更新）
-                node = self._plan_step_node(index, tool_name, content)
+                node = self._plan_step_node(node_id, tool_name, content, item)
                 if node is not None:
                     if node.kind == "plan":
                         rendered_plan = True
                     elif node.kind == "steps":
                         rendered_steps = True
+                elif message_id == last_plan_event and (
+                    plan_state.get("status") not in ("empty", "", None)
+                    or plan_state.get("content")
+                    or plan_state.get("title")
+                ):
+                    pending_extra.append(self._plan_node_from(f"fallback:plan:{message_id}", plan_state))
+                    rendered_plan = True
+                elif message_id == last_steps_event and self.steps:
+                    pending_extra.append(self._steps_node_from(f"fallback:steps:{message_id}", self.steps))
+                    rendered_steps = True
                 else:
                     failed = tool_failure_hint(content)
                     icon = _GLYPH_FAIL if failed else _GLYPH_OK
@@ -1300,34 +1348,48 @@ class RenderMixin:
                         meta = self._tool_display_meta(
                             str(info.get("name") or tool_name), info.get("args") or {}, content, failed
                         )
+                    tool_call = str((info or {}).get("name") or tool_name)
+                    args = (info or {}).get("args") or {}
+                    command = str(meta.get("command") or "") if meta else ""
+                    if tool_call == "execute_command":
+                        command = str(args.get("command") or "")
+                    elif tool_call == "run_program":
+                        command = " ".join(
+                            [str(args.get("program") or ""), *(str(a) for a in args.get("args") or [])]
+                        ).strip()
+                    compact_tool = self._is_compact_tool(tool_call, command)
+                    is_git = tool_call in _TOOL_CMD and bool(re.match(r"^\s*git(?:\s|$)", command))
+                    summary = self._tool_compact_summary(tool_call, args, content, failed) if compact_tool else ""
                     if meta is not None:
-                        base = tool_name or str((info or {}).get("name") or "") or "tool"
+                        base = tool_name or tool_call or "tool"
                         if meta.get("tool_kind") == "cmd":
-                            # 类型在前、状态图标居中、命令头附后：▾ ⚙ 执行命令 ✓ · npm run
                             label = f"⚙ 执行命令 {icon} · {cmd_heads.get(cid) or base}"
                         else:
                             path = str(meta.get("path") or "")
                             label = f"⚙ {base} {path} {icon}" if path else f"⚙ {base} {icon}"
+                        if is_git:
+                            label = f"⚙ git {icon}"
                         node = TreeNode(
-                            f"msg:{index}",
+                            message_id,
                             label,
                             "tool",
-                            default_expanded=is_latest,
+                            default_expanded=False if compact_tool else is_latest,
+                            summary=summary,
                             detail="",
                             meta=meta,
                         )
                     else:
-                        # 读取类等：保持概要显示（标题 + 结果正文，本轮展开、历史折叠）
                         result_text = content.strip()
-                        display = cmd_heads.get(cid) or tool_name or "tool"
+                        display = tool_name or "tool"
                         label = f"⚙ {display} {icon}{image_note}"
-                        if result_text:
+                        if not compact_tool and result_text:
                             label = f"{label} · {result_text}"
                         node = TreeNode(
-                            f"msg:{index}",
+                            message_id,
                             label,
                             "tool",
-                            default_expanded=is_latest,
+                            default_expanded=False if compact_tool else is_latest,
+                            summary=summary,
                             detail="",
                         )
             elif msg_type == "system_prompt":
@@ -1336,7 +1398,7 @@ class RenderMixin:
                 if files:
                     label += " · " + ", ".join(str(x) for x in files)
                 node = TreeNode(
-                    f"msg:{index}",
+                    message_id,
                     f"⚙ {label}",
                     "system_prompt",
                     default_expanded=False,
@@ -1351,7 +1413,7 @@ class RenderMixin:
                 if nid and nid != ntype:
                     label += f" · {nid}"
                 node = TreeNode(
-                    f"msg:{index}",
+                    message_id,
                     label,
                     "workflow_node",
                     default_expanded=False,
@@ -1359,7 +1421,7 @@ class RenderMixin:
                 )
             elif msg_type == "tool_call":
                 # 已完成思考：落库 thinking 字段固定折叠为一行，排在本轮正文/工具节点之前
-                think = self._thinking_node(index, item)
+                think = self._thinking_node(message_id, item)
                 if think is not None:
                     _parent().children.append(think)
                 names = []
@@ -1371,7 +1433,7 @@ class RenderMixin:
                 if text:
                     _parent().children.append(
                         TreeNode(
-                            f"msg:{index}",
+                            node_id,
                             f"◆ · {text}",
                             "assistant",
                             default_expanded=True,
@@ -1379,7 +1441,7 @@ class RenderMixin:
                         )
                     )
                 node = TreeNode(
-                    f"call:{index}",
+                    call_node_id,
                     f"⚙ {','.join(names) if names else '工具调用'}",
                     "tool",
                     default_expanded=False,
@@ -1414,7 +1476,7 @@ class RenderMixin:
                         )
                         if t_text:
                             node.children.append(
-                                TreeNode(f"sub:{sid}:{i}", f"Agent · {t_text}", "assistant")
+                                TreeNode(f"sub:{sid}:{i}", f"◆ · {t_text}", "assistant")
                             )
                         child = TreeNode(
                             f"sub:{sid}:{i}:call" if t_text else f"sub:{sid}:{i}",
@@ -1432,8 +1494,8 @@ class RenderMixin:
                         )
                     elif t_role == "assistant":
                         if not t_text:
-                            continue  # 空正文条目不产出悬空「Agent · 」行
-                        child = TreeNode(f"sub:{sid}:{i}", f"Agent · {t_text}", "assistant")
+                            continue  # 空正文条目不产出悬空消息行
+                        child = TreeNode(f"sub:{sid}:{i}", f"◆ · {t_text}", "assistant")
                     else:
                         if not t_text:
                             continue
@@ -1443,13 +1505,13 @@ class RenderMixin:
                     node.children.append(child)
             elif role == "assistant":
                 # 已完成思考（无工具调用的最终回复）：固定一行摘要，排在回复节点之前
-                think = self._thinking_node(index, item)
+                think = self._thinking_node(message_id, item)
                 if think is not None:
                     _parent().children.append(think)
                 # 完整回复写入 label，由 _tree_rows 折行；LLM 输出不限行数、无折叠指示
                 # 不建子节点、不开独立详情区
                 node = TreeNode(
-                    f"msg:{index}",
+                    node_id,
                     f"Agent · {content}",
                     "assistant",
                     default_expanded=True,
@@ -1458,7 +1520,7 @@ class RenderMixin:
                 if msg_type == "plan":
                     # 工作流 plan 节点收尾快照（_exec_plan 附带最终版 plan/steps JSON）：
                     # 计划/步骤节点随消息落位、排在文本节点之后（经 pending_extra）
-                    for extra in self._snapshot_nodes(index, item):
+                    for extra in self._snapshot_nodes(message_id, item):
                         pending_extra.append(extra)
                         if extra.kind == "plan":
                             rendered_plan = True
@@ -1467,7 +1529,7 @@ class RenderMixin:
             elif msg_type == "help":
                 # 帮助/命令反馈：≤3 行直接可见，更长默认收起、树内手动展开
                 node = TreeNode(
-                    f"msg:{index}",
+                    message_id,
                     "帮助",
                     "help",
                     default_expanded=len(content.splitlines()) <= 3,
@@ -1475,10 +1537,10 @@ class RenderMixin:
                 )
                 for i, line in enumerate(content.splitlines()):
                     # 不预截断：长行（如含密钥链接）由 _tree_rows 按实时宽度折行展示
-                    node.children.append(TreeNode(f"msg:{index}:{i}", line, "help_line"))
+                    node.children.append(TreeNode(f"{message_id}:{i}", line, "help_line"))
             else:
                 node = TreeNode(
-                    f"msg:{index}",
+                    message_id,
                     f"系统 · {content}",
                     "system",
                     default_expanded=False,
@@ -1488,15 +1550,15 @@ class RenderMixin:
             for extra in pending_extra:
                 _parent().children.append(extra)
 
-        # 旧会话回落：消息时间线没渲染出计划/步骤节点且状态非空（历史会话无快照消息）
-        # 时，按当前状态在任务根尾部补节点（仅兼容显示；新会话均走消息快照）
+        # 旧会话没有计划快照时，将当前状态锚定到最近一轮而非任务根尾部。
+        fallback_parent = current_turn or task_node
         plan = self.plan or {}
         if not rendered_plan and (
             plan.get("status") not in ("empty", "", None) or plan.get("content") or plan.get("title")
         ):
-            task_node.children.append(self._plan_node_from("fallback:plan", plan))
+            fallback_parent.children.append(self._plan_node_from("fallback:plan", plan))
         if not rendered_steps and self.steps:
-            task_node.children.append(self._steps_node_from("fallback:steps", self.steps))
+            fallback_parent.children.append(self._steps_node_from("fallback:steps", self.steps))
 
         # 流式树尾直播（纯 UI 状态，不在 session.messages 里）：思考过程折叠为尾部窗口，正文全文折行
         streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
@@ -1541,7 +1603,7 @@ class RenderMixin:
             id_base,
             f"计划 [{status or 'empty'}] {title}",
             "plan",
-            default_expanded=status in ("draft", "confirmed", "executing", "running"),
+            default_expanded=(not self.busy) and status in ("draft", "confirmed", "executing", "running"),
             summary=_oneline(body, 40),
             detail=body,
         )
@@ -1554,7 +1616,7 @@ class RenderMixin:
     def _steps_node_from(self, id_base: str, steps: List[dict]) -> TreeNode:
         """步骤清单快照 list → 节点（kind steps + step 子节点，done 折叠沿用 collapse_done）"""
         done = sum(1 for s in steps if isinstance(s, dict) and s.get("status") == "done")
-        node = TreeNode(id_base, f"步骤 {done}/{len(steps)}", "steps")
+        node = TreeNode(id_base, f"步骤 {done}/{len(steps)}", "steps", default_expanded=not self.busy)
         for step in steps:
             st = str(step.get("status") or "pending")
             icon = _STATUS_ICON.get(st, "○")
@@ -1573,19 +1635,58 @@ class RenderMixin:
             node.children.append(child)
         return node
 
-    def _thinking_node(self, index: int, item: dict) -> Optional[TreeNode]:
+    def _thinking_node(self, message_id: str, item: dict) -> Optional[TreeNode]:
         """已完成思考 → 摘要节点：收起为一行摘要，展开显示完整思考内容"""
         thinking = str(item.get("thinking") or "").strip()
         if not thinking:
             return None
         summary = next((ln.strip() for ln in thinking.splitlines() if ln.strip()), thinking)
         return TreeNode(
-            f"think:{index}",
+            f"think:{message_id}",
             f"💭 思考 · {_oneline(summary, 60)}",
             "thinking",
             default_expanded=False,
             detail=thinking,
         )
+
+    @staticmethod
+    def _is_compact_tool(name: str, command: str = "") -> bool:
+        return name in ("search", "read") or (
+            name in _TOOL_CMD and bool(re.match(r"^\s*git(?:\s|$)", command))
+        )
+
+    @staticmethod
+    def _tool_compact_summary(name: str, args: dict, content: str, failed: bool) -> str:
+        if name == "search":
+            match = re.search(r"找到\s+(\d+)\s+处匹配（(\d+)\s+个文件）", content)
+            if match:
+                file_count = int(match.group(2))
+                return f"搜索了 1 个模式，读取了 {file_count} 个文件"
+            if "未找到匹配" in content:
+                return "搜索了 1 个模式，读取了 0 个文件"
+            return "搜索了 1 个模式"
+        if name == "read":
+            path = str(args.get("file_path") or "")
+            range_match = re.search(r"第\s*(\d+)\s*[-–]\s*(\d+)\s*行\s*/\s*共\s*(\d+)\s*行", content)
+            if not range_match:
+                range_match = re.search(r"已截断：共\s*(\d+)\s*行，本次显示第\s*(\d+)\s*[-–]\s*(\d+)\s*行", content)
+                if range_match:
+                    total, start, end = range_match.groups()
+                    return f"读取 {path} · 第 {start}-{end} 行 / 共 {total} 行"
+            if range_match:
+                start, end, total = range_match.groups()
+                return f"读取 {path} · 第 {start}-{end} 行 / 共 {total} 行"
+            if "空文件" in content:
+                return f"读取 {path} · 空文件"
+            return f"读取 {path}" if path else "读取文件"
+        if name in _TOOL_CMD:
+            command = str(args.get("command") or "") if name == "execute_command" else ""
+            if name == "run_program":
+                command = " ".join([str(args.get("program") or ""), *(str(a) for a in args.get("args") or [])]).strip()
+            cmd = _command_head(command, 48) or "git"
+            state = "失败" if failed else "完成"
+            return f"{cmd} · {state}"
+        return ""
 
     def _tool_display_meta(self, name: str, args: dict, content: str, failed: bool) -> Optional[dict]:
         """命令/写入/编辑类工具 → 展开正文元数据；读取类或结构缺失返回 None（保持概要）
@@ -1615,20 +1716,33 @@ class RenderMixin:
             }
         return None
 
-    def _plan_step_node(self, index: int, tool_name: str, content: str) -> Optional[TreeNode]:
-        """计划四件套工具结果 → 时间线节点（JSON 快照冻结渲染）。
-        非四件套 / JSON 解析失败（如白名单预算外置后的指针文本）返回 None 回落普通工具节点。
-        节点 id 保持 msg:{index}（树回退锚点兼容）"""
+    def _plan_step_node(self, message_id: str, tool_name: str, content: str, item: dict) -> Optional[TreeNode]:
+        """计划四件套工具结果 → 时间线节点（冻结快照）。"""
         if tool_name not in ("write_plan", "update_plan", "generate_steps", "update_step_status"):
             return None
-        try:
-            data = json.loads(content)
-        except (json.JSONDecodeError, ValueError):
-            return None
+        data = item.get("timeline_snapshot")
+        if data is None:
+            try:
+                data = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                data = None
+        if data is None and item.get("persist_path"):
+            session = getattr(self, "_tree_session", None)
+            if session is not None:
+                data = toolstore_mod.read_persisted_content(
+                    session.config,
+                    session.project_id,
+                    session.session_id,
+                    str(item["persist_path"]),
+                )
+                try:
+                    data = json.loads(data)
+                except (json.JSONDecodeError, ValueError):
+                    data = None
         if tool_name in ("write_plan", "update_plan") and isinstance(data, dict):
-            return self._plan_node_from(f"msg:{index}", data)
-        if tool_name == "generate_steps" and isinstance(data, list) and all(isinstance(s, dict) for s in data):
-            return self._steps_node_from(f"msg:{index}", data)
+            return self._plan_node_from(message_id, data)
+        if tool_name == "generate_steps" and isinstance(data, list) and all(isinstance(step, dict) for step in data):
+            return self._steps_node_from(message_id, data)
         if tool_name == "update_step_status" and isinstance(data, dict):
             st = str(data.get("status") or "")
             icon = _STATUS_ICON.get(st, "○")
@@ -1636,11 +1750,11 @@ class RenderMixin:
             label = f"{icon} 步骤 {data.get('id')} → {st or '?'}"
             if note:
                 label += f" · {_oneline(note, 60)}"
-            return TreeNode(f"msg:{index}", label, "step_update", default_expanded=True, detail="")
+            return TreeNode(message_id, label, "step_update", default_expanded=True, detail="")
         return None
 
-    def _snapshot_nodes(self, index: int, item: dict) -> List[TreeNode]:
-        """type=plan 消息的 plan_snapshot/steps_snapshot extras（_exec_plan 落位最终版）→ 节点对"""
+    def _snapshot_nodes(self, message_id: str, item: dict) -> List[TreeNode]:
+        """type=plan 消息的计划快照 extras → 时间线节点"""
         out: List[TreeNode] = []
         raw_plan = item.get("plan_snapshot")
         if raw_plan:
@@ -1649,7 +1763,7 @@ class RenderMixin:
             except (json.JSONDecodeError, ValueError):
                 data = None
             if isinstance(data, dict):
-                out.append(self._plan_node_from(f"msg:{index}:plan", data))
+                out.append(self._plan_node_from(f"{message_id}:plan", data))
         raw_steps = item.get("steps_snapshot")
         if raw_steps:
             try:
@@ -1657,7 +1771,7 @@ class RenderMixin:
             except (json.JSONDecodeError, ValueError):
                 data = None
             if isinstance(data, list):
-                out.append(self._steps_node_from(f"msg:{index}:steps", data))
+                out.append(self._steps_node_from(f"{message_id}:steps", data))
         return out
 
     def _mcp_line(self) -> str:
@@ -1665,11 +1779,7 @@ class RenderMixin:
 
     def _tree_signature(self) -> tuple:
         """会话内容签名：命中则复用 _build_tree 结果，避免每帧全量重建（流式增长亦靠它失效）"""
-        msgs = self.messages[-200:]
-        total = 0
-        for m in msgs:
-            total += len(memory_mod.content_text(m.get("content")))
-            total += memory_mod.count_image_parts(m.get("content"))  # 图片块计入签名防漏失效
+        msgs = self.messages
         plan = self.plan or {}
         streaming = self.streaming_msg if isinstance(self.streaming_msg, dict) else None
         slots = self.subagent_stream if isinstance(self.subagent_stream, dict) else {}
@@ -1704,8 +1814,9 @@ class RenderMixin:
             )
         return (
             _node_sig(self._ui_tree_snapshot),
+            self._tree_generation,
             len(msgs),
-            total,
+            self._tree_archive_signature,
             self.task or "",
             len(self.steps),
             plan.get("status") or "",
@@ -2108,16 +2219,19 @@ class RenderMixin:
         }
         done = sum(1 for s in steps if str(s.get("status") or "") == "done")
         out = [self.c("warn") + _pad(_clip(f" 待办 {done}/{len(steps)}", w), w) + self.RESET]
-        cap = 8
-        for s in steps[:cap]:
-            st = str(s.get("status") or "pending")
+        running = next((s for s in steps if str(s.get("status") or "") == "running"), None)
+        upcoming = next((s for s in steps if str(s.get("status") or "pending") == "pending"), None)
+        for step in (running, upcoming if upcoming is not running else None):
+            if step is None:
+                continue
+            st = str(step.get("status") or "pending")
             icon = _STATUS_ICON.get(st, "○")
             col = status_c.get(st, self.c("dim"))
-            line = f" {icon} {s.get('id')}. {s.get('title') or ''}"
+            line = f" {icon} {step.get('id')}. {step.get('title') or ''}"
             out.append(col + _pad(_clip(line, w), w) + self.RESET)
-        extra = len(steps) - cap
-        if extra > 0:
-            out.append(self.c("dim") + _pad(_clip(f" … 还有 {extra} 步", w), w) + self.RESET)
+        remaining = sum(1 for s in steps if str(s.get("status") or "pending") == "pending")
+        if remaining > (1 if upcoming is not None else 0):
+            out.append(self.c("dim") + _pad(_clip(f" … 还有 {remaining - 1} 待办", w), w) + self.RESET)
         return out
 
     def _compose_plain(self, width: int, height: int) -> List[str]:

@@ -1158,14 +1158,14 @@ def tool_failure_hint(content: str) -> bool:
 # 变更类工具的成功回显彼此高度同构（批量重构实测相邻相似度 0.85-0.92），只按整串精确
 # 判重：模糊判重会把同一轮里的连续编辑误判为空转，在编辑已落盘后终止回合
 _EXACT_DEDUP_TOOLS = {"write", "edit_file", "delete_file"}
+_SPIN_EXACT_TOOLS = {"read", "search", "glob", "list_directory", "rag_search", "read_memory", "load_skill", "webfetch"}
 
 
 class SpinGuard:
     """空转计数器：结果重复出现才开始计数，计满才终止回合，主循环与子代理循环共用。
 
-    结果键取工具名+目标，read 以 file_path 为目标，变更类工具取整串内容精确判重，
-    其余工具取去空白内容并辅以 ≥0.9 前缀相似度判重，覆盖读变化中文件、结果仅数字微变
-    这类空转；本轮含重复则计数累加，全部为新结果则清零；达到 kill_count 即 spun_out() 为真。
+    只读观察工具与变更类工具按精确结果判重（read 另含分页范围），其余工具辅以 ≥0.9 前缀
+    相似度判重；本轮含重复则计数累加，整轮全新结果清零。
     """
 
     FUZZ_RATIO = 0.9
@@ -1179,34 +1179,38 @@ class SpinGuard:
         self.count = 0
 
     def feed(self, results) -> None:
-        """喂入本轮全部工具结果消息并更新计数，空轮或无结果为清零"""
+        """喂入本轮全部工具结果消息并更新计数，空轮或整轮全新结果为清零"""
         dups = 0
         for m in results or []:
             tool = str(m.get("tool_name") or "")
+            body = re.sub(r"\s+", "", memory_mod.content_text(m.get("content")))
             target = str(m.get("file_path") or "")
-            if target:
-                key = f"{tool}|{target}"
+            if tool == "read" and target:
+                digest = str(m.get("read_fingerprint") or hashlib.sha256(body.encode("utf-8")).hexdigest())
+                key = (
+                    f"{tool}|{os.path.normcase(os.path.normpath(target))}|"
+                    f"{m.get('read_offset', 0)}|{m.get('read_limit', 0)}|{digest}"
+                )
+                dup = key in self.seen
+                if not dup:
+                    self.seen.add(key)
+            elif tool in _EXACT_DEDUP_TOOLS or tool in _SPIN_EXACT_TOOLS:
+                key = f"{tool}|{body}"
                 dup = key in self.seen
                 if not dup:
                     self.seen.add(key)
             else:
-                body = re.sub(r"\s+", "", memory_mod.content_text(m.get("content")))
                 key = f"{tool}|{body}"
-                if tool in _EXACT_DEDUP_TOOLS:
-                    dup = key in self.seen
-                    if not dup:
-                        self.seen.add(key)
-                else:
-                    probe = body[: self.FUZZ_PREFIX]
-                    recent = self.recent.setdefault(tool, [])
-                    dup = key in self.seen or any(
-                        difflib.SequenceMatcher(None, probe, old).ratio() >= self.FUZZ_RATIO
-                        for old in recent
-                    )
-                    if not dup:
-                        self.seen.add(key)
-                        recent.append(probe)
-                        del recent[: -self.RECENT_CAP]
+                probe = body[: self.FUZZ_PREFIX]
+                recent = self.recent.setdefault(tool, [])
+                dup = key in self.seen or any(
+                    difflib.SequenceMatcher(None, probe, old).ratio() >= self.FUZZ_RATIO
+                    for old in recent
+                )
+                if not dup:
+                    self.seen.add(key)
+                    recent.append(probe)
+                    del recent[: -self.RECENT_CAP]
             if dup:
                 dups += 1
         self.count = self.count + dups if dups else 0

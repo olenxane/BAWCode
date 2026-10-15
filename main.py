@@ -1127,11 +1127,13 @@ class _AgentRunner:
         self.turn_start_index = 0
         self._queue: list = []
         self._submission_seq = 0
-        self._lock = threading.Lock()
+        # 调度锁：提交仲裁与会话结构操作共用；可重入，空闲锁内回调会再调本类原子方法
+        # （远程 /new → discard_pending_turn、/clear → clear_session_when_idle）
+        self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
 
     def run_when_idle(self, callback):
-        """与提交仲裁共用锁，空闲时执行会话修改。"""
+        """与提交仲裁共用锁，空闲时执行会话修改；锁可重入，回调内可再调本类原子方法。"""
         with self._lock:
             if self.busy:
                 return False, None
