@@ -62,7 +62,6 @@ from core.render import (
     _STREAM_THINKING_LINES,
     _THINKING_PHRASES,
     _TOOL_CMD,
-    _TOOL_CMD_OUTPUT_LINES,
     _TOOL_EDIT,
     _TOOL_WRITE,
     _TREE_FOLD_KINDS,
