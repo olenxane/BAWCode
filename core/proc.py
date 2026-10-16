@@ -1,4 +1,4 @@
-#进程执行底层：输出落临时文件并轮询等待，超时/取消时按进程树整体终止（Windows 走 Job Object）
+#进程执行底层：输出落临时文件并轮询等待，超时/取消时按进程树整体终止（Windows 走 Job Object以避免线程卡死）
 import ctypes
 import locale
 import os

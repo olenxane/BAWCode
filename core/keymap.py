@@ -204,8 +204,7 @@ class Keymap:
                         continue
                     if tok == "tab" and act == Action.FOCUS_NEXT and ctx == Context.INPUT.value:
                         continue
-                    # 单字符键（h/l/` 等）不得进输入上下文：否则打字被劫持为
-                    # 树/模式动作（如 expand:l 使输入框无法键入 l）
+                    # 单字符键（h/l/` 等）不得进输入上下文：否则打字被劫持为树/模式动作（如 expand:l 使输入框无法键入 l）
                     if len(tok) == 1 and ctx == Context.INPUT.value:
                         continue
                     table.setdefault((ctx, tok), act)

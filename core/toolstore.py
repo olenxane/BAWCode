@@ -1,6 +1,5 @@
-#该脚本负责工具调用结果的外置存储：超限/被剥离的工具输出以调用id哈希为文件名落盘，
-#供模型后续用 read 工具分批回读；提供 token 计量切片、原子写入与会话清理。
-#文件布局：data/toolcalls/{project_id}/{session_id}/call-{sha256}.txt
+#该脚本负责工具调用结果的外置存储：超限/被剥离的工具输出以调用id哈希为文件名落盘，供模型后续用 read 工具分批回读；提供 token 计量切片、原子写入与会话清理。
+#文件命名格式：data/toolcalls/{project_id}/{session_id}/call-{sha256}.txt
 import hashlib
 import json
 import os

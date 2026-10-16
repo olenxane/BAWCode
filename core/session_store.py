@@ -77,7 +77,7 @@ def revision_of(data: dict) -> int:
 
 
 def list_sessions(directory: Path) -> List[dict]:
-    """扫描目录返回会话元信息，按 updated_at 倒序（损坏文件跳过，不阻塞面板）"""
+    """扫描目录返回会话元信息，按 updated_at 倒序，自动跳过损坏文件"""
     items: List[dict] = []
     if not directory.exists():
         return items

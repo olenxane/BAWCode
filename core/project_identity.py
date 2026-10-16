@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""工作区项目标识符：绝对路径计算，事实来源写在项目文件夹 .bawcode/identity.json"""
+"""工作区项目标识符：绝对路径计算哈希，事实来源写在项目文件夹 .bawcode/identity.json"""
 from __future__ import annotations
 
 import hashlib

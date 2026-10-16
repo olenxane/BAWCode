@@ -180,7 +180,6 @@ def build_variable_context(
         "cpu_arch": platform.machine(),
         "username": os.environ.get("USERNAME") or os.environ.get("USER") or "",
         "home_dir": str(Path.home()),
-        # 必须与实际执行口径一致：execute_command 按选定执行器（core/shells.py）直接启动
         "shell_hint": _shell_hint(config),
         "model_name": model_name,
         "model_id": model_id,

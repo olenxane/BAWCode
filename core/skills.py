@@ -343,8 +343,7 @@ _summon_recent: Dict[str, dict] = {}
 SUMMON_DEDUP_SECONDS = 120
 SUMMON_RECENT_MAX = 8
 
-# 仅 UI 可见、不进 API 的消息类型（与 memory._api_session_item 同口径）：
-# 生成期间写入的进度节点属此类，故不影响请求指纹
+# 仅 UI 可见、不进 API 的消息类型（与 memory._api_session_item 同口径）
 _SUMMON_HIDDEN_TYPES = ("system_prompt", "help", "workflow_node", "subagent")
 
 
@@ -380,7 +379,7 @@ def summon(session, llm, config, scope: str = "global", system_prompt: Optional[
 
     系统提示词仍走 extra_system、技能生成提示词只作为末条用户消息发出，
     请求前缀与普通回合一致（提示词缓存命中）；产物按 scope 落盘并重扫使其立即可用。
-    重复提交（并发或短时间内重放）只调用一次 API、只落盘一份，返回值带 duplicate 标记。
+    重复提交只调用一次 API、只落盘一份，返回值带 duplicate 标记。
     """
     global _summon_inflight
 

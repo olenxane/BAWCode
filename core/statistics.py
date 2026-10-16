@@ -1,4 +1,4 @@
-"""轻量、静默的本地使用统计。"""
+"""轻量、静默的本地使用统计计数器"""
 import json
 import os
 import threading

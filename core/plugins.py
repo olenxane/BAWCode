@@ -950,7 +950,7 @@ def set_setting(pid: str, key: str, value: Any, config) -> Any:
             raise ValueError(f"插件 {pid} 配置 {key} 需要 {ctype} 类型，得到 {value!r}")
         value = coerced
         if ctype == "list" and value not in decl.get("options", []):
-            raise ValueError(f"插件 {pid} 配置 {key} 必须是 {decl.get('options')} 之一，得到 {value!r}")
+            raise ValueError(f"插件 {pid} 配置 {key} 必须是 {decl.get('options')} 之一，不能是 {value!r}")
         if ctype in ("int", "float") and value is not None:
             if "min" in decl:
                 value = max(decl["min"], value)

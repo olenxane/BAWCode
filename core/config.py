@@ -21,12 +21,11 @@ SAVE_LOCK = threading.Lock()
 
 
 def default_config() -> dict:
-    """内置默认配置：多 provider，model_name = provider_id-model_id"""
-    # providers[].advanced 为提供商级请求高级设置（设置页「提供商」标签折叠区）：
-    # send_temperature 勾选后请求才携带 temperature（默认不携带）；thinking_enabled
-    # true/false 强制开关思考，null=跟随模型档位；thinking_effort ""=跟随，
-    # none/low/medium/high/xhigh/max 覆盖模型档位。thinking_effort_field 和
-    # thinking_enabled_field 可自定义出站 JSON 的强度/开关键名，空值使用默认键名。
+    """内置默认配置：多 provider，model_name = provider_id-model_id
+    providers[].advanced 为提供商级请求高级设置（设置页「提供商」标签折叠区）：
+    send_temperature 勾选后请求才携带 temperature（默认不携带）；thinking_enabled
+    true/false 强制开关思考，null=跟随模型档位；thinking_effort ""=跟随，
+    none/low/medium/high/xhigh/max 覆盖模型档位。thinking_effort_field和thinking_enabled_field 可自定义出站 JSON 的强度/开关键名，空使用默认键名。"""
     return {
         "providers": [
             {
@@ -92,10 +91,9 @@ def default_config() -> dict:
             "scroll_max_step": 20,
             "tip_interval": 5,
         },
-        # stream: 流式输出开关（SSE 增量上屏）；首个 chunk 前失败自动回落非流式，
+        # stream: 流式输出开关；首个 chunk 前失败自动回落非流式，
         # 已收 chunk 后失败不回落不重试（内容已上屏）；false 完全走整段路径
-        # request_timeout：单次 LLM 请求整体超时秒数（连接+读流），超时按瞬态错误走 retry_times 重试；<=0 不限时
-        "llm": {"retry_times": 3, "retry_delay": 1.0, "stream": True, "request_timeout": 180},
+        "llm": {"retry_times": 3, "retry_delay": 1.0, "stream": True, "request_timeout": 180},#防止通通超市
         # 分级日志（core/log.py）：level 全局阈值 debug/info/warn/error/off；
         # modules 按模块覆盖粒度（如 {"llm": "debug", "ui": "off"}）；
         # console 同步输出 stderr；days_to_keep 保留天数（0 永久）
@@ -103,7 +101,7 @@ def default_config() -> dict:
             "level": "info",
             "modules": {},
             "console": False,
-            "days_to_keep": 14,
+            "days_to_keep": 30,
         },
         "memory": {
             "longterm_path": "data/memory.json",
@@ -112,15 +110,12 @@ def default_config() -> dict:
             "compress_threshold": 0.8,
             # 压缩保留尾段 token 预算（最近轮次原文不压缩，按轮次边界切尾，至少保留最后一轮）
             "compress_keep_recent_tokens": 16384,
-            # 摘要硬上限 token（超限视为摘要失控，放弃压缩保持历史不变）
-            "compress_summary_max_tokens": 1024,
+            # 摘要硬上限 token，超限则放弃本次压缩
+            "compress_summary_max_tokens": 64000,
         },
-        # 上下文管理（core/toolstore.py + memory.finalize_turn）：
-        # tool_whitelist 白名单内工具完整调用历史跨回合保留，会话累计超
-        # whitelist_budget_tokens 后最老的先外置磁盘；白名单外工具回合末剥离，
-        # 仅保留 description+调用id（最近 strip_keep_recent 条不剥离，0=严格全剥）；
-        # 行内限额：普通工具 inline_limit_tokens，large_tools 类
-        # inline_limit_tokens_large，超限部分外置并在结果中附落盘指针
+        """上下文管理(core/toolstore.py + memory.finalize_turn):
+            tool_whitelist内的白名单工具调用历史会有更长的生命周期，当白名单工具调用累计到达一定token时最老的工具调用历史仍然会被剥离；被剥离的调用历史将写盘保存；白名单外的工具在回合内轻压缩和
+            回合外大青蒜时会被剥离。工具剥离后仅保留模型生成的description和调用id，同时保留指向落盘文件的指针"""
         "context": {
             "tool_whitelist": [
                 "write_plan",
@@ -142,30 +137,23 @@ def default_config() -> dict:
             "strip_keep_recent": 6,
             "aggressive_optimization": False,
             "aggressive_keep_tool_rounds": 12,
-            # 回合中维护（memory.mid_turn_maintenance）：每次 LLM 请求前剥离保护集外的
-            # 旧工具输出；保护口径独立于回合末，thinking 保留到回合末才剥离
+            # 回合中维护（memory.mid_turn_maintenance）：每次 LLM 请求前剥离保护集外的旧工具输出；保护口径独立于回合末，thinking 保留到回合末才剥离
             "mid_turn_maintenance": True,
             "mid_turn_keep_tool_rounds": 12,
             "mid_turn_keep_reads_per_file": 3,
         },
-        # 技能加载系统（core/skills.py + tools.load_skill）：SKILL.md+YAML frontmatter，
-        # 双层目录 全局 dir + 项目 {workspace}/.bawcode/skills（项目级同名覆盖全局）；
-        # 启动仅扫元数据进 [可用技能] 补充（memory.build_context_supplements），
-        # 总预算 metadata_budget_tokens 超限降级为仅名称；正文经 load_skill 按需返回，
-        # 行内限额沿用 context.large_tools（load_skill 已列入，32k），超限外置 toolstore
+        #技能加载系统（core/skills.py + tools.load_skill），参考了helloAgent和qwen code的实现
         "skills": {
             "enabled": True,
             "dir": "data/skills",
             "metadata_budget_tokens": 1024,
         },
         "command_plugins": ["data/commands"],
-        # 插件系统（core/plugins.py）：dir 下 <id>/plugin.json + main.py，双层目录
-        # （项目级 {workspace}/.bawcode/plugins 同名覆盖全局）。插件可注册 hooks/
-        # commands/tools/skills/上下文补充；enabled=false 全局关闭；disable 按 id
-        # 禁用单个插件（/plugin disable 写入）。plugins_config.<id> 为插件私有配置
-        # （插件经 ctx.settings 读取，宿主不解释其内容）。插件目录可带
-        # requirements.txt 声明独有依赖：装载时缺失项经 pip 静默补齐；
-        # auto_install_deps=false 时只检查不安装，缺依赖记入 /plugin 诊断。
+        """插件系统（core/plugins.py）：dir 下 <id>/plugin.json + main.py，双层目录
+        （项目级 {workspace}/.bawcode/plugins 同名覆盖全局）。插件可注册 hooks/commands/tools/skills/上下文补充；enabled=false 全局关闭；
+        disable 按 id禁用单个插件（/plugin disable 写入）。plugins_config.<id> 为插件私有配置（插件经 ctx.settings 读取，宿主不解释其内容）。
+        插件目录可带requirements.txt 声明独有依赖：装载时缺失项经 pip 静默补齐；
+        auto_install_deps=false 时只检查不安装，缺依赖记入 /plugin 诊断。"""
         "plugins": {
             "enabled": True,
             "dir": "data/plugins",
@@ -173,14 +161,11 @@ def default_config() -> dict:
             "auto_install_deps": True,
         },
         "plugins_config": {},
-        # 外置工作流（core/workflow.py）：enabled=false（默认）时用户直接与 LLM 对话
-        # （系统提示词+工具循环，不经节点链）；true 时按 dir 下 <active>.json 声明的
-        # 线性节点链运行（system_prompt/skill/analyze/plan/execute/llm），加载失败
-        # 回退内置默认工作流；设置页"系统"标签可切换 enabled/active，/workflow 命令
-        # 切换即自动启用；编辑器 gui/workflow_editor.py（/workflow edit）。
-        # max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
-        # spin_kill_count：空转计数上限（core/tools.SpinGuard）——重复输出出现才开始
-        # 计数、整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限
+        """外置工作流（core/workflow.py）：enabled=false（默认）时用户直接与 LLM 对话
+        （系统提示词+工具循环，不经节点链）；true 时按 dir 下 <active>.json 声明的线性节点链运行（system_prompt/skill/analyze/plan/execute/llm），
+        加载失败回退内置默认工作流；设置页"系统"标签可切换 enabled/active，/workflow 命令切换即自动启用；
+        编辑器 gui/workflow_editor.py（/workflow edit）。max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
+        spin_kill_count：空转熔断器计数上限（core/tools.SpinGuard）——重复输出出现才开始计数、整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限"""
         "workflow": {
             "enabled": False,
             "dir": "data/workflows",
@@ -188,41 +173,39 @@ def default_config() -> dict:
             "max_rounds": 0,
             "spin_kill_count": 12,
         },
-        # 子代理系统（core/subagent.py）：task 工具派发独立上下文子代理，
+        """子代理系统（core/subagent.py）：task 工具派发独立上下文子代理，
         # query_subagent 查询其工作过程。enabled=false 不注册工具（模型侧不可见）。
         # 全程轨迹落盘 dir/{project_id}/{session_id}/{id}.json；角色=系统提示词
         # persona（agents_dir 下 <role>.json，内置 universal），模型经角色 model
         # 字段指定；工具权限跟随主代理当前访问模式，子代理无确认通道、可申请提权。
         # max_rounds 单次派发轮次上限（配合 workflow.spin_kill_count 空转计数：
         # 重复输出才计数、全新结果清零，计满终止）；result_char_cap 结果摘要字符上限；
-        # query_default_rounds 查询默认轮数；max_concurrent 同轮并行派发上限（超出排队等槽）
+        # query_default_rounds 查询默认轮数；max_concurrent 同轮并行派发上限（超出排队等槽）"""
         "subagent": {
             "enabled": True,
             "dir": "data/subagents",
             "agents_dir": "data/agents",
             "max_rounds": 20,
-            "result_char_cap": 3000,
+            "result_char_cap": 3200,
             "query_default_rounds": 3,
             "max_concurrent": 3,
         },
-        # 工具执行层（core/tools.py）：max_timeout 为模型传入 timeout 参数的
-        # 钳制上限（execute_command/run_program），防止模型传超大值绕过卡死兜底；
-        # ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟；
-        # 数字配置 >0 视为开）；default_shell 为 execute_command 默认执行器
-        # （core/shells.py：cmd/git_bash/powershell，执行时可用 shell 参数单次覆盖，
-        # 执行器未安装直接报错不静默切换；默认 cmd 为系统自带，Git Bash 需自行安装）
+        """工具执行层（core/tools.py）：
+        max_timeout 为模型传入 timeout 参数的钳制上限（execute_command/run_program），防止有豆包级模型传个9999999；
+        ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟；数字配置 >0 视为开）；
+        default_shell 为 execute_command 默认执行器core/shells.py：cmd/git_bash/powershell，执行时可用 shell 参数单次覆盖，执行器未安装直接报错不静默切换）"""
         "tools": {
-            "max_timeout": 600,
+            "max_timeout": 1200,
             "ask_user_timeout": True,
             "default_shell": "cmd",
         },
-        # MCP 客户端（core/mcp.py）：把外部 MCP 服务器的工具桥接进本机工具循环。
+        """MCP 客户端（core/mcp.py）：把外部 MCP 服务器的工具桥接进本机工具循环。参考了HelloAgent的实现。
         # enabled=false 不连接不注册（模型侧完全不可见）。servers 每项：stdio 用
         # command/args/env/cwd；远程用 url + headers（transport=http|sse，留空自动
         # 推断：/sse 结尾走 sse，其余 streamable HTTP）。timeout 单条调用超时秒数
         # （0 用全局 call_timeout）；include/exclude_tools 按原始工具名过滤。
         # 注册名 mcp__<服务器>__<工具>（超长/非法字符自动规范化加哈希后缀）；
-        # 权限默认逐次确认，「始终允许」指纹不含参数（mcp|<server>|<tool>）。
+        # 权限默认逐次确认，「始终允许」指纹不含参数（mcp|<server>|<tool>）。"""
         "mcp": {
             "enabled": False,
             "servers": {},
@@ -231,12 +214,12 @@ def default_config() -> dict:
             "call_timeout": 600,
             "auto_reconnect": True,
         },
-        # 回合快照与回收站（core/snapshot.py）：write/edit_file/delete_file
+        """回合快照与回收站（core/snapshot.py）：write/edit_file/delete_file
         # 改动前留底原始字节，回合末落盘 data/snapshots/{project}/{session}/{序号}/，
         # /undo 校验 md5 后字节级还原（用户事后改过的文件跳过）；回合开始轻量清单
         # （不含内容）回合末对账，execute_command 等绕过写入工具的改动仅列出无法还原。
         # trash_dir 项目回收站：delete_file 移入、/clear-trash 真正清空。
-        # inventory_max_files 清单文件数上限（0=禁用对账；超限本回合放弃对账）
+        # inventory_max_files 清单文件数上限（0=禁用对账；超限本回合放弃对账）"""
         "snapshot": {
             "enabled": True,
             "dir": "data/snapshots",
@@ -320,31 +303,32 @@ DEFAULT_MAX_TOKENS = 32768        # 32k
 DEFAULT_MODALITIES = ["text"]
 FULL_MODALITIES = ["text", "vision", "audio", "video"]
 
+# 一大串模型预置表，用于自动填写一些模型的参数
 MODEL_PRESET_RULES = [
-    # —— DeepSeek V4+：V4.1 额外支持图片，其余按纯文本预置 ——
+    # 蓝色大肥鱼
     (r"deepseek[-_ ]?v4[._-]1(?:\b|[-_])", 1000000, 384000, ["text", "vision"], "high"),
     (r"deepseek[-_ ]?v(?:4(?:\.\d+)?|[5-9]\d*(?:\.\d+)?)(?:\b|[-_])", 1000000, 384000, ["text"], "high"),
-    # —— OpenAI GPT 5.6+（含 6.x 及以上主版本）——
+    # 白色大肥龙
     (r"gpt[-_ ]?(?:5[._-](?:6|[7-9]\d*|\d{2,})|[6-9](?:[._-]\d+)?)(?:\b|[-_])", 1050000, 256000, ["text", "vision"], "high"),
-    # —— Google Gemini 全系列：文本、图片、音频、视频 ——
+    # 哈基米
     (r"gemini(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, FULL_MODALITIES, "none"),
-    # —— GLM 5.2+；5.3 Flash 全模态，普通 5.3 图片，其他版本纯文本 ——
+    # 代码在自己上传
     (r"glm[-_ ]?5[._-]3[-_ ]?flash(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, FULL_MODALITIES, "high"),
     (r"glm[-_ ]?5[._-]3(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
     (r"glm[-_ ]?5[._-](?:2|[3-9]\d*|\d{2,})(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text"], "high"),
-    # —— Anthropic Claude 4.5+ ——
+    # A/
     (r"claude(?:[-_ ][a-z0-9]+)*[-_ ]4[-_.-]5(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
     (r"claude(?:[-_ ][a-z0-9]+)*[-_ ]4[-_.-](?:[6-9]\d*|\d{2,})(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
     (r"claude(?:[-_ ][a-z0-9]+)*[-_ ][5-9](?:[._-]\d+)?(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
-    # —— Kimi K3 ——
+    # Kimi
     (r"kimi[-_ ]?k3(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
-    # —— SpaceBunny ——
+    # wb的匿名模型
     (r"space[-_ ]?bunny(?:\b|[-_])", 1000000, DEFAULT_MAX_TOKENS, ["text", "vision"], "none"),
-    # —— Qwen 3.5+ ——
+    # Qwen
     (r"qwen[-_ ]?3[._-]5(?:\b|[-_])", 256000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
     (r"qwen[-_ ]?3[._-](?:[6-9]\d*|\d{2,})(?:\b|[-_])", 256000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
     (r"qwen[-_ ]?[4-9](?:[._-]\d+)?(?:\b|[-_])", 256000, DEFAULT_MAX_TOKENS, ["text", "vision"], "high"),
-    # —— 仍保留的已知旧型号预置；未命中这些规则的模型走统一回退 ——
+    # 老东西
     (r"gpt-4\.1\b", 1047576, 32768, ["text", "vision"], "high"),
     (r"gpt-4o\b", 128000, 16384, ["text", "vision"], "medium"),
     (r"gpt-4-turbo\b", 128000, 4096, ["text"], "none"),
@@ -1036,7 +1020,7 @@ class Config:
 
     @property
     def mode(self) -> str:
-        """访问模式（单一事实源 data.ui.mode）。
+        """访问模式
 
         策略判定（llm.evaluate_tool）、UI 显示（TuiApp.mode）与重启恢复共用此值；
         切换入口（Shift+Tab、设置页、/mode 命令）均经本属性落盘同步。

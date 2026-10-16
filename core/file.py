@@ -78,7 +78,7 @@ def _scan_dir(folder: Path, root: Path, query: str, items: List[dict], limit: in
             if not entry.is_file(follow_symlinks=False):
                 continue
             if limit and len(items) >= limit:
-                continue  # 已截断：不再收文件，但目录仍计入待展开（more 为真）
+                continue  # 已截断：不再收文件，但目录仍计入待展开
             if entry.stat().st_size > MAX_FILE_BYTES:
                 continue
         except OSError:
@@ -100,7 +100,7 @@ def scan_candidates(prefix: str = "", workspace=None, depth: int = 1, limit: int
     """按目录层级分级扫描候选：depth=1 只扫工作区根目录，逐级下钻。
 
     返回 {"items": 候选列表, "more": 是否还有更深层目录未展开}。"""
-    root = workspace_path(workspace)
+    root = workspace_path(workspace)    
     query = str(prefix or "").replace("\\", "/").strip().lower()
     limit = max(0, int(limit))
     max_depth = None if depth is None else max(1, int(depth))

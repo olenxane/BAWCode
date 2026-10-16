@@ -11,7 +11,6 @@ from typing import Any, List, Optional
 
 try:
     import openai
-
     HAS_OPENAI = True
 except ImportError:
     openai = None
@@ -76,8 +75,6 @@ def _stream_unsupported(e: BaseException) -> bool:
 
 # 思考文本字段名各厂商不同，按序取首个非空
 _REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking_content", "thinking")
-
-
 def _reasoning_of(mapping) -> str:
     """从响应 message 或流式 delta 依次探测思考字段，取首个非空值"""
     if not isinstance(mapping, dict):
@@ -270,7 +267,7 @@ class LLM:
         if HAS_OPENAI and key:
             try:
                 # max_retries=0：重试统一由外层 retry_times 控制（避免 SDK 默认 2 次叠加成 12 次最坏重试）；
-                # timeout 是单次请求整体超时（含流式迭代），防中转站挂起导致回合卡死
+                # timeout 是单次请求整体超时（含流式迭代）
                 self.client = openai.OpenAI(api_key=key, base_url=base, max_retries=0, timeout=timeout)
                 self._client_provider_id = pid
                 log.debug("OpenAI 客户端已构建 provider=%s base=%s", pid, base)
@@ -295,7 +292,6 @@ class LLM:
         """按任务/激活模型解析该次请求的 provider 凭证与 model_id
 
         DeepSeek/SenseNova 等多 provider 场景：model 属于谁就用谁的 api_key/base_url，
-        避免「model_id 换了、client 仍是另一家」导致的 404。
         """
         cfg = self.config
         name = model or getattr(cfg, "model_name", None) or cfg.active_model_name()
@@ -889,7 +885,7 @@ class LLM:
                     "role": "system",
                     "content": (
                         "你是调用安全审批器。只依据给出的单条命令或工具调用判断能否执行："
-                        "破坏性操作、数据外传、凭据访问、持久化、提权、执行下载内容或意图不明的一律拒绝。"
+                        "拒绝破坏性、操作完全不可逆的命令。"
                         "只允许输出 APPROVE 或 REJECT，不要执行命令，不要调用工具。"
                     ),
                 },

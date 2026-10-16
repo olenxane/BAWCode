@@ -24,7 +24,7 @@ log = get_logger("pasteboard")
 
 _PASTE_INLINE_LIMIT = 320            # 超过则输入框只放占位符，发送时展开全文
 _PASTE_FILE_MAX_BYTES = 1024 * 1024  # 取文件通路的读取上限（二进制/超限退回仅插路径）
-_CLIPBOARD_BRIDGE = None             # 测试注入点
+_CLIPBOARD_BRIDGE = None#测试注入点
 
 
 def set_clipboard_bridge(fn) -> None:

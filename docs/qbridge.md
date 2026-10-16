@@ -62,15 +62,3 @@ QQ 侧应答**不设超时**——终端会一直等待，直到：
 | sync_tools | true | 工具活动行同步 |
 | sync_system | true | 系统消息同步 |
 | max_len | 2000 | 单条消息长度上限（分段发送） |
-
-## 依赖与实现说明
-
-- 依赖 `websockets>=13`（requirements.txt 已声明；缺失时插件正常装载、`/qbridge` 给出安装提示）。
-- OneBot 11 消息格式：接收优先 `message` 数组段，退回 `raw_message` CQ 码解析；发送用消息链数组（text / image 段，图片支持 `base64://` 与 `file://` URI，NapCat/LLOneBot/Lagrange 均支持）。
-- 依赖的宿主扩展点：`tool_confirm` / `ui_request`（新增，交互弹窗代答）/ `message_added`（新增，会话消息观察）/ `after_turn` / `before_tool`；`ctx.submit_turn` / `ctx.notify`。宿主较旧时相应能力静默降级。
-- 与 remote-control 插件同时启用工具确认代答时，两者按 hook 注册顺序竞争（都online时先注册者先答），建议按需二选一开启 `confirm_via_qq` / `remote_confirm`。
-- 已知限制：busy 期间 QQ 排队消息与终端消息交错时，图文对应可能错位（两条 FIFO 各自独立）；其他插件经 `before_turn` 改写注入文本时，回声过滤可能失配一次（多回显一条，无害）。
-
-## e2e
-
-`develop/test_qbridge_e2e.py`：内置假 OneBot WS 服务端 + mock LLM 走真实回合管线，覆盖连接/取号、双向文本、图片链、确认与选择框代答、手动接管、白名单/只读、防回声、off/on 重连与 teardown。

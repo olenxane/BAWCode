@@ -1,4 +1,25 @@
 #该脚本负责Agent的记忆部分，包含：1.llm参与的上下文压缩2.工具调用记录管理（白名单保留/回合末剥离/结果外置磁盘）3.长期记忆写入配置4.在agent对话时提供记忆补充内容
+"""
+上下文管理机制：
+    1. 行内限额 + 结果外置
+        每次工具调用生成call_id，description（目的概述），随消息保存
+        单条结果有行内 token 上限：普通工具4096tok，读写工具为32k
+        超限部分写入data/toolcalls/{project_id}/{session_id}/，行内只保留部分未截断头部内容和剥离文件指针，在需要时模型可回读
+    2. 回合中轻量维护
+        在每次llm请求前进行的轻量级上下文维护，仅保留部分调用历史，保留的部分为：
+            最近12轮常规工具调用
+            同一份文件最近n次read调用
+
+        未保护的非白名单结果就地改写为简明记录。激进模式下read/write的剥离频率会更高
+    3. 回合末剥离
+        白名单（默认 7 个计划/步骤/记忆类工具）完整跨回合保留；累计超32k时最老未保护项先外置。被剥的read记录会追加编辑新鲜度路标（为了避免幻觉）
+        非白名单：content 改写为"[已省略·工具名] description call_id=… 完整输出: 路径"，消息本体保留
+        额外：小于128 字符的短结果不剥（感觉收益不高）
+        激进模式额外按工具轮次，read文件路径，本轮write规则整理
+        思维链
+    4. LLM上下文压缩
+        达到压缩阈值时触发
+        """
 import hashlib
 import html
 import json
@@ -37,7 +58,6 @@ _IMAGE_MIME = {
 }
 _IMAGE_MAX_BYTES = 4 * 1024 * 1024  # 单图原始字节上限（base64 后约 5.4MB，兼容主流网关请求体限制）
 _IMAGE_MAX_COUNT = 4                # 单条工具结果最多携带图片数
-# 预算估算时单张图片的粗略 token 计价
 _IMAGE_TOKEN_ESTIMATE = 768
 
 
@@ -112,7 +132,7 @@ _COMPRESS_RETRY_HINT = (
 def parse_state_snapshot(text: str) -> Optional[dict]:
     """解析压缩模型输出的 <state_snapshot> 结构；返回 {"sections": dict, "xml": str} 或 None
 
-    容错：剥除首尾代码围栏与 <analysis> 草稿块（参考 qwen-code 的草稿-定稿两段式）；
+    剥除首尾代码围栏与 <analysis> 草稿块（参考 qwen-code 的草稿-定稿两段式）；
     至少 3 个节非空才认定有效——防止模型原样回显模板注释产出的空壳结构。
     """
     if not text or not text.strip():
@@ -152,7 +172,6 @@ def init_session(config, project_identity_data: Optional[dict] = None) -> "Memor
     """初始化全局记忆会话"""
     global _session
     _session = Memory(config, project_identity=project_identity_data)
-    # session_start 观察链：处理函数异常已在 hooks 内隔离
     hooks.collect_hook(
         "session_start",
         {
@@ -300,7 +319,7 @@ class Memory:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
 
     def _migrate_legacy_json(self) -> None:
-        """旧 memory.json 的 facts/notes 迁入记忆文件（幂等）。
+        """旧 memory.json 的 facts/notes 迁入记忆文件
 
         已落入文件的条目同步从内存清除，防止 save_longterm 把它们原样写回
         memory.json（否则下次启动重复注入，md 文件永远无法退役）；有残留则
@@ -810,10 +829,9 @@ class Memory:
         return message
 
     def mid_turn_maintenance(self) -> None:
-        """回合中工具结果维护：每次 LLM 请求前收敛早期的工具输出，防止单回合内
-        上下文无界膨胀。thinking 不在此处剥离——模型回合中推理需要思维痕迹。
+        """回合中工具结果维护：每次 LLM 请求前收敛早期的工具输出，防止单回合内上下文无界膨胀
 
-        保护集（回合末规则的回合中收紧版，幂等，原文均有 persist 落盘可回读）：
+        保护集：
         - strip_keep_recent 指定的最近工具条数（read/write 在激进模式下不受此保护）
         - 最近 mid_turn_keep_tool_rounds 个工具轮（仅保护其中的非 read/write 结果，
           与回合末口径一致，探索性读写在窗口外允许被剥）
@@ -1005,7 +1023,7 @@ class Memory:
         """把单条 tool 消息改写为简明记录（description+call_id+落盘路径）；返回是否改写"""
         content = message.get("content") or ""
         text = content_text(content)
-        # 带图片的记录不受短文本守卫保护：图片滞留上下文的代价远高于一条短记录
+        # 带图片的记录不受短文本守卫保护
         if not force and len(text) < _CONCISE_CONTENT_CHARS and not count_image_parts(content):
             return False
         if not message.get("persisted"):
@@ -1048,7 +1066,7 @@ class Memory:
                 and not message.get("stripped")
                 and index not in protected_indexes
             ):
-                # 图片块 token 计数器看不见，按常数计入预算防图片记录挤占上下文
+                # 图片块按常数计入预算防图片记录挤占上下文
                 tokens = toolstore.count_tokens_safe(content_text(message.get("content") or ""), model)
                 tokens += _IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
                 entries.append((index, tokens))
@@ -1198,7 +1216,7 @@ class Memory:
         return ""
 
     def _archive_old_segment(self, old_segment: List[dict]) -> Optional[Path]:
-        """旧段原文归档落盘（内存替换后原文仅存于此）；失败不阻塞压缩"""
+        """旧段原文归档落盘；失败不阻塞压缩"""
         try:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")

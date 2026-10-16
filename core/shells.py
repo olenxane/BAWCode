@@ -300,8 +300,7 @@ Write-Output ($targets -join "`n")
 """
 
 _PS_DETECT_SCRIPT = "\n".join([
-    # 统一 UTF-8：stdin 按 UTF-8 解码、stdout 按 UTF-8 输出，避免中文在代码页间乱码；
-    # 关进度输出，避免 CLIXML 噪音混进 stderr
+    # 统一 UTF-8：stdin 按 UTF-8 解码、stdout 按 UTF-8 输出，避免中文在代码页间乱码；关进度输出，避免 CLIXML 噪音混进 stderr
     "$ProgressPreference = 'SilentlyContinue'",
     "$ErrorActionPreference = 'Stop'",
     "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",

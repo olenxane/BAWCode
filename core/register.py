@@ -1,4 +1,4 @@
-#该文件实现一个工具装饰器的注册，将工具独立出来，便于后续导入和增加工具，使程序插件化
+#该文件实现工具装饰器的注册，是插件系统的基础
 import time
 from typing import Any, Callable, Dict, List, Optional
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""工作流编辑器（PySide6 最小原型）。
+"""工作流编辑器（PySide6）。
 
 用法: python -m gui.workflow_editor [工作流名]
 

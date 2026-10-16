@@ -205,6 +205,7 @@ def readonly_compound_cmd(cmd: str, shell: str = "") -> bool:
     if segs is None:
         return False
     return bool(segs) and all(readonly_simple_cmd(s) for s in segs)
+#匹配拦截命令
 _DANGEROUS_CMD_RE = re.compile(
     r"""(?xi)
     (?:

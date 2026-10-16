@@ -33,8 +33,8 @@ DEFAULT_TIMEOUT = 320
 MAX_TIMEOUT = 3200
 
 # 文件工具输出防护参数
-_READ_MAX_LINES = 2000       # read 单次返回行数上限，防大文件拖爆上下文，续读用 offset 分页
-_READ_MAX_LINE_CHARS = 2000  # read 单行字符上限，防超长单行炸上下文
+_READ_MAX_LINES = 2200       # read 单次返回行数上限，防大文件拖爆上下文，续读用 offset 分页
+_READ_MAX_LINE_CHARS = 1600  # read 单行字符上限，防超长单行炸上下文
 
 
 def _max_tool_timeout() -> int:

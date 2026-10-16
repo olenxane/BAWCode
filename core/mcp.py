@@ -1,4 +1,4 @@
-#MCP（Model Context Protocol）客户端桥接：把外部 MCP 服务器的工具接入本机工具循环
+#MCP（Model Context Protocol）客户端桥接：把外部 MCP 服务器的工具接入本机工具循环，参考了helloagent的设计
 #设计见 docs/mcp-integration.md。要点：
 #- 全部 MCP IO 跑在一个 daemon 事件循环线程里，同步侧经 run_coroutine_threadsafe 桥接，
 #  不改动 BAWCode 纯同步 + threading 的整体模型（信号处理只在主线程，loop 线程无此需求）

@@ -5,21 +5,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from core.log import get_logger
-
 log = get_logger("commands")
-
 _ROOT = Path(__file__).resolve().parent.parent
-
 _handlers: Dict[str, Callable] = {}
 _metas: Dict[str, dict] = {}
 _aliases: Dict[str, str] = {}
-# 插件覆盖同名内建命令时的原条目留底：插件卸载后恢复（与 register 的机制同构）
+# 插件覆盖同名内建命令时的原条目留底：插件卸载后恢复
 _overridden: Dict[str, dict] = {}
 # 命令参数补全器：name -> fn(config, arg) -> list[dict]
 _ARG_COMPLETERS: Dict[str, Callable] = {}
-# 补全器来源归属：name -> source（插件卸载时仅注销自己注册的补全器）
+# 补全器来源归属：name -> source
 _ARG_COMPLETER_SOURCES: Dict[str, str] = {}
-
 
 def _normalize(name: str) -> str:
     name = (name or "").strip()
@@ -53,11 +49,13 @@ def _filter_arg_items(items: List[dict], arg: str) -> List[dict]:
     return out
 
 
+#各个命令的补全函数大合集
+
 def _complete_mode(config, arg: str) -> List[dict]:
     rows = [
         ("confirm", "手动确认 · 非安全操作逐次确认"),
-        ("edit", "自动接收编辑 · 自动放行文件写入/编辑"),
-        ("auto", "自动模式 · 安全调用自动放行，其余由 LLM 审批"),
+        ("edit", "自动接受 · 自动放行文件写入/编辑"),
+        ("auto", "自动模式 · 由LLM替我审批")
         ("full", "完全访问 · 全部放行"),
     ]
     items = [{"name": f"/mode {m}", "hint": h, "source": "arg", "callable": True} for m, h in rows]
@@ -158,8 +156,7 @@ def set_handler(name: str, handler: Callable, source: str = "runtime") -> None:
     if not key or handler is None:
         return
     if source.startswith("plugin:") and key in _handlers and key not in _overridden:
-        # 插件覆盖真实存在的同名命令：留底原条目，插件卸载时恢复
-        # （仅首次覆盖留底；空桩与同来源重注册不留底）
+        # 插件覆盖真实存在的同名命令：留底原条目，插件卸载时恢复（仅首次）
         _overridden[key] = {
             "meta": dict(_metas[key]) if key in _metas else None,
             "handler": _handlers[key],
@@ -288,10 +285,6 @@ def remove_source(source: str) -> List[str]:
 
 def complete(prefix: str, limit: int = 220, config: Any = None) -> List[dict]:
     """命令名 + 参数补全
-
-    - `/mo` → 命令名补全
-    - `/mode ` 或 `/mode a` → 参数补全（confirm/edit/auto/full）
-    - `/model deep` → 模型名补全（model_name 优先于 provider_id）
     - 插件可用 register_arg_completer 扩展任意命令参数
     """
     raw = (prefix or "")
@@ -332,7 +325,7 @@ def complete(prefix: str, limit: int = 220, config: Any = None) -> List[dict]:
     exact_prefix.sort(key=lambda x: (len(x.get("name", "")), x.get("name", "")))
     substring.sort(key=lambda x: (len(x.get("name", "")), x.get("name", "")))
     items = exact_prefix + substring
-    # 有参数补全器的命令：在命令名精确命中后追加首条参数建议，便于一次 Tab 看到参数
+    # 有参数补全器的命令：在命令名精确命中后追加首条参数建议
     if not has_arg_sep:
         expanded = list(items)
         for item in list(items):

@@ -1,6 +1,8 @@
 #分级日志模块：debug/info/warn/error 四级，写入 data/log/ 按天分文件
 #粒度由 config.json 的 "log" 段控制：level 全局阈值，modules 按模块覆盖
+#环境变量 BAW_LOG_KEYINPUT=1 强制打开 keyinput 模块的 debug 逐键诊断
 import json
+import os
 import sys
 import threading
 import time
@@ -32,6 +34,10 @@ _fh_day = ""
 
 _loggers: dict = {}
 
+# 逐键诊断开关：BAW_LOG_KEYINPUT=1 时 keyinput 模块按 debug 输出（init() 内亦会叠加）
+if os.environ.get("BAW_LOG_KEYINPUT") == "1":
+    _module_levels["keyinput"] = _LEVEL_VALUE["debug"]
+
 
 def _normalize_level(value) -> Optional[int]:
     """'debug'/'info'/'warn'/'error'/'off' → 数值；非法返回 None（保持原值）"""
@@ -58,6 +64,8 @@ def init(cfg: Optional[dict], log_dir: Optional[Path] = None) -> None:
       modules: 按模块覆盖，如 {"llm": "debug", "ui": "off"}
       console: 是否同步输出到 stderr（默认 false）
       days_to_keep: 日志保留天数，0 为永久（默认 14）
+
+    环境变量 BAW_LOG_KEYINPUT=1 时 keyinput 模块强制为 debug（逐键诊断开关）。
     """
     global _level_value, _module_levels, _log_dir, _console, _days_to_keep
     cfg = cfg or {}
@@ -72,6 +80,8 @@ def init(cfg: Optional[dict], log_dir: Optional[Path] = None) -> None:
             if target is not None and str(name).strip():
                 cleaned[str(name).strip().lower()] = target
         _module_levels = cleaned
+    if os.environ.get("BAW_LOG_KEYINPUT") == "1":
+        _module_levels["keyinput"] = _LEVEL_VALUE["debug"]
     if log_dir is not None:
         _log_dir = Path(log_dir)
     if "console" in cfg:

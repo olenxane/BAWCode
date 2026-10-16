@@ -1,4 +1,4 @@
-# token 计算：优先 API usage，否则用 tiktoken 真实分词
+# token 计算：优先读取API usage，否则用 tiktoken 真实分词
 from typing import Iterable, List, Optional
 
 try:
@@ -9,7 +9,7 @@ except ImportError:
     tiktoken = None
     HAS_TIKTOKEN = False
 
-# model → encoding 名称（无法按 model 查找时的回落）
+# model → encoding 名称
 _FALLBACK_ENCODING = "cl100k_base"
 
 

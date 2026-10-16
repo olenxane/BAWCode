@@ -1,4 +1,3 @@
-#此文件为ui的渲染交互脚本：无边框分区、主题、确认流程、token状态
 import difflib
 import functools
 import json

@@ -34,8 +34,6 @@ BAWCode 插件系统把 **hook 扩展点、斜杠命令、模型可见工具、�
 
 ## 1. 快速开始
 
-30 秒写一个能用的插件：
-
 **第 1 步**：创建目录 `data/plugins/my-first-plugin/`，放入两个文件。
 
 `plugin.json`：

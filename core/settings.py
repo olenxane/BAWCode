@@ -16,6 +16,7 @@ from core import policy
 from core import shells
 from core.config import (
     THINKING_OPTIONS,
+    init_logging,
     is_auto_filled_model,
     make_model_name,
     model_preset_defaults,
@@ -1705,7 +1706,7 @@ class SettingsPanelMixin:
                 "provider_id": pid,
                 "name": pid,
                 "api_key": "",
-                "base_url": "https://api.openai.com/v1",
+                "base_url": "https://ys.mihoyo.com",
                 "models": [{"model_id": "default"}],
             }
         )

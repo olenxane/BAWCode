@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""回合运行时：一轮回合的执行底座，与工作流节点编排（core/workflow.py）分离。
+"""AgentLoop核心代码
 
 本模块承载与"是否启用工作流"无关的回合执行机制：
   TurnIO / TurnContext  —— UI 桥回调集合与单回合上下文（引擎经此移交交互，不依赖 UI）
@@ -9,8 +9,7 @@
   run_direct            —— 直接对话（工作流未启用）：注入系统提示词后进工具循环
 
 取消/中断抛 TurnInterrupt（调用方按中断语义收尾 _aborted）；回合正常终止
-（用户取消任务/计划未确认/推理出错/轮次上限）抛 TurnStop。依赖单向：
-core.workflow → 本模块；本模块不得 import core.workflow。
+（用户取消任务/计划未确认/推理出错/轮次上限）抛 TurnStop。
 """
 from __future__ import annotations
 
@@ -128,10 +127,8 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
     """工具调用循环：返回 {"status", "content"}
 
     status: complete（模型本轮不再调用工具）/ error / max_rounds。
-    取消/中断抛 TurnInterrupt。轮次用尽且空转计数未满时续期（续期总量受
-    config.workflow.max_total_rounds 兜底保险丝约束，默认 100，正常任务碰不到）：
-    空转计数器（SpinGuard——重复/近似重复输出才开始计数，整轮全新结果清零）计满
-    config.workflow.spin_kill_count 才终止回合，正常推进的回合可以一直跑到保险丝。"""
+    取消/中断抛 TurnInterrupt。轮次用尽且空转计数未满时续期（续期总量受config.workflow.max_total_rounds 兜底保险丝约束，默认为320）：
+    空转计数器（SpinGuard——重复/近似重复输出才开始计数，整轮全新结果清零）计满config.workflow.spin_kill_count 才终止回合"""
     io, session, llm = turn.io, turn.session, turn.llm
     wf_cfg = (getattr(turn.config, "data", None) or {}).get("workflow") or {}
     try:
@@ -154,7 +151,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 io.status("回合终止")
                 return {"status": "max_rounds", "content": ""}
             if spin.spun_out():
-                reason = f"空转计数满 {spin.count} 次（重复输出过多），终止回合"
+                reason = f"空转计数满 {spin.count} 次，判定Agent可能进入错误循环，终止回合"
                 session.add_message("assistant", f"{reason}。")
                 log.warn("%s", reason)
                 io.status("空转终止")
@@ -258,10 +255,14 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             ],
             **thinking_extra,
         )
+        # 同步到 UI 快照：工具确认弹窗期间主线程读 self.messages 渲染树，
+        # 否则本轮 assistant(tool_call) 节点要等下轮 io.status 才出现
+        if turn.app is not None:
+            turn.app.refresh_from_session(session, render=False)
         registered = 0
         round_results = []
         log.debug("第%d轮返回 %d 个工具调用", round_no, len(tool_calls))
-        # task 工具自身已立即提交后台任务；同轮多个 task 自然连续返回，不在此 join
+        #task工具自身已立即提交后台任务；同轮多个task自然连续返回，不在此join
         try:
             for call in tool_calls:
                 check_cancel(turn)
@@ -272,12 +273,12 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     check_cancel(turn)
                     result = llm.execute_approved_tool(call)
                 elif action == policy.LLM_APPROVE:
-                    io.phase(f"LLM 审批中 · {call.get('name')}")
+                    io.phase(f"LLM审批中 · {call.get('name')}")
                     check_cancel(turn)
                     if llm.approve_tool_call(call):
                         result = llm.execute_approved_tool(call)
                     else:
-                        result = {"content": policy.approval_reject_message("LLM 审批拒绝或失败")}
+                        result = {"content": policy.approval_reject_message("LLM审批拒绝或失败")}
                 elif action == policy.CONFIRM:
                     io.phase(f"待确认 · {call.get('name')}")
                     check_cancel(turn)
@@ -322,7 +323,7 @@ def run_direct(turn: TurnContext) -> str:
     skills_mod.set_injection(enabled=None, allow=None)
     ensure_system_prompt(turn)
     turn.io.status("执行步骤")
-    # config.workflow.max_rounds >0 时全局覆盖（与 execute 节点的"设置页最大工具轮数"语义一致）
+    # config.workflow.max_rounds >0 时全局覆盖
     max_rounds = _DIRECT_EXECUTE_NODE["max_rounds"]
     wf_cfg = (getattr(turn.config, "data", None) or {}).get("workflow") or {}
     try:

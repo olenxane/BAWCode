@@ -2,6 +2,7 @@
 """渲染器：主题/ANSI 工具、会话树与分区布局、滚动条、选区、代码高亮。
 渲染方法以混入类 RenderMixin。TuiApp 的状态由 ui.py 持有，本模块只读取/产出屏幕内容。
 """
+
 from __future__ import annotations
 
 import difflib
@@ -101,7 +102,7 @@ _TURN_TOKENS_REFRESH = 2.0
 # 带后缀的阶段（如「工具调用中 · read」）轮换基名文案、保留后缀；未登记的阶段按原样显示
 _PHASE_POOLS = {
     "思考中": _THINKING_PHRASES,
-    "工具调用中": ("调用工具中", "等待工具返回", "处理工具输出"),
+    "工具调用中": ("调用工具中", "敲打工具中", "正在对工具进行深度求索"),
     "待确认": ("等待确认", "等待你的决定"),
 }
 
@@ -986,18 +987,42 @@ def _oneline(text: str, limit: int = 80) -> str:
     plain = _ANSI_RE.sub("", str(text or "")).replace("\n", " ")
     return plain if len(plain) <= limit else plain[:limit] + "…"
 
-def _git_branch() -> str:
-    # 项目即进程启动目录（与 ensure_project_identity(Path.cwd()) 同源）
+def _read_head(gitdir: Path) -> str:
+    """读 <gitdir>/HEAD，返回分支名或短 hash；读不到返回空串"""
     try:
-        head = Path.cwd() / ".git" / "HEAD"
-        if head.exists():
-            ref = head.read_text(encoding="utf-8", errors="replace").strip()
-            if ref.startswith("ref:"):
-                return ref.split("/")[-1] or "main"
-            return ref[:7] if ref else "main"
+        head = gitdir / "HEAD"
+        if not head.exists():
+            return ""
+        ref = head.read_text(encoding="utf-8", errors="replace").strip()
+        if ref.startswith("ref:"):
+            return ref.split("/")[-1] or ""
+        return ref[:7] if ref else ""
     except OSError:
-        pass
-    return "main"
+        return ""
+
+
+def _git_branch() -> str:
+    """从 cwd 向上找 .git 目录/文件，返回当前分支名；找不到仓库返回空串。
+
+    .git 为文件时是 worktree/子模块（内容是 "gitdir: <路径>"），按该路径再找 HEAD。
+    """
+    for parent in [Path.cwd(), *Path.cwd().parents]:
+        dotgit = parent / ".git"
+        if dotgit.is_dir():
+            return _read_head(dotgit)
+        if dotgit.is_file():
+            try:
+                line = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                return ""
+            if line.startswith("gitdir:"):
+                gitdir = line[len("gitdir:"):].strip()
+                gitdir = Path(gitdir)
+                if not gitdir.is_absolute():
+                    gitdir = (parent / gitdir).resolve()
+                return _read_head(gitdir)
+            return ""
+    return ""
 
 def load_theme(name: str) -> Dict[str, Any]:
     """载入 data/theme/<name>.json；无效则忽略并回落默认"""
@@ -1643,7 +1668,7 @@ class RenderMixin:
         summary = next((ln.strip() for ln in thinking.splitlines() if ln.strip()), thinking)
         return TreeNode(
             f"think:{message_id}",
-            f"💭 思考 · {_oneline(summary, 60)}",
+            f"思考 · {_oneline(summary, 60)}",
             "thinking",
             default_expanded=False,
             detail=thinking,
@@ -1651,7 +1676,7 @@ class RenderMixin:
 
     @staticmethod
     def _is_compact_tool(name: str, command: str = "") -> bool:
-        return name in ("search", "read") or (
+        return name in ("search", "read", "glob") or (
             name in _TOOL_CMD and bool(re.match(r"^\s*git(?:\s|$)", command))
         )
 
@@ -1665,6 +1690,14 @@ class RenderMixin:
             if "未找到匹配" in content:
                 return "搜索了 1 个模式，读取了 0 个文件"
             return "搜索了 1 个模式"
+        if name == "glob":
+            pattern = str(args.get("pattern") or "")
+            match = re.search(r"找到\s+(\d+)\s+个文件", content)
+            if match:
+                return f"匹配 {match.group(1)} 个文件 · {pattern}"
+            if "未找到匹配文件" in content:
+                return f"匹配 0 个文件 · {pattern}"
+            return f"glob · {pattern}" if pattern else "glob"
         if name == "read":
             path = str(args.get("file_path") or "")
             range_match = re.search(r"第\s*(\d+)\s*[-–]\s*(\d+)\s*行\s*/\s*共\s*(\d+)\s*行", content)
@@ -2045,7 +2078,7 @@ class RenderMixin:
                 continue
             if node.kind == "stream_thinking":
                 # 思考过程（流式进行中）：独立节点，头部 + 折叠时尾部滚动窗 / 展开时全文
-                head_text = f"{_marker(True, expanded)} 💭 思考"
+                head_text = f"{_marker(True, expanded)} 思考"
                 if abs_i == self.tree_cursor and tree_focus:
                     rows.append(self.C_HL + _pad(_clip(f"{indent}{head_text}", width), width) + self.RESET)
                 else:
@@ -2438,9 +2471,14 @@ class RenderMixin:
             policy.MODE_CONFIRM: self.c("accent"),
             policy.MODE_FULL: self.c("err"),
         }.get(self.mode, self.c("accent"))
+        git_seg = (
+            self.c("dim") + f" · git:({self.git_branch}) · " + self.RESET
+            if self.git_branch
+            else self.c("dim") + " · 无git · " + self.RESET
+        )
         info = (
             self.c("accent") + f"→{self.project_name}" + self.RESET
-            + self.c("dim") + f" · git:({self.git_branch}) · " + self.RESET
+            + git_seg
             + self.c("ink") + self.model_name + self.RESET
             + self.c("dim") + " · " + self.RESET
             + mode_c + mode_label + self.RESET

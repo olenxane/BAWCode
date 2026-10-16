@@ -9,11 +9,9 @@
 #   collect_hook —— 观察链：收集所有非 None 返回值组成列表返回。适配
 #                   context_supplement/after_turn/session_start 这类"多方贡献"的扩展点。
 #
-# 每个处理函数带 owner 归属（插件 id），支持按 owner 注销（插件卸载）；单个处理
-# 函数异常被隔离记录，不中断链条。
+# 每个处理函数带 owner 归属（插件 id），支持按 owner 注销（插件卸载）；单个处理函数异常被隔离记录，不中断链条。
 #
-# 与 config.external_apis 的关系：external_apis.<事件>=URL 时自动挂接 HTTP POST
-# 处理函数（owner=external_apis），失败回落本地默认逻辑（返回 None）。
+# 与 config.external_apis 的关系：external_apis.<事件>=URL 时自动挂接 HTTP POST处理函数（owner=external_apis），失败回落本地默认逻辑（返回 None）。
 #
 # 事件目录见 EVENTS 与 docs/plugin-development.md。
 import json

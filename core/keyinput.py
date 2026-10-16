@@ -4,12 +4,6 @@
 公开契约：read_key_event / read_events / read_key / flush_input /
 direction_of + KeyEvent NamedTuple。
 
-数据源：Windows 下强制 ConsoleInputReader 事件记录路径（pt 默认经
-_is_win_vt100_input_enabled 试探切到 Vt100ConsoleInputReader，该路径丢弃
-MOUSE_EVENT 记录——鼠标滚轮/拖拽全断）；其他平台走 pt 的 Vt100 输入路径
-（键盘可用，鼠标不支持）。翻译层 KeyPress → KeyEvent；读取循环后台线程 +
-队列，read_events(0) 非阻塞供拍帧泵。
-
 物理键位：
   Enter        → submit（直接发送）
   Ctrl+Enter   → newline（pt 形态为 Escape+ControlM 序列，此处折叠）
@@ -17,18 +11,15 @@ MOUSE_EVENT 记录——鼠标滚轮/拖拽全断）；其他平台走 pt 的 Vt
   Shift+Enter  → 与 Enter 同形 → submit（事件流固有限制，无法区分）
   Alt+Enter    → newline（同形折叠）
   submit_ctrl 事件不产生：keymap 的 send=ctrl+enter 绑定闲置；
-  如需独立发送键可配置 send=f5 等（Enter 始终发送）。
 """
 from __future__ import annotations
 
-import os
 import queue
 import sys
 import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
 from core.log import get_logger
@@ -40,28 +31,15 @@ class KeyEvent(NamedTuple):
 
 
 TICK = KeyEvent("tick", "")
-Event = KeyEvent  # 别名
+Event = KeyEvent
 
 log = get_logger("keyinput")
 
 _WINDOWS = sys.platform == "win32"
-# 输入层取证日志开关：环境变量 BAW_LOG_KEYINPUT=1 开启（默认关闭）
-_LOG_ON = os.environ.get("BAW_LOG_KEYINPUT") == "1"
-_LOG_PATH = Path(__file__).resolve().parent.parent / "develop" / "pt_input.log"
+# 逐键诊断走 log.debug：config log.modules.keyinput=debug 或 BAW_LOG_KEYINPUT=1 开启
 
 
-def _flog(msg: str) -> None:
-    if _LOG_ON:
-        try:
-            with open(_LOG_PATH, "a", encoding="utf-8") as fh:
-                import datetime
-
-                fh.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S.%f} {msg}\n")
-        except OSError:
-            pass
-
-
-# ----- 翻译层（纯函数，无 TTY 依赖，可直接单测） -----
+# ----- 翻译层 -----
 
 def _hotkey(name: str, ctrl: bool, alt: bool, shift: bool) -> KeyEvent:
     mods = ""
@@ -113,8 +91,7 @@ _PASTE_CONT_WINDOW = 0.3  # 续接窗口秒数
 def _fold_paste_run(presses: List, i: int, n: int, cont: bool = False) -> Optional[Tuple[str, int]]:
     """conhost 粘贴折叠启发式：presses[i:] 起的连续段满足粘贴特征时折叠为单 paste。
 
-    终端拦截 Ctrl+V 后，剪贴板文本以按键记录流到达，与逐键打字同形。批次内
-    连续段满足以下任一特征判为粘贴：
+    终端拦截 Ctrl+V 后，剪贴板文本以按键记录流到达，与逐键打字同形。批次内连续段满足以下任一特征判为粘贴：
       - 段内出现"中部"回车/Tab（非批尾）→ 多行粘贴（否则会逐行提交）
       - 纯可打印字符连续 ≥ _PASTE_BURST_MIN（单行长文本；打字/自动重复在帧泵
         批次里到不了这个量级）
@@ -173,12 +150,12 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
         if key == _K.Escape and nxt is not None:
             if nxt.key == _K.ControlM:
                 out.append(KeyEvent("newline", ""))
-                _flog("fold: esc+c-m -> newline (ctrl+enter)")
+                log.debug("fold: esc+c-m -> newline (ctrl+enter)")
                 i += 2
                 continue
             if _is_char_press(nxt.key, nxt.data):
                 out.append(KeyEvent("char", nxt.key))
-                _flog("fold: esc+%r -> char" % nxt.key)
+                log.debug("fold: esc+%r -> char", nxt.key)
                 i += 2
                 continue
 
@@ -186,7 +163,7 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
         if key == _K.BracketedPaste:
             if data:
                 out.append(KeyEvent("paste", data))
-                _flog("paste data len=%d" % len(data))
+                log.debug("paste data len=%d", len(data))
                 i += 1
                 continue
             text: List[str] = []
@@ -195,7 +172,7 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
                 text.append(presses[j].key)
                 j += 1
             out.append(KeyEvent("paste", "".join(text)))
-            _flog("paste assembled len=%d" % len("".join(text)))
+            log.debug("paste assembled len=%d", len(text))
             i = j
             continue
 
@@ -207,7 +184,7 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
             text, j = folded
             out.append(KeyEvent("paste", text))
             _LAST_PASTE[0] = time.monotonic()
-            _flog("paste folded len=%d cont=%s" % (len(text), cont))
+            log.debug("paste folded len=%d cont=%s", len(text), cont)
             i = j
             continue
 
@@ -215,7 +192,7 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
         if ev is not None:
             out.append(ev)
         else:
-            _flog("drop key=%r data=%r" % (key, data))
+            log.debug("drop key=%r data=%r", key, data)
         i += 1
     return out
 
@@ -223,7 +200,7 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
 def _press_to_event(key, data: str) -> Optional[KeyEvent]:
     # 鼠标
     if key == _K.WindowsMouseEvent:
-        _flog("mouse data=%r" % (data,))
+        log.debug("mouse data=%r", data)
         return _mouse_event(data)
 
     # 枚举键优先（Keys 是 str 混入枚举，必须先于 isinstance(key, str) 判断）
@@ -313,16 +290,14 @@ except ImportError:  # pragma: no cover - 无 prompt_toolkit 时翻译层不可�
     _PASTE_BURST_MIN = 0
 
 
-# ----- 强制事件记录路径（鼠标修复） -----
+# ----- 强制事件记录路径 -----
 
 def _baw_win32_input_cls():
     """构造强制事件记录路径的 Win32Input 子类。
 
-    pt 默认经 _is_win_vt100_input_enabled() 试探（临时设置 ENABLE_VIRTUAL_
-    TERMINAL_INPUT）选择 Vt100ConsoleInputReader——该路径的 _get_keys 只解码
-    KEY_EVENT，MOUSE_EVENT 记录被丢弃（滚轮/滑块拖拽全断）；VT 路径的鼠标
-    需应用主动发 \\x1b[?1000h 上报序列，裸 reader 没有。此处强制回到
-    ConsoleInputReader 事件记录路径：MOUSE_EVENT → WindowsMouseEvent →
+    pt 默认经 _is_win_vt100_input_enabled() 试探（临时设置 ENABLE_VIRTUAL_TERMINAL_INPUT）选择 Vt100ConsoleInputReader
+    ——该路径的 _get_keys 只解码KEY_EVENT，MOUSE_EVENT 记录被丢弃（滚轮/滑块拖拽全断）；
+    VT 路径的鼠标需应用主动发 \\x1b[?1000h 上报序列，裸 reader 没有。此处强制回到ConsoleInputReader 事件记录路径：MOUSE_EVENT → WindowsMouseEvent →
     翻译层；raw_mode 也不再设置输入 VT。
     """
     try:
@@ -339,7 +314,7 @@ def _baw_win32_input_cls():
     return BawWin32Input
 
 
-# ----- 读取循环（后台线程 + 队列，阻塞读键不阻塞 20fps 帧泵） -----
+# ----- 读取循环 -----
 
 class _PtReader:
     def __init__(self) -> None:
@@ -375,13 +350,11 @@ class _PtReader:
             self._raw.__enter__()  # raw 模式与 paused() 的暂挂/恢复配对
             threading.Thread(target=self._pump, daemon=True, name="bawcode-pt-input").start()
             log.info("pt 输入后端启动: %s", type(self._input).__name__)
-            _flog("started reader=%s" % type(self._input).__name__)
         except Exception as exc:
             self.dead.set()
             if self._raw is not None:
                 self._raw.__exit__(None, None, None)
             log.error("pt 输入后端启动失败: %r", exc)
-            _flog("start failed: %r" % (exc,))
 
     def _pump(self) -> None:
         # 两个平台的 read_keys 都不接收超时参数
@@ -403,7 +376,6 @@ class _PtReader:
                     time.sleep(0.01)
         except Exception as exc:  # noqa: B014 - 后台线程兜底
             log.error("pt 读键线程退出: %r", exc)
-            _flog("pump exit: %r" % (exc,))
             self.dead.set()
 
     def read_events(self, timeout: float = 0.02) -> List[KeyEvent]:
@@ -459,7 +431,7 @@ def get_reader() -> "_PtReader":
     return _reader
 
 
-# ----- 公开契约（与 keyinput 函数签名一致） -----
+# ----- 公开契约-----
 
 def read_key_event(timeout: float = 0.02) -> Event:
     return get_reader().read_event(timeout)
