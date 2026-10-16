@@ -38,8 +38,12 @@ from urllib.parse import unquote, urlparse
 
 try:
     from core import plugins as plugins_mod
+    from core import register as register_mod
+    from core import session_store as session_store_mod
 except ImportError:  # 插件目录被单独导入（类型检查等场景）时的防御
     plugins_mod = None
+    register_mod = None
+    session_store_mod = None
 
 try:  # 图片下载（requests 为宿主运行时依赖，正常必然可用）
     import requests
@@ -76,6 +80,10 @@ class _State:
         self.bound_user = ""
         self.self_id = ""           # 机器人 QQ 号（事件帧 / get_login_info 自动获取）
         self.last_error = ""
+        self.reconnect_requested = False
+        self.clear_confirmation = None
+        self.qq_origin = None
+        self.tool_call_targets = {}
 
 
 def setup(ctx):
@@ -129,6 +137,16 @@ def setup(ctx):
     def _app():
         return plugins_mod.runtime().get("app") if plugins_mod else None
 
+    def _session():
+        runner = _runner()
+        return getattr(runner, "session", None) if runner is not None else None
+
+    def _refresh_session(session):
+        app = _app()
+        if app is not None:
+            app.refresh_from_session(session, render=False)
+            app._tree_follow_tail = True
+
     # ---- 发送（hook 线程入队，WS 线程消费）----
 
     def _target_allowed(target: str) -> bool:
@@ -138,11 +156,11 @@ def setup(ctx):
                 return True
             return bool(st.bound_user and st.bound_user in _allowlist() and st.bound == target)
 
-    def _send(target: str, segments: list) -> None:
-        if not target or not segments or not _target_allowed(target):
+    def _send(target: str, segments: list, force: bool = False) -> None:
+        if not target or not segments or (not force and not _target_allowed(target)):
             return
         try:
-            tx.put_nowait({"target": target, "segments": segments})
+            tx.put_nowait({"target": target, "segments": segments, "force": force})
         except queue.Full:
             ctx.log.warn("qbridge 发送队列已满，丢弃消息")
 
@@ -162,6 +180,49 @@ def setup(ctx):
         for chunk in _split_text(text):
             _send(target, [{"type": "text", "data": chunk}])
 
+    def _origin_target(origin: dict) -> str:
+        if origin.get("message_type") == "group" and origin.get("group_id") is not None:
+            return f"group/{origin['group_id']}"
+        return f"private/{origin['user_id']}"
+
+    def _send_reply_to_source(uid: str, message_type: str, group_id, text: str) -> None:
+        target = f"group/{group_id}" if message_type == "group" and group_id is not None else f"private/{uid}"
+        for chunk in _split_text(text):
+            _send(target, [{"type": "text", "data": chunk}], force=True)
+
+    def _tool_send_image(file_path: str, caption: str = "") -> str:
+        suffix = Path(file_path).suffix.lower()
+        if suffix not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+            return "图片路径扩展名不受支持"
+        return _send_tool_attachment("image", file_path, caption)
+
+    def _tool_send_file(file_path: str, caption: str = "") -> str:
+        return _send_tool_attachment("file", file_path, caption)
+
+    def _send_tool_attachment(kind: str, file_path: str, caption: str = "") -> str:
+        if not _enabled():
+            return "QQ桥当前已停用，不能发送附件。"
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            return f"文件不存在或不是普通文件：{path}"
+        with st.lock:
+            origin = st.qq_origin
+        if not origin:
+            return "本回合没有可用的 QQ 发起会话；请从白名单 QQ 消息启动任务后再发送。"
+        segment = {"type": kind, "data": str(path)}
+        if caption:
+            segments = [{"type": "text", "data": caption}, segment]
+        else:
+            segments = [segment]
+        _send(origin["target"], segments, force=True)
+        with st.lock:
+            st.qq_origin = None
+        ctx.notify(f"[QQ桥] Agent 请求发送{('图片' if kind == 'image' else '文件')}到 {origin['target']}：{path.name}")
+        return f"已提交发送到 {origin['target']}：{path.name}"
+
+    def _send_to_target(target: str, segments: list) -> None:
+        _send(target, segments, force=True)
+
     def _send_segments(segments: list) -> None:
         target = _bound_or_none()
         if not target:
@@ -177,6 +238,35 @@ def setup(ctx):
         d = ctx.storage_dir() / "qq-images"
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def _render_tool_image(name: str, args: dict, output: str):
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            ctx.log.warn("qbridge 工具改动图片发送需要 Pillow")
+            return None
+        source = str(args.get("new_str") or args.get("content") or output)
+        if name == "edit_file":
+            old_lines = [f"- {line}" for line in str(args.get("old_str") or "").splitlines()]
+            new_lines = [f"+ {line}" for line in str(args.get("new_str") or "").splitlines()]
+            source = "\n".join(old_lines + new_lines)
+        lines = (source[:6000].splitlines() or [""])[:140]
+        filename = str(args.get("file_path") or "")
+        try:
+            font = ImageFont.truetype("msyh.ttc", 18)
+        except OSError:
+            font = ImageFont.load_default()
+        padding, line_height, title_height = 24, 24, 48
+        width = min(1400, max(720, max((len(line) for line in lines), default=0) * 11 + padding * 2))
+        height = title_height + len(lines) * line_height + padding * 2
+        image = Image.new("RGB", (width, height), "#171923")
+        draw = ImageDraw.Draw(image)
+        draw.text((padding, padding), f"{name} · {filename}", fill="#79c0ff", font=font)
+        for index, line in enumerate(lines):
+            draw.text((padding, title_height + index * line_height), line[:160], fill="#e6edf3", font=font)
+        path = _img_dir() / f"tool-preview-{uuid.uuid4().hex[:10]}.png"
+        image.save(path, format="PNG")
+        return path
 
     def _fetch_image(ref: str):
         """图片引用 → 本地路径（http(s) 下载；file:// 或本地路径直接使用）"""
@@ -231,7 +321,12 @@ def setup(ctx):
         if not _enabled():
             return
         text = str(payload.get("response") or "").strip()
-        if text:
+        with st.lock:
+            origin = st.qq_origin
+            st.qq_origin = None
+        if text and origin:
+            _send_reply_to_source(origin["user_id"], origin["message_type"], origin.get("group_id"), text)
+        elif text:
             _send_text(text)
 
     def _on_before_tool(payload):
@@ -244,6 +339,40 @@ def setup(ctx):
         except (TypeError, ValueError):
             arg_line = _oneline(str(args))
         _send_text(f"🔧 {name} {arg_line[:200]}".rstrip())
+        if name in ("write", "edit_file"):
+            session = _session()
+            call_id = ""
+            if session is not None:
+                for message in reversed(session.messages):
+                    if message.get("role") == "assistant" and message.get("tool_calls"):
+                        call_id = next((str(call.get("id") or "") for call in message.get("tool_calls", [])
+                                        if isinstance(call, dict) and str(call.get("name") or "") == name), "")
+                        if call_id:
+                            break
+            with st.lock:
+                if st.qq_origin and call_id:
+                    st.tool_call_targets[call_id] = dict(st.qq_origin)
+
+    def _on_after_tool(payload):
+        if not _enabled() or not _cfg_bool("sync_tool_images", True):
+            return
+        name = str(payload.get("name") or "")
+        if name not in ("write", "edit_file"):
+            return
+        call_id = str(payload.get("call_id") or "")
+        with st.lock:
+            origin = st.tool_call_targets.pop(call_id, None)
+        if not origin:
+            return
+        output = str(payload.get("output") or "")
+        if not re.search(r"(?:写入成功|位置写入成功|编辑成功)", output):
+            return
+        image_path = _render_tool_image(name, payload.get("args") or {}, output)
+        if image_path:
+            _send_to_target(origin["target"], [
+                {"type": "text", "data": f"📝 {name} 改动预览"},
+                {"type": "image", "data": str(image_path)},
+            ])
 
     def _on_message_added(payload):
         if not _enabled():
@@ -273,7 +402,35 @@ def setup(ctx):
 
     ctx.register_hook("after_turn", _on_after_turn)
     ctx.register_hook("before_tool", _on_before_tool)
+    ctx.register_hook("after_tool", _on_after_tool)
     ctx.register_hook("message_added", _on_message_added)
+
+    def _register_attachment_tools():
+        ctx.register_tool(
+            name="qbridge_send_image",
+            description="将本机图片文件发送到本回合发起 QQ 会话。仅在任务由 QQ 消息发起时可用。",
+            usage="qbridge_send_image(file_path, caption)",
+            schema={"type": "object", "properties": {
+                "file_path": {"type": "string", "description": "本机图片路径"},
+                "caption": {"type": "string", "description": "可选图片说明"},
+            }, "required": ["file_path"]},
+        )(_tool_send_image)
+        ctx.register_tool(
+            name="qbridge_send_file",
+            description="将本机文件发送到本回合发起 QQ 会话。文件内容会外发，请仅发送用户要求分享的文件。",
+            usage="qbridge_send_file(file_path, caption)",
+            schema={"type": "object", "properties": {
+                "file_path": {"type": "string", "description": "本机文件路径"},
+                "caption": {"type": "string", "description": "可选文件说明"},
+            }, "required": ["file_path"]},
+        )(_tool_send_file)
+
+    _register_attachment_tools()
+    if register_mod is not None:
+        def _remove_attachment_tools():
+            register_mod.unregister_owner(ctx.plugin_id)
+
+        ctx.register_teardown(_remove_attachment_tools)
 
     # ---- 交互等待：无 QQ 超时，终端提交新消息即手动接管 ----
 
@@ -525,6 +682,121 @@ def setup(ctx):
                     pass
             _send_text(result)
 
+    def _handle_qq_command(text: str, uid: str, message_type: str, group_id=None) -> bool:
+        command = text.strip()
+        if not command.startswith("/") and command not in ("帮助", "状态", "解绑", "重连") and not command.startswith("绑定 "):
+            return False
+        if command.startswith("/"):
+            parts = command.split(maxsplit=1)
+            op = parts[0].lower()
+            arg = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            op = {"帮助": "/help", "状态": "/status", "解绑": "/unbind", "重连": "/reconnect"}.get(command, "/bind" if command.startswith("绑定 ") else "")
+            arg = command[3:].strip() if command.startswith("绑定 ") else ""
+        if op in ("/help", "/qbridge"):
+            reply = "QQ桥指令：/help /status /bind private/<id> /bind group/<id> /unbind /reconnect /new /rename <标题> /sessions /resume <id> /clear /clear confirm\n图片/文件：qbridge_send_image、qbridge_send_file（由 Agent 在任务中调用）"
+        elif op in ("/status",):
+            reply = _status_line()
+        elif op in ("/unbind",):
+            if str(_cfg("target") or "").strip():
+                reply = "当前同步目标由配置项 target 固定，请先在终端清空配置后再解绑。"
+            else:
+                with st.lock:
+                    st.bound = ""
+                    st.bound_user = ""
+                reply = "已解除同步目标绑定。"
+        elif op in ("/bind",):
+            target = arg
+            if not re.fullmatch(r"(private|group)/\d+", target):
+                reply = "格式错误。用法：/bind private/<QQ号> 或 /bind group/<群号>"
+            elif str(_cfg("target") or "").strip():
+                reply = "当前同步目标由配置项 target 固定，请在终端修改配置后再绑定。"
+            else:
+                with st.lock:
+                    st.bound = target
+                    st.bound_user = uid
+                reply = f"已绑定同步目标 {target}"
+        elif op == "/reconnect":
+            with st.lock:
+                ws = st.ws
+                running = st.thread is not None and st.thread.is_alive()
+                st.reconnect_requested = running
+            reply = "已请求重连。" if running and ws is not None else "桥接当前未运行或尚未连接，无法重连。"
+        elif op in ("/new", "/rename", "/resume", "/sessions", "/clear"):
+            reply = _session_command(op, arg, uid)
+        else:
+            reply = "未知指令。发送 /help 查看可用 QQ 桥指令。"
+            if not command.startswith("/"):
+                return False
+        _send_reply_to_source(uid, message_type, group_id, reply)
+        ctx.notify(f"[QQ桥] QQ 用户 {uid} 执行“{command}”：{reply.splitlines()[0]}")
+        return True
+
+    def _session_command(op: str, arg: str, uid: str) -> str:
+        runner = _runner()
+        session = getattr(runner, "session", None) if runner is not None else None
+        if runner is None or session is None:
+            return "会话运行时尚未就绪。"
+        if getattr(runner, "busy", False):
+            return "当前回合进行中，请停止或等待回合结束后再操作会话。"
+        if op == "/clear":
+            with st.lock:
+                if arg.lower() != "confirm":
+                    st.clear_confirmation = (uid, session.session_id, time.monotonic() + 60)
+                    return f"将清空会话 {session.session_id} 的内容及相关记录。请在 60 秒内发送 /clear confirm。"
+                confirmation = st.clear_confirmation
+                st.clear_confirmation = None
+            if not confirmation or confirmation[0] != uid or confirmation[1] != session.session_id or confirmation[2] < time.monotonic():
+                return "清空确认无效或已过期，请先发送 /clear。"
+            session.clear()
+            app = _app()
+            if app is not None:
+                app.task = ""
+                app.status = "会话已清空"
+            _refresh_session(session)
+            return f"会话 {session.session_id} 已清空。"
+        if op == "/new":
+            session.save_session()
+            session.start_new_session()
+            app = _app()
+            if app is not None:
+                app.task = ""
+                app.status = "新会话已开启"
+            _refresh_session(session)
+            return f"新会话已开启：{session.session_id}"
+        if op == "/rename":
+            if not arg:
+                return "用法：/rename <标题>"
+            title = session.rename_session(arg)
+            session.save_session()
+            _refresh_session(session)
+            return f"当前会话已重命名：{title}"
+        if session_store_mod is None:
+            return "宿主缺少会话存储模块。"
+        directory = session_store_mod.sessions_dir(ctx.config, session.project_id)
+        if op == "/sessions":
+            rows = session_store_mod.list_sessions(directory)[:20]
+            if not rows:
+                return "当前没有已保存的历史会话。"
+            return "最近历史会话：\\n" + "\\n".join(
+                f"{row['id']} · {row['title']} · {row['message_count']} 条" for row in rows
+            )
+        if op == "/resume":
+            if not arg:
+                return "用法：/resume <会话ID>（先用 /sessions 查看列表）"
+            data = session_store_mod.load_session_data(directory, arg)
+            if not data:
+                return f"找不到可加载的会话：{arg}"
+            session.save_session()
+            session.switch_to(data)
+            app = _app()
+            if app is not None:
+                app._tree_follow_tail = True
+                app.status = f"已切换：{session.session_title or session.session_id}"
+            _refresh_session(session)
+            return f"已切换会话：{session.session_title or session.session_id}"
+        return "未知会话指令。"
+
     def _route_qq_message(ev):
         if not _enabled():
             return
@@ -558,6 +830,11 @@ def setup(ctx):
             ctx.log.debug("qbridge 白名单外消息已忽略: user=%s", uid)
             return
         text, images = _parse_incoming(ev)
+        if text.startswith("/"):
+            if _handle_qq_command(text, uid, ev.get("message_type"), ev.get("group_id")):
+                return
+        elif not images and _handle_qq_command(text, uid, ev.get("message_type"), ev.get("group_id")):
+            return
         with st.lock:
             item = st.pending
         if item is not None and text and _answer_pending(item, text):
@@ -567,6 +844,18 @@ def setup(ctx):
             p = _fetch_image(ref)
             if p:
                 paths.append(p)
+        runner = _runner()
+        busy_origin = runner is not None and getattr(runner, "busy", False)
+        if not busy_origin:
+            with st.lock:
+                st.qq_origin = {
+                    "user_id": uid,
+                    "message_type": ev.get("message_type"),
+                    "group_id": ev.get("group_id"),
+                    "target": key,
+                }
+        else:
+            ctx.notify(f"[QQ桥] 收到 {uid} 的后续输入，排队/插话消息不会切换附件发送目标。")
         _submit_to_terminal(text, paths)
 
     # ---- WS 线程 ----
@@ -585,7 +874,7 @@ def setup(ctx):
             except queue.Empty:
                 return
             target = job["target"]
-            if not _target_allowed(target):
+            if not job.get("force") and not _target_allowed(target):
                 continue
             kind, _, val = target.partition("/")
             ident = int(val) if val.isdigit() else val
@@ -595,8 +884,23 @@ def setup(ctx):
                 action, pid = "send_private_msg", {"user_id": ident}
             message = []
             for seg in job["segments"]:
-                if seg.get("type") == "image":
-                    message.append({"type": "image", "data": {"file": seg.get("data")}})
+                if seg.get("type") in ("image", "file"):
+                    file_value = str(seg.get("data") or "")
+                    seg_type = seg["type"]
+                    if not file_value.lower().startswith(("http://", "https://", "base64://")):
+                        if not Path(file_value).is_file():
+                            ctx.log.warn("qbridge 附件不存在，跳过发送: %s", file_value)
+                            continue
+                        file_path = Path(file_value).resolve()
+                        if seg_type == "image":
+                            image_bytes = file_path.read_bytes()
+                            if len(image_bytes) > 8 * 1024 * 1024:
+                                ctx.log.warn("qbridge 图片超过 OneBot 直接发送限制，跳过: %s", file_path)
+                                continue
+                            file_value = "base64://" + base64.b64encode(image_bytes).decode("ascii")
+                        else:
+                            file_value = str(file_path)
+                    message.append({"type": seg_type, "data": {"file": file_value}})
                 else:
                     message.append({"type": "text", "data": {"text": str(seg.get("data") or "")}})
             try:
@@ -630,6 +934,8 @@ def setup(ctx):
                 ctx.log.warn("qbridge API 失败 echo=%s retcode=%s data=%s",
                              data.get("echo"), retcode, str(data.get("data"))[:200])
 
+    ctx._qbridge_handle_frame = _handle_frame
+
     def _ws_loop():
         while not st.stop.is_set():
             url = str(_cfg("ws_url") or "").strip()
@@ -661,6 +967,11 @@ def setup(ctx):
             try:
                 _api_call(ws, "get_login_info", {}, echo="qb-login")
                 while not st.stop.is_set():
+                    with st.lock:
+                        reconnect_requested = st.reconnect_requested
+                        st.reconnect_requested = False
+                    if reconnect_requested:
+                        break
                     try:
                         raw = ws.recv(timeout=0.2)
                     except TimeoutError:
@@ -685,7 +996,10 @@ def setup(ctx):
                     pass
             if st.stop.is_set():
                 break
-            st.stop.wait(5)
+            with st.lock:
+                reconnect_requested = st.reconnect_requested
+                st.reconnect_requested = False
+            st.stop.wait(0 if reconnect_requested else 5)
 
     def _start() -> str:
         if not _WS_OK:
@@ -737,24 +1051,38 @@ def setup(ctx):
         low = arg.lower()
         if low == "on":
             if not _WS_OK:
-                return "缺少依赖 websockets（pip install websockets>=13）"
+                result = "缺少依赖 websockets（pip install websockets>=13）"
+                ctx.notify(f"[QQ桥] /qbridge on 失败：{result}")
+                return result
             if plugins_mod is not None:
                 plugins_mod.set_setting(ctx.plugin_id, "enabled", True, cctx.get("config") or ctx.config)
-            return _start()
+            result = _start()
+            ctx.notify(f"[QQ桥] /qbridge on：{result}")
+            return result
         if low == "off":
             if plugins_mod is not None:
                 plugins_mod.set_setting(ctx.plugin_id, "enabled", False, cctx.get("config") or ctx.config)
-            return _stop()
+            result = _stop()
+            ctx.notify(f"[QQ桥] /qbridge off：{result}")
+            return result
         if low.startswith("bind"):
             val = arg[4:].strip()
             if not re.fullmatch(r"(private|group)/\d+", val):
-                return "目标格式: private/<QQ号> 或 group/<群号>"
+                result = "目标格式: private/<QQ号> 或 group/<群号>"
+                ctx.notify(f"[QQ桥] /qbridge bind 失败：{result}")
+                return result
             if plugins_mod is not None:
                 plugins_mod.set_setting(ctx.plugin_id, "target", val, cctx.get("config") or ctx.config)
             with st.lock:
                 st.bound = val
-            return f"qbridge 已绑定 {val}"
-        return _status_line()
+                st.bound_user = ""
+            result = f"qbridge 已绑定 {val}"
+            ctx.notify(f"[QQ桥] /qbridge bind：{result}")
+            return result
+        result = _status_line()
+        if low in ("", "status"):
+            ctx.notify(f"[QQ桥] 查询状态：{result.splitlines()[0]}")
+        return result
 
     def _complete(config, arg):
         items = [

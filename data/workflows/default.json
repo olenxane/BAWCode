@@ -3,21 +3,35 @@
   "description": "",
   "nodes": [
     {
-      "id": "system_prompt",
-      "type": "system_prompt",
+      "id": "plan",
+      "type": "plan",
       "enabled": true,
-      "files": [
-        "system_prompt.md"
-      ]
+      "confirm": true,
+      "steps": true,
+      "retry_times": 2,
+      "model": "token公社-573-codex#1/gpt-6-luna"
     },
     {
       "id": "execute",
       "type": "execute",
       "enabled": true,
-      "max_rounds": 9,
+      "max_rounds": 32,
       "model_role": "code",
       "prompt_files": [],
-      "capture": ""
+      "capture": "",
+      "model": "token公社-free-workbuddy-cn/deepseek-v4.1-flash"
+    },
+    {
+      "id": "review",
+      "type": "review",
+      "enabled": true,
+      "prompt_files": [
+        "review.md"
+      ],
+      "capture": "review_result",
+      "max_rounds": 2,
+      "model_role": "review",
+      "model": "token公社-573-codex#1/gpt-6-luna"
     }
   ]
 }

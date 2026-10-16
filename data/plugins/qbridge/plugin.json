@@ -14,6 +14,7 @@
     { "key": "allow_users", "type": "str", "default": "", "label": "控制白名单", "hint": "逗号分隔的QQ号；严格模式：仅名单内可向终端发消息/应答交互，留空=QQ侧纯只读镜像" },
     { "key": "confirm_via_qq", "type": "bool", "default": true, "label": "工具确认映射到QQ", "hint": "终端提交新消息可随时转回终端面板" },
     { "key": "sync_tools", "type": "bool", "default": true, "label": "同步工具活动", "hint": "每次工具执行推送一行摘要" },
+    { "key": "sync_tool_images", "type": "bool", "default": true, "label": "同步文件改动图片", "hint": "QQ 发起的回合中，write/edit_file 成功后发送改动预览 PNG；需要 Pillow" },
     { "key": "sync_system", "type": "bool", "default": true, "label": "同步系统消息", "hint": "命令回显/插件通知等系统消息转发到 QQ" },
     { "key": "max_len", "type": "int", "default": 2000, "min": 200, "max": 4000, "label": "单条消息上限", "hint": "超长文本按此长度分段发送" }
   ]
