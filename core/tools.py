@@ -2482,13 +2482,16 @@ def write_memory(keyword: str, content: str, type: str = "project") -> str:
 
 @register.register(
     name="update_memory",
-    description="Replace a project keyword memory or the full contents of a global function memory file (optional rename)",
+    description="Update a memory file (optional rename): project keyword memories are fully replaced, global function files merge by '## section' keeping unmentioned sections",
     usage="update_memory <keyword> <content> <type> [new_keyword]",
     schema={
         "type": "object",
         "properties": {
             "keyword": {"type": "string", "description": "Keyword of the memory to update"},
-            "content": {"type": "string", "description": "New memory body, full replacement"},
+            "content": {
+                "type": "string",
+                "description": "New memory body; for global files only the '## sections' present here are replaced and the rest are kept, project files are replaced as a whole",
+            },
             "type": {
                 "type": "string",
                 "enum": ["global", "project"],

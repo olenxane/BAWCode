@@ -292,19 +292,14 @@ class Memory:
         return data
 
     def _ensure_md_files(self) -> None:
+        """只保证记忆目录存在：项目记忆按关键词落在 Projects/{pid}/，不再预建单文件"""
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
-        if self.project_id and not self.project_md_path.exists():
-            self.project_md_path.write_text(
-                f"# 项目记忆：{self.project_identity.get('workspace_name') or self.project_id}\n\n"
-                f"## 项目约定\n\n## 技术栈\n\n## 未决事项\n",
-                encoding="utf-8",
-            )
 
     def _migrate_legacy_json(self) -> None:
-        """旧 memory.json 的 facts/notes 迁入 md 文件（幂等）。
+        """旧 memory.json 的 facts/notes 迁入记忆文件（幂等）。
 
-        已落入 md 的条目同步从内存清除，防止 save_longterm 把它们原样写回
+        已落入文件的条目同步从内存清除，防止 save_longterm 把它们原样写回
         memory.json（否则下次启动重复注入，md 文件永远无法退役）；有残留则
         保留待下次启动重试，不丢数据。"""
         facts = self.longterm.get("facts") or []
@@ -313,34 +308,33 @@ class Memory:
             return
         facts_left = list(facts)
         global_agent_path = self.memory_dir_for("global") / "Agent.md"
-        legacy_agent_path = self.agent_md_path if self.agent_md_path.exists() else global_agent_path
-        try:
-            text = legacy_agent_path.read_text(encoding="utf-8") if legacy_agent_path.exists() else ""
-        except OSError:
-            text = ""
         if facts:
+            try:
+                text = global_agent_path.read_text(encoding="utf-8") if global_agent_path.exists() else ""
+            except OSError:
+                text = ""
             if "## 用户偏好" not in text:
                 text = text.rstrip() + "\n\n## 用户偏好\n"
             for f in facts:
                 line = f"- {f}"
                 if line not in text:
                     text = text.replace("## 用户偏好", f"## 用户偏好\n{line}", 1)
-            legacy_agent_path.parent.mkdir(parents=True, exist_ok=True)
-            legacy_agent_path.write_text(text, encoding="utf-8")
+            global_agent_path.parent.mkdir(parents=True, exist_ok=True)
+            global_agent_path.write_text(text, encoding="utf-8")
             facts_left = []
         notes_left = list(notes)
-        if notes and self.project_md_path.exists():
-            try:
-                ptext = self.project_md_path.read_text(encoding="utf-8")
-            except OSError:
-                ptext = ""
-            if "## 项目约定" in ptext:
-                for n in notes:
-                    line = f"- {n}"
-                    if line not in ptext:
-                        ptext = ptext.replace("## 项目约定", f"## 项目约定\n{line}", 1)
-                self.project_md_path.write_text(ptext, encoding="utf-8")
-                notes_left = []
+        project_dir = self.memory_dir_for("project")
+        if notes and project_dir is not None:
+            project_dir.mkdir(parents=True, exist_ok=True)
+            for note in notes:
+                key = self.sanitize_keyword(str(note).splitlines()[0]) or "migrated"
+                path = project_dir / f"{key}.md"
+                try:
+                    if not path.exists():
+                        path.write_text(str(note), encoding="utf-8")
+                    notes_left.remove(note)
+                except OSError as e:
+                    log.warn("迁移项目笔记失败 %s: %s", path, e)
         if not facts_left and not notes_left:
             backup = self.longterm_path.with_suffix(".json.bak")
             try:
@@ -422,7 +416,7 @@ class Memory:
     # ----- 分类记忆（多 md 文件） -----
     # global/{功能}.md 全局记忆：每个文件可追加多条记忆，启动时全量注入；
     # Projects/{pid}/{关键词}.md 项目记忆：仅注入关键词索引，正文按需 read_memory；
-    # 旧全局关键词文件归并到 global/Agent.md，旧项目 md 拆分迁移（.bak 备份）
+    # 旧单文件（data/memory/Agent.md、Projects/{pid}.md）启动时归并、拆分（.bak 留存）
 
     KEYWORD_MAX_LEN = 40
 
@@ -486,7 +480,8 @@ class Memory:
         return "created", key
 
     def update_memory_file(self, mtype: str, keyword: str, content, new_keyword: str = "") -> tuple:
-        """更新内容/改名；返回 (status, key)，status: ok/missing/conflict/invalid/error"""
+        """更新内容/改名；全局记忆按节合并（未提及的章节保留）；
+        返回 (status, key)，status: ok/missing/conflict/invalid/error"""
         d = self.memory_dir_for(mtype)
         key = self.sanitize_keyword(keyword)
         if d is None or not key:
@@ -495,21 +490,48 @@ class Memory:
         if not path.exists():
             return "missing", key
         new_key = self.sanitize_keyword(new_keyword) if new_keyword else ""
+        text = str(content or "")
+        if mtype == "global":
+            try:
+                text = self._merge_memory_sections(path.read_text(encoding="utf-8"), text)
+            except OSError as e:
+                log.warn("全局记忆读取失败，按整体覆盖处理 %s: %s", path, e)
         try:
             if new_key and new_key != key:
                 target = d / f"{new_key}.md"
                 if target.exists():
                     return "conflict", new_key
-                path.write_text(str(content or ""), encoding="utf-8")
+                path.write_text(text, encoding="utf-8")
                 path.rename(target)
                 log.info("记忆已更新并改名(%s): %s -> %s", mtype, key, new_key)
                 return "ok", new_key
-            path.write_text(str(content or ""), encoding="utf-8")
+            path.write_text(text, encoding="utf-8")
         except OSError as e:
             log.error("更新记忆失败 %s: %s", path, e)
             return "error", key
         log.info("记忆已更新(%s): %s", mtype, key)
         return "ok", key
+
+    @staticmethod
+    def _merge_memory_sections(existing: str, incoming: str) -> str:
+        """全局记忆按 '## 节' 合并：只替换新内容里出现的同名节，其余节原样保留。
+
+        新内容不含二级标题（单主题短文件）时按整体覆盖，保持旧有语义。
+        """
+        if not existing.strip():
+            return incoming
+        blocks = re.findall(r"^##[ \t]+(.+?)[ \t]*$(.*?)(?=^##[ \t]+|\Z)", incoming, flags=re.M | re.DOTALL)
+        if not blocks:
+            return incoming
+        merged = existing.rstrip() + "\n"
+        for name, body in blocks:
+            section = f"## {name}\n{body.strip()}\n\n"
+            pattern = re.compile(rf"^##[ \t]+{re.escape(name)}[ \t]*$.*?(?=^##[ \t]+|\Z)", flags=re.M | re.DOTALL)
+            if pattern.search(merged):
+                merged = pattern.sub(lambda _match: section, merged, count=1)
+            else:
+                merged = merged.rstrip() + "\n\n" + section
+        return merged.rstrip() + "\n"
 
     def delete_memory_file(self, mtype: str, keyword: str) -> tuple:
         """删除关键词记忆；返回 (status, key)，status: deleted/missing/invalid/error"""
@@ -556,47 +578,34 @@ class Memory:
             entries = [text.strip()]
         return [e for e in entries if e]
 
+    @staticmethod
+    def _free_backup_path(source: Path) -> Path:
+        """源文件退役备份名：同名 .bak 已存在时追加序号，避免旧备份永久阻塞退役"""
+        backup = source.with_name(source.name + ".bak")
+        index = 1
+        while backup.exists():
+            index += 1
+            backup = source.with_name(f"{source.name}.{index}.bak")
+        return backup
+
     def migrate_legacy_memory_files(self) -> None:
-        """归并旧全局记忆并拆分旧项目记忆，源文件以 .bak 留存。"""
+        """退役旧记忆单文件：旧全局 Agent.md 归并进 global/Agent.md，旧项目 md 拆分进关键词目录（源文件以 .bak 留存）。"""
         global_dir = self.memory_dir_for("global")
-        if global_dir is not None:
-            sources = []
-            if self.agent_md_path.exists():
-                sources.append(self.agent_md_path)
-            if global_dir.exists():
-                sources.extend(sorted(p for p in global_dir.glob("*.md") if p.name != "Agent.md"))
+        if global_dir is not None and self.agent_md_path.exists():
             target = global_dir / "Agent.md"
-            pieces = []
-            merged_sources = []
-            for source in sources:
-                try:
-                    text = source.read_text(encoding="utf-8").strip()
-                except OSError as e:
-                    log.warn("旧全局记忆读取失败 %s: %s", source, e)
-                    continue
-                merged_sources.append(source)
+            try:
+                text = self.agent_md_path.read_text(encoding="utf-8").strip()
                 if text:
-                    pieces.append(text if source == self.agent_md_path else f"## {source.stem}\n\n{text}")
-            if pieces:
-                try:
                     global_dir.mkdir(parents=True, exist_ok=True)
                     existing = target.read_text(encoding="utf-8").strip() if target.exists() else ""
                     merged = existing or "# Agent 长期记忆（全局）"
-                    for piece in pieces:
-                        if piece not in merged:
-                            merged += "\n\n" + piece
+                    if text not in merged:
+                        merged += "\n\n" + text
                     target.write_text(merged.rstrip() + "\n", encoding="utf-8")
-                except OSError as e:
-                    log.warn("全局记忆归并失败 %s: %s", target, e)
-                    merged_sources = []
-            for source in merged_sources:
-                backup = source.with_name(source.name + ".bak")
-                try:
-                    if not backup.exists():
-                        source.rename(backup)
-                        log.info("旧全局记忆已归并: %s -> %s", source, target)
-                except OSError as e:
-                    log.warn("旧全局记忆备份失败 %s: %s", source, e)
+                self.agent_md_path.rename(self._free_backup_path(self.agent_md_path))
+                log.info("旧全局记忆已归并: %s -> %s", self.agent_md_path, target)
+            except OSError as e:
+                log.warn("旧全局记忆迁移失败，源文件保留 %s: %s", self.agent_md_path, e)
 
         path = self.project_md_path
         if not path.exists():
@@ -624,7 +633,7 @@ class Memory:
                 (project_dir / f"{key}.md").write_text(item, encoding="utf-8")
             except OSError as e:
                 log.warn("迁移项目记忆写入失败 %s: %s", key, e)
-        backup = path.with_name(path.name + ".bak")
+        backup = self._free_backup_path(path)
         try:
             path.rename(backup)
             log.info("旧项目记忆已迁移: %s -> %s（%d 条）", path, project_dir, len(entries))
