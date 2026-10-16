@@ -232,6 +232,9 @@ class Memory:
         self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", 6))
         self.aggressive_optimization = bool(ctx_cfg.get("aggressive_optimization", False))
         self.aggressive_keep_tool_rounds = int(ctx_cfg.get("aggressive_keep_tool_rounds", 12))
+        self.mid_turn_maintenance_enabled = bool(ctx_cfg.get("mid_turn_maintenance", True))
+        self.mid_turn_keep_tool_rounds = int(ctx_cfg.get("mid_turn_keep_tool_rounds", 12))
+        self.mid_turn_keep_reads_per_file = int(ctx_cfg.get("mid_turn_keep_reads_per_file", 3))
         toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
@@ -805,6 +808,98 @@ class Memory:
             message["persist_path"] = str(persist_path)
             message["total_lines"] = total_lines
         return message
+
+    def mid_turn_maintenance(self) -> None:
+        """回合中工具结果维护：每次 LLM 请求前收敛早期的工具输出，防止单回合内
+        上下文无界膨胀。thinking 不在此处剥离——模型回合中推理需要思维痕迹。
+
+        保护集（回合末规则的回合中收紧版，幂等，原文均有 persist 落盘可回读）：
+        - strip_keep_recent 指定的最近工具条数（read/write 在激进模式下不受此保护）
+        - 最近 mid_turn_keep_tool_rounds 个工具轮（仅保护其中的非 read/write 结果，
+          与回合末口径一致，探索性读写在窗口外允许被剥）
+        - 每个文件最近 mid_turn_keep_reads_per_file 次 read
+        - 当前回合（最后一条 user 之后）的 write/delete_file 结果
+        白名单超预算的最老未保护结果同样外置。"""
+        if not self.messages:
+            return
+        ctx_cfg = (getattr(self.config, "data", None) or {}).get("context") or {}
+        self.aggressive_optimization = bool(ctx_cfg.get("aggressive_optimization", False))
+        self.mid_turn_maintenance_enabled = bool(ctx_cfg.get("mid_turn_maintenance", self.mid_turn_maintenance_enabled))
+        if not self.mid_turn_maintenance_enabled:
+            return
+        self.aggressive_keep_tool_rounds = int(ctx_cfg.get("aggressive_keep_tool_rounds", 12))
+        self.mid_turn_keep_tool_rounds = int(ctx_cfg.get("mid_turn_keep_tool_rounds", self.mid_turn_keep_tool_rounds))
+        self.mid_turn_keep_reads_per_file = int(ctx_cfg.get("mid_turn_keep_reads_per_file", self.mid_turn_keep_reads_per_file))
+        self.tool_whitelist = set(ctx_cfg.get("tool_whitelist", self.tool_whitelist) or [])
+        self.whitelist_budget_tokens = int(ctx_cfg.get("whitelist_budget_tokens", self.whitelist_budget_tokens))
+        self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", self.strip_keep_recent))
+        model = getattr(self.config, "model_name", "")
+        tool_indexes = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
+        if not tool_indexes:
+            return
+        protected = self._mid_turn_protected_tool_indexes(tool_indexes)
+        stripped = 0
+        for index in tool_indexes:
+            message = self.messages[index]
+            if message.get("stripped") or index in protected:
+                continue
+            tool_name = message.get("tool_name")
+            # 激进模式下 read/write 先于白名单判定：白名单工具的超龄结果按预算外置兜底，
+            # 与回合末 finalize_turn 的分支顺序一致
+            if self.aggressive_optimization and tool_name in ("read", "write"):
+                prefix = "已省略·较早读取" if tool_name == "read" else "已省略·较早写入"
+                if self._strip_tool_message(message, prefix=prefix, force=True):
+                    stripped += 1
+                continue
+            if tool_name in self.tool_whitelist:
+                continue
+            if self._strip_tool_message(message, prefix="已省略"):
+                stripped += 1
+        evicted = self._evict_whitelist_overflow(model, protected_indexes=protected)
+        if stripped or evicted:
+            log.info(
+                "回合中维护: 剥离工具记录%d条 白名单外置%d条（保护最近%d轮；每文件最近%d次读取）",
+                stripped, evicted, self.mid_turn_keep_tool_rounds,
+                self.mid_turn_keep_reads_per_file,
+            )
+
+    def _mid_turn_protected_tool_indexes(self, tool_indexes: List[int]) -> set:
+        """回合中保护集：最近工具轮内的非读写结果、每文件最近 N 次 read、
+        当前回合的 write/delete_file，外加 strip_keep_recent 最近条数。"""
+        protected = set()
+        if self.strip_keep_recent > 0:
+            protected.update(tool_indexes[-self.strip_keep_recent:])
+        # 工具轮次：与 _aggressive_protected_tool_indexes 同口径，按 assistant tool_calls 计数
+        round_indexes = []
+        tool_to_round = {}
+        current_round = None
+        last_user_index = max(
+            (i for i, message in enumerate(self.messages) if message.get("role") == "user"),
+            default=-1,
+        )
+        reads_by_path = {}
+        for index, message in enumerate(self.messages):
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                current_round = len(round_indexes)
+                round_indexes.append(index)
+            elif message.get("role") == "tool":
+                if current_round is not None:
+                    tool_to_round[index] = current_round
+                tool_name = message.get("tool_name")
+                if index > last_user_index and tool_name in ("write", "delete_file"):
+                    protected.add(index)
+                if tool_name == "read" and message.get("file_path"):
+                    path = os.path.normcase(os.path.normpath(str(message["file_path"])))
+                    reads_by_path.setdefault(path, []).append(index)
+        keep_rounds = max(0, self.mid_turn_keep_tool_rounds)
+        recent_rounds = set(range(max(0, len(round_indexes) - keep_rounds), len(round_indexes)))
+        for index, round_index in tool_to_round.items():
+            if round_index in recent_rounds and self.messages[index].get("tool_name") not in ("read", "write"):
+                protected.add(index)
+        keep_reads = max(0, self.mid_turn_keep_reads_per_file)
+        for indexes in reads_by_path.values():
+            protected.update(indexes[-keep_reads:] if keep_reads else [])
+        return protected
 
     def finalize_turn(self) -> None:
         """回合末工具结果维护：普通模式按白名单/最近消息规则剥离；激进模式额外按
@@ -1408,6 +1503,9 @@ class Memory:
 
         顺序：system提示词 → 长期记忆等补充 → 会话历史（含 tool/tool_calls）。
         """
+        # 先剥离早期工具输出再判摘要：与回合末"先收敛再压缩"同口径，
+        # 避免摘要模型看到未外置的原始大输出
+        self.mid_turn_maintenance()
         self.maybe_compress(llm_fn=self._llm_fn)
         messages: List[dict] = []
         if extra_system:

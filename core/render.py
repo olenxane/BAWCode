@@ -75,9 +75,6 @@ def safe_text(text: str) -> str:
 # 会话树收起渲染：消息类节点最多显示的视觉行数，超出部分折叠并附「… (+N 行)」指示行
 _TREE_INLINE_CAP = 3
 
-# 非指定工具（读取类等）展开时的输出行数上限，超出部分截断并附「… (+N 行)」
-_TREE_TOOL_CAP = 5
-
 # 参与 3 行折叠的消息类节点；assistant/stream_* 全文显示，plan/help 走子节点机制
 _TREE_FOLD_KINDS = {"user", "tool", "system", "system_prompt"}
 
@@ -118,7 +115,6 @@ _TOOL_WRITE = {"write"}
 
 _TOOL_EDIT = {"edit_file"}
 
-_TOOL_CMD_OUTPUT_LINES = 3  # 命令类展开时显示的输出行数（超出折叠为「还有 N 行」）
 
 # diff 行底色（叠在关键词高亮前景之上）：红删 / 绿增
 _DIFF_DEL_BG = (58, 26, 30)
@@ -1348,6 +1344,10 @@ class RenderMixin:
                         meta = self._tool_display_meta(
                             str(info.get("name") or tool_name), info.get("args") or {}, content, failed
                         )
+                    if meta is None:
+                        meta = {"tool_kind": "result", "output": content}
+                    if item.get("persist_path"):
+                        meta["persist_path"] = str(item["persist_path"])
                     tool_call = str((info or {}).get("name") or tool_name)
                     args = (info or {}).get("args") or {}
                     command = str(meta.get("command") or "") if meta else ""
@@ -1981,15 +1981,43 @@ class RenderMixin:
                             )
                         )
                     if expanded:
+                        # 命令/写入/编辑类：手动展开时回读外置完整输出（默认展开仍用行内 meta 输出）
+                        if node.id in self.expanded and meta.get("persist_path"):
+                            session = getattr(self, "_tree_session", None)
+                            persisted = toolstore_mod.read_persisted_content(
+                                getattr(session, "config", None),
+                                getattr(session, "project_id", ""),
+                                getattr(session, "session_id", ""),
+                                str(meta["persist_path"]),
+                            )
+                            if persisted:
+                                meta = dict(meta)
+                                meta["output"] = persisted
                         rows.extend(self._tool_detail_rows(meta, gseg, width, gw))
                     spans.append((span_start, len(rows) - span_start))
                     continue
                 # 工具调用（含工具轮）：标题青色（14babc）+ 内容纯白，同一物理行双色。
                 # 折叠仅显示标题行（✓/× 状态在标题内），完整输出展开后查看
-                title, sep, content_text = label.partition(" · ")
+                title, sep, inline_output = label.partition(" · ")
                 probe_title = f"{indent}· {title}"
                 budget = max(8, width - _display_width(probe_title) - _display_width(" · "))
-                has_output = bool(sep) and content_text != ""
+                # 正文来源优先级：meta 输出 → label 行内摘要；
+                # 外置完整文件仅在用户手动展开该节点时回读（默认展开态仍看行内预览）
+                content_text = str(meta.get("output") or "") if meta is not None else ""
+                if not content_text and sep:
+                    content_text = inline_output
+                manual_open = node.id in self.expanded
+                if manual_open and expanded and meta and meta.get("persist_path"):
+                    session = getattr(self, "_tree_session", None)
+                    persisted = toolstore_mod.read_persisted_content(
+                        getattr(session, "config", None),
+                        getattr(session, "project_id", ""),
+                        getattr(session, "session_id", ""),
+                        str(meta["persist_path"]),
+                    )
+                    if persisted:
+                        content_text = persisted
+                has_output = bool(content_text) or bool(meta and meta.get("persist_path"))
                 wrapped = _wrap(content_text, budget) if (has_output and expanded) else []
                 if foldable and not expanded and has_output:
                     has = True  # 折叠时 marker 提示有可展开内容
@@ -1997,10 +2025,9 @@ class RenderMixin:
                 title_w = gw + _display_width(title_part)
                 title_ansi = self._title_with_status(title_part, self.c("tool_title"))
                 if has_output and expanded:
-                    # 非指定工具输出截断：最多 _TREE_TOOL_CAP 行，其余折为「… (+N 行)」
-                    shown = wrapped[:_TREE_TOOL_CAP]
-                    first = shown[0] if shown else ""
-                    rest = shown[1:]
+                    # 非指定工具输出：展开后全量展示（外置结果优先回读完整正文）
+                    first = wrapped[0] if wrapped else ""
+                    rest = wrapped[1:]
                     row = (gseg + _clip_keep_ansi(title_ansi, max(1, width - gw))
                            + self.c("tool_content") + _clip(" · " + first, max(8, width - title_w - 3)) + self.RESET)
                     if abs_i == self.tree_cursor and tree_focus:
@@ -2009,12 +2036,6 @@ class RenderMixin:
                         rows.append(row)
                     for wline in rest:
                         rows.append(gseg + self.c("tool_content") + _clip("  " + wline, max(1, width - gw)) + self.RESET)
-                    hidden = len(wrapped) - len(shown)
-                    if hidden > 0:
-                        rows.append(
-                            gseg + self.c("dim")
-                            + _clip(f"  … (+{hidden} 行)", max(1, width - gw)) + self.RESET
-                        )
                 else:
                     if abs_i == self.tree_cursor and tree_focus:
                         rows.append(self.C_HL + _pad(f"{indent}{title_part}", width) + self.RESET)
@@ -2122,11 +2143,9 @@ class RenderMixin:
                 prefix = f"{prompt_c}${self.RESET} " if k == 0 else "  "
                 out.append(gseg + self.c("tool_content") + _clip(ind + prefix + ln, body_w) + self.RESET)
             out_lines = str(meta.get("output") or "").strip().splitlines()
-            for ln in out_lines[:_TOOL_CMD_OUTPUT_LINES]:
-                out.append(gseg + self.c("dim") + _clip(ind + "│ " + ln, body_w) + self.RESET)
-            extra = len(out_lines) - _TOOL_CMD_OUTPUT_LINES
-            if extra > 0:
-                out.append(gseg + self.c("dim") + _clip(ind + f"│ … 还有 {extra} 行输出", body_w) + self.RESET)
+            for ln in out_lines:
+                for ln_piece in _wrap(ln, body_w - len(ind) - 2):
+                    out.append(gseg + self.c("dim") + _clip(ind + "│ " + ln_piece, body_w) + self.RESET)
         elif kind == "write":
             path = str(meta.get("path") or "")
             code = str(meta.get("content") or "")

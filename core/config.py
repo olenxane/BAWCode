@@ -141,6 +141,11 @@ def default_config() -> dict:
             "strip_keep_recent": 6,
             "aggressive_optimization": False,
             "aggressive_keep_tool_rounds": 12,
+            # 回合中维护（memory.mid_turn_maintenance）：每次 LLM 请求前剥离保护集外的
+            # 旧工具输出；保护口径独立于回合末，thinking 保留到回合末才剥离
+            "mid_turn_maintenance": True,
+            "mid_turn_keep_tool_rounds": 12,
+            "mid_turn_keep_reads_per_file": 3,
         },
         # 技能加载系统（core/skills.py + tools.load_skill）：SKILL.md+YAML frontmatter，
         # 双层目录 全局 dir + 项目 {workspace}/.bawcode/skills（项目级同名覆盖全局）；
