@@ -94,7 +94,8 @@ def default_config() -> dict:
         },
         # stream: 流式输出开关（SSE 增量上屏）；首个 chunk 前失败自动回落非流式，
         # 已收 chunk 后失败不回落不重试（内容已上屏）；false 完全走整段路径
-        "llm": {"retry_times": 3, "retry_delay": 1.0, "stream": True},
+        # request_timeout：单次 LLM 请求整体超时秒数（连接+读流），超时按瞬态错误走 retry_times 重试；<=0 不限时
+        "llm": {"retry_times": 3, "retry_delay": 1.0, "stream": True, "request_timeout": 180},
         # 分级日志（core/log.py）：level 全局阈值 debug/info/warn/error/off；
         # modules 按模块覆盖粒度（如 {"llm": "debug", "ui": "off"}）；
         # console 同步输出 stderr；days_to_keep 保留天数（0 永久）

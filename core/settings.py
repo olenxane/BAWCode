@@ -882,6 +882,7 @@ class SettingsPanelMixin:
                 {"key": "tip_interval", "label": "提示间隔秒", "type": "text", "current": ui_cfg.get("tip_interval", 5)},
                 {"key": "retry_times", "label": "LLM重试次数", "type": "text", "current": llm_cfg.get("retry_times", 3)},
                 {"key": "retry_delay", "label": "LLM重试延迟", "type": "text", "current": llm_cfg.get("retry_delay", 1.0)},
+                {"key": "request_timeout", "label": "LLM请求超时秒", "type": "text", "current": llm_cfg.get("request_timeout", 180), "hint": "单次请求整体超时（含流式挂起），0=不限时 · 超时自动重试"},
                 {"key": "scroll_v0", "label": "滚动v0", "type": "text", "current": ui_cfg.get("scroll_v0", 1.0)},
                 {"key": "scroll_hold_ms", "label": "长按阈值ms", "type": "text", "current": ui_cfg.get("scroll_hold_ms", 150)},
                 {"key": "scroll_max_step", "label": "滚动最大步长", "type": "text", "current": ui_cfg.get("scroll_max_step", 20)},
@@ -1836,6 +1837,11 @@ class SettingsPanelMixin:
         if "retry_delay" in s:
             try:
                 llm_cfg["retry_delay"] = float(s["retry_delay"])
+            except (TypeError, ValueError):
+                pass
+        if "request_timeout" in s:
+            try:
+                llm_cfg["request_timeout"] = max(0, float(s["request_timeout"]))
             except (TypeError, ValueError):
                 pass
         mem_cfg = config.data.setdefault("memory", {})

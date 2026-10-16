@@ -266,10 +266,12 @@ class LLM:
         key = api_key if api_key is not None else getattr(self.config, "api_key", "")
         base = base_url if base_url is not None else getattr(self.config, "base_url", "") or ""
         base = normalize_base_url(base or "")
+        timeout = self._request_timeout() or None  # 0/负值=不限时 → None
         if HAS_OPENAI and key:
             try:
-                # max_retries=0：重试统一由外层 retry_times 控制（避免 SDK 默认 2 次叠加成 12 次最坏重试）
-                self.client = openai.OpenAI(api_key=key, base_url=base, max_retries=0)
+                # max_retries=0：重试统一由外层 retry_times 控制（避免 SDK 默认 2 次叠加成 12 次最坏重试）；
+                # timeout 是单次请求整体超时（含流式迭代），防中转站挂起导致回合卡死
+                self.client = openai.OpenAI(api_key=key, base_url=base, max_retries=0, timeout=timeout)
                 self._client_provider_id = pid
                 log.debug("OpenAI 客户端已构建 provider=%s base=%s", pid, base)
             except Exception as e:
@@ -358,8 +360,16 @@ class LLM:
         request = urllib.request.Request(
             self._chat_url(req), data=body, headers=self._headers(req), method="POST"
         )
-        with urllib.request.urlopen(request, timeout=120) as resp:
+        with urllib.request.urlopen(request, timeout=self._request_timeout() or None) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def _request_timeout(self) -> float:
+        """单次 LLM 请求超时秒数（llm.request_timeout，默认 180；<=0 不限时→回落 None）"""
+        try:
+            value = float((self.config.data or {}).get("llm", {}).get("request_timeout", 180))
+        except (TypeError, ValueError):
+            value = 180.0
+        return value if value > 0 else 0.0
 
     # ----- 流式（SSE）：双路径聚合，产出伪 OpenAI 响应复用 _normalize -----
 
@@ -461,7 +471,7 @@ class LLM:
         request = urllib.request.Request(
             self._chat_url(req), data=body, headers=self._headers(req), method="POST"
         )
-        resp = urllib.request.urlopen(request, timeout=120)
+        resp = urllib.request.urlopen(request, timeout=self._request_timeout() or None)
         with self._inflight_lock:
             self._inflight_resps.add(resp)
         try:
