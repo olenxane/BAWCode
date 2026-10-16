@@ -34,6 +34,7 @@
 | `remote-control` | 能够在浏览器中随时随地实时操作终端，或者说是个WebUI |
 | `qbridge` | 适配OneBotv11正向WS，可以直接在QQ里coding |
 | `emotion-detector` | 用户消息情绪识别，情绪不佳时让AI主动哄你 |
+| `web-search` | 必应网络搜索工具：关键词 → 真实浏览器头请求结果页 → 结构化结果（标题/链接/摘要） |
 
 ## 安装与运行
 

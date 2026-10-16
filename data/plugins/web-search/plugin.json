@@ -1,0 +1,12 @@
+{
+  "id": "web-search",
+  "name": "网络搜索",
+  "version": "0.1.0",
+  "description": "必应网络搜索工具：关键词拼接必应搜索 URL，以真实浏览器头请求结果页，BeautifulSoup 解析为结构化结果（标题/链接/摘要）返回给模型；无状态单次请求，配置实时生效",
+  "author": "BAWCode",
+  "entry": "main.py",
+  "config": [
+    { "key": "max_results", "type": "int", "default": 10, "min": 1, "max": 30, "label": "结果条数上限", "hint": "单次搜索返回的最大结果数" },
+    { "key": "base_url", "type": "str", "default": "https://www.bing.com", "label": "必应地址", "hint": "被风控时可换成 https://cn.bing.com" }
+  ]
+}
