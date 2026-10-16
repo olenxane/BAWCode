@@ -64,10 +64,12 @@ try:
     from core import file as file_mod
     from core import memory as memory_mod
     from core import plugins as plugins_mod
+    from core import toolstore as toolstore_mod
 except ImportError:  # 插件目录被单独导入（类型检查等场景）时的防御
     file_mod = None
     memory_mod = None
     plugins_mod = None
+    toolstore_mod = None
 
 try:
     from core.tools import tool_failure_hint
@@ -866,6 +868,10 @@ def setup(ctx):
                 args = (info or {}).get("args") or {}
                 failed = bool(tool_failure_hint(text)) if tool_failure_hint else False
                 entry["failed"] = failed
+                # 行内 content 可能已被剥离为摘要；persist_path 指向完整外置文件，
+                # 页面按需经 /api/tool_output 回读（与 TUI 手动展开回读一致）
+                if m.get("persist_path"):
+                    entry["persist_path"] = str(m.get("persist_path"))
                 render = _plan_render(name, text) or _tool_render(name, args, text, failed)
                 if render:
                     entry["render"] = render
@@ -1952,6 +1958,28 @@ def setup(ctx):
                     except ValueError:
                         depth = 1
                     self._json(200, _file_candidates(query, depth))
+                elif path == "/api/tool_output":
+                    # 按需回读外置工具输出完整正文（与 TUI 手动展开节点回读一致）；
+                    # 仅限当前会话存储目录内的文件，read_persisted_content 自带越界校验
+                    params = parse_qs(urlparse(self.path).query)
+                    unknown = [k for k in params if k not in {"path", "key", "token"}]
+                    if unknown:
+                        self._json(400, {"ok": False, "message": f"未知参数: {', '.join(sorted(unknown))}"})
+                        return
+                    session = _session()
+                    if session is None or toolstore_mod is None:
+                        self._json(503, {"ok": False, "message": "会话未就绪"})
+                        return
+                    text = toolstore_mod.read_persisted_content(
+                        getattr(session, "config", None),
+                        getattr(session, "project_id", ""),
+                        getattr(session, "session_id", ""),
+                        (params.get("path") or [""])[0],
+                    )
+                    if text:
+                        self._json(200, {"ok": True, "output": text})
+                    else:
+                        self._json(404, {"ok": False, "message": "外置输出不存在或不可读"})
                 elif path == "/api/settings":
                     self._json(200, _settings_get())
                 else:

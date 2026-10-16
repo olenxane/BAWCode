@@ -876,7 +876,6 @@ logEl.addEventListener("scroll", () => {
 function stick() { if (pinned) logEl.scrollTop = logEl.scrollHeight; }
 
 const STEP_ICON = { done: "●", running: "◐", failed: "✗", pending: "○" };
-const TOOL_CMD_LINES = 3;  // 命令类输出预览行数，超出折叠（与 TUI 一致）
 
 /* 工具详细正文：按后端下发的渲染载荷分类（命令/写入/编辑），与 TUI core/render.py 对齐 */
 function toolBody(o) {
@@ -886,13 +885,11 @@ function toolBody(o) {
     b.append(el("div", "label", "命令"));
     b.append(el("pre", "cmdline", "$ " + (r.command || "")));
     const out = (r.output || "").replace(/\n+$/, "");
-    const lines = out ? out.split("\n") : [];
-    if (lines.length) {
+    if (out || o.persist_path) {
       b.append(el("div", "label", "输出"));
-      b.append(el("pre", "", lines.slice(0, TOOL_CMD_LINES).join("\n")));
-      if (lines.length > TOOL_CMD_LINES) {
-        b.append(el("div", "label", `… 还有 ${lines.length - TOOL_CMD_LINES} 行输出`));
-      }
+      const pre = el("pre", "", out);
+      if (o.persist_path) { pre.dataset.fullout = o.persist_path; }
+      b.append(pre);
     }
     return b;
   }
@@ -943,10 +940,12 @@ function toolBody(o) {
     b.append(el("div", "label", "参数"));
     b.append(el("pre", "", JSON.stringify(o.args, null, 2)));
   }
-  if (o.output) {
+  if (o.output || o.persist_path) {
     // 输出预览被截断时（实时事件只带前若干字符）明确提示，避免误以为已完整
     b.append(el("div", "label", "输出" + (o.truncated ? "（预览，回合结束后显示完整输出）" : "")));
-    b.append(el("pre", "", o.output));
+    const pre = el("pre", "", o.output || "");
+    if (o.persist_path) { pre.dataset.fullout = o.persist_path; }
+    b.append(pre);
   }
   return b;
 }
@@ -966,8 +965,28 @@ function buildToolCard(o) {
   if (o.desc) s.append(el("span", "tdesc", o.desc));
   if (o.elapsed !== undefined && o.elapsed !== null) s.append(el("span", "telapsed", o.elapsed + "s"));
   d.append(s);
-  d.append(toolBody(o));
+  const body = toolBody(o);
+  d.append(body);
   if (o.render) d.open = true;  // 命令/写入/编辑类默认展开，与 TUI 一致
+  // 外置完整输出：仅在用户点击展开时按需拉取替换预览（与 TUI 手动展开回读 persist_path 一致；
+  // 默认展开的卡片不拉取——open=true 的初始赋值也会异步触发 toggle，故以点击标记区分）
+  if (o.persist_path) {
+    s.addEventListener("click", () => { d.dataset.userToggled = "1"; });
+    d.addEventListener("toggle", async () => {
+      if (!d.open || !d.dataset.userToggled || d.dataset.fullLoaded) return;
+      const target = body.querySelector("pre[data-fullout]");
+      if (!target) return;
+      d.dataset.fullLoaded = "1";
+      target.textContent += "\n（加载完整输出…）";
+      try {
+        const r = await api("/api/tool_output?path=" + encodeURIComponent(o.persist_path));
+        if (r.ok && r.output) target.textContent = r.output;
+        else if (r.ok === false) target.textContent += `\n（完整输出读取失败: ${r.message || "未知错误"}）`;
+      } catch (e) {
+        target.textContent += "\n（完整输出加载失败: " + e + "）";
+      }
+    });
+  }
   return d;
 }
 
@@ -1038,7 +1057,7 @@ function renderMessage(m) {
   if (m.type === "subagent") { logEl.append(subagentBlock(m)); return; }
   const role = m.role;
   if (role === "tool" || m.type === "tool") {
-    appendToolResult({ name: m.tool_name, desc: m.description, output: m.content, failed: m.failed, render: m.render });
+    appendToolResult({ name: m.tool_name, desc: m.description, output: m.content, failed: m.failed, render: m.render, persist_path: m.persist_path });
   } else if (role === "user") {
     const d = el("div", "msg user");
     d.append(el("span", "who", "你"));
@@ -1622,7 +1641,7 @@ function connect() {
         break;
       case "tool_after":
         liveSeal();
-        appendToolResult({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render, truncated: p.truncated });
+        appendToolResult({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render, truncated: p.truncated, persist_path: p.persist_path });
         stick();
         pollStatus();
         break;
