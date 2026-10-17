@@ -127,7 +127,8 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
     """工具调用循环：返回 {"status", "content"}
 
     status: complete（模型本轮不再调用工具）/ error / max_rounds。
-    取消/中断抛 TurnInterrupt。轮次用尽且空转计数未满时续期（续期总量受config.workflow.max_total_rounds 兜底保险丝约束，默认为320）：
+    取消/中断抛 TurnInterrupt。轮次用尽且空转计数未满时续期——正常推进的回合不设次数上限，
+    config.workflow.max_total_rounds 是可选的兜底保险丝（0/负数 = 不启用）：
     空转计数器（SpinGuard——重复/近似重复输出才开始计数，整轮全新结果清零）计满config.workflow.spin_kill_count 才终止回合"""
     io, session, llm = turn.io, turn.session, turn.llm
     wf_cfg = (getattr(turn.config, "data", None) or {}).get("workflow") or {}
@@ -139,8 +140,8 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         fuse_cfg = int(wf_cfg.get("max_total_rounds") or 0)
     except (TypeError, ValueError):
         fuse_cfg = 0
-    # 续期保险丝：只拦真失控，可调且不小于单轮 max_rounds
-    total_cap = fuse_cfg if fuse_cfg > 0 else max(100, max(1, max_rounds))
+    # 兜底保险丝：默认不启用（0/负数 = 无限制），正常推进的回合可无限续期
+    total_cap = fuse_cfg if fuse_cfg > 0 else float("inf")
     round_no = 0
     while True:
         if round_no >= max(1, max_rounds):

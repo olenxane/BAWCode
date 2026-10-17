@@ -1125,9 +1125,15 @@ function liveAppend(kind, piece) {
   const think = live.querySelector("details.think");
   const pre = think.querySelector("pre");
   if (kind === "reasoning") {
+    // 已开始输出阶段性正文：本轮思考不再回显（与 TUI 一致）
+    if (think.dataset.sealed) return;
     think.style.display = "";
     pre.textContent += piece;
   } else {
+    // 阶段性正文到达：清掉前面已累积的思考
+    think.dataset.sealed = "1";
+    think.style.display = "none";
+    pre.textContent = "";
     $("live-body").textContent += piece;
   }
   stick();

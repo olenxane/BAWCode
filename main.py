@@ -982,8 +982,15 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
             msg = {"role": "assistant", "content": "", "thinking": "", "type": "streaming"}
             app.streaming_msg = msg
         if kind == "reasoning":
+            # 模型已开始输出阶段性正文：后续思考不回显（session 留档不受影响）
+            if msg.get("thinking_sealed"):
+                hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
+                return
             msg["thinking"] += piece
         else:
+            # 阶段性正文到达：清掉前面已累积的思考
+            msg["thinking_sealed"] = True
+            msg["thinking"] = ""
             msg["content"] += piece
         hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
 

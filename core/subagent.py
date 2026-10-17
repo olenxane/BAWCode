@@ -882,7 +882,7 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
               max_rounds: int, spin: SpinGuard, directory: Path) -> tuple:
     """子代理执行循环。返回 (status, final_text)；防空转与主循环同判据（SpinGuard：
     重复/近似重复输出才开始计数，整轮全新结果清零，计满 spin_kill_count 终止）；
-    续期总量受 config.workflow.max_total_rounds 兜底保险丝约束（默认 100）"""
+    续期不设次数上限，config.workflow.max_total_rounds 为可选兜底保险丝（0/负数 = 不启用）"""
     llm, io = rt["llm"], rt["io"]
     rid = str(record.get("id") or "")
     wf_cfg = (getattr(rt.get("config"), "data", None) or {}).get("workflow") or {}
@@ -890,7 +890,8 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
         fuse_cfg = int(wf_cfg.get("max_total_rounds") or 0)
     except (TypeError, ValueError):
         fuse_cfg = 0
-    total_cap = fuse_cfg if fuse_cfg > 0 else max(100, max(1, max_rounds))
+    # 兜底保险丝：默认不启用（0/负数 = 无限制），正常推进的回合可无限续期
+    total_cap = fuse_cfg if fuse_cfg > 0 else float("inf")
     rounds = 0
     while True:
         if rounds >= max_rounds:

@@ -254,6 +254,7 @@ class Memory:
         self.mid_turn_maintenance_enabled = bool(ctx_cfg.get("mid_turn_maintenance", True))
         self.mid_turn_keep_tool_rounds = int(ctx_cfg.get("mid_turn_keep_tool_rounds", 12))
         self.mid_turn_keep_reads_per_file = int(ctx_cfg.get("mid_turn_keep_reads_per_file", 3))
+        self.mid_turn_keep_thinking_rounds = int(ctx_cfg.get("mid_turn_keep_thinking_rounds", 3))
         toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
@@ -837,7 +838,9 @@ class Memory:
           与回合末口径一致，探索性读写在窗口外允许被剥）
         - 每个文件最近 mid_turn_keep_reads_per_file 次 read
         - 当前回合（最后一条 user 之后）的 write/delete_file 结果
-        白名单超预算的最老未保护结果同样外置。"""
+        白名单超预算的最老未保护结果同样外置。
+        思考滑窗（mid_turn_keep_thinking_rounds）独立于上述保护集：只保留最近 N 条
+        assistant 思考出站，更旧的打 thinking_stripped 标仅留档。"""
         if not self.messages:
             return
         ctx_cfg = (getattr(self.config, "data", None) or {}).get("context") or {}
@@ -848,10 +851,15 @@ class Memory:
         self.aggressive_keep_tool_rounds = int(ctx_cfg.get("aggressive_keep_tool_rounds", 12))
         self.mid_turn_keep_tool_rounds = int(ctx_cfg.get("mid_turn_keep_tool_rounds", self.mid_turn_keep_tool_rounds))
         self.mid_turn_keep_reads_per_file = int(ctx_cfg.get("mid_turn_keep_reads_per_file", self.mid_turn_keep_reads_per_file))
+        self.mid_turn_keep_thinking_rounds = int(
+            ctx_cfg.get("mid_turn_keep_thinking_rounds", self.mid_turn_keep_thinking_rounds)
+        )
         self.tool_whitelist = set(ctx_cfg.get("tool_whitelist", self.tool_whitelist) or [])
         self.whitelist_budget_tokens = int(ctx_cfg.get("whitelist_budget_tokens", self.whitelist_budget_tokens))
         self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", self.strip_keep_recent))
         model = getattr(self.config, "model_name", "")
+        # 思考滑窗不依赖工具记录：没有工具结果的回合同样要收敛历史思考
+        self._mid_turn_strip_old_thinking()
         tool_indexes = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
         if not tool_indexes:
             return
@@ -880,6 +888,25 @@ class Memory:
                 stripped, evicted, self.mid_turn_keep_tool_rounds,
                 self.mid_turn_keep_reads_per_file,
             )
+
+    def _mid_turn_strip_old_thinking(self) -> None:
+        """回合中思考滑窗：只保留最近 mid_turn_keep_thinking_rounds 条思考出站
+
+        超出窗口的最旧思考打 thinking_stripped 标，_api_session_item 不再并回正文，
+        原文仍在消息里供 UI 与会话存档查看。0 表示关闭本项滑窗。"""
+        keep = max(0, self.mid_turn_keep_thinking_rounds)
+        if keep == 0:
+            return
+        indexes = [
+            i for i, m in enumerate(self.messages)
+            if m.get("role") == "assistant" and m.get("thinking") and not m.get("thinking_stripped")
+        ]
+        stripped = 0
+        for index in indexes[:-keep]:
+            self.messages[index]["thinking_stripped"] = True
+            stripped += 1
+        if stripped:
+            log.info("回合中维护: 思维链剥离%d条（保留最近%d条思考）", stripped, keep)
 
     def _mid_turn_protected_tool_indexes(self, tool_indexes: List[int]) -> set:
         """回合中保护集：最近工具轮内的非读写结果、每文件最近 N 次 read、
@@ -1101,14 +1128,17 @@ class Memory:
         return (item.get("type") or "") not in ("system_prompt", "help", "workflow_node", "subagent")
 
     def _count_tokens(self, messages: List[dict]) -> int:
-        """tiktoken 计消息列表 token；不可用时字符数减半兜底（estimate_context_tokens 共用）"""
+        """tiktoken 计消息列表 token；不可用时字符数减半兜底（estimate_context_tokens 共用）
+
+        先按 _api_session_item 转成实际出站消息，思考仅在窗口内并回正文时才计入。"""
         from core import tokens as tokenmod
 
         model = getattr(self.config, "model_name", "") or ""
+        payload = [out for out in (self._api_session_item(m) for m in messages) if out]
         try:
-            return tokenmod.count_message_tokens(messages, model)
+            return tokenmod.count_message_tokens(payload, model)
         except Exception:
-            chars = sum(len(content_text(m.get("content"))) for m in messages)
+            chars = sum(len(content_text(m.get("content"))) for m in payload)
             return max(1, chars // 2)
 
     def _round_boundaries(self) -> List[int]:

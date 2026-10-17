@@ -137,10 +137,12 @@ def default_config() -> dict:
             "strip_keep_recent": 6,
             "aggressive_optimization": False,
             "aggressive_keep_tool_rounds": 12,
-            # 回合中维护（memory.mid_turn_maintenance）：每次 LLM 请求前剥离保护集外的旧工具输出；保护口径独立于回合末，thinking 保留到回合末才剥离
+            # 回合中维护（memory.mid_turn_maintenance）：每次 LLM 请求前剥离保护集外的旧工具输出；保护口径独立于回合末
             "mid_turn_maintenance": True,
             "mid_turn_keep_tool_rounds": 12,
             "mid_turn_keep_reads_per_file": 3,
+            # 回合中思考滑窗：只保留最近 N 条 assistant 思考出站，更旧的打 thinking_stripped 标仅留档（原文不删，回合末仍全量剥离）；0=关闭本项
+            "mid_turn_keep_thinking_rounds": 3,
         },
         #技能加载系统（core/skills.py + tools.load_skill），参考了helloAgent和qwen code的实现
         "skills": {
@@ -165,7 +167,8 @@ def default_config() -> dict:
         （系统提示词+工具循环，不经节点链）；true 时按 dir 下 <active>.json 声明的线性节点链运行（system_prompt/skill/analyze/plan/execute/llm），
         加载失败回退内置默认工作流；设置页"系统"标签可切换 enabled/active，/workflow 命令切换即自动启用；
         编辑器 gui/workflow_editor.py（/workflow edit）。max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
-        spin_kill_count：空转熔断器计数上限（core/tools.SpinGuard）——重复输出出现才开始计数、整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限"""
+        spin_kill_count：空转熔断器计数上限（core/tools.SpinGuard）——重复输出出现才开始计数、整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限；
+        max_total_rounds：可选兜底保险丝——>0 时封顶续期总量（0/未配置 = 不启用）"""
         "workflow": {
             "enabled": False,
             "dir": "data/workflows",
