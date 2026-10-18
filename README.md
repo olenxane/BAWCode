@@ -57,6 +57,8 @@ python main.py                    # 进入 TUI
 /rag                  RAG 状态 / 建索引 / 开关（插件）
 ```
 
+![运行截图:能够良好执行真实任务](assets/running.png)
+
 ## 项目结构
 
 ```
