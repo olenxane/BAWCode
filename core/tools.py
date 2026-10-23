@@ -32,6 +32,22 @@ log = get_logger("tools")
 DEFAULT_TIMEOUT = 320
 MAX_TIMEOUT = 3200
 
+
+class CommandOutput(str):
+    """命令文本及执行元数据。
+
+    保持 str 接口，已有工具调用方仍可直接显示、判断或序列化返回文本；
+    消息入库前另外读取真实退出码和原始输出，避免从输出中的任意数字猜测执行状态。
+    """
+
+    def __new__(cls, text: str, exit_code=None, output_text=None, exit_status="未知"):
+        result = super().__new__(cls, text)
+        result.exit_code = exit_code
+        result.output_text = text if output_text is None else output_text
+        result.exit_status = exit_status
+        return result
+
+
 # 文件工具输出防护参数
 _READ_MAX_LINES = 2200       # read 单次返回行数上限，防大文件拖爆上下文，续读用 offset 分页
 _READ_MAX_LINE_CHARS = 1600  # read 单行字符上限，防超长单行炸上下文
@@ -316,16 +332,25 @@ def execute_command(
         return _with_notice(f"执行失败: {e}", fallback_notice)
     if status == "cancelled":
         log.warn("命令被回合中断: %s", command)
-        return _with_notice("命令已被中断（进程树已终止）", fallback_notice)
+        return CommandOutput(
+            _with_notice("命令已被中断（进程树已终止）", fallback_notice),
+            output_text=output or "", exit_status="已中断",
+        )
     if status == "timeout":
         log.warn("命令超时（>%ds）: %s", timeout, command)
-        return _with_notice(f"命令超时（>{timeout}s）", fallback_notice)
+        return CommandOutput(
+            _with_notice(f"命令超时（>{timeout}s）", fallback_notice),
+            output_text=output or "", exit_status="超时",
+        )
     if code != 0:
         log.warn("命令退出码 %d: %s", code, command)
-        return _with_notice(f"命令退出码 {code}\n{output or ''}".strip(), fallback_notice)
+        return CommandOutput(
+            _with_notice(f"命令退出码 {code}\n{output or ''}".strip(), fallback_notice), code, output or "",
+        )
     log.debug("命令完成，输出 %d 字符", len(output or ""))
     # 无输出也要明说，便于模型与真失败（退出码非 0）区分
-    return _with_notice((output or "").strip() or "命令完成，无输出（退出码 0）。", fallback_notice)
+    text = _with_notice((output or "").strip() or "命令完成，无输出（退出码 0）。", fallback_notice)
+    return CommandOutput(text, code, output or "")
 
 
 # execute_command 后台执行：监视线程在进程退出后经 main 注册的 runner.notify 发起新回合通知
@@ -404,12 +429,14 @@ def _execute_command_background(command: str, cwd: Optional[str], argv, stdin_te
         name=f"bawcode-bg-{task_id}",
     ).start()
     log.info("后台任务启动 id=%s pid=%s 执行器=%s 输出=%s", task_id, proc.pid, shell_name, out_file)
-    return _with_notice(
+    text = _with_notice(
         f"已在后台启动（id={task_id} pid={proc.pid}，cwd={cwd or '当前目录'}）\n"
         f"输出文件: {out_file}\n"
         f"完成后系统会自动通知（届时用 read 工具读取输出文件）；期间也可随时用 read 查看该文件获取当前输出。",
         notice,
     )
+    # 启动回执不代表执行完成，不能预填退出码 0。
+    return CommandOutput(text, exit_status="尚未完成")
 
 
 def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: str, started: float,
@@ -1778,15 +1805,15 @@ def run_program(
         return f"启动失败: {e}"
     if status == "cancelled":
         log.warn("程序被回合中断: %s", " ".join(cmd))
-        return "程序已被中断（进程树已终止）"
+        return CommandOutput("程序已被中断（进程树已终止）", output_text=output or "", exit_status="已中断")
     if status == "timeout":
         log.warn("程序超时（>%ds）: %s", timeout, " ".join(cmd))
-        return f"程序超时（>{timeout}s）"
+        return CommandOutput(f"程序超时（>{timeout}s）", output_text=output or "", exit_status="超时")
     if code != 0:
         log.warn("程序退出码 %d: %s", code, " ".join(cmd))
         # 退出码进返回值：与 execute_command 同口径，供失败启发式与模型感知
-        return f"命令退出码 {code}\n{output}".strip()
-    return output.strip() or "命令退出码 0"
+        return CommandOutput(f"命令退出码 {code}\n{output}".strip(), code, output or "")
+    return CommandOutput(output.strip() or "命令退出码 0", code, output or "")
 
 
 # ----- webfetch：以真实浏览器头抓取页面，剥离脚本/导航/广告等噪音，

@@ -82,6 +82,9 @@ class TokenMeter:
         self.api_prompt_tokens = 0
         self.api_completion_tokens = 0
         self.api_total_tokens = 0
+        # 累计缓存命中 token：OpenAI 系在 prompt_tokens_details.cached_tokens，
+        # DeepSeek 在 prompt_cache_hit_tokens；未返回时保持 0
+        self.cached_prompt_tokens = 0
         self.last_context_tokens = 0
         self.context_window = 0
         self.balance: Optional[float] = None
@@ -135,6 +138,11 @@ class TokenMeter:
             self.source = "api"
             self.last_context_tokens = int(usage.get("prompt_tokens") or self.last_context_tokens)
             self.turn_peak_context_tokens = max(self.turn_peak_context_tokens, self.last_context_tokens)
+            details = usage.get("prompt_tokens_details")
+            cached = details.get("cached_tokens") if isinstance(details, dict) else 0
+            if cached is None:
+                cached = usage.get("prompt_cache_hit_tokens") or 0
+            self.cached_prompt_tokens += int(cached or 0)
         except (TypeError, ValueError):
             pass
 
@@ -188,6 +196,8 @@ class TokenMeter:
             token_part = f"tokens {ctx} [{src}]"
         if billed > 0:
             token_part += f" · 累计 {billed}"
+        if self.cached_prompt_tokens > 0:
+            token_part += f" · 缓存命中 {self.cached_prompt_tokens}"
         if self.balance is not None:
             bal = f" · 余额 {self.balance}"
             if self.balance_currency:

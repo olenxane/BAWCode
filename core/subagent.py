@@ -39,6 +39,8 @@ from core import policy
 from core import memory as memory_mod
 from core import prompt_loader
 from core import register
+from core import tokens as token_mod
+from core import toolstore
 from core.llm import CANCELLED
 from core.log import get_logger
 from core.tools import SpinGuard
@@ -154,6 +156,9 @@ def subagent_cfg(config) -> dict:
         "result_char_cap": max(200, _int(data.get("result_char_cap"), 3000)),
         "query_default_rounds": max(1, _int(data.get("query_default_rounds"), 3)),
         "max_concurrent": max(1, _int(data.get("max_concurrent"), _DEFAULT_MAX_CONCURRENT)),
+        "context_fold_ratio": float(data.get("context_fold_ratio") or 0.85),
+        "context_fold_keep_rounds": max(0, _int(data.get("context_fold_keep_rounds"), 4)),
+        "context_fold_digest_chars": max(0, _int(data.get("context_fold_digest_chars"), 240)),
     }
 
 
@@ -878,6 +883,69 @@ def _build_summary(record: dict, final_text: str, cfg: dict, record_path: Option
     return "\n".join(parts)
 
 
+def _fold_old_tool_outputs(rt: dict, record: dict, messages: List[dict]) -> int:
+    """子代理上下文接近窗口时折叠旧工具输出
+
+    只处理最近 context_fold_keep_rounds 个工具轮之外的结果：完整内容写入会话外置目录，
+    行内保留头尾摘要与回读指针。返回折叠条数；未达阈值时不做任何改动。
+    """
+    config = rt.get("config")
+    window = int(getattr(config, "context_window", 0) or 0)
+    if window <= 0:
+        return 0
+    cfg = subagent_cfg(config)
+    ratio = min(max(float(cfg.get("context_fold_ratio") or 0.85), 0.1), 0.98)
+    keep_rounds = max(0, int(cfg.get("context_fold_keep_rounds") or 4))
+    digest_chars = max(0, int(cfg.get("context_fold_digest_chars") or 240))
+    model = str(record.get("model") or "")
+    try:
+        used = token_mod.count_message_tokens(messages, model)
+    except Exception:
+        return 0
+    if used < int(window * ratio):
+        return 0
+    # 最近 N 个工具轮内的结果保持原文
+    round_indexes = [
+        index for index, message in enumerate(messages)
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    ]
+    protected_ids = set()
+    for index in round_indexes[-keep_rounds:] if keep_rounds else []:
+        for call in messages[index].get("tool_calls") or []:
+            if isinstance(call, dict) and call.get("id"):
+                protected_ids.add(str(call["id"]))
+    session = rt.get("session")
+    project_id = str(getattr(session, "project_id", "") or "")
+    session_id = str(getattr(session, "session_id", "") or "")
+    folded = 0
+    for message in messages:
+        if message.get("role") != "tool" or message.get("folded"):
+            continue
+        if str(message.get("tool_call_id") or "") in protected_ids:
+            continue
+        text = str(message.get("content") or "")
+        if len(text) <= digest_chars * 2:
+            continue
+        call_id = str(message.get("tool_call_id") or "")
+        path = toolstore.persist(
+            config, project_id, session_id, call_id,
+            str(message.get("tool_name") or "tool"),
+            {}, str(message.get("description") or ""), text,
+        )
+        digest = ""
+        if digest_chars > 0:
+            head = digest_chars * 3 // 5
+            tail = digest_chars - head
+            digest = f"{text[:head]} …[省略{len(text) - digest_chars}字]… {text[-tail:]} "
+        pointer = f"[完整输出: {path}]" if path else ""
+        message["content"] = f"[子代理上下文折叠] {digest}{pointer}"
+        message["folded"] = True
+        folded += 1
+    if folded:
+        log.info("子代理 #%s 上下文折叠 %d 条旧工具输出（约%d token）", record.get("id"), folded, used)
+    return folded
+
+
 def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict],
               max_rounds: int, spin: SpinGuard, directory: Path) -> tuple:
     """子代理执行循环。返回 (status, final_text)；防空转与主循环同判据（SpinGuard：
@@ -908,6 +976,7 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
         record["rounds"] = rounds
         if io.cancelled() or llm.cancelled():
             return ("interrupted", "")
+        _fold_old_tool_outputs(rt, record, messages)
         _live_phase(rt, rid, f"推理 · 第{rounds}轮")
 
         def on_delta(kind, piece):

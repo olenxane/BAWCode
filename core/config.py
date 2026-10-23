@@ -112,10 +112,15 @@ def default_config() -> dict:
             "compress_keep_recent_tokens": 16384,
             # 摘要硬上限 token，超限则放弃本次压缩
             "compress_summary_max_tokens": 64000,
+            # 摘要软目标占旧段 token 的比例（提示词内的目标字数由程序计算）
+            "compress_summary_ratio": 0.06,
+            # 压缩后的目标水位占可用输入预算的比例；尾段预算同时受 compress_keep_recent_tokens 限制
+            "compress_target_ratio": 0.45,
         },
-        """上下文管理(core/toolstore.py + memory.finalize_turn):
-            tool_whitelist内的白名单工具调用历史会有更长的生命周期，当白名单工具调用累计到达一定token时最老的工具调用历史仍然会被剥离；被剥离的调用历史将写盘保存；白名单外的工具在回合内轻压缩和
-            回合外大青蒜时会被剥离。工具剥离后仅保留模型生成的description和调用id，同时保留指向落盘文件的指针"""
+        # 上下文管理(core/toolstore.py + memory.finalize_turn):
+        # tool_whitelist 内的白名单工具调用历史有更长的生命周期，当白名单工具调用累计到达一定 token 时
+        # 最老的工具调用历史仍会被剥离；被剥离的调用历史写盘保存。白名单外的工具在回合内轻压缩和
+        # 回合末整理时被剥离。工具剥离后保留 description、调用 id、结果摘要与落盘指针。
         "context": {
             "tool_whitelist": [
                 "write_plan",
@@ -143,6 +148,12 @@ def default_config() -> dict:
             "mid_turn_keep_reads_per_file": 3,
             # 回合中思考滑窗：只保留最近 N 条 assistant 思考出站，更旧的打 thinking_stripped 标仅留档（原文不删，回合末仍全量剥离）；0=关闭本项
             "mid_turn_keep_thinking_rounds": 3,
+            # 请求预算安全余量：完整请求（系统提示/工具定义/记忆/历史）与模型窗口之间保留的 token
+            "request_safety_tokens": 2048,
+            # 工具结果折叠后保留的证据摘要字符数（头尾各取一部分）；0=只留指针
+            "strip_digest_chars": 200,
+            # 激进模式下每个文件最多保留多少个不同读取范围的记录（同范围只保留最新一次）
+            "aggressive_keep_reads_per_file": 3,
         },
         #技能加载系统（core/skills.py + tools.load_skill），参考了helloAgent和qwen code的实现
         "skills": {
@@ -151,11 +162,12 @@ def default_config() -> dict:
             "metadata_budget_tokens": 1024,
         },
         "command_plugins": ["data/commands"],
-        """插件系统（core/plugins.py）：dir 下 <id>/plugin.json + main.py，双层目录
-        （项目级 {workspace}/.bawcode/plugins 同名覆盖全局）。插件可注册 hooks/commands/tools/skills/上下文补充；enabled=false 全局关闭；
-        disable 按 id禁用单个插件（/plugin disable 写入）。plugins_config.<id> 为插件私有配置（插件经 ctx.settings 读取，宿主不解释其内容）。
-        插件目录可带requirements.txt 声明独有依赖：装载时缺失项经 pip 静默补齐；
-        auto_install_deps=false 时只检查不安装，缺依赖记入 /plugin 诊断。"""
+        # 插件系统（core/plugins.py）：dir 下 <id>/plugin.json + main.py，双层目录
+        # （项目级 {workspace}/.bawcode/plugins 同名覆盖全局）。插件可注册 hooks/commands/tools/skills/上下文补充；
+        # enabled=false 全局关闭；disable 按 id 禁用单个插件（/plugin disable 写入）。
+        # plugins_config.<id> 为插件私有配置（插件经 ctx.settings 读取，宿主不解释其内容）。
+        # 插件目录可带 requirements.txt 声明独有依赖：装载时缺失项经 pip 静默补齐；
+        # auto_install_deps=false 时只检查不安装，缺依赖记入 /plugin 诊断。
         "plugins": {
             "enabled": True,
             "dir": "data/plugins",
@@ -163,12 +175,14 @@ def default_config() -> dict:
             "auto_install_deps": True,
         },
         "plugins_config": {},
-        """外置工作流（core/workflow.py）：enabled=false（默认）时用户直接与 LLM 对话
-        （系统提示词+工具循环，不经节点链）；true 时按 dir 下 <active>.json 声明的线性节点链运行（system_prompt/skill/analyze/plan/execute/llm），
-        加载失败回退内置默认工作流；设置页"系统"标签可切换 enabled/active，/workflow 命令切换即自动启用；
-        编辑器 gui/workflow_editor.py（/workflow edit）。max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
-        spin_kill_count：空转熔断器计数上限（core/tools.SpinGuard）——重复输出出现才开始计数、整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限；
-        max_total_rounds：可选兜底保险丝——>0 时封顶续期总量（0/未配置 = 不启用）"""
+        # 外置工作流（core/workflow.py）：enabled=false（默认）时用户直接与 LLM 对话
+        # （系统提示词+工具循环，不经节点链）；true 时按 dir 下 <active>.json 声明的线性节点链运行
+        # （system_prompt/skill/analyze/plan/execute/llm），加载失败回退内置默认工作流；
+        # 设置页"系统"标签可切换 enabled/active，/workflow 命令切换即自动启用；
+        # 编辑器 gui/workflow_editor.py（/workflow edit）。max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
+        # spin_kill_count：空转熔断器计数上限（core/tools.SpinGuard）——重复输出出现才开始计数、
+        # 整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限；
+        # max_total_rounds：可选兜底保险丝——>0 时封顶续期总量（0/未配置 = 不启用）。
         "workflow": {
             "enabled": False,
             "dir": "data/workflows",
@@ -176,14 +190,16 @@ def default_config() -> dict:
             "max_rounds": 0,
             "spin_kill_count": 12,
         },
-        """子代理系统（core/subagent.py）：task 工具派发独立上下文子代理，
+        # 子代理系统（core/subagent.py）：task 工具派发独立上下文子代理，
         # query_subagent 查询其工作过程。enabled=false 不注册工具（模型侧不可见）。
         # 全程轨迹落盘 dir/{project_id}/{session_id}/{id}.json；角色=系统提示词
         # persona（agents_dir 下 <role>.json，内置 universal），模型经角色 model
         # 字段指定；工具权限跟随主代理当前访问模式，子代理无确认通道、可申请提权。
         # max_rounds 单次派发轮次上限（配合 workflow.spin_kill_count 空转计数：
         # 重复输出才计数、全新结果清零，计满终止）；result_char_cap 结果摘要字符上限；
-        # query_default_rounds 查询默认轮数；max_concurrent 同轮并行派发上限（超出排队等槽）"""
+        # query_default_rounds 查询默认轮数；max_concurrent 同轮并行派发上限（超出排队等槽）。
+        # context_fold_ratio：子代理请求达到模型窗口该比例时折叠旧工具输出；
+        # context_fold_keep_rounds：折叠时最近 N 个工具轮保持原文。
         "subagent": {
             "enabled": True,
             "dir": "data/subagents",
@@ -192,23 +208,27 @@ def default_config() -> dict:
             "result_char_cap": 3200,
             "query_default_rounds": 3,
             "max_concurrent": 3,
+            "context_fold_ratio": 0.85,
+            "context_fold_keep_rounds": 4,
+            "context_fold_digest_chars": 240,
         },
-        """工具执行层（core/tools.py）：
-        max_timeout 为模型传入 timeout 参数的钳制上限（execute_command/run_program），防止有豆包级模型传个9999999；
-        ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟；数字配置 >0 视为开）；
-        default_shell 为 execute_command 默认执行器core/shells.py：cmd/git_bash/powershell，执行时可用 shell 参数单次覆盖，执行器未安装直接报错不静默切换）"""
+        # 工具执行层（core/tools.py）：
+        # max_timeout 为模型传入 timeout 参数的钳制上限（execute_command/run_program），防止极端取值；
+        # ask_user_timeout 为询问用户弹框的自动超时开关（bool，开启固定 5 分钟；数字配置 >0 视为开）；
+        # default_shell 为 execute_command 默认执行器 core/shells.py：cmd/git_bash/powershell，
+        # 执行时可用 shell 参数单次覆盖，执行器未安装直接报错不静默切换。
         "tools": {
             "max_timeout": 1200,
             "ask_user_timeout": True,
             "default_shell": "cmd",
         },
-        """MCP 客户端（core/mcp.py）：把外部 MCP 服务器的工具桥接进本机工具循环。参考了HelloAgent的实现。
+        # MCP 客户端（core/mcp.py）：把外部 MCP 服务器的工具桥接进本机工具循环。
         # enabled=false 不连接不注册（模型侧完全不可见）。servers 每项：stdio 用
         # command/args/env/cwd；远程用 url + headers（transport=http|sse，留空自动
         # 推断：/sse 结尾走 sse，其余 streamable HTTP）。timeout 单条调用超时秒数
         # （0 用全局 call_timeout）；include/exclude_tools 按原始工具名过滤。
         # 注册名 mcp__<服务器>__<工具>（超长/非法字符自动规范化加哈希后缀）；
-        # 权限默认逐次确认，「始终允许」指纹不含参数（mcp|<server>|<tool>）。"""
+        # 权限默认逐次确认，「始终允许」指纹不含参数（mcp|<server>|<tool>）。
         "mcp": {
             "enabled": False,
             "servers": {},
@@ -217,12 +237,12 @@ def default_config() -> dict:
             "call_timeout": 600,
             "auto_reconnect": True,
         },
-        """回合快照与回收站（core/snapshot.py）：write/edit_file/delete_file
+        # 回合快照与回收站（core/snapshot.py）：write/edit_file/delete_file
         # 改动前留底原始字节，回合末落盘 data/snapshots/{project}/{session}/{序号}/，
         # /undo 校验 md5 后字节级还原（用户事后改过的文件跳过）；回合开始轻量清单
         # （不含内容）回合末对账，execute_command 等绕过写入工具的改动仅列出无法还原。
         # trash_dir 项目回收站：delete_file 移入、/clear-trash 真正清空。
-        # inventory_max_files 清单文件数上限（0=禁用对账；超限本回合放弃对账）"""
+        # inventory_max_files 清单文件数上限（0=禁用对账；超限本回合放弃对账）。
         "snapshot": {
             "enabled": True,
             "dir": "data/snapshots",
@@ -524,6 +544,12 @@ class Config:
 
     def _sanitize_data(self) -> None:
         """字段级矫正：类型不符的关键容器回退为空，避免下游 .get/迭代崩溃"""
+        # 旧默认配置把说明文字误写成字典键（相邻字符串字面量拼接），只清理这类超长伪键
+        known_sections = ("context", "plugins", "workflow", "subagent", "tools", "mcp", "snapshot")
+        for key in list(self.data):
+            if isinstance(key, str) and len(key) > 64 and key.endswith(known_sections):
+                log.warn("清理配置中的说明文字伪键: %.40s…", key)
+                self.data.pop(key, None)
         if not isinstance(self.data.get("providers"), list):
             self.data["providers"] = []
         # 非 dict 的 provider 条目（脏数据）直接丢弃

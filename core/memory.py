@@ -122,8 +122,15 @@ _SNAPSHOT_SECTIONS = (
     "next_step",
 )
 
+# 摘要必须携带的任务状态节：缺少任一项说明压缩丢掉了后续执行所需信息
+_REQUIRED_SNAPSHOT_SECTIONS = (
+    "primary_request_and_intent",
+    "current_work",
+    "next_step",
+)
+
 _COMPRESS_RETRY_HINT = (
-    "\n\n注意：上一次输出无法被程序解析为 <state_snapshot> 结构。"
+    "\n\n注意：上一次输出无法被程序解析为 <state_snapshot> 结构，或缺少必需节。"
     "请重新输出：先 <analysis> 草稿，随后严格按模板输出 <state_snapshot> XML，"
     "XML 之外不要有任何文字（也不要代码围栏）。"
 )
@@ -151,6 +158,16 @@ def parse_state_snapshot(text: str) -> Optional[dict]:
     if sum(1 for v in sections.values() if v) < 3:
         return None
     return {"sections": sections, "xml": xml}
+
+
+def parse_required_snapshot(text: str) -> Optional[dict]:
+    """解析摘要并校验必需的任务状态节；缺节视为不可用，避免压缩后丢失当前工作"""
+    structured = parse_state_snapshot(text)
+    if structured is None:
+        return None
+    if any(not structured["sections"].get(tag) for tag in _REQUIRED_SNAPSHOT_SECTIONS):
+        return None
+    return structured
 
 # 会话级记忆单例，由 main 初始化
 _session: Optional["Memory"] = None
@@ -235,10 +252,14 @@ class Memory:
             self.projects_dir / f"{self.project_id}.md" if self.project_id else self.projects_dir / "_default.md"
         )
         self.auto_compress = memory_cfg.get("auto_compress", True)
-        self.compress_threshold = memory_cfg.get("compress_threshold", 0.8)
+        # 阈值与目标水位都限制在 (0,1]，避免异常配置导致永不触发或目标超过窗口
+        self.compress_threshold = min(max(float(memory_cfg.get("compress_threshold", 0.8)), 0.1), 1.0)
         # 压缩管线：尾段保留预算（最近轮次原文）与摘要硬上限；连续失败熔断计数
         self.compress_keep_recent_tokens = int(memory_cfg.get("compress_keep_recent_tokens", 16384))
-        self.compress_summary_max_tokens = int(memory_cfg.get("compress_summary_max_tokens", 1024))
+        self.compress_summary_max_tokens = int(memory_cfg.get("compress_summary_max_tokens", 64000))
+        # 摘要软目标比例与压缩目标水位：目标水位用于动态收紧尾段预算
+        self.compress_summary_ratio = max(0.01, float(memory_cfg.get("compress_summary_ratio", 0.06)))
+        self.compress_target_ratio = min(max(float(memory_cfg.get("compress_target_ratio", 0.45)), 0.1), 0.95)
         self._compress_fail_streak = 0
         self._compress_noop_fingerprint = ""
         # 上下文管理（core/toolstore.py）：白名单/预算/行内限额/回合末剥离保护
@@ -255,6 +276,12 @@ class Memory:
         self.mid_turn_keep_tool_rounds = int(ctx_cfg.get("mid_turn_keep_tool_rounds", 12))
         self.mid_turn_keep_reads_per_file = int(ctx_cfg.get("mid_turn_keep_reads_per_file", 3))
         self.mid_turn_keep_thinking_rounds = int(ctx_cfg.get("mid_turn_keep_thinking_rounds", 3))
+        # 完整请求预算：窗口扣除输出预留与安全余量后的输入上限
+        self.request_safety_tokens = int(ctx_cfg.get("request_safety_tokens", 2048))
+        # 工具结果折叠时保留的头尾摘要字符数；0=只保留指针
+        self.strip_digest_chars = int(ctx_cfg.get("strip_digest_chars", 200))
+        # 激进模式下每个文件保留的不同读取范围数
+        self.aggressive_keep_reads_per_file = int(ctx_cfg.get("aggressive_keep_reads_per_file", 3))
         toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
@@ -770,8 +797,17 @@ class Memory:
         args = call.get("arguments")
         if not isinstance(args, dict):
             args = {}
+        # 命令工具通过字符串附带元数据，显示文本仍兼容旧接口；摘要必须在行内截断前生成，
+        # 否则外置后的 content 尾部只是回读指针，不是原始输出的末行。
+        exit_code = getattr(content, "exit_code", None)
+        exit_status = getattr(content, "exit_status", None)
+        if exit_status is None:
+            exit_status = "未知" if tool_name in ("execute_command", "run_program") else "不适用"
+        output_text = getattr(content, "output_text", None)
         if not isinstance(content, str):
             content = content_text(content)
+        digest_text = content if output_text is None else output_text
+        result_digest = self._result_digest(digest_text, exit_code, exit_status)
         read_fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest() if tool_name == "read" else ""
         timeline_snapshot = None
         if tool_name in ("write_plan", "update_plan", "generate_steps", "update_step_status"):
@@ -810,6 +846,9 @@ class Memory:
             "tool_name": tool_name,
             "tool_call_id": call_id,
             "description": description,
+            "exit_code": exit_code,
+            "exit_status": exit_status,
+            "result_digest": result_digest,
         }
         if timeline_snapshot is not None:
             extra["timeline_snapshot"] = timeline_snapshot
@@ -857,6 +896,9 @@ class Memory:
         self.tool_whitelist = set(ctx_cfg.get("tool_whitelist", self.tool_whitelist) or [])
         self.whitelist_budget_tokens = int(ctx_cfg.get("whitelist_budget_tokens", self.whitelist_budget_tokens))
         self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", self.strip_keep_recent))
+        self.strip_digest_chars = int(
+            ctx_cfg.get("strip_digest_chars", getattr(self, "strip_digest_chars", 200))
+        )
         model = getattr(self.config, "model_name", "")
         # 思考滑窗不依赖工具记录：没有工具结果的回合同样要收敛历史思考
         self._mid_turn_strip_old_thinking()
@@ -922,7 +964,9 @@ class Memory:
             (i for i, message in enumerate(self.messages) if message.get("role") == "user"),
             default=-1,
         )
-        reads_by_path = {}
+        # 读取记录按“文件 + 读取范围”分组：同一文件的不同片段各自保留最新一次，
+        # 避免读了 1-100 行再读 500-600 行时前一段被误判为重复读取
+        reads_by_file = {}
         for index, message in enumerate(self.messages):
             if message.get("role") == "assistant" and message.get("tool_calls"):
                 current_round = len(round_indexes)
@@ -935,15 +979,16 @@ class Memory:
                     protected.add(index)
                 if tool_name == "read" and message.get("file_path"):
                     path = os.path.normcase(os.path.normpath(str(message["file_path"])))
-                    reads_by_path.setdefault(path, []).append(index)
+                    scope = (message.get("read_offset") or 0, message.get("read_limit") or 0)
+                    reads_by_file.setdefault(path, {})[scope] = index
         keep_rounds = max(0, self.mid_turn_keep_tool_rounds)
         recent_rounds = set(range(max(0, len(round_indexes) - keep_rounds), len(round_indexes)))
         for index, round_index in tool_to_round.items():
             if round_index in recent_rounds and self.messages[index].get("tool_name") not in ("read", "write"):
                 protected.add(index)
         keep_reads = max(0, self.mid_turn_keep_reads_per_file)
-        for indexes in reads_by_path.values():
-            protected.update(indexes[-keep_reads:] if keep_reads else [])
+        for scopes in reads_by_file.values():
+            protected.update(sorted(scopes.values())[-keep_reads:] if keep_reads else [])
         return protected
 
     def finalize_turn(self) -> None:
@@ -957,6 +1002,12 @@ class Memory:
         self.tool_whitelist = set(ctx_cfg.get("tool_whitelist", self.tool_whitelist) or [])
         self.whitelist_budget_tokens = int(ctx_cfg.get("whitelist_budget_tokens", self.whitelist_budget_tokens))
         self.strip_keep_recent = int(ctx_cfg.get("strip_keep_recent", self.strip_keep_recent))
+        self.strip_digest_chars = int(
+            ctx_cfg.get("strip_digest_chars", getattr(self, "strip_digest_chars", 200))
+        )
+        self.aggressive_keep_reads_per_file = int(
+            ctx_cfg.get("aggressive_keep_reads_per_file", getattr(self, "aggressive_keep_reads_per_file", 3))
+        )
         model = getattr(self.config, "model_name", "")
         tool_indexes = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
         recent_tool_indexes = tool_indexes[-self.strip_keep_recent:] if self.strip_keep_recent > 0 else []
@@ -1019,7 +1070,9 @@ class Memory:
             default=-1,
         )
         current_write_indexes = set()
-        last_read_by_path = {}
+        # 读取记录按“文件 + 版本指纹 + 读取范围”分组：文件修改后旧版本片段不再受保护，
+        # 不同范围各自保留最新一次，避免只保护最后一个片段
+        reads_by_file = {}
         for index, message in enumerate(self.messages):
             if message.get("role") == "assistant" and message.get("tool_calls"):
                 current_round = len(round_indexes)
@@ -1031,7 +1084,12 @@ class Memory:
                     current_write_indexes.add(index)
                 if message.get("tool_name") == "read" and message.get("file_path"):
                     path = os.path.normcase(os.path.normpath(str(message["file_path"])))
-                    last_read_by_path[path] = index
+                    scope = (
+                        message.get("read_fingerprint") or "",
+                        message.get("read_offset") or 0,
+                        message.get("read_limit") or 0,
+                    )
+                    reads_by_file.setdefault(path, {})[scope] = index
         keep_rounds = max(0, self.aggressive_keep_tool_rounds)
         recent_rounds = set(range(max(0, len(round_indexes) - keep_rounds), len(round_indexes)))
         protected = {
@@ -1043,11 +1101,48 @@ class Memory:
             if self.messages[index].get("tool_name") not in ("read", "write")
         }
         protected.update(current_write_indexes)
-        protected.update(last_read_by_path.values())
+        keep_reads = max(0, int(getattr(self, "aggressive_keep_reads_per_file", 3)))
+        for scopes in reads_by_file.values():
+            protected.update(sorted(scopes.values())[-keep_reads:] if keep_reads else [])
         return protected
 
+    def _result_digest(self, text: str, exit_code=None, exit_status="不适用") -> str:
+        """结果摘要保存退出码及输出首末行，中间内容不进入摘要。
+
+        字符上限只约束输出片段，退出码和省略标记独立保留；多行输出均分首末行预算，
+        首行从开头截取、末行从结尾截取，单行不重复。没有真实退出码时明确标注状态。
+        """
+        status = str(exit_code) if exit_code is not None else exit_status
+        prefix = f"退出码: {status}"
+        limit = max(0, int(getattr(self, "strip_digest_chars", 200)))
+        if limit <= 0:
+            return prefix
+        lines = str(text or "").splitlines()
+        if not lines:
+            return f"{prefix}；输出: [无输出]"
+        first = " ".join(lines[0].split())
+        if len(lines) == 1:
+            if len(first) > limit:
+                first = first[:limit] + "…[截断]"
+            return f"{prefix}；输出: {first or '[空行]'}"
+        last = " ".join(lines[-1].split())
+        first_budget = min(len(first), (limit + 1) // 2)
+        last_budget = min(len(last), limit - first_budget)
+        first_budget = min(len(first), limit - last_budget)
+        first_text = first[:first_budget] if first_budget else ""
+        last_text = last[-last_budget:] if last_budget else ""
+        if len(first) > first_budget:
+            first_text += "…[截断]"
+        if len(last) > last_budget:
+            last_text = "…[截断]" + last_text
+        parts = [prefix, f"首行: {first_text or '[空行]'}"]
+        if len(lines) > 2:
+            parts.append(f"…[省略中间{len(lines) - 2}行]…")
+        parts.append(f"末行: {last_text or '[空行]'}")
+        return "；".join(parts)
+
     def _strip_tool_message(self, message: dict, prefix: str, force: bool = False) -> bool:
-        """把单条 tool 消息改写为简明记录（description+call_id+落盘路径）；返回是否改写"""
+        """把单条 tool 消息改写为简明记录（description+结果摘要+call_id+落盘路径）；返回是否改写"""
         content = message.get("content") or ""
         text = content_text(content)
         # 带图片的记录不受短文本守卫保护
@@ -1068,6 +1163,20 @@ class Memory:
         parts = [f"[{prefix}·{message.get('tool_name') or 'tool'}]"]
         if message.get("description"):
             parts.append(str(message["description"]))
+        digest = message.get("result_digest")
+        if digest is None:
+            # 旧会话没有预存摘要；已外置的结果优先读取完整正文，不能把指针当作末行。
+            source_text = text
+            if message.get("persist_path"):
+                source_text = toolstore.read_persisted_content(
+                    self.config, self.project_id, self.session_id, message["persist_path"],
+                )
+            exit_status = "未知" if message.get("tool_name") in ("execute_command", "run_program") else "不适用"
+            digest = self._result_digest(
+                source_text, message.get("exit_code"), message.get("exit_status") or exit_status,
+            )
+        if digest:
+            parts.append(f"[结果摘要] {digest}")
         if message.get("tool_call_id"):
             parts.append(f"call_id={message['tool_call_id']}")
         if message.get("persist_path"):
@@ -1127,13 +1236,13 @@ class Memory:
         """与 _api_session_item 同规则的可见性判断（UI 专用注入不参与压缩与轮次统计）"""
         return (item.get("type") or "") not in ("system_prompt", "help", "workflow_node", "subagent")
 
-    def _count_tokens(self, messages: List[dict]) -> int:
+    def _count_tokens(self, messages: List[dict], model: Optional[str] = None) -> int:
         """tiktoken 计消息列表 token；不可用时字符数减半兜底（estimate_context_tokens 共用）
 
         先按 _api_session_item 转成实际出站消息，思考仅在窗口内并回正文时才计入。"""
         from core import tokens as tokenmod
 
-        model = getattr(self.config, "model_name", "") or ""
+        model = model or getattr(self.config, "model_name", "") or ""
         payload = [out for out in (self._api_session_item(m) for m in messages) if out]
         try:
             return tokenmod.count_message_tokens(payload, model)
@@ -1150,13 +1259,34 @@ class Memory:
         ]
 
     def _atomic_blocks(self) -> List[tuple]:
-        """按消息协议切原子块，assistant tool_calls 与其 tool 结果不可拆分"""
+        """按消息协议切原子块，assistant tool_calls 与其 tool 结果不可拆分
+
+        UI 专用节点（子代理完成、工作流节点等）不进出站消息，但可能落在工具调用与
+        结果之间。这里把它们并入当前块，避免按角色扫描时被隔断成孤儿 tool 消息。
+        """
         blocks = []
-        index = 0
-        while index < len(self.messages):
-            start, end = conv_block_bounds(self.messages, index)
-            blocks.append((start, end))
-            index = end + 1
+        current = None
+        for index, item in enumerate(self.messages):
+            role = item.get("role")
+            if not self._api_visible(item):
+                # 不可见节点：有进行中的块就并入，否则自成一块
+                if current is not None:
+                    current = (current[0], index)
+                else:
+                    blocks.append((index, index))
+                continue
+            if current is not None:
+                if role == "tool":
+                    current = (current[0], index)
+                    continue
+                blocks.append(current)
+                current = None
+            if role == "assistant" and item.get("tool_calls"):
+                current = (index, index)
+            else:
+                blocks.append((index, index))
+        if current is not None:
+            blocks.append(current)
         return blocks
 
     def _tail_start_index(self, budget_tokens: int) -> int:
@@ -1235,6 +1365,34 @@ class Memory:
         )
         return any(marker in summary and marker not in history for marker in markers)
 
+    def _summary_history_text(self, messages: List[dict]) -> str:
+        """压缩输入文本：保留工具调用参数，避免文件路径与执行命令只存在于参数里
+
+        content 只取纯文本部分，数组形态（图片块）直接内插会把 base64 整段拼进提示词。
+        工具调用参数截断到固定长度，既保留关键信息又防止单个调用挤占摘要输入预算。
+        """
+        lines = []
+        for message in messages:
+            if not self._api_visible(message):
+                continue
+            text = content_text(message.get("content"))
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    name = call.get("name") or (call.get("function") or {}).get("name") or "tool"
+                    args = call.get("arguments")
+                    try:
+                        args_text = json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args
+                    except (TypeError, ValueError):
+                        args_text = str(args)
+                    args_text = " ".join(str(args_text or "").split())
+                    if len(args_text) > 600:
+                        args_text = args_text[:600] + "…"
+                    text = f"{text}\n[调用 {name} {args_text}]".strip()
+            lines.append(f"{message.get('role')}: {text}")
+        return "\n".join(lines)
+
     def _compress_fail(self, reason: str) -> str:
         """压缩失败统一出口：计数熔断，历史保持不变"""
         self._compress_fail_streak += 1
@@ -1246,7 +1404,7 @@ class Memory:
         return ""
 
     def _archive_old_segment(self, old_segment: List[dict]) -> Optional[Path]:
-        """旧段原文归档落盘；失败不阻塞压缩"""
+        """旧段原文归档落盘；失败返回 None，调用方据此保留原历史"""
         try:
             self.sessions_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -1264,18 +1422,23 @@ class Memory:
             os.replace(tmp, path)
             return path
         except OSError as e:
-            log.warn("压缩归档写入失败（压缩继续）: %s", e)
+            log.warn("压缩归档写入失败，历史保持不变: %s", e)
             return None
 
-    def compress(self, llm_fn: Optional[Callable[[str], str]] = None, external_handler=None) -> str:
+    def compress(
+        self,
+        llm_fn: Optional[Callable[[str], str]] = None,
+        external_handler=None,
+        keep_recent_tokens: Optional[int] = None,
+    ) -> str:
         """上下文压缩：旧段 LLM 结构化摘要 + 保留预算内最近轮次原文
 
-        管线：按轮次边界切尾（预算 compress_keep_recent_tokens，至少保留最后一轮）
-        → 旧段先走 memory_compress 钩子，无结果再走 LLM（提示词由 core/prompts 加载，
-        token 目标按旧段规模程序计算：5% 钳制到 [150, 800]）
-        → 解析校验 state_snapshot 结构（失败重试一次，仍失败按压缩失败处理不替换历史）
+        管线：按轮次边界切尾（预算取 keep_recent_tokens，缺省 compress_keep_recent_tokens，
+        至少保留最后一轮）→ 旧段先走 memory_compress 钩子，无结果再走 LLM
+        （提示词由 core/prompts 加载，token 目标按旧段规模与 compress_summary_ratio 计算）
+        → 解析并校验必需的任务状态节（失败重试一次，仍失败按压缩失败处理不替换历史）
         → 旧段归档落盘 → 新上下文 = [摘要] + 尾段。
-        任何一步失败返回 "" 且不替换历史。
+        归档失败不替换历史：原始记录是唯一可追溯来源。
         """
         if not self.messages:
             return ""
@@ -1283,7 +1446,8 @@ class Memory:
         if fingerprint == self._compress_noop_fingerprint:
             log.debug("压缩跳过: 当前历史与上次无效压缩相同")
             return ""
-        old_segment, tail = self._compression_segments(self.compress_keep_recent_tokens)
+        keep_budget = self.compress_keep_recent_tokens if keep_recent_tokens is None else keep_recent_tokens
+        old_segment, tail = self._compression_segments(max(1, int(keep_budget)))
         if not old_segment:
             self._compress_noop_fingerprint = fingerprint
             log.debug("压缩跳过: 旧段为空（最近轮次已覆盖全部历史）")
@@ -1295,12 +1459,7 @@ class Memory:
         old_tokens = self._count_tokens(old_segment)
         before_tokens = self._count_tokens(self.messages)
 
-        # content 取纯文本部分：数组形态（图片块）直接内插会把 base64 整段拼进提示词
-        history_text = "\n".join(
-            f"{m.get('role')}: {content_text(m.get('content'))}"
-            for m in old_segment
-            if self._api_visible(m)
-        )
+        history_text = self._summary_history_text(old_segment)
         summary = hooks.call_user_participating(
             "memory_compress",
             {"action": "compress", "history": history_text},
@@ -1311,12 +1470,15 @@ class Memory:
             summary = summary["summary"]
         structured = None
         if isinstance(summary, str) and summary.strip():
-            structured = parse_state_snapshot(summary)
+            structured = parse_required_snapshot(summary)
         if not (isinstance(summary, str) and summary.strip()):
             if llm_fn is None:
                 return self._compress_fail("无钩子结果且未注入 llm_fn")
-            # 软目标：旧段 token 的 5%，钳制到 [150, 800]；硬上限另由校验执行
-            target = min(800, max(150, int(old_tokens * 0.05)))
+            # 软目标：旧段 token 的固定比例，下限 300，上限取 compress_summary_max_tokens
+            target = min(
+                self.compress_summary_max_tokens,
+                max(300, int(old_tokens * getattr(self, "compress_summary_ratio", 0.06))),
+            )
             prompt = (
                 prompt_loader.get_compress_prompt(target, config=self.config)
                 + "\n\n## 对话历史\n"
@@ -1326,18 +1488,18 @@ class Memory:
                 summary = llm_fn(prompt)
             except Exception as e:
                 return self._compress_fail(f"摘要 LLM 调用异常 ({e})")
-            structured = parse_state_snapshot(summary)
+            structured = parse_required_snapshot(summary)
             if structured is None:
                 # 结构校验失败重试一次；仍失败走 _compress_fail 熔断，不可解析的摘要绝不入库
                 try:
                     retry_summary = llm_fn(prompt + _COMPRESS_RETRY_HINT)
                 except Exception as e:
                     return self._compress_fail(f"摘要重试 LLM 调用异常 ({e})")
-                retry_structured = parse_state_snapshot(retry_summary)
+                retry_structured = parse_required_snapshot(retry_summary)
                 if retry_structured is not None:
                     summary, structured = retry_summary, retry_structured
             if structured is None:
-                return self._compress_fail("摘要无法解析为 state_snapshot 结构（已重试一次）")
+                return self._compress_fail("摘要无法解析为完整 state_snapshot 结构（已重试一次）")
 
         # 钩子提供的纯文本摘要保持既有契约（非结构化但可用）；LLM 路径必为结构化
         summary_text = structured["xml"] if structured is not None else summary.strip()
@@ -1379,22 +1541,59 @@ class Memory:
                 f"压缩后上下文未变小（{before_tokens}->{after_tokens} token）"
             )
 
-        self._compress_fail_streak = 0
+        # 先归档再替换：替换后旧段只存在于摘要，归档失败则保留原历史
         archive_path = self._archive_old_segment(old_segment)
-        pointer = f"\n\n[完整历史已归档: {archive_path}]" if archive_path else ""
-        summary_msg["content"] += pointer
+        if archive_path is None:
+            return self._compress_fail("旧段归档失败，历史保持不变")
+        self._compress_fail_streak = 0
+        summary_msg["content"] += f"\n\n[完整历史已归档: {archive_path}]"
         self.messages = [summary_msg] + tail
         log.info(
-            "上下文压缩完成: 旧段%d条(约%d token) -> 摘要%d token(%s) + 尾段%d条原文%s",
+            "上下文压缩完成: 旧段%d条(约%d token) -> 摘要%d token(%s) + 尾段%d条原文，归档=%s",
             len(old_segment), old_tokens, summary_tokens,
-            "结构化" if structured is not None else "纯文本", len(tail),
-            f"，归档={archive_path.name}" if archive_path else "（归档失败，摘要继续）",
+            "结构化" if structured is not None else "纯文本", len(tail), archive_path.name,
         )
         return summary_text
 
-    def maybe_compress(self, llm_fn: Optional[Callable[[str], str]] = None) -> None:
-        """按配置阈值自动压缩（阈值与估计均为 token 量纲）；连续失败≥2次熔断，
-        新用户回合自动复位（add_message）"""
+    def _model_limits(self, model: Optional[str] = None) -> tuple:
+        """本次调用模型的 (窗口, 输出上限)：指定模型时按配置查找，找不到回落激活模型"""
+        window = int(getattr(self.config, "context_window", 0) or 0)
+        max_tokens = int(getattr(self.config, "max_tokens", 0) or 0)
+        if not model:
+            return window, max_tokens
+        list_models = getattr(self.config, "list_models", None)
+        if not callable(list_models):
+            return window, max_tokens
+        for row in list_models():
+            if model in (row.get("model_name"), row.get("model_id")):
+                return int(row.get("context_window") or window), int(row.get("max_tokens") or max_tokens)
+        return window, max_tokens
+
+    def request_budget(self, model: Optional[str] = None) -> int:
+        """本次请求可用输入预算：模型窗口扣除输出预留与安全余量
+
+        输出预留取该模型的 max_tokens，但最多扣掉一半窗口，避免小窗口模型把输入预算压到 0。
+        """
+        window, max_tokens = self._model_limits(model)
+        if window <= 0:
+            return 0
+        reserve = min(max(0, max_tokens), window // 2)
+        safety = max(0, int(getattr(self, "request_safety_tokens", 2048)))
+        return max(0, window - reserve - safety)
+
+    def maybe_compress(
+        self,
+        llm_fn: Optional[Callable[[str], str]] = None,
+        payload_tokens: int = 0,
+        fixed_tokens: int = 0,
+        model: Optional[str] = None,
+    ) -> None:
+        """按完整请求预算触发压缩
+
+        payload_tokens 是包含系统提示、记忆补充、工具定义与历史在内的请求总量；
+        未提供时退回只统计会话历史。fixed_tokens 是历史之外的固定开销，用于把
+        压缩后的尾段预算压到目标水位以下。连续失败≥2次熔断，新用户回合复位。
+        """
         if not self.auto_compress:
             return
         if self._compress_fail_streak >= 2:
@@ -1402,15 +1601,21 @@ class Memory:
             return
         if llm_fn is None:
             llm_fn = self._llm_fn
-        limit = int(self.config.context_window * self.compress_threshold)
-        if limit <= 0:
+        budget = self.request_budget(model)
+        if budget <= 0:
             return
-        estimate = self.estimate_context_tokens()
-        if estimate >= limit:
-            log.info("触发自动压缩: 约%d token >= 阈值%d token", estimate, limit)
-            self.compress(llm_fn=llm_fn)
-        else:
-            log.debug("未达压缩阈值: 约%d token/%d token", estimate, limit)
+        limit = int(budget * self.compress_threshold)
+        estimate = int(payload_tokens or self.estimate_context_tokens())
+        if estimate < limit:
+            log.debug("未达压缩阈值: 完整请求约%d token / 阈值%d token", estimate, limit)
+            return
+        target = int(budget * getattr(self, "compress_target_ratio", 0.45)) - max(0, int(fixed_tokens))
+        keep_recent = max(512, min(int(getattr(self, "compress_keep_recent_tokens", 16384)), target))
+        log.info(
+            "触发自动压缩: 完整请求约%d token >= 阈值%d token（尾段预算%d token）",
+            estimate, limit, keep_recent,
+        )
+        self.compress(llm_fn=llm_fn, keep_recent_tokens=keep_recent)
 
     def build_context_supplements(self) -> List[dict]:
         """关键词记忆（全局全量+项目索引）+ 计划/步骤（队首 system 区域）"""
@@ -1546,15 +1751,56 @@ class Memory:
                     out["content"] = None
         return out
 
-    def build_messages(self, extra_system: Optional[str] = None) -> List[dict]:
-        """组装发送给 LLM 的完整消息列表
+    def _payload_tokens(self, messages: List[dict], model: Optional[str] = None) -> int:
+        """按出站形态计算消息列表 token；tiktoken 不可用时按字符数折半"""
+        from core import tokens as tokenmod
 
-        顺序：system提示词 → 长期记忆等补充 → 会话历史（含 tool/tool_calls）。
+        model = model or getattr(self.config, "model_name", "") or ""
+        try:
+            return tokenmod.count_message_tokens(messages, model)
+        except Exception:
+            chars = sum(len(content_text(m.get("content"))) for m in messages)
+            return max(1, chars // 2)
+
+    @staticmethod
+    def _tool_defs_tokens(tools, model: Optional[str] = None) -> int:
+        """工具定义 token：schema 作为请求的一部分计入预算"""
+        if not tools:
+            return 0
+        from core import tokens as tokenmod
+
+        try:
+            text = json.dumps(tools, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return 0
+        try:
+            return tokenmod.count_tokens(text, model or "")
+        except Exception:
+            return max(1, len(text) // 2)
+
+    @staticmethod
+    def _drop_orphan_tools(messages: List[dict]) -> List[dict]:
+        """丢弃没有对应 assistant tool_call 的 tool 消息，避免出站配对不完整
+
+        缺失结果的调用由主循环 finally 与会话加载修复负责补齐，这里只处理孤儿结果。
         """
-        # 先剥离早期工具输出再判摘要：与回合末"先收敛再压缩"同口径，
-        # 避免摘要模型看到未外置的原始大输出
-        self.mid_turn_maintenance()
-        self.maybe_compress(llm_fn=self._llm_fn)
+        call_ids = set()
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                if isinstance(call, dict) and call.get("id"):
+                    call_ids.add(call["id"])
+        kept = []
+        for message in messages:
+            if message.get("role") == "tool" and message.get("tool_call_id") not in call_ids:
+                log.warn("丢弃孤儿 tool 消息: tool=%s", message.get("tool_name") or "-")
+                continue
+            kept.append(message)
+        return kept
+
+    def _assemble_messages(self, extra_system: Optional[str] = None) -> List[dict]:
+        """组装出站消息：system 提示 → 记忆等补充 → 会话历史（含 tool/tool_calls）"""
         messages: List[dict] = []
         if extra_system:
             messages.append({"role": "system", "content": extra_system})
@@ -1564,6 +1810,54 @@ class Memory:
             if mapped:
                 messages.append(mapped)
         return messages
+
+    def build_messages(
+        self,
+        extra_system: Optional[str] = None,
+        tools=None,
+        model: Optional[str] = None,
+    ) -> List[dict]:
+        """组装发送给 LLM 的完整请求
+
+        激进模式每次执行完整回合末维护，普通模式按预算触发回合中维护；随后按
+        系统提示、记忆补充、工具定义与历史的完整预算判断压缩。替换历史后重新组装，
+        最后清理没有对应调用的 tool 消息。
+        """
+        ctx_cfg = (getattr(self.config, "data", None) or {}).get("context") or {}
+        aggressive = bool(ctx_cfg.get("aggressive_optimization", False))
+        # 激进模式每次请求前执行完整回合末维护，包括剥离全部历史思考；
+        # 不受预算水位或回合中维护开关影响，其余模式沿用预算触发规则。
+        if aggressive:
+            self.finalize_turn()
+        messages = self._assemble_messages(extra_system)
+        tools_tokens = self._tool_defs_tokens(tools, model)
+        payload_tokens = self._payload_tokens(messages, model) + tools_tokens
+        # 预算充足时不改写已发送历史，保持前缀稳定以提高缓存命中；
+        # 接近压缩阈值才做回合中收敛，收敛后再按完整请求判断是否压缩
+        budget = self.request_budget(model)
+        maintain_line = int(budget * self.compress_threshold * 0.75) if budget > 0 else 0
+        if not aggressive and (maintain_line <= 0 or payload_tokens >= maintain_line):
+            self.mid_turn_maintenance()
+            messages = self._assemble_messages(extra_system)
+            payload_tokens = self._payload_tokens(messages, model) + tools_tokens
+        history_tokens = self._count_tokens(self.messages, model)
+        before_history = self.messages
+        self.maybe_compress(
+            llm_fn=self._llm_fn,
+            payload_tokens=payload_tokens,
+            fixed_tokens=max(0, payload_tokens - history_tokens),
+            model=model,
+        )
+        if self.messages is not before_history:
+            messages = self._assemble_messages(extra_system)
+            budget = self.request_budget(model)
+            remaining = self._payload_tokens(messages, model) + tools_tokens
+            if budget > 0 and remaining >= int(budget * self.compress_threshold):
+                log.warn(
+                    "压缩后完整请求仍约%d token（预算%d），可能因固定内容或保护集过大",
+                    remaining, budget,
+                )
+        return self._drop_orphan_tools(messages)
 
     # ----- 历史会话保存/切换 -----
 

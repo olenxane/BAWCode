@@ -382,7 +382,7 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
         check_cancel(turn)
         plan = llm.generate_plan(
             turn.user_text, model=plan_model,
-            messages=session.build_messages(extra_system=turn.system_prompt_text or None),
+            messages=session.build_messages(extra_system=turn.system_prompt_text or None, model=plan_model),
         )
         check_cancel(turn)
         reason = _plan_error(plan)
@@ -430,10 +430,10 @@ def _exec_analyze(node: dict, turn: TurnContext) -> None:
     io.status("LLM 复杂度判定")
     io.phase("思考中")
     stage = _node_stage(turn, node, JUDGE_PROMPT_BUILTIN)
-    payload = session.build_messages(extra_system=_stage_system(turn, node, stage))
     model = _node_model(turn.config, node)
     if model is None:
         model = _role_model(turn.config, node.get("model_role") or "plan")
+    payload = session.build_messages(extra_system=_stage_system(turn, node, stage), model=model)
     result = llm.chat(payload, model=model, on_delta=io.on_delta)
     io.clear_stream()
     check_cancel(turn)
@@ -530,7 +530,7 @@ def _exec_llm(node: dict, turn: TurnContext) -> None:
     else:
         # 单次问答：完整上下文（历史+记忆补充）+ 节点提示词，不带工具
         io.phase("思考中")
-        payload = session.build_messages(extra_system=_stage_system(turn, node, stage))
+        payload = session.build_messages(extra_system=_stage_system(turn, node, stage), model=model)
         result = llm.chat(payload, model=model, on_delta=io.on_delta)
         io.clear_stream()
         check_cancel(turn)

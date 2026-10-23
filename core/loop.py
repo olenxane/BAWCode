@@ -168,9 +168,10 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         while True:
             io.phase("思考中")
             drain_injections(turn)  # 回合中插话：并入本回合，下一轮模型即看到
-            payload = session.build_messages(extra_system=extra_system)
+            tool_defs = register.get_tool_defs()
+            payload = session.build_messages(extra_system=extra_system, tools=tool_defs, model=model)
             llm.meter.measure_context(payload)
-            response = llm.chat(payload, tools=register.get_tool_defs(), model=model, on_delta=io.on_delta)
+            response = llm.chat(payload, tools=tool_defs, model=model, on_delta=io.on_delta)
             io.clear_stream()  # 树尾直播收口：正式消息按现有路径入库
             if turn.app is not None:
                 turn.app.token_meter = llm.meter
