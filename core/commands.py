@@ -55,7 +55,7 @@ def _complete_mode(config, arg: str) -> List[dict]:
     rows = [
         ("confirm", "手动确认 · 非安全操作逐次确认"),
         ("edit", "自动接受 · 自动放行文件写入/编辑"),
-        ("auto", "自动模式 · 由LLM替我审批")
+        ("auto", "自动模式 · 由LLM替我审批"),
         ("full", "完全访问 · 全部放行"),
     ]
     items = [{"name": f"/mode {m}", "hint": h, "source": "arg", "callable": True} for m, h in rows]

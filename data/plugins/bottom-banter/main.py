@@ -1,3 +1,5 @@
+
+from bawcode_sdk import PluginContext
 import random
 import time
 
@@ -26,7 +28,7 @@ _BANTER = (
 )#本段内容均由蓝色大肥鱼自行联想，我没有参与任何提示词编写或者暗示
 
 
-def setup(ctx):
+def setup(ctx: PluginContext):
     state = {"second": -1, "banter": _BANTER[0]}
 
     def bottom_rows(payload):

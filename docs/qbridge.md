@@ -1,6 +1,6 @@
 # qbridge —— QQ 桥接插件
 
-经 OneBot 11 正向 WebSocket 连接 QQ 机器人框架，把终端与 QQ 双向同步：终端上的对话与过程动态镜像到 QQ，QQ 收到的消息（含图片）作为输入注入终端，确认/选择框可映射到 QQ 远程应答。
+经 OneBot 11 正向 WebSocket 连接 QQ 机器人框架，把终端与 QQ 双向同步：终端上的对话与过程动态镜像到 QQ，QQ 收到的消息（含图片）作为输入注入终端，确认/选择框可映射到 QQ 远程应答。插件入口使用随宿主提供的 `bawcode_sdk`，不直接导入 `core` 实现；SDK v1 清单声明为 `"sdk_version": 1`。通用接口及迁移约定见[插件开发指南](plugin-development.md#15-sdk-v1架构宿主服务与迁移)。
 
 ## 快速开始
 

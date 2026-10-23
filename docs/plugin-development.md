@@ -6,7 +6,7 @@ BAWCode 插件系统把 **hook 扩展点、斜杠命令、模型可见工具、�
 
 - 插件 = 一个目录：`plugin.json`（清单）+ `main.py`（入口）+ 可选的 `skills/` 等资源
 - 装载时机：BAWCode 启动时自动发现并装载（先于会话初始化，可收到 `session_start`）
-- 官方完整示例：`data/plugins/hello-plugin/`（本指南所有 API 它都在用）
+- 官方完整示例：`data/plugins/hello-plugin/`（命令、工具、hook、技能与配置示例）
 
 > **信任模型**：插件在本进程内以完整权限运行 Python 代码（可读写文件、发起网络请求）。
 > 只安装可信来源的插件；分发前请阅读插件源码。
@@ -41,6 +41,7 @@ BAWCode 插件系统把 **hook 扩展点、斜杠命令、模型可见工具、�
 ```json
 {
   "id": "my-first-plugin",
+  "sdk_version": 1,
   "name": "My First Plugin",
   "version": "0.1.0",
   "description": "演示：一条命令 + 一个 hook"
@@ -50,7 +51,9 @@ BAWCode 插件系统把 **hook 扩展点、斜杠命令、模型可见工具、�
 `main.py`：
 
 ```python
-def setup(ctx):
+from bawcode_sdk import PluginContext
+
+def setup(ctx: PluginContext):
     # 一条斜杠命令
     ctx.register_command(
         "/ping-me",
@@ -94,7 +97,7 @@ my-plugin/
 ├── skills/            # 可选：插件自带技能，自动并入技能系统（见 §8）
 │   └── my-usage/
 │       └── SKILL.md
-├── lib/               # 可选：插件自己的辅助模块（装载期间插件目录在 sys.path 上，可直接 import）
+├── lib/               # 可选：插件自己的辅助模块（使用 from .lib import helpers 相对导入）
 └── （其他任意资源文件）
 ```
 
@@ -147,6 +150,7 @@ Pillow>=10
 |------|------|------|------|
 | `id` | string | 目录名 | 插件唯一标识。**装载后不可与他人重复**；只允许字母、数字、`-`、`_`，且以字母或数字开头。作为所有注册项的 owner，用于卸载与诊断 |
 | `name` | string | 取 `id` | 展示名 |
+| `sdk_version` | int | 省略为旧插件兼容模式 | 新插件填写 `1`；不支持的版本在导入前拒绝。SDK v1 使用独立包命名空间，不修改 sys.path |
 | `version` | string | `"0.0.0"` | 版本号，`/plugin` 列表展示 |
 | `description` | string | `""` | 一句话描述，`/plugin` 列表展示 |
 | `author` | string | `""` | 作者 |
@@ -163,7 +167,7 @@ Pillow>=10
 
 ## 4. PluginContext API 参考
 
-`setup(ctx)` 收到的 `ctx` 是 `core.plugins.PluginContext` 实例，这是插件的全部能力面。
+`setup(ctx)` 收到的 `ctx` 是 `bawcode_sdk.PluginContext` 实例，这是插件的全部能力面。
 所有经 ctx 注册的内容自动携带 `owner=插件 id`，插件卸载/重载时**整体注销**，无需手工清理。
 
 ### 4.1 属性
@@ -196,8 +200,13 @@ Pillow>=10
 | `ctx.register_ui_bottom(fn, priority=100)` | 每帧提供统计栏下方的 ANSI 文本行 | §4.6 |
 | `ctx.storage_dir()` | 插件专属持久化目录（自动创建） | §4.3 |
 | `ctx.register_teardown(fn)` | 注册卸载回调：卸载/重载时停线程、释放资源 | §12 |
-| `core.plugins.runtime()` | 模块级函数：只读运行时载体 `{app, runner}` | §12 |
-| `ctx.submit_turn(text)` | 以用户语义提交一条消息开启回合 | §4.4 |
+| `ctx.runtime` | 高级兼容视图：运行时载体 `{app, runner}` 的对象引用 | §12 |
+| `ctx.host` | 显式宿主服务（会话、文件、工具、命令、模型、插件管理等） | §15 |
+| `ctx.session` | 当前会话对象，未就绪为 None | §15 |
+| `ctx.get_setting(key, default=None)` / `ctx.set_setting(key, value)` | 本插件配置读取、校验和持久化 | §15 |
+| `ctx.unregister_hook(event, handler=None, name="")` | 仅注销本插件匹配的订阅 | §15 |
+| `ctx.interrupt_turn()` | 请求调度器中断回合，返回 bool | §15 |
+| `ctx.submit_turn(text, images=None)` | 以用户语义提交一条消息开启回合 | §4.4 |
 | `ctx.notify(text)` | 用户可见通知（写入会话系统消息） | §4.4 |
 | `ctx.request_llm_retry()` | 请求重试当前失败的 LLM 请求（仅 API 错误等待态有效） | §4.5 |
 
@@ -206,10 +215,11 @@ Pillow>=10
 插件可把实时状态显示在主窗口中。两个回调都在 UI 帧线程调用，应保持快速、无阻塞；回调异常由 hook 系统隔离。
 
 ```python
-from core.ui import TreeNode
+from bawcode_sdk import PluginContext
 
 
-def setup(ctx):
+def setup(ctx: PluginContext):
+    TreeNode = ctx.ui.tree_node
     def tree_nodes(payload):
         return TreeNode(
             f"plugin:{ctx.plugin_id}:status",
@@ -659,7 +669,7 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
    "log": { "level": "info", "modules": { "plugins": "debug", "hooks": "debug" } }
    ```
 
-3. **hook 链诊断**：`hooks.list_hooks()`（可在插件里调用）返回
+3. **hook 链诊断**：`ctx.host.hooks.list_hooks()`返回
    `{事件: [{owner, priority, name}]}`，核对注册与优先级
 4. **常见错误对照**：
 
@@ -692,7 +702,7 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 ```
 
 - **装载在主线程**，但 hook 调用多发生在 **agent 后台线程**；hook 注册表有锁保护，
-  `/plugin reload` 与在途回合并发是安全的（在途调用可能拿到旧快照，属预期）
+  注册表锁并不保证插件业务线程与重载原子：在途调用可能拿到旧回调。请在空闲时重载，并在 teardown 中停止、唤醒和等待自己的后台任务
 - **类用户操作 API 的可用时机**：`bind_runtime` 注入后（回合调度器创建之后）`ctx.ui`
   与 `ctx.submit_turn` 才生效；此前调用返回失败提示/None，不抛异常。`/plugin reload`
   不影响已注入的运行时载体
@@ -703,12 +713,11 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
   `ctx.register_teardown(fn)` 注册卸载回调——卸载/重载/禁用回滚时按注册顺序执行
   （异常隔离记日志）。没有它，`/plugin reload` 后旧线程会残留且插件自身无法停止
   （模块对象已换新）。官方示例：remote-control 插件的 HTTP 服务即经 teardown 停止
-- **运行时载体只读访问**：`core.plugins.runtime()` 返回 `{app, runner}`（`bind_runtime`
+- **运行时载体只读访问**：`ctx.runtime` 返回 `{app, runner}`（`bind_runtime`
   注入的同一对象引用；未注入时值为 None）。可读取 `app.busy / app.streaming_msg /
   app.status` 等实时状态、`runner.busy` 判定忙闲，或 `runner.llm.cancel()` 中断在途
   请求（remote-control 的"停止"按钮即此实现）。约定只读，勿替换其中对象
-- **sys.path**：装载期间插件目录会被加入 `sys.path`（便于 `import 自带模块`），卸载时
-  移除。若插件以后台线程长期持有 import 引用，重载后旧模块对象仍存活，注意避免
+- **模块隔离**：SDK v1 插件不加入 `sys.path`，入口与相对导入的子模块放在插件独立命名空间。卸载会清理整个命名空间，重载直接编译源码，避免同秒修改命中旧字节码。省略 `sdk_version` 的旧插件保留绝对导入路径兼容，但其绝对导入辅助模块不保证隔离；请迁移到相对导入。
 - hook 处理函数**不要长时间阻塞**：`before_tool`/`before_turn` 在关键路径上，阻塞会
   卡住整个回合；耗时工作请放线程并及时返回
 
@@ -734,16 +743,14 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 的自定义事件）。装载顺序按目录名排序，有依赖时在 setup 里防御性判断（对方可能未装载）。
 
 **Q：插件能发 LLM 请求吗？**
-可以：`ctx.config` 拿到宿主配置后自建请求，或用 `session.set_llm_fn` 注入的函数。建议
-经宿主 `LLM` 实例（`ctx.config` + `core.llm.LLM`）以复用重试/计费统计。整段接管主对话
-请用 `llm_request` 扩展点。
+通常使用 `ctx.submit_turn()` 交给宿主调度，不要在后台线程并发调用当前主回合的 LLM。独立推理可通过第三方模型客户端和插件自己的配置实现；SDK v1 暂未提供独立 LLM 会话服务。整段接管主对话请用 `llm_request` 扩展点。
 
 **Q：能改模型返回内容吗？**
 `llm_request` 可整段接管；`before_turn` 可改写用户输入；`before_tool` 可改写工具参数或
 拒绝工具。没有"事后改 assistant 输出"的扩展点——那是故意的（避免插件篡改对话历史）。
 
 **Q：插件能像用户一样发消息、弹面板吗？**
-能，见 §4.4：`ctx.submit_turn(text)` 等价用户发送（busy 时按设置排队/中断）、
+能，见 §4.4：`ctx.submit_turn(text, images=None)` 等价用户发送（busy 时排队）、
 `ctx.notify(text)` 写用户可见通知、`ctx.ui.confirm/choose/line` 弹交互面板（仅 agent
 线程）。注意 submit_turn 的自激风险——循环触发自己的 hook 请加冷却。
 
@@ -763,9 +770,120 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 
 ---
 
-*本指南对应实现：`core/plugins.py`（装载器）、`core/hooks.py`（hook 链）；
+*本指南对应实现：`core/plugin_system/`（宿主管理与适配）、`bawcode_sdk/`（公开接口）、`core/plugins.py`（兼容入口）、`core/hooks.py`（hook 链）；
 示例插件：`data/plugins/hello-plugin/`（入门）、`data/plugins/rag/`（项目 RAG 知识库，
 自核心剥离的真实案例：同名工具迁移 + context_supplement 上下文补充 + external_apis
 接管语义保留）、`data/plugins/remote-control/`（远程控制：后台 HTTP 服务 + register_teardown
 + 类用户操作 API + tool_confirm 代答的综合案例）；
 端到端测试：`develop/test_plugins_e2e.py`、`develop/test_rag_plugin.py`、`develop/test_remote_control_e2e.py`。*
+
+
+## 15. SDK v1：架构、宿主服务与迁移
+
+### 15.1 稳定入口和依赖方向
+
+```text
+插件 -> bawcode_sdk.PluginContext -> HostAPI -> core/plugin_system/adapter.py
+                                                -> 宿主命令、工具、会话等实现
+```
+
+`bawcode_sdk` 只依赖 Python 标准库，导入它不会导入 `core`、终端界面或模型客户端。
+SDK 随 BAWCode 安装，无需插件另外安装；包含 `py.typed`，可直接用类型注解。
+其他宿主或单元测试可以实现 `HostAPI.invoke(service, operation, *args, **kwargs)` 与
+`HostAPI.value(service, name)`，再通过 `PluginContext(..., host=adapter)` 注入。
+这不意味着 BAWCode 的 Config/Session/App 对象已成为跨宿主通用数据模型：它们仍是高级兼容对象，见下文。
+
+宿主侧职责：
+- `discovery.py`：双层目录、清单和 SDK 版本检查。
+- `dependencies.py`：依赖检查与可选 pip 安装。
+- `loader.py`：入口边界检查、包命名空间、源码重载和卸载清理。
+- `manager.py`：生命周期、状态、技能同步、配置持久化。
+- `runtime.py`：延迟绑定 app/runner、通知、中断。
+- `adapter.py`：公开服务到内部实现的唯一映射点。
+- `core.plugins`：保留主程序 `/plugin`、设置页和旧插件的公开管理函数及旧构造方式。
+  私有 `_loaded`、`_runtime`、`_pip_install` 不属于兼容 API；测试应在对应实现模块打桩。
+
+### 15.2 新增便捷接口
+
+```python
+from bawcode_sdk import PluginContext
+
+
+def setup(ctx: PluginContext):
+    @ctx.register_command('/sample-toggle')
+    def toggle(command_ctx, args):
+        enabled = ctx.set_setting('enabled', not ctx.get_setting('enabled', True))
+        return f'enabled={enabled}'
+
+    def observer(payload):
+        ctx.log.info('turn finished')
+
+    ctx.register_hook('after_turn', observer)
+    # 临时订阅可调用 ctx.unregister_hook('after_turn', observer)；只影响本插件。
+    # setup 也可返回一个无参数清理函数，等效于 register_teardown。
+    return lambda: ctx.log.info('stopped')
+```
+
+`set_setting` 按声明转换、钳制并保存；无效 bool、NaN/Infinity 会被拒绝。
+持久化失败会恢复原内存值并抛出异常，不会假报保存成功。
+卸载清理按注册顺序执行且每个 context 只执行一次；单个清理函数的 Exception/SystemExit
+不阻断后续清理。关闭后的 context 不允许重新注册命令、工具或 hook。
+`ctx.ui.tree_node(...)` 创建与终端兼容的树节点，无需导入 `core.ui.TreeNode`。
+
+### 15.3 高级宿主服务
+
+管理型插件经 `ctx.host.<服务>.<操作>` 使用显式白名单服务，不再直接导入 `core` 模块。
+所有可调用操作和常量列在 `bawcode_sdk/host.py` 的 `SERVICE_METHODS` / `SERVICE_VALUES` 中；
+不存在的服务操作抛出 `AttributeError`，不会任意转发宿主私有成员。
+
+| 服务 | 主要能力 |
+| --- | --- |
+| `sessions` | 当前会话、消息纯文本/图片数、会话目录、列表、读取、衍生记录删除 |
+| `files` | 文件补全候选、引用格式、读取外置工具输出 |
+| `commands` | 命令列表、补全、解析和执行 |
+| `tools` | 工具列表、元数据、失败提示 |
+| `plugins` | 插件列表、配置声明与读写、启停、重载 |
+| `models` | 模型显示名、模型 API 地址规范化 |
+| `workflows` / `snapshots` | 工作流列表/选择、快照查询与回滚 |
+| `agents` / `skills` / `mcp` | 子代理记录、技能加载器、MCP 状态 |
+| `policy` | 模式常量与显示标签 |
+| `hooks` | 订阅、触发、诊断 |
+
+这些高级操作保留对应宿主函数的参数、返回结构与副作用；例如：
+
+```python
+session = ctx.session
+if session is not None:
+    directory = ctx.host.sessions.sessions_dir(ctx.config, session.project_id)
+    rows = ctx.host.sessions.list_sessions(directory)
+items = ctx.host.commands.complete('/hel', config=ctx.config)
+```
+
+注册扩展请优先使用 `ctx.register_*`，以自动附带 owner 和清理检查。
+高级服务不是安全沙箱，也不会替调用者自动做远程身份认证、确认、空闲锁或权限审批。
+尤其 `commands.execute`、会话删除、快照回滚与配置修改须由管理插件自行鉴权，并在适当时机
+通过 `ctx.run_when_idle(callback)` 串行化。不要经底层工具注册表执行模型工具以绕过正常审批管线。
+`ctx.config`、`ctx.session`、`ctx.runtime` 仍暴露活对象，便于现有管理插件完整迁移；
+不承诺其私有字段稳定，也不承诺任意线程读写安全。通用插件优先使用高层方法。
+
+### 15.4 迁移旧插件
+
+1. 清单添加 `"sdk_version": 1`；入口 `from bawcode_sdk import PluginContext`，注解 `setup(ctx: PluginContext)`。
+2. `from core import plugins; plugins.set_setting(ctx.plugin_id, ...)` 改成 `ctx.set_setting(...)`。
+3. `plugins.runtime()` 改为 `ctx.runtime`；读取当前会话用 `ctx.session`。
+4. 辅助模块改为 `from . import helper` / `from .package import ...`，删除 sys.path/sys.modules 手动修改。
+5. 管理能力迁移到 `ctx.host`，后台线程/服务器始终登记 teardown。无需自行注销 owner 下的工具。
+6. 相对导入以插件根目录为包根；即使 entry 指向子目录文件，也以插件根目录解析。
+7. 在临时工作区测试 `/plugin reload`、禁用、导入失败和 setup 中途失败；不得留下旧线程或监听端口。
+
+内置九个插件均已迁移；远程控制保留原有 HTTP/API 行为，QQ 桥保留白名单和确认流程。
+使用旧 `sdk_version` 缺省模式的插件仍可加载，但旧宿主不认识 SDK v1，新插件应与新版 BAWCode 一起分发。
+
+### 15.5 验证
+
+```bash
+python -m compileall -q bawcode_sdk core/plugin_system data/plugins
+```
+
+发布前可在宿主项目的临时工作区验证插件发现、SDK 版本拒绝、相对导入隔离、重载清理、
+失败回滚与配置持久化；不要把测试夹具或临时测试脚本放入发布源码。

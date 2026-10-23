@@ -22,6 +22,8 @@
 """
 from __future__ import annotations
 
+from bawcode_sdk import PluginContext
+
 import re
 from typing import List, Optional, Tuple
 
@@ -142,7 +144,7 @@ def render_note(level: str, hits: List[str]) -> str:
     )
 
 
-def setup(ctx) -> None:
+def setup(ctx: PluginContext) -> None:
     ctx.log.info("emotion-detector 装载，配置=%s", ctx.settings)
 
     def _extra() -> str:
@@ -172,14 +174,10 @@ def setup(ctx) -> None:
         cmd = sub[0].lower() if sub else "status"
         rest = sub[1].strip() if len(sub) > 1 else ""
         if cmd == "on":
-            from core import plugins as plugins_mod
-
-            plugins_mod.set_setting(ctx.plugin_id, "enabled", True, cctx.get("config") or ctx.config)
+            ctx.set_setting("enabled", True)
             return "情绪识别已开启"
         if cmd == "off":
-            from core import plugins as plugins_mod
-
-            plugins_mod.set_setting(ctx.plugin_id, "enabled", False, cctx.get("config") or ctx.config)
+            ctx.set_setting("enabled", False)
             return "情绪识别已关闭（只影响后续回合）"
         if cmd == "test":
             if not rest:

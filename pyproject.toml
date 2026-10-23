@@ -31,5 +31,8 @@ bawcode = "main:cli"
 
 [tool.setuptools]
 # 源码运行为主（data/ 运行时资源不入包）；此处仅保证 pip install . 可构建
-packages = ["core", "gui"]
+packages = ["core", "core.plugin_system", "bawcode_sdk", "gui"]
 py-modules = ["main"]
+
+[tool.setuptools.package-data]
+bawcode_sdk = ["py.typed"]
