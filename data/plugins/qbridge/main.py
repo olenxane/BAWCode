@@ -27,6 +27,8 @@ Lagrange.OneBot / go-cqhttp 等）暴露的 WebSocket 服务端（配置 ws_url�
 
 依赖：websockets>=13（requirements.txt 已声明；缺失时 /qbridge 给出提示）。
 """
+
+from bawcode_sdk import PluginContext
 import json
 import queue
 import re
@@ -35,15 +37,6 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import unquote, urlparse
-
-try:
-    from core import plugins as plugins_mod
-    from core import register as register_mod
-    from core import session_store as session_store_mod
-except ImportError:  # 插件目录被单独导入（类型检查等场景）时的防御
-    plugins_mod = None
-    register_mod = None
-    session_store_mod = None
 
 try:  # 图片下载（requests 为宿主运行时依赖，正常必然可用）
     import requests
@@ -86,7 +79,7 @@ class _State:
         self.tool_call_targets = {}
 
 
-def setup(ctx):
+def setup(ctx: PluginContext):
     st = _State()
     tx: queue.Queue = queue.Queue(maxsize=_TX_CAP)
 
@@ -132,10 +125,10 @@ def setup(ctx):
             return _enabled() and _running() and bool(st.bound) and _target_allowed(st.bound)
 
     def _runner():
-        return plugins_mod.runtime().get("runner") if plugins_mod else None
+        return ctx.runtime.get("runner")
 
     def _app():
-        return plugins_mod.runtime().get("app") if plugins_mod else None
+        return ctx.runtime.get("app")
 
     def _session():
         runner = _runner()
@@ -426,12 +419,6 @@ def setup(ctx):
         )(_tool_send_file)
 
     _register_attachment_tools()
-    if register_mod is not None:
-        def _remove_attachment_tools():
-            register_mod.unregister_owner(ctx.plugin_id)
-
-        ctx.register_teardown(_remove_attachment_tools)
-
     # ---- 交互等待：无 QQ 超时，终端提交新消息即手动接管 ----
 
     def _release_pending(reason: str) -> None:
@@ -771,11 +758,11 @@ def setup(ctx):
             session.save_session()
             _refresh_session(session)
             return f"当前会话已重命名：{title}"
-        if session_store_mod is None:
+        if ctx.host.sessions is None:
             return "宿主缺少会话存储模块。"
-        directory = session_store_mod.sessions_dir(ctx.config, session.project_id)
+        directory = ctx.host.sessions.sessions_dir(ctx.config, session.project_id)
         if op == "/sessions":
-            rows = session_store_mod.list_sessions(directory)[:20]
+            rows = ctx.host.sessions.list_sessions(directory)[:20]
             if not rows:
                 return "当前没有已保存的历史会话。"
             return "最近历史会话：\\n" + "\\n".join(
@@ -784,7 +771,7 @@ def setup(ctx):
         if op == "/resume":
             if not arg:
                 return "用法：/resume <会话ID>（先用 /sessions 查看列表）"
-            data = session_store_mod.load_session_data(directory, arg)
+            data = ctx.host.sessions.load_session_data(directory, arg)
             if not data:
                 return f"找不到可加载的会话：{arg}"
             session.save_session()
@@ -1054,14 +1041,14 @@ def setup(ctx):
                 result = "缺少依赖 websockets（pip install websockets>=13）"
                 ctx.notify(f"[QQ桥] /qbridge on 失败：{result}")
                 return result
-            if plugins_mod is not None:
-                plugins_mod.set_setting(ctx.plugin_id, "enabled", True, cctx.get("config") or ctx.config)
+            if ctx.host.plugins is not None:
+                ctx.set_setting("enabled", True)
             result = _start()
             ctx.notify(f"[QQ桥] /qbridge on：{result}")
             return result
         if low == "off":
-            if plugins_mod is not None:
-                plugins_mod.set_setting(ctx.plugin_id, "enabled", False, cctx.get("config") or ctx.config)
+            if ctx.host.plugins is not None:
+                ctx.set_setting("enabled", False)
             result = _stop()
             ctx.notify(f"[QQ桥] /qbridge off：{result}")
             return result
@@ -1071,8 +1058,8 @@ def setup(ctx):
                 result = "目标格式: private/<QQ号> 或 group/<群号>"
                 ctx.notify(f"[QQ桥] /qbridge bind 失败：{result}")
                 return result
-            if plugins_mod is not None:
-                plugins_mod.set_setting(ctx.plugin_id, "target", val, cctx.get("config") or ctx.config)
+            if ctx.host.plugins is not None:
+                ctx.set_setting("target", val)
             with st.lock:
                 st.bound = val
                 st.bound_user = ""

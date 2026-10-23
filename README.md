@@ -69,5 +69,5 @@ docs/                 文档
 
 ## 文档
 
-- [插件开发指南](docs/plugin-development.md) —— hook 事件目录、PluginContext API、示例
+- [插件开发指南](docs/plugin-development.md) —— `bawcode_sdk` 通用 SDK、hook 事件、宿主服务、SDK v1 迁移与测试
 - [QQ 桥接](docs/qbridge.md) —— OneBot 对接与消息路由指北

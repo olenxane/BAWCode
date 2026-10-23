@@ -1,10 +1,12 @@
+
+from bawcode_sdk import PluginContext
 import time
 from typing import Optional
 
 from PIL import Image
 
 try:
-    import computer_use_backend as backend
+    from . import computer_use_backend as backend
 except ImportError as _e:  # 缺 pyautogui 等依赖时不注册，宿主占位壳自然回位
     backend = None
     _IMPORT_ERROR = str(_e)
@@ -267,7 +269,7 @@ def _computer_use(action: str = "", params: Optional[dict] = None, **_) -> dict:
     return {"content": text}
 
 
-def setup(ctx) -> None:
+def setup(ctx: PluginContext) -> None:
     global _ctx
     if backend is None:
         ctx.log.warn("computer-use 依赖缺失（%s），未注册工具", _IMPORT_ERROR)

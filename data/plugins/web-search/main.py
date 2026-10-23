@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+from bawcode_sdk import PluginContext
+
 import base64
 import binascii
 import re
@@ -93,7 +95,7 @@ def parse_results(soup, limit: int) -> List[Tuple[str, str, str]]:
     return results
 
 
-def setup(ctx):
+def setup(ctx: PluginContext):
     @ctx.register_tool(
         name="web_search",
         description=(

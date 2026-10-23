@@ -115,8 +115,8 @@ def register_hook(
     return _decorator
 
 
-def unregister_hook(event: str, handler: Optional[Callable] = None, owner: str = "", name: str = "") -> int:
-    """按 handler 身份 / owner / name 注销处理函数（任一条件匹配即注销），返回注销数量"""
+def unregister_hook(event: str, handler: Optional[Callable] = None, owner: str = "", name: str = "", *, match_all: bool = False) -> int:
+    """默认任一条件匹配即注销；SDK 使用 match_all 限定 owner 和可选 handler/name。"""
     with _lock:
         entries = _handlers.get(event)
         if not entries:
@@ -128,6 +128,12 @@ def unregister_hook(event: str, handler: Optional[Callable] = None, owner: str =
                 or (owner and entry["owner"] == owner)
                 or (name and entry["name"] == name)
             )
+            if match_all:
+                match = bool(handler is not None or owner or name) and (
+                    (handler is None or entry["handler"] is handler)
+                    and (not owner or entry["owner"] == owner)
+                    and (not name or entry["name"] == name)
+                )
             if match:
                 removed += 1
             else:

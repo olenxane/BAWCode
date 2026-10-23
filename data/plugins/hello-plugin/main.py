@@ -12,8 +12,10 @@
 清单声明的缺省值。把本目录整个复制改名，即是新插件的起点。
 """
 
+from bawcode_sdk import PluginContext
 
-def setup(ctx):
+
+def setup(ctx: PluginContext):
     # ctx.log 已按插件 id 命名空间化（plugins.hello-plugin）
     ctx.log.info("hello-plugin 装载，配置=%s", ctx.settings)
 

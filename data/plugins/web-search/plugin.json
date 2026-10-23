@@ -1,4 +1,5 @@
 {
+  "sdk_version": 1,
   "id": "web-search",
   "name": "网络搜索",
   "version": "0.1.0",

@@ -7,31 +7,26 @@
 
 from __future__ import annotations
 
+from bawcode_sdk import PluginContext
+
 import os
 import shutil
-import sys
 import threading
 import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 
-# 清掉旧包缓存，保证 /plugin reload 后载入修改过的副本
-for _name in [n for n in sys.modules if n == "tmplayer" or n.startswith("tmplayer.")]:
-    del sys.modules[_name]
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
 from rich.console import Console
 
-from tmplayer import ui as tm_ui
-from tmplayer.config import ConfigError, load_config
-from tmplayer.lyrics import load_lyrics
-from tmplayer.metadata import read_metadata
-from tmplayer.player import Player, PlayState
-from tmplayer.playlist import Playlist
-from tmplayer.spectrum import SpectrumAnalyzer
-from tmplayer.stats import StatsTracker
+from .tmplayer import ui as tm_ui
+from .tmplayer.config import ConfigError, load_config
+from .tmplayer.lyrics import load_lyrics
+from .tmplayer.metadata import read_metadata
+from .tmplayer.player import Player, PlayState
+from .tmplayer.playlist import Playlist
+from .tmplayer.spectrum import SpectrumAnalyzer
+from .tmplayer.stats import StatsTracker
 
 _HELP = (
     "音乐播放器指令：\n"
@@ -613,7 +608,7 @@ class MusicController:
         self.log.info("音乐播放器已停止")
 
 
-def setup(ctx):
+def setup(ctx: PluginContext):
     try:
         ctl = MusicController(ctx)
     except Exception as e:

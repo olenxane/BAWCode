@@ -37,6 +37,8 @@
   hooks 事件 ui_request（询问面板代答）/ stream_delta / turn_status（collect）；
   plugins.runtime() 只读运行时载体；ctx.register_teardown 卸载回调。
 """
+
+from bawcode_sdk import PluginContext
 import copy
 import difflib
 import functools
@@ -57,45 +59,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
-
-from core.config import make_model_name
-
-try:
-    from core import file as file_mod
-    from core import memory as memory_mod
-    from core import plugins as plugins_mod
-    from core import toolstore as toolstore_mod
-except ImportError:  # 插件目录被单独导入（类型检查等场景）时的防御
-    file_mod = None
-    memory_mod = None
-    plugins_mod = None
-    toolstore_mod = None
-
-try:
-    from core.tools import tool_failure_hint
-except ImportError:
-    tool_failure_hint = None
-
-try:  # 远程命令/信息面板依赖的宿主模块（缺失时对应端点降级提示）
-    from core import commands as commands_mod
-    from core import mcp as mcp_mod
-    from core import policy as policy_mod
-    from core import register as register_mod
-    from core import session_store as session_store_mod
-    from core import skills as skills_mod
-    from core import snapshot as snapshot_mod
-    from core import subagent as subagent_mod
-    from core import workflow as workflow_mod
-except ImportError:
-    commands_mod = None
-    mcp_mod = None
-    policy_mod = None
-    register_mod = None
-    session_store_mod = None
-    skills_mod = None
-    snapshot_mod = None
-    subagent_mod = None
-    workflow_mod = None
 
 try:  # 语法高亮 / diff：与 TUI（core/render.py）同源 pygments，缺失时降级为纯文本
     from pygments import highlight as _pyg_highlight
@@ -135,11 +98,9 @@ _TOOL_OUT_PREVIEW = 2000       # 工具输出实时预览字符上限（完整�
 
 def _as_text(value) -> str:
     """工具参数取值转文本：数组形态 content 优先取文本部分"""
-    if memory_mod is not None:
-        try:
-            return memory_mod.content_text(value)
-        except Exception:
-            pass
+    if isinstance(value, list):
+        return "\n".join(str(p.get("text") or "") for p in value
+                         if isinstance(p, dict) and p.get("type") == "text")
     if isinstance(value, str):
         return value
     return "" if value is None else str(value)
@@ -408,7 +369,7 @@ class _State:
         self.thread = None
 
 
-def setup(ctx):
+def setup(ctx: PluginContext):
     st = _State()
 
     # ---- 配置 ----
@@ -534,7 +495,7 @@ def setup(ctx):
         name = str(payload.get("name") or "")
         args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
         output = str(payload.get("output") or "")
-        failed = bool(tool_failure_hint(output)) if tool_failure_hint else False
+        failed = bool(ctx.host.tools.failure_hint(output)) if ctx.host.tools.failure_hint else False
         render = _plan_render(name, output) or _tool_render(name, args, output, failed)
         # 实时事件只带输出预览（完整输出随回合结束的快照下发）；截断时显式标记，页面据此提示
         evt = {"t": "tool_after", "name": payload.get("name"),
@@ -566,7 +527,7 @@ def setup(ctx):
         """把回合中并入的插话广播到所有网页客户端。"""
         if payload.get("injected") and payload.get("role") == "user":
             content = payload.get("content")
-            text = memory_mod.content_text(content) if memory_mod else str(content or "")
+            text = ctx.host.sessions.content_text(content) if ctx.host.sessions else str(content or "")
             _broadcast({"t": "message_added", "role": "user", "content": text,
                         "injected": True, "turn_id": str(getattr(_runner(), "active_turn_id", "") or "")})
             return None
@@ -688,13 +649,13 @@ def setup(ctx):
     # ---- 宿主运行时访问（缺载体/缺属性时降级为 None，端点各自兜底）----
 
     def _session():
-        return memory_mod.get_session() if memory_mod else None
+        return ctx.host.sessions.get_session() if ctx.host.sessions else None
 
     def _runner():
-        return plugins_mod.runtime().get("runner") if plugins_mod else None
+        return ctx.runtime.get("runner") if ctx.host.plugins else None
 
     def _app():
-        return plugins_mod.runtime().get("app") if plugins_mod else None
+        return ctx.runtime.get("app") if ctx.host.plugins else None
 
     def _llm():
         runner = _runner()
@@ -803,11 +764,11 @@ def setup(ctx):
         except Exception:
             info["model"] = ""
         info["mode"] = mode
-        if policy_mod is not None:
-            info["mode_label"] = policy_mod.MODE_LABELS.get(mode, mode)
-        if workflow_mod is not None:
+        if ctx.host.policy is not None:
+            info["mode_label"] = ctx.host.policy.MODE_LABELS.get(mode, mode)
+        if ctx.host.workflows is not None:
             try:
-                info["workflow"] = workflow_mod.active_name(ctx.config)
+                info["workflow"] = ctx.host.workflows.active_name(ctx.config)
             except Exception:
                 pass
         info["tokens"] = _tokens_info()
@@ -845,8 +806,8 @@ def setup(ctx):
                     }
         for m in raw:
             # 数组形态 content 取文本部分（防 base64 图片块灌进网页）；附图片计数
-            text = memory_mod.content_text(m.get("content")) if memory_mod else str(m.get("content") or "")
-            n_imgs = memory_mod.count_image_parts(m.get("content")) if memory_mod else 0
+            text = ctx.host.sessions.content_text(m.get("content")) if ctx.host.sessions else str(m.get("content") or "")
+            n_imgs = ctx.host.sessions.count_image_parts(m.get("content")) if ctx.host.sessions else 0
             # 消息正文/思考链不做字符截断：截断会丢信息且网页无法还原（工具载荷另有行数上限，
             # 且都带 truncated 标记让页面提示）；总量由 max_history 的条数上限约束
             entry = {"role": m.get("role"), "content": text}
@@ -866,7 +827,7 @@ def setup(ctx):
                 info = call_info.get(str(m.get("tool_call_id") or ""))
                 name = str((info or {}).get("name") or m.get("tool_name") or "")
                 args = (info or {}).get("args") or {}
-                failed = bool(tool_failure_hint(text)) if tool_failure_hint else False
+                failed = bool(ctx.host.tools.failure_hint(text)) if ctx.host.tools.failure_hint else False
                 entry["failed"] = failed
                 # 行内 content 可能已被剥离为摘要；persist_path 指向完整外置文件，
                 # 页面按需经 /api/tool_output 回读（与 TUI 手动展开回读一致）
@@ -998,15 +959,15 @@ def setup(ctx):
         session, err = _require_session()
         if err:
             return err
-        if session_store_mod is None:
+        if ctx.host.sessions is None:
             return {"ok": False, "message": "宿主缺少 session_store 模块"}
         sid = (sid or "").strip()
         if not sid:
             return {"ok": False, "message": "缺少会话 id"}
         if sid == session.session_id:
             return {"ok": True, "result": "已是当前会话"}
-        directory = session_store_mod.sessions_dir(ctx.config, session.project_id)
-        data = session_store_mod.load_session_data(directory, sid)
+        directory = ctx.host.sessions.sessions_dir(ctx.config, session.project_id)
+        data = ctx.host.sessions.load_session_data(directory, sid)
         if not data:
             return {"ok": False, "message": f"会话加载失败: {sid}"}
         session.save_session()
@@ -1024,12 +985,12 @@ def setup(ctx):
         session, err = _require_session()
         if err:
             return err
-        if session_store_mod is None:
+        if ctx.host.sessions is None:
             return {"ok": False, "message": "宿主缺少 session_store 模块"}
         sid = (sid or "").strip()
         if sid == session.session_id:
             return {"ok": False, "message": "不能删除当前会话（可用清空/新建）"}
-        result = session_store_mod.clear_session_artifacts(ctx.config, session.project_id, sid)
+        result = ctx.host.sessions.clear_session_artifacts(ctx.config, session.project_id, sid)
         if result.get("ok") and result["resources"]["session"]["removed"]:
             _broadcast({"t": "sessions_changed", "id": sid})
             return {"ok": True, "result": f"会话及衍生记录已删除: {sid}", "cleanup": result["resources"]}
@@ -1041,11 +1002,11 @@ def setup(ctx):
         session, err = _require_session()
         if err:
             return err
-        if session_store_mod is None:
+        if ctx.host.sessions is None:
             return {"ok": False, "message": "宿主缺少 session_store 模块"}
-        directory = session_store_mod.sessions_dir(ctx.config, session.project_id)
+        directory = ctx.host.sessions.sessions_dir(ctx.config, session.project_id)
         items = []
-        for row in session_store_mod.list_sessions(directory):
+        for row in ctx.host.sessions.list_sessions(directory):
             items.append({
                 "id": row.get("id"),
                 "title": row.get("title") or "（无标题会话）",
@@ -1104,44 +1065,44 @@ def setup(ctx):
         return {"ok": True, "result": f"已切换 {row['model_name']}", "model": row["model_name"]}
 
     def _op_mode(mode: str) -> dict:
-        if policy_mod is None:
+        if ctx.host.policy is None:
             return {"ok": False, "message": "宿主缺少 policy 模块"}
         mode = (mode or "").strip().lower()
         if mode == "manual":  # 旧值兼容：manual 已更名 confirm（与 /mode 命令同映射）
-            mode = policy_mod.MODE_CONFIRM
-        if mode not in policy_mod.MODES:
-            return {"ok": False, "message": "模式: " + " | ".join(policy_mod.MODES)}
+            mode = ctx.host.policy.MODE_CONFIRM
+        if mode not in ctx.host.policy.MODES:
+            return {"ok": False, "message": "模式: " + " | ".join(ctx.host.policy.MODES)}
         app = _app()
         if app is not None:
             app.mode = mode
         ctx.config.data.setdefault("ui", {})["mode"] = mode
         ctx.config.mode = mode
         ctx.config.save()
-        label = policy_mod.MODE_LABELS.get(mode, mode)
+        label = ctx.host.policy.MODE_LABELS.get(mode, mode)
         _broadcast({"t": "reset"})
         return {"ok": True, "result": f"访问模式: {label}", "mode": mode, "mode_label": label}
 
     def _workflows_listing() -> dict:
-        if workflow_mod is None:
+        if ctx.host.workflows is None:
             return {"ok": False, "message": "宿主缺少 workflow 模块"}
         try:
-            enabled = bool(getattr(workflow_mod, "workflow_enabled", lambda c: True)(ctx.config))
+            enabled = bool(getattr(ctx.host.workflows, "workflow_enabled", lambda c: True)(ctx.config))
             return {
                 "ok": True,
                 "enabled": enabled,
-                "active": workflow_mod.active_name(ctx.config),
-                "workflows": workflow_mod.list_workflows(ctx.config),
+                "active": ctx.host.workflows.active_name(ctx.config),
+                "workflows": ctx.host.workflows.list_workflows(ctx.config),
             }
         except Exception as e:
             return {"ok": False, "message": f"工作流列表读取失败: {e}"}
 
     def _op_workflow_switch(name: str) -> dict:
-        if workflow_mod is None:
+        if ctx.host.workflows is None:
             return {"ok": False, "message": "宿主缺少 workflow 模块"}
         name = (name or "").strip()
-        if name not in workflow_mod.list_workflows(ctx.config):
+        if name not in ctx.host.workflows.list_workflows(ctx.config):
             return {"ok": False, "message": f"未找到工作流: {name}"}
-        workflow_mod.set_active(ctx.config, name)
+        ctx.host.workflows.set_active(ctx.config, name)
         # 显式选择工作流即启用（工作流默认关闭=直接对话，与 /workflow 命令同语义）
         ctx.config.data.setdefault("workflow", {})["enabled"] = True
         ctx.config.save()
@@ -1151,10 +1112,10 @@ def setup(ctx):
         session, err = _require_session()
         if err:
             return err
-        if snapshot_mod is None:
+        if ctx.host.snapshots is None:
             return {"ok": False, "message": "宿主缺少 snapshot 模块"}
-        turns = snapshot_mod.list_turns(ctx.config, session.project_id, session.session_id)
-        keep = snapshot_mod.snapshot_cfg(ctx.config)["max_turns"]
+        turns = ctx.host.snapshots.list_turns(ctx.config, session.project_id, session.session_id)
+        keep = ctx.host.snapshots.snapshot_cfg(ctx.config)["max_turns"]
         return {
             "ok": True,
             "turns": turns,
@@ -1162,7 +1123,7 @@ def setup(ctx):
             "has_more": False,
             "keep": keep,
             "session_id": session.session_id,
-            "trash": snapshot_mod.trash_count(ctx.config, session.project_id),
+            "trash": ctx.host.snapshots.trash_count(ctx.config, session.project_id),
         }
 
     @_idle_operation
@@ -1173,9 +1134,9 @@ def setup(ctx):
         session, err = _require_session()
         if err:
             return err
-        if snapshot_mod is None:
+        if ctx.host.snapshots is None:
             return {"ok": False, "message": "宿主缺少 snapshot 模块"}
-        result = snapshot_mod.undo(
+        result = ctx.host.snapshots.undo(
             ctx.config, session.project_id, session.session_id, which, checkpoint=checkpoint
         )
         if result is None:
@@ -1216,37 +1177,37 @@ def setup(ctx):
         }
 
     def _tools_listing() -> dict:
-        if register_mod is None:
+        if ctx.host.tools is None:
             return {"ok": False, "message": "宿主缺少 register 模块"}
         return {"ok": True, "tools": [
             {"name": t.get("name"), "description": t.get("description") or ""}
-            for t in register_mod.list_tools()
+            for t in ctx.host.tools.list_tools()
         ]}
 
     def _agents_listing() -> dict:
-        if subagent_mod is None:
+        if ctx.host.agents is None:
             return {"ok": False, "message": "宿主缺少 subagent 模块"}
         session = _session()
         records = []
         if session is not None:
             try:
-                for rec in subagent_mod.list_records(ctx.config, session)[-20:]:
+                for rec in ctx.host.agents.list_records(ctx.config, session)[-20:]:
                     records.append({
                         "id": rec.get("id"),
                         "role": rec.get("role"),
                         "status": str(rec.get("status") or ""),
-                        "status_label": subagent_mod.status_label(str(rec.get("status") or "")),
+                        "status_label": ctx.host.agents.status_label(str(rec.get("status") or "")),
                         "rounds": rec.get("rounds", 0),
                         "task": " ".join(str(rec.get("task") or "").split())[:120],
                     })
             except Exception:
                 pass
-        return {"ok": True, "records": records, "roles": subagent_mod.roles_listing()}
+        return {"ok": True, "records": records, "roles": ctx.host.agents.roles_listing()}
 
     def _skills_listing() -> dict:
-        if skills_mod is None:
+        if ctx.host.skills is None:
             return {"ok": False, "message": "宿主缺少 skills 模块"}
-        loader = skills_mod.get_loader(ctx.config)
+        loader = ctx.host.skills.get_loader(ctx.config)
         if loader is None:
             return {"ok": False, "message": "技能系统未启用（config.skills.enabled 或缺少 pyyaml）"}
         listing = loader.listing()
@@ -1254,21 +1215,21 @@ def setup(ctx):
                 "listing": listing or "暂无技能（放置 data/skills/<name>/SKILL.md）"}
 
     def _mcp_listing() -> dict:
-        if mcp_mod is None:
+        if ctx.host.mcp is None:
             return {"ok": False, "message": "宿主缺少 mcp 模块"}
-        return {"ok": True, "status": mcp_mod.status_listing()}
+        return {"ok": True, "status": ctx.host.mcp.status_listing()}
 
     def _plugins_listing() -> dict:
-        if plugins_mod is None:
+        if ctx.host.plugins is None:
             return {"ok": False, "message": "宿主缺少 plugins 模块"}
-        return {"ok": True, "plugins": plugins_mod.statuses(),
-                "text": plugins_mod.status_listing()}
+        return {"ok": True, "plugins": ctx.host.plugins.statuses(),
+                "text": ctx.host.plugins.status_listing()}
 
     def _commands_listing() -> dict:
-        if commands_mod is None:
+        if ctx.host.commands is None:
             return {"ok": False, "message": "宿主缺少 commands 模块"}
         items = []
-        for meta in commands_mod.list_commands():
+        for meta in ctx.host.commands.list_commands():
             if not meta.get("callable"):
                 continue
             items.append({
@@ -1284,8 +1245,6 @@ def setup(ctx):
     _CMD_BUSY_BLOCKED = {"/clear", "/new", "/resume", "/undo", "/clear-trash"}
 
     def _provider_models(data: dict) -> dict:
-        from core.config import normalize_base_url
-
         url = data.get("base_url", "")
         key = data.get("api_key", "")
         if not isinstance(url, str) or not url.strip() or not isinstance(key, str):
@@ -1295,7 +1254,7 @@ def setup(ctx):
         try:
             from openai import OpenAI
 
-            with OpenAI(base_url=normalize_base_url(url), api_key=key or "no-key",
+            with OpenAI(base_url=ctx.host.models.normalize_base_url(url), api_key=key or "no-key",
                         timeout=15, max_retries=0) as client:
                 ids = []
                 seen = set()
@@ -1331,13 +1290,13 @@ def setup(ctx):
         return {"ok": True, "result": "提供商已删除", "model": ctx.config.active_model_name()}
 
     def _file_candidates(prefix, depth=1) -> dict:
-        if file_mod is None:
+        if ctx.host.files is None:
             return {"ok": False, "message": "宿主缺少 file 模块"}
         session = _session()
         selected_workspace = getattr(session, "workspace", root_workspace)
         depth = max(1, int(depth))
-        depth = min(depth, getattr(file_mod, "MAX_SCAN_DEPTH", 32))
-        result = file_mod.scan_candidates(str(prefix or ""), selected_workspace, depth=depth)
+        depth = min(depth, getattr(ctx.host.files, "MAX_SCAN_DEPTH", 32))
+        result = ctx.host.files.scan_candidates(str(prefix or ""), selected_workspace, depth=depth)
         items = result["items"]
         return {
             "ok": True,
@@ -1347,7 +1306,7 @@ def setup(ctx):
             ],
             "more": result["more"],
             "depth": depth,
-            "max_depth": getattr(file_mod, "MAX_SCAN_DEPTH", 32),
+            "max_depth": getattr(ctx.host.files, "MAX_SCAN_DEPTH", 32),
             "count": len(items),
         }
 
@@ -1385,9 +1344,9 @@ def setup(ctx):
     def _complete(prefix) -> dict:
         if not isinstance(prefix, str):
             return {"ok": False, "message": "prefix 须为字符串"}
-        if commands_mod is None:
+        if ctx.host.commands is None:
             return {"ok": False, "message": "宿主缺少 commands 模块"}
-        return {"ok": True, "items": commands_mod.complete(prefix, config=ctx.config)}
+        return {"ok": True, "items": ctx.host.commands.complete(prefix, config=ctx.config)}
 
     # ---- 设置面板：读取 / 保存（与 TUI /settings 同源，经 config 对象读写）----
 
@@ -1422,14 +1381,14 @@ def setup(ctx):
             for row in cfg.list_models()
         ]
         themes = ["dark"] + [t for t in cfg.list_themes() if t != "dark"]
-        workflows = workflow_mod.list_workflows(cfg) if workflow_mod else []
-        wf_active = workflow_mod.active_name(cfg) if workflow_mod else ""
+        workflows = ctx.host.workflows.list_workflows(cfg) if ctx.host.workflows else []
+        wf_active = ctx.host.workflows.active_name(cfg) if ctx.host.workflows else ""
         # 插件列表 + 声明式配置（与 TUI 设置页"插件"标签对齐）
         plugins_list = []
-        if plugins_mod:
-            for row in plugins_mod.statuses():
+        if ctx.host.plugins:
+            for row in ctx.host.plugins.statuses():
                 pid = row["id"]
-                decls = plugins_mod.declared_configs(pid)
+                decls = ctx.host.plugins.declared_configs(pid)
                 configs = []
                 for d in decls:
                     configs.append({
@@ -1441,7 +1400,7 @@ def setup(ctx):
                         "options": d.get("options"),
                         "min": d.get("min"),
                         "max": d.get("max"),
-                        "current": plugins_mod.get_setting(pid, d["key"], d.get("default"), cfg),
+                        "current": ctx.host.plugins.get_setting(pid, d["key"], d.get("default"), cfg),
                     })
                 plugins_list.append({
                     "id": pid,
@@ -1578,7 +1537,7 @@ def setup(ctx):
                     cfg.set_task_model(task_key.replace("task_", ""), v)
             active_model = str(values.get("active_model_name") or "").strip()
             if active_model == select_model:
-                active_model = make_model_name(row["provider_id"], updates.get("model_id", row["model_id"]))
+                active_model = ctx.host.models.make_model_name(row["provider_id"], updates.get("model_id", row["model_id"]))
             if active_model:
                 cfg.switch_model(active_model)
             cfg.apply_active()
@@ -1616,8 +1575,8 @@ def setup(ctx):
             wf_cfg = d.setdefault("workflow", {})
             if "workflow_enabled" in values:
                 wf_cfg["enabled"] = bool(values["workflow_enabled"])
-            if "workflow_active" in values and workflow_mod:
-                workflow_mod.set_active(cfg, str(values["workflow_active"]))
+            if "workflow_active" in values and ctx.host.workflows:
+                ctx.host.workflows.set_active(cfg, str(values["workflow_active"]))
             if "max_tool_rounds" in values:
                 wf_cfg["max_rounds"] = max(0, int(float(values["max_tool_rounds"])))
             if "spin_kill_count" in values:
@@ -1639,16 +1598,16 @@ def setup(ctx):
 
         elif section == "plugins":
             # 插件启停：{plugin_id: true/false}
-            if plugins_mod is None:
+            if ctx.host.plugins is None:
                 return {"ok": False, "message": "宿主缺少 plugins 模块"}
             for pid, enabled in values.items():
-                if not plugins_mod.set_enabled(pid, bool(enabled), cfg):
+                if not ctx.host.plugins.set_enabled(pid, bool(enabled), cfg):
                     return {"ok": False, "message": f"插件 {pid} 状态写入失败"}
-            plugins_mod.reload(cfg)
+            ctx.host.plugins.reload(cfg)
 
         elif section == "plugin_config":
             # 单个插件配置项写透：{plugin_id, key, value}
-            if plugins_mod is None:
+            if ctx.host.plugins is None:
                 return {"ok": False, "message": "宿主缺少 plugins 模块"}
             pid = str(values.get("plugin_id") or "")
             key = str(values.get("key") or "")
@@ -1656,7 +1615,7 @@ def setup(ctx):
             if not pid or not key:
                 return {"ok": False, "message": "缺少 plugin_id 或 key"}
             try:
-                val = plugins_mod.set_setting(pid, key, value, cfg)
+                val = ctx.host.plugins.set_setting(pid, key, value, cfg)
             except ValueError as e:
                 return {"ok": False, "message": str(e)}
             return {"ok": True, "result": f"{pid}.{key} = {val}"}
@@ -1676,7 +1635,7 @@ def setup(ctx):
         return {"ok": True, "result": f"设置已保存（{section}）"}
 
     def _op_command(line: str) -> dict:
-        if commands_mod is None:
+        if ctx.host.commands is None:
             return {"ok": False, "message": "宿主缺少 commands 模块"}
         line = (line or "").strip()
         if not line.startswith("/"):
@@ -1704,7 +1663,7 @@ def setup(ctx):
         before = len(session.messages)
         origin_id = str(getattr(session, "session_id", "") or "")
         try:
-            result = commands_mod.execute(line, cctx)
+            result = ctx.host.commands.execute(line, cctx)
         except Exception as e:
             return {"ok": False, "message": f"命令执行异常: {e}"}
         # 命令反馈多数经 _echo 写入会话 system 消息；部分 handler 返回说明文本
@@ -1867,7 +1826,7 @@ def setup(ctx):
                         tmp.write_bytes(body)
                         tmp.replace(target)
                         rel = target.relative_to(root_workspace).as_posix()
-                        return {"name": filename, "path": rel, "reference": file_mod.quote_reference(rel)}, ""
+                        return {"name": filename, "path": rel, "reference": ctx.host.files.quote_reference(rel)}, ""
                     return None, "上传请求中没有文件"
                 except (OSError, ValueError) as exc:
                     return None, f"上传失败: {exc}"
@@ -1967,10 +1926,10 @@ def setup(ctx):
                         self._json(400, {"ok": False, "message": f"未知参数: {', '.join(sorted(unknown))}"})
                         return
                     session = _session()
-                    if session is None or toolstore_mod is None:
+                    if session is None or ctx.host.files is None:
                         self._json(503, {"ok": False, "message": "会话未就绪"})
                         return
-                    text = toolstore_mod.read_persisted_content(
+                    text = ctx.host.files.read_persisted_content(
                         getattr(session, "config", None),
                         getattr(session, "project_id", ""),
                         getattr(session, "session_id", ""),

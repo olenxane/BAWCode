@@ -32,6 +32,8 @@ set_rag 的项目级开关存 state.json（不随索引过期）。
 """
 from __future__ import annotations
 
+from bawcode_sdk import PluginContext
+
 import hashlib
 import json
 import math
@@ -130,7 +132,7 @@ _EMB_MAX_CHUNKS = 5000       # 嵌入切片数上限（防超大规模仓库）
 _INDEX_VERSION = 1
 
 
-def setup(ctx):
+def setup(ctx: PluginContext):
     storage = ctx.storage_dir()  # {workspace}/.bawcode/plugin-data/rag/
     index_file = storage / "index.json"
     emb_file = storage / "embeddings.json"
@@ -148,11 +150,7 @@ def setup(ctx):
     # ---------- 配置 ----------
 
     def _cfg() -> dict:
-        data = (getattr(ctx.config, "data", None) or {})
-        persisted = dict((data.get("plugins_config") or {}).get("rag") or {})
-        out = dict(ctx.settings)
-        out.update(persisted)
-        return out
+        return ctx.settings
 
     def _enabled() -> bool:
         if proj_enabled is not None:
