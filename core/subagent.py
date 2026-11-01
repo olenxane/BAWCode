@@ -895,8 +895,11 @@ def _fold_old_tool_outputs(rt: dict, record: dict, messages: List[dict]) -> int:
         return 0
     cfg = subagent_cfg(config)
     ratio = min(max(float(cfg.get("context_fold_ratio") or 0.85), 0.1), 0.98)
-    keep_rounds = max(0, int(cfg.get("context_fold_keep_rounds") or 4))
-    digest_chars = max(0, int(cfg.get("context_fold_digest_chars") or 240))
+    # 用户配置 0 是有效值，不能用 or 回落默认
+    keep_rounds = cfg.get("context_fold_keep_rounds")
+    keep_rounds = max(0, int(4 if keep_rounds is None else keep_rounds))
+    digest_chars = cfg.get("context_fold_digest_chars")
+    digest_chars = max(0, int(240 if digest_chars is None else digest_chars))
     model = str(record.get("model") or "")
     try:
         used = token_mod.count_message_tokens(messages, model)
@@ -923,7 +926,10 @@ def _fold_old_tool_outputs(rt: dict, record: dict, messages: List[dict]) -> int:
             continue
         if str(message.get("tool_call_id") or "") in protected_ids:
             continue
-        text = str(message.get("content") or "")
+        # 带图片的结果不折叠，避免把 base64 写进外置文件和摘要
+        if memory_mod.count_image_parts(message.get("content")):
+            continue
+        text = memory_mod.content_text(message.get("content"))
         if len(text) <= digest_chars * 2:
             continue
         call_id = str(message.get("tool_call_id") or "")

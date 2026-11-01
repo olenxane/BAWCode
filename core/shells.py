@@ -262,9 +262,16 @@ def build_command(command: str, name: str) -> Tuple[Optional[list], str, bool]:
 # 判定删除命令与目标：平铺枚举 AST（不做嵌套递归，避免在函数作用域内无限展开），
 # 字面常量 path 作为目标；变量/展开串/子表达式标记为动态，交由调用方拒绝而非猜目标
 _PS_VISIT = r"""
-$names = @('remove-item', 'rm', 'del', 'erase', 'rd', 'rmdir', 'rimraf', 'deltree')
+$names = @('remove-item', 'rm', 'del', 'erase', 'rd', 'rmdir', 'ri', 'rimraf', 'deltree', 'unlink')
+$cdNames = @('cd', 'chdir', 'set-location', 'sl', 'push-location', 'pushd')
+$evalNames = @('iex', 'invoke-expression')
+$filterParams = @('filter', 'include', 'exclude')
+$pathParams = @('path', 'literalpath', 'pspath', 'lp')
 $targets = New-Object 'System.Collections.Generic.List[string]'
 $dynamic = $false
+$found = $false
+$hasCd = $false
+$hasEval = $false
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($cmd, [ref]$null, [ref]$errors)
 if ($errors.Count -gt 0) {
@@ -274,26 +281,34 @@ if ($errors.Count -gt 0) {
 }
 foreach ($cmdAst in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
     $name = $cmdAst.GetCommandName()
-    if (-not $name -or ($names -notcontains $name.ToLower())) { continue }
-    $skipNext = $false
-    $firstName = $true
-    foreach ($el in $cmdAst.CommandElements) {
-        if ($firstName) { $firstName = $false; continue }
-        if ($el -is [System.Management.Automation.Language.CommandParameterAst]) {
-            $skipNext = $true
+    if (-not $name) { continue }
+    $lower = $name.ToLower()
+    if ($cdNames -contains $lower) { $hasCd = $true; continue }
+    if ($evalNames -contains $lower) { $hasEval = $true; continue }
+    if ($names -notcontains $lower) { continue }
+    $found = $true
+    # 按 cmdlet 元数据静态绑定参数，只把路径参数当目标，-Filter 等参数值不会被误当路径
+    $binding = [System.Management.Automation.Language.StaticParameterBinder]::BindCommand($cmdAst, $true)
+    if ($binding.BindingExceptions.Count -gt 0) { $dynamic = $true }
+    foreach ($key in $binding.BoundParameters.Keys) {
+        $k = $key.ToLower()
+        if ($filterParams -contains $k) { $dynamic = $true; continue }
+        if (-not (($pathParams -contains $k) -or ($k -match '^\d+$'))) { continue }
+        $value = $binding.BoundParameters[$key].Value
+        $items = if ($value -is [System.Management.Automation.Language.ArrayLiteralAst]) { $value.Elements } else { @($value) }
+        foreach ($item in $items) {
+            if ($item -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $targets.Add($item.Value) }
+            else { $dynamic = $true }
         }
-        elseif ($el -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-            if (-not $skipNext) { $targets.Add($el.Value) }
-        }
-        elseif ($el -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) { $dynamic = $true }
-        elseif ($el -is [System.Management.Automation.Language.VariableExpressionAst]) { $dynamic = $true }
-        elseif ($el -is [System.Management.Automation.Language.ArrayLiteralAst]) { $dynamic = $true }
-        elseif ($el -is [System.Management.Automation.Language.ArrayExpressionAst]) { $dynamic = $true }
-        elseif ($el -is [System.Management.Automation.Language.SubExpressionAst]) { $dynamic = $true }
-        elseif ($el -isnot [System.Management.Automation.Language.CommandExpressionAst]) { $dynamic = $true }
-        $skipNext = $false
     }
 }
+if (-not $found) {
+    $flag = if ($hasEval) { 'D' } else { 'N' }
+    Write-Output ($flag + '|')
+    exit 0
+}
+# cd 会改变相对路径的基准，iex 内的删除无法静态解析
+if ($hasCd -or $hasEval) { $dynamic = $true }
 $flag = if ($dynamic) { 'D' } else { 'T' }
 Write-Output ($flag + '|')
 Write-Output ($targets -join "`n")
@@ -342,28 +357,34 @@ def _powershell_run(binary: str, script: str, stdin_text: str, timeout: int) -> 
     return out
 
 
-def powershell_parse(command: str) -> Tuple[Optional[list], bool]:
-    """PowerShell AST 解析：返回 (删除目标, 是否含动态表达式)
+PS_PARSE_NONE = "none"
+PS_PARSE_OK = "ok"
+PS_PARSE_DYNAMIC = "dynamic"
+PS_PARSE_ERROR = "error"
 
-    未识别为删除命令返回 (None, False)；识别为删除但目标不可靠时返回 ([] , True)。
-    语法错误由 syntax_issue 先行拦截，这里返回 (None, False)。"""
+
+def powershell_parse(command: str) -> Tuple[Optional[list], str]:
+    """PowerShell AST 解析删除命令：返回 (删除目标, 状态)
+
+    状态 none 表示不含删除命令，目标为 None；ok 为确定的字面目标；
+    dynamic 为目标不可静态确定；error 为解释器不可用、超时或解析失败，调用方应按拦截处理。"""
     binary = _resolve_process(POWERSHELL)
     if binary is None:
-        return None, False
+        return None, PS_PARSE_ERROR
     out = _powershell_run(binary, _PS_DETECT_SCRIPT, str(command or ""), 30)
     if not out:
-        return None, False
+        return None, PS_PARSE_ERROR
     head = out.split("|", 1)
     flag = head[0]
-    if flag == "E":
-        return None, False
-    if flag not in ("T", "D"):
-        return None, False
+    if flag == "N":
+        return None, PS_PARSE_NONE
+    if flag == "D":
+        return [], PS_PARSE_DYNAMIC
+    if flag != "T":
+        return None, PS_PARSE_ERROR
     body = head[1] if len(head) > 1 else ""
     targets = [part for part in body.replace("\r", "").split("\n") if part.strip()]
-    if flag == "D":
-        return [], True
-    return targets, False
+    return targets, PS_PARSE_OK
 
 
 def syntax_issue(command: str, name: str) -> str:

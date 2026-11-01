@@ -21,6 +21,7 @@ SERVICE_METHODS = {
     "skills": ("get_loader",),
     "mcp": ("status_listing",),
     "models": ("make_model_name", "normalize_base_url"),
+    "settings": ("fields", "read_field", "write_field"),
     "runtime": ("snapshot", "notify", "interrupt", "tree_node"),
     "logging": ("get_logger",),
 }

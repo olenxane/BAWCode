@@ -136,6 +136,20 @@ _COMPRESS_RETRY_HINT = (
 )
 
 
+class SummaryCallError(RuntimeError):
+    """摘要模型调用失败；压缩据此直接记失败，不再重试"""
+
+
+def summary_llm_fn(llm) -> Callable[[str], str]:
+    """把 llm.chat 包装成压缩用的 llm_fn；接口报错时抛 SummaryCallError，避免空串触发重试"""
+    def call(prompt: str) -> str:
+        result = llm.chat([{"role": "user", "content": prompt}]) or {}
+        if result.get("error"):
+            raise SummaryCallError(str(result["error"]))
+        return result.get("content", "") or ""
+    return call
+
+
 def parse_state_snapshot(text: str) -> Optional[dict]:
     """解析压缩模型输出的 <state_snapshot> 结构；返回 {"sections": dict, "xml": str} 或 None
 
@@ -448,7 +462,8 @@ class Memory:
         # message_added 观察链：外部同步/转发方消费（content 可能为多模态数组）；
         # 处理函数异常已在 hooks 内隔离，处理函数内不得再写会话消息（会递归）
         hooks.collect_hook("message_added", {"role": role, "content": content, **extra})
-        if role == "user":
+        # 插话与子代理通知不算新用户回合，否则熔断会在回合中途被清零
+        if role == "user" and not extra.get("injected"):
             self._compress_noop_fingerprint = ""
             if self._compress_fail_streak:
                 # 新用户回合复位压缩熔断：上轮的 API 故障可能已恢复，重试频率限制为每回合一轮
@@ -834,9 +849,9 @@ class Memory:
                 self.config, self.project_id, self.session_id,
                 call_id, tool_name, args, description, content,
             )
-            if persist_path is not None:
-                preview = toolstore.slice_to_tokens(content, cap, getattr(self.config, "model_name", ""))
-                content = f"{preview}\n\n[{toolstore.pointer_line(persist_path, total_lines)}]"
+            # 外置失败也必须截断，否则单条结果可能撑爆上下文窗口
+            preview = toolstore.slice_to_tokens(content, cap, getattr(self.config, "model_name", ""))
+            content = f"{preview}\n\n[{toolstore.pointer_line(persist_path, total_lines)}]"
         # 数组形态：text 块在前，图片块随后
         message_content: Union[str, list] = (
             [{"type": "text", "text": content}] + image_parts if image_parts else content
@@ -1486,6 +1501,9 @@ class Memory:
             )
             try:
                 summary = llm_fn(prompt)
+            except SummaryCallError as e:
+                # 接口已报错，结构重试只会再打一轮失败请求
+                return self._compress_fail(f"摘要 LLM 调用失败 ({e})")
             except Exception as e:
                 return self._compress_fail(f"摘要 LLM 调用异常 ({e})")
             structured = parse_required_snapshot(summary)
@@ -1557,7 +1575,10 @@ class Memory:
 
     def _model_limits(self, model: Optional[str] = None) -> tuple:
         """本次调用模型的 (窗口, 输出上限)：指定模型时按配置查找，找不到回落激活模型"""
-        window = int(getattr(self.config, "context_window", 0) or 0)
+        from core.config import DEFAULT_CONTEXT_WINDOW
+
+        # 窗口未知时按默认窗口算预算，否则自动压缩永远不触发
+        window = int(getattr(self.config, "context_window", 0) or 0) or DEFAULT_CONTEXT_WINDOW
         max_tokens = int(getattr(self.config, "max_tokens", 0) or 0)
         if not model:
             return window, max_tokens

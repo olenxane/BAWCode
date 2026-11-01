@@ -77,6 +77,13 @@ LOGIN_MAX_FAILS = 5          # 连续密码错误次数上限，达到即短暂�
 LOGIN_BLOCK_SECONDS = 60     # 触发上限后的锁定时长（秒）
 SSE_HEARTBEAT = 10  # 秒；顺带用于探测死连接与退出检查
 CLIENT_TTL = 60  # 秒；窗口内有鉴权请求即视为浏览器在线（刷新/休眠会断 SSE，页面轮询仍在）
+_SECRET_KEY_RE = re.compile(r"(?i)(api_key|password|secret|(?:^|_)token$)")
+
+
+def _is_secret_key(key: str) -> bool:
+    """配置项是否属于密钥类，网页端只回传是否已设置"""
+    return bool(_SECRET_KEY_RE.search(str(key or "")))
+
 
 # ---- 渲染辅助：与 TUI core/render.py 对齐的工具分类 / pygments 高亮 / diff ----
 # 分类口径与 TUI 的 _tool_display_meta 保持一致；插件不依赖宿主内部实现，逻辑在此独立实现
@@ -107,21 +114,6 @@ def _as_text(value) -> str:
 
 def _esc(text) -> str:
     return html.escape(str(text or ""), quote=False)
-
-
-# 快捷键项与默认值（网页设置页读取/写回共用同一份清单）
-_SHORTCUT_DEFAULTS = (
-    ("switch_mode", "shift+tab"),
-    ("switch_focus", "tab"),
-    ("send", "ctrl+enter"),
-    ("newline", "shift+enter"),
-    ("complete", "tab"),
-    ("scroll_up", "pageup"),
-    ("scroll_down", "pagedown"),
-    ("expand", "right"),
-    ("collapse", "left"),
-    ("rollback", "ctrl+z"),
-)
 
 
 def _shortcut_text(value) -> str:
@@ -1251,6 +1243,10 @@ def setup(ctx: PluginContext):
             return {"ok": False, "message": "请填写有效的 base_url 和 api_key"}
         url = url.strip()
         key = key.strip()
+        if not key:
+            # 网页端不持有已存密钥，留空时取该提供商已保存的值
+            saved = ctx.config.find_provider(str(data.get("provider_id") or "")) or {}
+            key = str(saved.get("api_key") or "")
         try:
             from openai import OpenAI
 
@@ -1354,13 +1350,6 @@ def setup(ctx: PluginContext):
         """汇总当前配置，按标签页组织返回给网页端"""
         cfg = ctx.config
         d = cfg.data or {}
-        ui = d.get("ui") or {}
-        mem = d.get("memory") or {}
-        llm = d.get("llm") or {}
-        ctx_cfg = d.get("context") or {}
-        wf = d.get("workflow") or {}
-        tools = d.get("tools") or {}
-        log_cfg = d.get("log") or {}
         providers = cfg.providers() or []
         active_pid = d.get("active_provider_id", "")
         provider = cfg.find_provider(active_pid) or (providers[0] if providers else {})
@@ -1380,9 +1369,11 @@ def setup(ctx: PluginContext):
             }
             for row in cfg.list_models()
         ]
-        themes = ["dark"] + [t for t in cfg.list_themes() if t != "dark"]
-        workflows = ctx.host.workflows.list_workflows(cfg) if ctx.host.workflows else []
-        wf_active = ctx.host.workflows.active_name(cfg) if ctx.host.workflows else ""
+        provider_entries = []
+        for row in providers:
+            entry = copy.deepcopy(row)
+            entry["api_key_set"] = bool(entry.pop("api_key", ""))
+            provider_entries.append(entry)
         # 插件列表 + 声明式配置（与 TUI 设置页"插件"标签对齐）
         plugins_list = []
         if ctx.host.plugins:
@@ -1391,16 +1382,20 @@ def setup(ctx: PluginContext):
                 decls = ctx.host.plugins.declared_configs(pid)
                 configs = []
                 for d in decls:
+                    current = ctx.host.plugins.get_setting(pid, d["key"], d.get("default"), cfg)
+                    secret = _is_secret_key(d["key"])
                     configs.append({
                         "key": d["key"],
                         "label": d.get("label") or d["key"],
                         "type": d["type"],
                         "hint": d.get("hint") or "",
-                        "default": d.get("default"),
+                        "default": "" if secret else d.get("default"),
                         "options": d.get("options"),
                         "min": d.get("min"),
                         "max": d.get("max"),
-                        "current": ctx.host.plugins.get_setting(pid, d["key"], d.get("default"), cfg),
+                        "current": "" if secret else current,
+                        "secret": secret,
+                        "is_set": bool(current) if secret else None,
                     })
                 plugins_list.append({
                     "id": pid,
@@ -1414,11 +1409,11 @@ def setup(ctx: PluginContext):
             "ok": True,
             "provider": {
                 "providers": [{"provider_id": p.get("provider_id"), "name": p.get("name")} for p in providers],
-                "entries": copy.deepcopy(providers),
+                "entries": provider_entries,
                 "active_provider_id": active_pid,
                 "provider_id": provider.get("provider_id", ""),
                 "provider_name": provider.get("name", ""),
-                "api_key": provider.get("api_key", ""),
+                "api_key_set": bool(provider.get("api_key")),
                 "base_url": provider.get("base_url", ""),
                 "balance_url": provider.get("balance_url", ""),
                 "temperature": provider.get("temperature", 1.0),
@@ -1439,32 +1434,33 @@ def setup(ctx: PluginContext):
                 "model_names": cfg.list_model_names() or [],
                 "entries": model_entries,
             },
+            # 系统/快捷键：字段清单与当前值由宿主 settings 服务按
+            # data/settings_schema.json 声明生成（与 TUI /settings 同源）
             "system": {
-                "theme": getattr(cfg, "theme", ui.get("theme", "dark")),
-                "themes": themes,
-                "mode": getattr(cfg, "mode", ui.get("mode", "auto")),
-                "logo": bool(ui.get("logo", True)),
-                "font_size": getattr(cfg, "font_size", 16),
-                "tip_interval": ui.get("tip_interval", 5),
-                "retry_times": llm.get("retry_times", 3),
-                "retry_delay": llm.get("retry_delay", 1.0),
-                "auto_compress": bool(mem.get("auto_compress", True)),
-                "compress_threshold": mem.get("compress_threshold", 0.8),
-                "compress_keep_recent_tokens": mem.get("compress_keep_recent_tokens", 16384),
-                "compress_summary_max_tokens": mem.get("compress_summary_max_tokens", 1024),
-                "tool_whitelist": ", ".join(str(x) for x in (ctx_cfg.get("tool_whitelist") or [])),
-                "max_tool_rounds": wf.get("max_rounds", 0),
-                "spin_kill_count": wf.get("spin_kill_count", 12),
-                "max_tool_timeout": tools.get("max_timeout", 600),
-                "ask_user_timeout": bool(tools.get("ask_user_timeout", True)),
-                "workflow_enabled": bool(wf.get("enabled", False)),
-                "workflow_active": wf_active,
-                "workflows": workflows,
-                "log_level": log_cfg.get("level", "info"),
+                "fields": [
+                    {
+                        "key": f["key"],
+                        "label": f.get("label") or f["key"],
+                        "type": f["type"],
+                        "hint": f.get("hint") or "",
+                        "options": f.get("options"),
+                        "min": f.get("min"),
+                        "max": f.get("max"),
+                        "current": f.get("current"),
+                    }
+                    for f in ctx.host.settings.fields("system", cfg)
+                ],
             },
             "shortcuts": {
-                key: _shortcut_text(ui.get(key, default))
-                for key, default in _SHORTCUT_DEFAULTS
+                "fields": [
+                    {
+                        "key": f["key"],
+                        "label": f.get("label") or f["key"],
+                        "hint": f.get("hint") or "",
+                        "current": _shortcut_text(f.get("current")),
+                    }
+                    for f in ctx.host.settings.fields("shortcuts", cfg)
+                ],
             },
             "plugins": plugins_list,
         }
@@ -1494,6 +1490,9 @@ def setup(ctx: PluginContext):
             provider["provider_id"] = pid
             for key in ("api_key", "base_url", "balance_url", "temperature", "default_model_id"):
                 if key in values:
+                    # 网页端拿不到已存密钥，空值表示不修改
+                    if key == "api_key" and not str(values[key] or "").strip() and existing:
+                        continue
                     provider[key] = values[key]
             if "provider_name" in values:
                 provider["name"] = str(values["provider_name"] or pid)
@@ -1543,58 +1542,19 @@ def setup(ctx: PluginContext):
             cfg.apply_active()
 
         elif section == "system":
-            ui_cfg = d.setdefault("ui", {})
-            if "theme" in values:
-                ui_cfg["theme"] = str(values["theme"])
-            if "mode" in values:
-                cfg.mode = str(values["mode"])  # 属性 setter 校验、旧值 manual 映射 confirm 并落盘 ui.mode
-            if "logo" in values:
-                ui_cfg["logo"] = bool(values["logo"])
-            if "font_size" in values:
-                ui_cfg["font_size"] = int(float(values["font_size"]))
-                d.setdefault("system", {})["font_size"] = ui_cfg["font_size"]
-            if "tip_interval" in values:
-                ui_cfg["tip_interval"] = float(values["tip_interval"])
-            llm_cfg = d.setdefault("llm", {})
-            if "retry_times" in values:
-                llm_cfg["retry_times"] = int(float(values["retry_times"]))
-            if "retry_delay" in values:
-                llm_cfg["retry_delay"] = float(values["retry_delay"])
-            mem_cfg = d.setdefault("memory", {})
-            if "auto_compress" in values:
-                mem_cfg["auto_compress"] = bool(values["auto_compress"])
-            if "compress_threshold" in values:
-                mem_cfg["compress_threshold"] = float(values["compress_threshold"])
-            if "compress_keep_recent_tokens" in values:
-                mem_cfg["compress_keep_recent_tokens"] = max(0, int(float(values["compress_keep_recent_tokens"])))
-            if "compress_summary_max_tokens" in values:
-                mem_cfg["compress_summary_max_tokens"] = max(100, int(float(values["compress_summary_max_tokens"])))
-            if "tool_whitelist" in values:
-                ctx_cfg = d.setdefault("context", {})
-                ctx_cfg["tool_whitelist"] = [p.strip() for p in str(values["tool_whitelist"]).split(",") if p.strip()]
-            wf_cfg = d.setdefault("workflow", {})
-            if "workflow_enabled" in values:
-                wf_cfg["enabled"] = bool(values["workflow_enabled"])
-            if "workflow_active" in values and ctx.host.workflows:
-                ctx.host.workflows.set_active(cfg, str(values["workflow_active"]))
-            if "max_tool_rounds" in values:
-                wf_cfg["max_rounds"] = max(0, int(float(values["max_tool_rounds"])))
-            if "spin_kill_count" in values:
-                wf_cfg["spin_kill_count"] = max(1, int(float(values["spin_kill_count"])))
-            if "max_tool_timeout" in values:
-                d.setdefault("tools", {})["max_timeout"] = max(1, int(float(values["max_tool_timeout"])))
-            if "ask_user_timeout" in values:
-                d.setdefault("tools", {})["ask_user_timeout"] = bool(values["ask_user_timeout"])
-            if "log_level" in values:
-                level = str(values["log_level"]).strip().lower()
-                if level in ("debug", "info", "warn", "error", "off"):
-                    d.setdefault("log", {})["level"] = level
+            # 按声明字段写回：类型转换/钳制/副作用（mode setter、log_level
+            # 重初始化、workflow_active、font_size 双写等）在宿主模块内
+            fields = {f["key"]: f for f in ctx.host.settings.fields("system", cfg)}
+            for key, raw in values.items():
+                field = fields.get(key)
+                if field is not None:
+                    ctx.host.settings.write_field(cfg, field, raw)
 
         elif section == "shortcuts":
             ui_cfg = d.setdefault("ui", {})
-            for key, _default in _SHORTCUT_DEFAULTS:
-                if key in values:
-                    ui_cfg[key] = _shortcut_binding(values[key])
+            for f in ctx.host.settings.fields("shortcuts", cfg):
+                if f["key"] in values:
+                    ui_cfg[f["key"]] = _shortcut_binding(values[f["key"]])
 
         elif section == "plugins":
             # 插件启停：{plugin_id: true/false}
@@ -1614,11 +1574,14 @@ def setup(ctx: PluginContext):
             value = values.get("value")
             if not pid or not key:
                 return {"ok": False, "message": "缺少 plugin_id 或 key"}
+            secret = _is_secret_key(key)
+            if secret and not str(value or "").strip():
+                return {"ok": True, "result": f"{pid}.{key} 未修改"}
             try:
                 val = ctx.host.plugins.set_setting(pid, key, value, cfg)
             except ValueError as e:
                 return {"ok": False, "message": str(e)}
-            return {"ok": True, "result": f"{pid}.{key} = {val}"}
+            return {"ok": True, "result": f"{pid}.{key} 已更新" if secret else f"{pid}.{key} = {val}"}
 
         else:
             return {"ok": False, "message": f"未知设置分区: {section}"}

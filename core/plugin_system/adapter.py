@@ -7,6 +7,7 @@ _MODULES = {
     "sessions": "session_store", "files": "file", "plugins": "plugins",
     "workflows": "workflow", "snapshots": "snapshot", "agents": "subagent",
     "skills": "skills", "mcp": "mcp", "models": "config", "policy": "policy",
+    "settings": "settings_schema",
     "logging": "log",
 }
 _OVERRIDES = {

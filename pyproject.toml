@@ -16,6 +16,7 @@ dependencies = [
     "prompt_toolkit>=3.0.53",
     "pyyaml>=6.0",
     "mcp>=1.2.0",
+    "pygments>=2.13",
 ]
 
 [project.optional-dependencies]
@@ -30,9 +31,10 @@ qbridge = ["websockets>=13", "Pillow>=10"]
 bawcode = "main:cli"
 
 [tool.setuptools]
-# 源码运行为主（data/ 运行时资源不入包）；此处仅保证 pip install . 可构建
+# 只支持在源码目录 pip install -e . 安装：运行时按 __file__ 定位仓库内 data/，非 editable 安装会找不到配置与主题
 packages = ["core", "core.plugin_system", "bawcode_sdk", "gui"]
 py-modules = ["main"]
 
 [tool.setuptools.package-data]
 bawcode_sdk = ["py.typed"]
+core = ["prompts/*.md"]

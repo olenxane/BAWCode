@@ -139,7 +139,7 @@ class TokenMeter:
             self.last_context_tokens = int(usage.get("prompt_tokens") or self.last_context_tokens)
             self.turn_peak_context_tokens = max(self.turn_peak_context_tokens, self.last_context_tokens)
             details = usage.get("prompt_tokens_details")
-            cached = details.get("cached_tokens") if isinstance(details, dict) else 0
+            cached = details.get("cached_tokens") if isinstance(details, dict) else None
             if cached is None:
                 cached = usage.get("prompt_cache_hit_tokens") or 0
             self.cached_prompt_tokens += int(cached or 0)

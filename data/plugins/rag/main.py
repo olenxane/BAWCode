@@ -128,6 +128,9 @@ _CHUNK_MAX_CHARS = 8000      # 单切片内容截断保护（异常巨大的函�
 _DOC_MAX_CHARS = 600         # 单切片 doc（注释/docstring）截断
 _EMB_BATCH = 32              # 嵌入 API 单批条数
 _EMB_MAX_CHUNKS = 5000       # 嵌入切片数上限（防超大规模仓库）
+_RECALL_EMB_TIMEOUT = 8      # 召回时嵌入请求超时秒数，不重试
+_BREAKER_FAILS = 3           # 召回嵌入连续失败达到该次数即熔断
+_BREAKER_COOLDOWN = 300      # 熔断期秒数，期间召回直接走关键词
 
 _INDEX_VERSION = 1
 
@@ -146,6 +149,9 @@ def setup(ctx: PluginContext):
     parsers: Dict[str, Any] = {}
     meta = {"built_at": "", "workspace": ""}
     lock = threading.Lock()
+    build_lock = threading.Lock()
+    grammar_cache: Dict[str, set] = {}
+    emb_breaker = {"fails": 0, "open_until": 0.0}
 
     # ---------- 配置 ----------
 
@@ -223,20 +229,30 @@ def setup(ctx: PluginContext):
             except OSError:
                 pass
 
-    def _persist(stats: dict) -> None:
+    def _persist_snapshot(stats: dict) -> dict:
+        """须在 lock 内调用：更新元信息并取一份可在锁外落盘的浅拷贝"""
         meta["built_at"] = datetime.now().isoformat(timespec="seconds")
         meta["workspace"] = str(ctx.workspace)
-        _dump(index_file, {
-            "version": _INDEX_VERSION,
-            "built_at": meta["built_at"],
-            "workspace": meta["workspace"],
-            "ttl_days": _ttl_days(),
-            "files": {rel: list(e["stat"] or []) for rel, e in docs_index.items()},
-            "chunks_by_file": {rel: e["chunks"] for rel, e in docs_index.items()},
-            "stats": stats,
-        })
-        if emb_model_used:
-            _dump(emb_file, {"model": emb_model_used, "vecs": embs})
+        return {
+            "index": {
+                "version": _INDEX_VERSION,
+                "built_at": meta["built_at"],
+                "workspace": meta["workspace"],
+                "ttl_days": _ttl_days(),
+                "files": {rel: list(e["stat"] or []) for rel, e in docs_index.items()},
+                "chunks_by_file": {rel: e["chunks"] for rel, e in docs_index.items()},
+                "stats": stats,
+            },
+            "emb": {"model": emb_model_used, "vecs": dict(embs)} if emb_model_used else None,
+        }
+
+    def _write_snapshot(snapshot: dict) -> None:
+        try:
+            _dump(index_file, snapshot["index"])
+            if snapshot["emb"] is not None:
+                _dump(emb_file, snapshot["emb"])
+        except OSError as e:
+            ctx.log.warn("RAG 索引持久化失败: %s", e)
 
     # ---------- doc 匹配基提取（注释 + docstring） ----------
 
@@ -411,7 +427,8 @@ def setup(ctx: PluginContext):
         base, model, _ = _emb_config()
         return _mode() == "embedding" and bool(base) and bool(model)
 
-    def _embed_texts(texts: List[str]) -> Optional[List[List[float]]]:
+    def _embed_texts(texts: List[str], timeout: float = 30,
+                     max_retries: int = 1) -> Optional[List[List[float]]]:
         """OpenAI 兼容 /v1/embeddings；失败返回 None（调用方回落 keyword）"""
         base, model, key = _emb_config()
         if not base or not model:
@@ -419,17 +436,24 @@ def setup(ctx: PluginContext):
         try:
             from openai import OpenAI
 
-            client = OpenAI(base_url=base, api_key=key or "EMPTY", timeout=30, max_retries=1)
-            out: List[Optional[List[float]]] = [None] * len(texts)
-            for i in range(0, len(texts), _EMB_BATCH):
-                resp = client.embeddings.create(model=model, input=texts[i:i + _EMB_BATCH])
-                for d in resp.data:
-                    out[i + d.index] = [round(v, 5) for v in d.embedding]
+            client = OpenAI(base_url=base, api_key=key or "EMPTY", timeout=timeout,
+                            max_retries=max_retries)
+            try:
+                out: List[Optional[List[float]]] = [None] * len(texts)
+                for i in range(0, len(texts), _EMB_BATCH):
+                    resp = client.embeddings.create(model=model, input=texts[i:i + _EMB_BATCH])
+                    for d in resp.data:
+                        out[i + d.index] = [round(v, 5) for v in d.embedding]
+            finally:
+                client.close()
             if any(v is None for v in out):
                 return None
             return out  # type: ignore[return-value]
         except Exception as e:
-            ctx.log.warn("RAG 嵌入失败，回落关键词匹配: %s", e)
+            msg = str(e)
+            if key:
+                msg = msg.replace(key, "***")
+            ctx.log.warn("RAG 嵌入失败，回落关键词匹配: %s: %s", type(e).__name__, msg[:300])
             return None
 
     def _cosine(a: List[float], b: List[float]) -> float:
@@ -442,85 +466,97 @@ def setup(ctx: PluginContext):
 
     # ---------- 索引构建（手动触发） ----------
 
-    def refresh() -> dict:
+    def _parse_file(rel: str, data: bytes) -> List[dict]:
+        ext = os.path.splitext(rel)[1].lower()
+        if ext in LANG_BY_EXT:
+            lang, def_types = LANG_BY_EXT[ext]
+            try:
+                valid = grammar_cache.get(lang)
+                if valid is None:
+                    valid = grammar_cache[lang] = _grammar_types(lang)
+                chunks = _parse_code(rel, lang, def_types & valid, data)
+            except Exception:
+                chunks = []
+            if not chunks:  # 语法异常/无定义节点 → 整文件一片兜底
+                chunks = [_mk_chunk(rel, lang, "file", [], data.decode("utf-8", "ignore"))]
+            return chunks
+        if ext in MARKDOWN_EXTS:
+            return _parse_markdown(rel, data.decode("utf-8", "ignore"))
+        return [_mk_chunk(rel, "text", "file", [], data.decode("utf-8", "ignore"))]
+
+    def refresh() -> Optional[dict]:
         """增量重建：只重解析 (mtime, size) 变化的文件；embedding 模式下为
-        变化文件中带 doc 的切片补算向量。构建后持久化。"""
-        nonlocal emb_model_used
+        变化文件中带 doc 的切片补算向量。构建后持久化。
+        扫描、解析与嵌入都在 lock 外完成，最后在锁内整体替换；同一时间只允许一个构建，
+        已有构建进行中时返回 None。"""
+        nonlocal emb_model_used, recall_cache
         if not _TS_OK:
             return {"files": 0, "chunks": 0, "changed": 0, "elapsed": 0.0, "embedded": 0}
-        cfg = _cfg()
-        excludes = {d.strip() for d in str(cfg.get("exclude_dirs") or "").split(",") if d.strip()}
-        t0 = time.monotonic()
-        changed = 0
-        nfiles = 0
-        nchunks = 0
-        with lock:
-            root = str(ctx.workspace)
-            seen = set()
-            for rel, full, st in _scan(root, excludes):
-                nfiles += 1
-                seen.add(rel)
+        if not build_lock.acquire(blocking=False):
+            return None
+        try:
+            cfg = _cfg()
+            excludes = {d.strip() for d in str(cfg.get("exclude_dirs") or "").split(",") if d.strip()}
+            t0 = time.monotonic()
+            changed = 0
+            nchunks = 0
+            with lock:
+                old_index = dict(docs_index)
+                old_model = emb_model_used
+                old_uids = set(embs)
+            new_index: Dict[str, dict] = {}
+            for rel, full, st in _scan(str(ctx.workspace), excludes):
                 key = (st.st_mtime_ns, st.st_size)
-                ent = docs_index.get(rel)
+                ent = old_index.get(rel)
                 if ent and ent["stat"] == key:
+                    new_index[rel] = ent
                     nchunks += len(ent["chunks"])
                     continue
-                ext = os.path.splitext(rel)[1].lower()
                 try:
                     with open(full, "rb") as fh:
                         data = fh.read()
                 except OSError:
                     continue
-                if ext in LANG_BY_EXT:
-                    lang, def_types = LANG_BY_EXT[ext]
-                    try:
-                        valid = _grammar_types(lang)
-                        chunks = _parse_code(rel, lang, def_types & valid, data)
-                    except Exception:
-                        chunks = []
-                    if not chunks:  # 语法异常/无定义节点 → 整文件一片兜底
-                        chunks = [_mk_chunk(rel, lang, "file", [],
-                                            data.decode("utf-8", "ignore"))]
-                elif ext in MARKDOWN_EXTS:
-                    chunks = _parse_markdown(rel, data.decode("utf-8", "ignore"))
-                else:
-                    chunks = [_mk_chunk(rel, "text", "file", [],
-                                        data.decode("utf-8", "ignore"))]
-                docs_index[rel] = {"stat": key, "chunks": chunks}
+                chunks = _parse_file(rel, data)
+                new_index[rel] = {"stat": key, "chunks": chunks}
                 nchunks += len(chunks)
                 changed += 1
-            for rel in [r for r in docs_index if r not in seen]:
-                del docs_index[rel]
             # 向量维护：模型变更即全量失效；uid 失效清理
             model_now = _emb_config()[1]
-            if emb_model_used and model_now and emb_model_used != model_now:
-                embs.clear()
-                emb_model_used = ""
-            live_uids = set()
-            for rel, ent in docs_index.items():
+            model_changed = bool(old_model and model_now and old_model != model_now)
+            if model_changed:
+                old_uids = set()
+            live = {}
+            for ent in new_index.values():
                 for ch in ent["chunks"]:
-                    live_uids.add(_uid(ch))
-            for uid in [u for u in embs if u not in live_uids]:
-                embs.pop(uid, None)
-            # 补算清单在锁内取快照；嵌入请求在锁外执行（网络 I/O 持锁会阻塞召回与状态查询）
-            todo = [(_uid(ch), ch["doc"]) for ent in docs_index.values()
-                    for ch in ent["chunks"]
-                    if _uid(ch) not in embs and ch.get("doc")]
-        embedded = 0
-        if todo and _emb_ready() and (not emb_model_used or emb_model_used == model_now):
-            todo = todo[:_EMB_MAX_CHUNKS]
-            vecs = _embed_texts([t for _, t in todo])
-            if vecs is not None:
-                with lock:
-                    for (uid, _), v in zip(todo, vecs):
-                        embs[uid] = v
-                    embedded = len(todo)
+                    live[_uid(ch)] = ch
+            todo = [(uid, ch["doc"]) for uid, ch in live.items()
+                    if uid not in old_uids and ch.get("doc")]
+            new_vecs: Dict[str, List[float]] = {}
+            if todo and _emb_ready():
+                todo = todo[:_EMB_MAX_CHUNKS]
+                vecs = _embed_texts([t for _, t in todo])
+                if vecs is not None:
+                    new_vecs = {uid: v for (uid, _), v in zip(todo, vecs)}
+            stats = {"files": len(new_index), "chunks": nchunks, "changed": changed,
+                     "elapsed": time.monotonic() - t0, "embedded": len(new_vecs)}
+            with lock:
+                docs_index.clear()
+                docs_index.update(new_index)
+                if model_changed:
+                    embs.clear()
+                    emb_model_used = ""
+                for uid in [u for u in embs if u not in live]:
+                    embs.pop(uid, None)
+                if new_vecs:
+                    embs.update(new_vecs)
                     emb_model_used = model_now
-        stats = {"files": nfiles, "chunks": nchunks, "changed": changed,
-                 "elapsed": time.monotonic() - t0, "embedded": embedded}
-        with lock:
-            _persist(stats)
-        return stats
+                recall_cache = ("", "", [])
+                snapshot = _persist_snapshot(stats)
+            _write_snapshot(snapshot)
+            return stats
+        finally:
+            build_lock.release()
 
     def _uid(ch: dict) -> str:
         # uid 含内容指纹：行内编辑（起始行不变）也能让旧向量失效重算，避免旧向量持续召回
@@ -582,14 +618,26 @@ def setup(ctx: PluginContext):
 
     def _search_embedding(message: str, top_k: int) -> Optional[List[Tuple[float, dict]]]:
         """doc 向量召回；无向量/模型不匹配/调用失败返回 None（回落 keyword）"""
-        if emb_model_used != _emb_config()[1] or not embs:
+        with lock:
+            if emb_model_used != _emb_config()[1] or not embs:
+                return None
+            vec_items = list(embs.items())
+        now = time.monotonic()
+        if emb_breaker["open_until"] > now:
             return None
-        qv = _embed_texts([message])
+        qv = _embed_texts([message], timeout=_RECALL_EMB_TIMEOUT, max_retries=0)
         if qv is None:
+            emb_breaker["fails"] += 1
+            if emb_breaker["fails"] >= _BREAKER_FAILS:
+                emb_breaker["fails"] = 0
+                emb_breaker["open_until"] = now + _BREAKER_COOLDOWN
+                ctx.log.warn("RAG 嵌入连续失败 %d 次，%d 秒内召回改用关键词匹配",
+                             _BREAKER_FAILS, _BREAKER_COOLDOWN)
             return None
+        emb_breaker["fails"] = 0
         uid2chunk = {_uid(ch): ch for ch in _all_chunks()}
         scored = []
-        for uid, vec in embs.items():
+        for uid, vec in vec_items:
             ch = uid2chunk.get(uid)
             if ch is None:
                 continue
@@ -668,6 +716,8 @@ def setup(ctx: PluginContext):
             return ("tree-sitter 依赖未安装（pip install tree_sitter "
                     "tree-sitter-language-pack），结构索引不可用")
         st = refresh()
+        if st is None:
+            return "已有索引构建正在进行，请稍后再试"
         extra = f"，嵌入向量 {st['embedded']} 条" if st.get("embedded") else ""
         return (f"索引完成并已持久化：源文件 {st['files']} 个 / 切片 {st['chunks']} 条，"
                 f"重解析 {st['changed']} 个{extra}，耗时 {st['elapsed']:.2f}s")

@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 from typing import Callable, Dict, Optional
 
+from core import memory as memory_mod
 from core import policy
 from core import prompt_loader
 from core import register
@@ -227,7 +228,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 finalize = getattr(session, "finalize_turn", None)
                 if callable(finalize):
                     finalize()
-                session.maybe_compress(llm_fn=lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
+                session.maybe_compress(llm_fn=memory_mod.summary_llm_fn(llm))
             io.status("就绪")
             return {"status": "complete", "content": content}
 

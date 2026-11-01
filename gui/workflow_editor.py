@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -970,7 +971,10 @@ class EditorWindow(QtWidgets.QMainWindow):
             return
         path = workflow_mod.workflow_path(None, self._name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self._build_data(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # 先写临时文件再替换，保存中途崩溃不会留下半截工作流
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(self._build_data(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
         self.setWindowTitle(f"BAWCode 工作流编辑器 · {self._name}")
         self.statusBar().showMessage(f"已保存 {path}", 5000)
 

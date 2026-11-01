@@ -7,8 +7,8 @@ Lagrange.OneBot / go-cqhttp 等）暴露的 WebSocket 服务端（配置 ws_url�
 
 同步语义（/qbridge on 开启后）：
   终端 → QQ  助手回复（after_turn，超长分段）、终端侧输入的用户消息（[终端]
-            前缀，含粘贴图片→消息链）、系统消息（[系统] 前缀，可开关）、
-            工具执行活动（🔧 一行摘要，可开关）
+            前缀，含粘贴图片→消息链）、系统消息（[系统] 前缀，可开关）；
+            工具调用过程与结果不同步
   QQ → 终端  白名单用户的消息作为输入框消息注入（ctx.submit_turn：idle 开新
             回合，busy 按设置排队/中断）；图片段下载到本地后走宿主多模态
             管线（app.pending_images）；消息链=文本+图片混合转发
@@ -22,13 +22,15 @@ Lagrange.OneBot / go-cqhttp 等）暴露的 WebSocket 服务端（配置 ws_url�
 消息（self_id）与 QQ 提交文本的回声均被过滤，不会自激。
 
 依赖宿主扩展点（缺失时相应能力静默降级，插件仍可装载）：
-  hooks: tool_confirm / ui_request / message_added / after_turn / before_tool；
+  hooks: tool_confirm / ui_request / message_added / after_turn；
   ctx.submit_turn / ctx.notify；plugins.runtime()。
 
 依赖：websockets>=13（requirements.txt 已声明；缺失时 /qbridge 给出提示）。
 """
 
 from bawcode_sdk import PluginContext
+import base64
+import binascii
 import json
 import queue
 import re
@@ -36,7 +38,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 try:  # 图片下载（requests 为宿主运行时依赖，正常必然可用）
     import requests
@@ -55,6 +57,8 @@ _ALWAYS = ("2", "always", "总是", "总是允许")
 _NO = ("3", "n", "no", "否", "拒绝")
 _SKIP = ("跳过", "skip", "忽略", "decline")
 _TX_CAP = 500  # 发送队列上限：慢消费时丢事件，不拖垮 hook 线程
+_IMG_MAX_BYTES = 20 * 1024 * 1024
+_REMOTE_CONTROL_PREFIX = "[远程控制]"
 
 
 class _State:
@@ -76,7 +80,6 @@ class _State:
         self.reconnect_requested = False
         self.clear_confirmation = None
         self.qq_origin = None
-        self.tool_call_targets = {}
 
 
 def setup(ctx: PluginContext):
@@ -129,10 +132,6 @@ def setup(ctx: PluginContext):
 
     def _app():
         return ctx.runtime.get("app")
-
-    def _session():
-        runner = _runner()
-        return getattr(runner, "session", None) if runner is not None else None
 
     def _refresh_session(session):
         app = _app()
@@ -213,9 +212,6 @@ def setup(ctx: PluginContext):
         ctx.notify(f"[QQ桥] Agent 请求发送{('图片' if kind == 'image' else '文件')}到 {origin['target']}：{path.name}")
         return f"已提交发送到 {origin['target']}：{path.name}"
 
-    def _send_to_target(target: str, segments: list) -> None:
-        _send(target, segments, force=True)
-
     def _send_segments(segments: list) -> None:
         target = _bound_or_none()
         if not target:
@@ -232,64 +228,64 @@ def setup(ctx: PluginContext):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def _render_tool_image(name: str, args: dict, output: str):
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-        except ImportError:
-            ctx.log.warn("qbridge 工具改动图片发送需要 Pillow")
-            return None
-        source = str(args.get("new_str") or args.get("content") or output)
-        if name == "edit_file":
-            old_lines = [f"- {line}" for line in str(args.get("old_str") or "").splitlines()]
-            new_lines = [f"+ {line}" for line in str(args.get("new_str") or "").splitlines()]
-            source = "\n".join(old_lines + new_lines)
-        lines = (source[:6000].splitlines() or [""])[:140]
-        filename = str(args.get("file_path") or "")
-        try:
-            font = ImageFont.truetype("msyh.ttc", 18)
-        except OSError:
-            font = ImageFont.load_default()
-        padding, line_height, title_height = 24, 24, 48
-        width = min(1400, max(720, max((len(line) for line in lines), default=0) * 11 + padding * 2))
-        height = title_height + len(lines) * line_height + padding * 2
-        image = Image.new("RGB", (width, height), "#171923")
-        draw = ImageDraw.Draw(image)
-        draw.text((padding, padding), f"{name} · {filename}", fill="#79c0ff", font=font)
-        for index, line in enumerate(lines):
-            draw.text((padding, title_height + index * line_height), line[:160], fill="#e6edf3", font=font)
-        path = _img_dir() / f"tool-preview-{uuid.uuid4().hex[:10]}.png"
-        image.save(path, format="PNG")
-        return path
+    def _new_image_path(suffix: str) -> Path:
+        return _img_dir() / f"{time.strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:8]}{suffix}"
 
     def _fetch_image(ref: str):
-        """图片引用 → 本地路径（http(s) 下载；file:// 或本地路径直接使用）"""
+        """图片引用 → 本地路径；只接受 http(s) 与 base64://，拒绝 file:// 与本地路径"""
         ref = str(ref or "").strip()
         if not ref:
             return None
         low = ref.lower()
-        if low.startswith("file://"):
-            path = unquote(urlparse(ref).path)
-            if re.match(r"^/[A-Za-z]:", path):  # Windows file:///C:/... 还原盘符路径
-                path = path[1:]
-            return path if Path(path).is_file() else None
-        if low.startswith(("http://", "https://")):
-            if requests is None:
-                return None
+        if low.startswith("base64://"):
             try:
-                resp = requests.get(ref, timeout=15)
-                resp.raise_for_status()
-            except Exception as e:
-                ctx.log.warn("qbridge 图片下载失败: %r", e)
+                data = base64.b64decode(ref[9:], validate=False)
+            except (binascii.Error, ValueError) as e:
+                ctx.log.warn("qbridge base64 图片解码失败: %r", e)
                 return None
-            suffix = Path(urlparse(ref).path).suffix.lower()
-            if suffix not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
-                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-                suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
-                          "image/webp": ".webp", "image/bmp": ".bmp"}.get(ctype, ".png")
-            path = _img_dir() / f"{time.strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:8]}{suffix}"
-            path.write_bytes(resp.content)
+            if not data or len(data) > _IMG_MAX_BYTES:
+                ctx.log.warn("qbridge base64 图片为空或超过大小上限，已忽略")
+                return None
+            path = _new_image_path(".png")
+            path.write_bytes(data)
             return str(path)
-        return ref if Path(ref).is_file() else None
+        if not low.startswith(("http://", "https://")):
+            ctx.log.debug("qbridge 已拒绝非 http(s) 图片引用: %s", ref[:80])
+            return None
+        if requests is None:
+            return None
+        path = None
+        try:
+            with requests.get(ref, timeout=15, stream=True) as resp:
+                resp.raise_for_status()
+                declared = resp.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > _IMG_MAX_BYTES:
+                    ctx.log.warn("qbridge 图片超过大小上限，已放弃: %s 字节", declared)
+                    return None
+                suffix = Path(urlparse(ref).path).suffix.lower()
+                if suffix not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                    suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                              "image/webp": ".webp", "image/bmp": ".bmp"}.get(ctype, ".png")
+                path = _new_image_path(suffix)
+                total = 0
+                with open(path, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > _IMG_MAX_BYTES:
+                            raise ValueError("图片超过大小上限")
+                        fh.write(chunk)
+            return str(path)
+        except Exception as e:
+            ctx.log.warn("qbridge 图片下载失败: %r", e)
+            if path is not None:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            return None
 
     def _extract_user_content(content):
         """会话用户消息 content → (文本, [data URL 图片])；content 可能为多模态数组"""
@@ -322,51 +318,6 @@ def setup(ctx: PluginContext):
         elif text:
             _send_text(text)
 
-    def _on_before_tool(payload):
-        if not _enabled() or not _cfg_bool("sync_tools", True):
-            return
-        name = str(payload.get("name") or "?")
-        args = payload.get("args") if payload.get("args") is not None else payload.get("arguments") or {}
-        try:
-            arg_line = _oneline(json.dumps(args, ensure_ascii=False))
-        except (TypeError, ValueError):
-            arg_line = _oneline(str(args))
-        _send_text(f"🔧 {name} {arg_line[:200]}".rstrip())
-        if name in ("write", "edit_file"):
-            session = _session()
-            call_id = ""
-            if session is not None:
-                for message in reversed(session.messages):
-                    if message.get("role") == "assistant" and message.get("tool_calls"):
-                        call_id = next((str(call.get("id") or "") for call in message.get("tool_calls", [])
-                                        if isinstance(call, dict) and str(call.get("name") or "") == name), "")
-                        if call_id:
-                            break
-            with st.lock:
-                if st.qq_origin and call_id:
-                    st.tool_call_targets[call_id] = dict(st.qq_origin)
-
-    def _on_after_tool(payload):
-        if not _enabled() or not _cfg_bool("sync_tool_images", True):
-            return
-        name = str(payload.get("name") or "")
-        if name not in ("write", "edit_file"):
-            return
-        call_id = str(payload.get("call_id") or "")
-        with st.lock:
-            origin = st.tool_call_targets.pop(call_id, None)
-        if not origin:
-            return
-        output = str(payload.get("output") or "")
-        if not re.search(r"(?:写入成功|位置写入成功|编辑成功)", output):
-            return
-        image_path = _render_tool_image(name, payload.get("args") or {}, output)
-        if image_path:
-            _send_to_target(origin["target"], [
-                {"type": "text", "data": f"📝 {name} 改动预览"},
-                {"type": "image", "data": str(image_path)},
-            ])
-
     def _on_message_added(payload):
         if not _enabled():
             return
@@ -388,14 +339,12 @@ def setup(ctx: PluginContext):
             if not _cfg_bool("sync_system", True):
                 return
             text = content.strip() if isinstance(content, str) else _extract_user_content(content)[0]
-            if not text or text.startswith("[QQ桥]"):
+            if not text or text.startswith(("[QQ桥]", _REMOTE_CONTROL_PREFIX)):
                 return
             _send_text("[系统] " + text)
         # assistant/tool：回复由 after_turn 统一同步，工具输出不同步
 
     ctx.register_hook("after_turn", _on_after_turn)
-    ctx.register_hook("before_tool", _on_before_tool)
-    ctx.register_hook("after_tool", _on_after_tool)
     ctx.register_hook("message_added", _on_message_added)
 
     def _register_attachment_tools():
@@ -724,8 +673,20 @@ def setup(ctx: PluginContext):
         session = getattr(runner, "session", None) if runner is not None else None
         if runner is None or session is None:
             return "会话运行时尚未就绪。"
-        if getattr(runner, "busy", False):
-            return "当前回合进行中，请停止或等待回合结束后再操作会话。"
+        busy_reply = "当前回合进行中，请停止或等待回合结束后再操作会话。"
+
+        def _idle(callback) -> str:
+            result = ctx.run_when_idle(callback)
+            if isinstance(result, dict):
+                message = str(result.get("message") or "")
+                return busy_reply if "回合进行中" in message else (message or "会话操作失败。")
+            return str(result)
+
+        def _discard_pending():
+            discard = getattr(runner, "discard_pending_turn", None)
+            if callable(discard):
+                discard()
+
         if op == "/clear":
             with st.lock:
                 if arg.lower() != "confirm":
@@ -735,29 +696,51 @@ def setup(ctx: PluginContext):
                 st.clear_confirmation = None
             if not confirmation or confirmation[0] != uid or confirmation[1] != session.session_id or confirmation[2] < time.monotonic():
                 return "清空确认无效或已过期，请先发送 /clear。"
-            session.clear()
-            app = _app()
-            if app is not None:
-                app.task = ""
-                app.status = "会话已清空"
-            _refresh_session(session)
-            return f"会话 {session.session_id} 已清空。"
+
+            def _do_clear():
+                if session.session_id != confirmation[1]:
+                    return "会话已切换，清空已取消，请重新发送 /clear。"
+                clear_idle = getattr(runner, "clear_session_when_idle", None)
+                if callable(clear_idle):
+                    idle, cleanup = clear_idle()
+                    if not idle:
+                        return busy_reply
+                else:
+                    cleanup = session.clear()
+                app = _app()
+                if app is not None:
+                    app.task = ""
+                    app.status = "会话已清空"
+                _refresh_session(session)
+                if isinstance(cleanup, dict) and not cleanup.get("ok", True):
+                    return f"会话 {session.session_id} 已清空，但部分衍生记录清理失败。"
+                return f"会话 {session.session_id} 已清空。"
+
+            return _idle(_do_clear)
         if op == "/new":
-            session.save_session()
-            session.start_new_session()
-            app = _app()
-            if app is not None:
-                app.task = ""
-                app.status = "新会话已开启"
-            _refresh_session(session)
-            return f"新会话已开启：{session.session_id}"
+            def _do_new():
+                _discard_pending()
+                session.save_session()
+                session.start_new_session()
+                app = _app()
+                if app is not None:
+                    app.task = ""
+                    app.status = "新会话已开启"
+                _refresh_session(session)
+                return f"新会话已开启：{session.session_id}"
+
+            return _idle(_do_new)
         if op == "/rename":
             if not arg:
                 return "用法：/rename <标题>"
-            title = session.rename_session(arg)
-            session.save_session()
-            _refresh_session(session)
-            return f"当前会话已重命名：{title}"
+
+            def _do_rename():
+                title = session.rename_session(arg)
+                session.save_session()
+                _refresh_session(session)
+                return f"当前会话已重命名：{title}"
+
+            return _idle(_do_rename)
         if ctx.host.sessions is None:
             return "宿主缺少会话存储模块。"
         directory = ctx.host.sessions.sessions_dir(ctx.config, session.project_id)
@@ -765,7 +748,7 @@ def setup(ctx: PluginContext):
             rows = ctx.host.sessions.list_sessions(directory)[:20]
             if not rows:
                 return "当前没有已保存的历史会话。"
-            return "最近历史会话：\\n" + "\\n".join(
+            return "最近历史会话：\n" + "\n".join(
                 f"{row['id']} · {row['title']} · {row['message_count']} 条" for row in rows
             )
         if op == "/resume":
@@ -774,14 +757,19 @@ def setup(ctx: PluginContext):
             data = ctx.host.sessions.load_session_data(directory, arg)
             if not data:
                 return f"找不到可加载的会话：{arg}"
-            session.save_session()
-            session.switch_to(data)
-            app = _app()
-            if app is not None:
-                app._tree_follow_tail = True
-                app.status = f"已切换：{session.session_title or session.session_id}"
-            _refresh_session(session)
-            return f"已切换会话：{session.session_title or session.session_id}"
+
+            def _do_resume():
+                _discard_pending()
+                session.save_session()
+                session.switch_to(data)
+                app = _app()
+                if app is not None:
+                    app._tree_follow_tail = True
+                    app.status = f"已切换：{session.session_title or session.session_id}"
+                _refresh_session(session)
+                return f"已切换会话：{session.session_title or session.session_id}"
+
+            return _idle(_do_resume)
         return "未知会话指令。"
 
     def _route_qq_message(ev):
@@ -812,9 +800,6 @@ def setup(ctx: PluginContext):
         if auto_bound:
             ctx.notify(f"[QQ桥] 已绑定同步会话 {key}（/qbridge bind <private|group>/<id> 可更改）")
         elif not matched:
-            return
-        if uid not in _allowlist():
-            ctx.log.debug("qbridge 白名单外消息已忽略: user=%s", uid)
             return
         text, images = _parse_incoming(ev)
         if text.startswith("/"):
@@ -860,40 +845,47 @@ def setup(ctx: PluginContext):
                 job = tx.get_nowait()
             except queue.Empty:
                 return
-            target = job["target"]
-            if not job.get("force") and not _target_allowed(target):
-                continue
-            kind, _, val = target.partition("/")
-            ident = int(val) if val.isdigit() else val
-            if kind == "group":
-                action, pid = "send_group_msg", {"group_id": ident}
-            else:
-                action, pid = "send_private_msg", {"user_id": ident}
-            message = []
-            for seg in job["segments"]:
-                if seg.get("type") in ("image", "file"):
-                    file_value = str(seg.get("data") or "")
-                    seg_type = seg["type"]
-                    if not file_value.lower().startswith(("http://", "https://", "base64://")):
-                        if not Path(file_value).is_file():
-                            ctx.log.warn("qbridge 附件不存在，跳过发送: %s", file_value)
-                            continue
-                        file_path = Path(file_value).resolve()
-                        if seg_type == "image":
-                            image_bytes = file_path.read_bytes()
-                            if len(image_bytes) > 8 * 1024 * 1024:
-                                ctx.log.warn("qbridge 图片超过 OneBot 直接发送限制，跳过: %s", file_path)
-                                continue
-                            file_value = "base64://" + base64.b64encode(image_bytes).decode("ascii")
-                        else:
-                            file_value = str(file_path)
-                    message.append({"type": seg_type, "data": {"file": file_value}})
-                else:
-                    message.append({"type": "text", "data": {"text": str(seg.get("data") or "")}})
             try:
-                _api_call(ws, action, {**pid, "message": message})
+                _send_job(ws, job)
             except Exception as e:
-                ctx.log.warn("qbridge 发送失败: %r", e)
+                ctx.log.warn("qbridge 发送任务处理异常，已丢弃: %r", e)
+
+    def _send_job(ws, job) -> None:
+        target = job["target"]
+        if not job.get("force") and not _target_allowed(target):
+            return
+        kind, _, val = target.partition("/")
+        ident = int(val) if val.isdigit() else val
+        if kind == "group":
+            action, pid = "send_group_msg", {"group_id": ident}
+        else:
+            action, pid = "send_private_msg", {"user_id": ident}
+        message = []
+        for seg in job["segments"]:
+            if seg.get("type") in ("image", "file"):
+                file_value = str(seg.get("data") or "")
+                seg_type = seg["type"]
+                if not file_value.lower().startswith(("http://", "https://", "base64://")):
+                    if not Path(file_value).is_file():
+                        ctx.log.warn("qbridge 附件不存在，跳过发送: %s", file_value)
+                        continue
+                    file_path = Path(file_value).resolve()
+                    if seg_type == "image":
+                        if file_path.stat().st_size > 8 * 1024 * 1024:
+                            ctx.log.warn("qbridge 图片超过 OneBot 直接发送限制，跳过: %s", file_path)
+                            continue
+                        file_value = "base64://" + base64.b64encode(file_path.read_bytes()).decode("ascii")
+                    else:
+                        file_value = str(file_path)
+                message.append({"type": seg_type, "data": {"file": file_value}})
+            else:
+                message.append({"type": "text", "data": {"text": str(seg.get("data") or "")}})
+        if not message:
+            return
+        try:
+            _api_call(ws, action, {**pid, "message": message})
+        except Exception as e:
+            ctx.log.warn("qbridge 发送失败: %r", e)
 
     def _handle_frame(ws, raw) -> None:
         data = json.loads(raw)
@@ -920,8 +912,6 @@ def setup(ctx: PluginContext):
             if retcode not in (0, 1) and data.get("status") != "async":
                 ctx.log.warn("qbridge API 失败 echo=%s retcode=%s data=%s",
                              data.get("echo"), retcode, str(data.get("data"))[:200])
-
-    ctx._qbridge_handle_frame = _handle_frame
 
     def _ws_loop():
         while not st.stop.is_set():
@@ -968,6 +958,8 @@ def setup(ctx: PluginContext):
                             _handle_frame(ws, raw)
                         except (json.JSONDecodeError, ValueError) as e:
                             ctx.log.warn("qbridge 非法帧: %r", e)
+                        except Exception as e:
+                            ctx.log.warn("qbridge 帧处理异常: %r", e)
                     _drain_tx(ws)
             except Exception as e:
                 st.last_error = str(e) or e.__class__.__name__

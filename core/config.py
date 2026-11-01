@@ -70,7 +70,7 @@ def default_config() -> dict:
             "plan_files": ["plan.md"],
         },
         "system": {"font_size": 16},
-        "security": {"delete_guard": True},
+        "security": {"delete_guard": True, "strict_delete_guard": True},
         "ui": {
             "theme": "dark",
             "mode": "auto",
@@ -1081,6 +1081,8 @@ class Config:
                 ) as handle:
                     tmp = Path(handle.name)
                     handle.write(json.dumps(self.data, ensure_ascii=False, indent=2))
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 os.replace(tmp, self.config_path)
             finally:
                 if tmp is not None:

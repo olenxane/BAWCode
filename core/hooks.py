@@ -193,8 +193,9 @@ def _ordered(event: str) -> List[dict]:
 def _invoke(entry: dict, data: dict) -> Any:
     try:
         return entry["handler"](data)
-    except Exception as e:
-        log.warn("扩展点处理函数执行失败 event=%s owner=%s: %s", data.get("_event"), entry["owner"] or "-", e)
+    except (Exception, SystemExit) as e:
+        # 插件里的 sys.exit 不能让宿主退出
+        log.warn("扩展点处理函数执行失败 event=%s owner=%s: %r", data.get("_event"), entry["owner"] or "-", e)
         return None
 
 

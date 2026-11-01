@@ -7,7 +7,7 @@ prompt_toolkit>=3.0.53
 pyyaml>=6.0
 # 工作流编辑器 GUI（/workflow edit；缺失时主程序可用，仅编辑器不可用）
 PySide6>=6.6
-# MCP 客户端桥接（core/mcp.py；缺失时主程序可用，仅 MCP 功能不可用）
+# MCP 客户端桥接（core/mcp.py；pyproject 中列为核心依赖）
 mcp>=1.2.0
 # webfetch 工具（core/tools.py；缺失时主程序可用，仅 webfetch 返回依赖提示）
 requests>=2.31.0
@@ -19,4 +19,5 @@ tree-sitter-language-pack>=1.20,<1.21
 # QQ 桥接插件（OneBot 正向 WS 客户端及文本改动预览图片）
 websockets>=13
 Pillow>=10
-pygments
+# 远程控制网页端代码高亮；rich 已间接依赖
+pygments>=2.13

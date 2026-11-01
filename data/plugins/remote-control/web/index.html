@@ -2001,7 +2001,9 @@ function buildProviderTab(body, data) {
   const editSel = stSelect([...providers.map(x => x.provider_id), "(新建)"], p.provider_id || "(新建)");
   const pidInput = stInput(p.provider_id);
   const nameInput = stInput(p.provider_name);
-  const keyInput = stInput(p.api_key);
+  const keyInput = stInput("", "password");
+  keyInput.autocomplete = "new-password";
+  keyInput.placeholder = p.api_key_set ? "已设置，留空不修改" : "未设置";
   const urlInput = stInput(p.base_url);
   const balInput = stInput(p.balance_url);
   const tempInput = stInput(p.temperature, "number");
@@ -2026,7 +2028,8 @@ function buildProviderTab(body, data) {
     const creating = editSel.value === "(新建)";
     pidInput.value = row.provider_id || "";
     nameInput.value = row.name || "";
-    keyInput.value = row.api_key || "";
+    keyInput.value = "";
+    keyInput.placeholder = row.api_key_set ? "已设置，留空不修改" : "未设置";
     urlInput.value = row.base_url || "https://api.openai.com/v1";
     balInput.value = row.balance_url || "";
     tempInput.value = row.temperature ?? 1.0;
@@ -2125,7 +2128,7 @@ function buildProviderTab(body, data) {
     stRow("", pruneBtn),
     stRow("", refillBtn),
   );
-  card.append(el("div", "st-note", "获取的模型保存后生效；API Key 明文存储于本地配置文件"));
+  card.append(el("div", "st-note", "获取的模型保存后生效；已保存的 API Key 不会回传到网页，留空表示不修改"));
   const actions = el("div", "st-actions");
   const saveBtn = stSaveBtn("provider", () => ({
     active_provider_id: activeSel.value,
@@ -2203,99 +2206,71 @@ function buildModelTab(body, data) {
   body.append(card);
 }
 
-/* 系统标签页 */
+/* 系统标签页：字段由后端按 data/settings_schema.json 声明下发，前端按类型渲染 */
 function buildSystemTab(body, data) {
-  const s = data.system || {};
+  const fields = (data.system && data.system.fields) || [];
+  if (!fields.length) {
+    body.append(el("div", "empty-note", "（无配置项）"));
+    return;
+  }
   const card = el("div", "st-card");
-  const themeSel = stSelect(s.themes || ["dark"], s.theme);
-  const modeSel = stSelect(["confirm", "edit", "auto", "full"], s.mode);
-  const logoTog = stToggle(s.logo);
-  const fontInput = stInput(s.font_size, "number");
-  const tipInput = stInput(s.tip_interval, "number");
-  const retryInput = stInput(s.retry_times, "number");
-  const delayInput = stInput(s.retry_delay, "number");
-  delayInput.step = "0.1";
-  const compressTog = stToggle(s.auto_compress);
-  const threshInput = stInput(s.compress_threshold, "number");
-  threshInput.step = "0.05";
-  const keepInput = stInput(s.compress_keep_recent_tokens, "number");
-  const sumInput = stInput(s.compress_summary_max_tokens, "number");
-  const wlInput = stInput(s.tool_whitelist);
-  const roundsInput = stInput(s.max_tool_rounds, "number");
-  const spinInput = stInput(s.spin_kill_count, "number");
-  const timeoutInput = stInput(s.max_tool_timeout, "number");
-  const askTog = stToggle(s.ask_user_timeout);
-  const wfTog = stToggle(s.workflow_enabled);
-  const wfSel = stSelect(s.workflows || [], s.workflow_active);
-  const logSel = stSelect(["debug", "info", "warn", "error", "off"], s.log_level);
-  card.append(
-    stRow("主题", themeSel),
-    stRow("访问模式", modeSel),
-    stRow("会话区Logo", logoTog),
-    stRow("字体大小", fontInput),
-    stRow("提示间隔秒", tipInput),
-    stRow("LLM重试次数", retryInput),
-    stRow("LLM重试延迟", delayInput),
-    stRow("自动压缩上下文", compressTog),
-    stRow("压缩阈值", threshInput),
-    stRow("压缩保留尾段token", keepInput),
-    stRow("摘要上限token", sumInput),
-    stRow("工具白名单", wlInput),
-    stRow("最大工具轮数", roundsInput),
-    stRow("空转计数上限", spinInput),
-    stRow("命令超时上限秒", timeoutInput),
-    stRow("询问自动超时", askTog),
-    stRow("启用工作流", wfTog),
-    stRow("工作流", wfSel),
-    stRow("日志等级", logSel),
-  );
+  const inputs = {};
+  for (const f of fields) {
+    let input;
+    if (f.type === "bool") {
+      input = stToggle(!!f.current);
+    } else if (f.type === "choice") {
+      input = stSelect((f.options || []).map(String), f.current);
+    } else if (f.type === "int" || f.type === "float") {
+      input = stInput(f.current, "number");
+      input.step = f.type === "float" ? "0.1" : "1";
+      if (f.min != null) input.min = f.min;
+      if (f.max != null) input.max = f.max;
+    } else {  // str / csv
+      input = stInput(f.current ?? "");
+    }
+    inputs[f.key] = input;
+    const row = stRow(f.label, input);
+    if (f.hint) row.title = f.hint;
+    card.append(row);
+  }
   const actions = el("div", "st-actions");
-  actions.append(stSaveBtn("system", () => ({
-    theme: themeSel.value,
-    mode: modeSel.value,
-    logo: logoTog.classList.contains("on"),
-    font_size: parseInt(fontInput.value) || 16,
-    tip_interval: parseFloat(tipInput.value) || 5,
-    retry_times: parseInt(retryInput.value) || 3,
-    retry_delay: parseFloat(delayInput.value) || 1.0,
-    auto_compress: compressTog.classList.contains("on"),
-    compress_threshold: parseFloat(threshInput.value) || 0.8,
-    compress_keep_recent_tokens: parseInt(keepInput.value) || 16384,
-    compress_summary_max_tokens: parseInt(sumInput.value) || 1024,
-    tool_whitelist: wlInput.value,
-    max_tool_rounds: parseInt(roundsInput.value) || 0,
-    spin_kill_count: parseInt(spinInput.value) || 12,
-    max_tool_timeout: parseInt(timeoutInput.value) || 600,
-    ask_user_timeout: askTog.classList.contains("on"),
-    workflow_enabled: wfTog.classList.contains("on"),
-    workflow_active: wfSel.value,
-    log_level: logSel.value,
-  })));
+  actions.append(stSaveBtn("system", () => {
+    const out = {};
+    for (const f of fields) {
+      const input = inputs[f.key];
+      if (f.type === "bool") out[f.key] = input.classList.contains("on");
+      else if (f.type === "int") out[f.key] = parseInt(input.value);
+      else if (f.type === "float") out[f.key] = parseFloat(input.value);
+      else out[f.key] = input.value;
+    }
+    return out;
+  }));
   card.append(actions);
   body.append(card);
 }
 
-/* 快捷键标签页 */
+/* 快捷键标签页：字段由后端按声明下发 */
 function buildShortcutsTab(body, data) {
-  const s = data.shortcuts || {};
-  const card = el("div", "st-card");
-  const keys = [
-    ["switch_mode", "切换模式"], ["switch_focus", "切换焦点"], ["send", "发送"],
-    ["newline", "换行"], ["complete", "命令补全"], ["scroll_up", "滚动上"],
-    ["scroll_down", "滚动下"], ["expand", "树展开"], ["collapse", "树折叠"],
-    ["rollback", "树回退"],
-  ];
-  const inputs = {};
-  for (const [key, label] of keys) {
-    const inp = stInput(s[key] || "");
-    inputs[key] = inp;
-    card.append(stRow(label, inp));
+  const fields = (data.shortcuts && data.shortcuts.fields) || [];
+  if (!fields.length) {
+    body.append(el("div", "empty-note", "（无配置项）"));
+    return;
   }
-  card.append(el("div", "st-note", "快捷键值如 shift+tab / ctrl+enter / f2 等"));
+  const card = el("div", "st-card");
+  const inputs = {};
+  for (const f of fields) {
+    const inp = stInput(f.current ?? "");
+    inputs[f.key] = inp;
+    const row = stRow(f.label, inp);
+    if (f.hint) row.title = f.hint;
+    card.append(row);
+  }
+  card.append(el("div", "st-note", "快捷键值如 shift+tab / ctrl+enter / f2 等，多键以 / 或 , 分隔"));
   const actions = el("div", "st-actions");
   actions.append(stSaveBtn("shortcuts", () => {
     const out = {};
-    for (const [key] of keys) out[key] = inputs[key].value;
+    for (const f of fields) out[f.key] = inputs[f.key].value;
     return out;
   }));
   card.append(actions);
@@ -2391,9 +2366,13 @@ function buildPluginConfigRow(pid, cfg) {
     row.append(sel);
   } else {
     // str / int / float：文本输入 + 失焦保存
-    const inputType = cfg.key === "login_password" ? "password"
+    const inputType = cfg.secret ? "password"
       : cfg.type === "int" || cfg.type === "float" ? "number" : "text";
-    const inp = stInput(cfg.current ?? cfg.default ?? "", inputType);
+    const inp = stInput(cfg.secret ? "" : (cfg.current ?? cfg.default ?? ""), inputType);
+    if (cfg.secret) {
+      inp.autocomplete = "new-password";
+      inp.placeholder = cfg.is_set ? "已设置，留空不修改" : "未设置";
+    }
     if (cfg.type === "float") inp.step = "0.1";
     if (cfg.min !== undefined && cfg.min !== null) inp.min = cfg.min;
     if (cfg.max !== undefined && cfg.max !== null) inp.max = cfg.max;

@@ -13,10 +13,9 @@ from typing import Any, Dict, List, Optional
 
 from core import keyinput
 from core import policy
-from core import shells
+from core import settings_schema
 from core.config import (
     THINKING_OPTIONS,
-    init_logging,
     is_auto_filled_model,
     make_model_name,
     model_preset_defaults,
@@ -27,16 +26,6 @@ from core.log import get_logger
 from core.textbuf import TextBuffer
 
 log = get_logger("settings")
-
-
-def _shell_availability_hint() -> str:
-    """默认执行器字段的提示：列出本机探测结果，选到不可用的会自动回退 cmd 并提示"""
-    ready = [name for name in shells.SHELL_NAMES if shells.available(name)]
-    missing = [name for name in shells.SHELL_NAMES if name not in ready]
-    parts = [f"本机可用: {'/'.join(ready) or '无'}"]
-    if missing:
-        parts.append(f"不可用: {'/'.join(missing)}（选用后自动回退 {shells.label(shells.CMD)}）")
-    return " · ".join(parts)
 
 
 # ----- 渲染层纯函数：运行期惰性导入，避免循环依赖 -----
@@ -249,29 +238,6 @@ class SettingsPanelMixin:
     # ----- 设置：三标签页 -----
     settings_tabs = ["提供商", "模型", "系统", "快捷键", "插件"]
 
-    # 快捷键可选值（设置页 ←→）
-    SHORTCUT_OPTIONS = {
-        "switch_mode": [
-            "shift+tab",
-            "f2",
-            "f3",
-            "ctrl+g",
-            "ctrl+t",
-            "ctrl+e",
-            "`",
-            "~",
-        ],
-        "switch_focus": ["tab", "f4", "ctrl+o"],
-        "send": ["ctrl+enter", "f5", "ctrl+s"],
-        "newline": ["shift+enter", "enter"],
-        "complete": ["tab"],
-        "scroll_up": ["pageup", "ctrl+up"],
-        "scroll_down": ["pagedown", "ctrl+down"],
-        "expand": ["right", "l"],
-        "collapse": ["left", "h"],
-        "rollback": ["ctrl+z"],
-    }
-
     def _settings_model_names(self, config) -> List[str]:
         """模型页可选模型名：排除已标记清理的模型"""
         removed_names = {
@@ -281,23 +247,6 @@ class SettingsPanelMixin:
         }
         names = [name for name in config.list_model_names() if name not in removed_names]
         return names or [config.model_name]
-
-    @staticmethod
-    def _settings_workflow_names(config) -> List[str]:
-        """已识别的工作流列表（data/workflows/*.json），至少含当前激活项"""
-        from core import workflow as workflow_mod
-
-        names = workflow_mod.list_workflows(config)
-        active = workflow_mod.active_name(config)
-        if active not in names:
-            names.append(active)
-        return names or ["default"]
-
-    @staticmethod
-    def _settings_workflow_current(config) -> str:
-        from core import workflow as workflow_mod
-
-        return workflow_mod.active_name(config)
 
     # 焦点离开时才重建模型列表的文本字段
     _MODEL_LIST_TEXT_KEYS = frozenset({"provider_id", "model_id"})
@@ -501,7 +450,7 @@ class SettingsPanelMixin:
 
     def _settings_snapshot(self, config) -> dict:
         s = self.settings_scratch
-        return {
+        snap = {
             "active_provider_id": s.get("active_provider_id", config.data.get("active_provider_id")),
             "provider_id": s.get("provider_id", self.settings_provider_id),
             "provider_name": s.get("provider_name"),
@@ -522,15 +471,17 @@ class SettingsPanelMixin:
             "thinking_effort": s.get("thinking_effort"),
             "model_work": repr(self.settings_model_work),
             "model_removed": repr({pid: sorted(mids) for pid, mids in self.settings_model_removed.items()}),
-            "theme": s.get("theme", getattr(config, "theme", "")),
-            "mode": s.get("mode", getattr(config, "mode", "")),
-            "log_level": s.get("log_level"),
             "select_model": s.get("select_model"),
             "task_plan": s.get("task_plan"),
             "task_code": s.get("task_code"),
             "task_review": s.get("task_review"),
-            "switch_mode": s.get("key_switch_mode"),
         }
+        # 系统/快捷键键集随声明文件，脏值比对不逐键枚举
+        for field in settings_schema.fields("system", config):
+            snap[field["key"]] = s.get(field["key"])
+        for field in settings_schema.fields("shortcuts", config):
+            snap[f"key_{field['key']}"] = s.get(f"key_{field['key']}")
+        return snap
 
     def _settings_is_dirty(self, config) -> bool:
         if self.settings_tabs[self.settings_tab] == "模型":
@@ -779,35 +730,24 @@ class SettingsPanelMixin:
                 {"key": "add_model", "label": "添加模型到提供商", "type": "action", "hint": "写入工作列表，保存提供商时 diff 生效"},
             ]
         elif tab == "快捷键":
-            key_defs = [
-                ("switch_mode", "切换模式", "Shift+Tab 始终有效；此为额外映射"),
-                ("switch_focus", "切换焦点", "会话树 ↔ 输入框"),
-                ("send", "发送", "Enter 恒提交；此为额外发送键"),
-                ("newline", "换行", "默认 Shift+Enter；Enter 不作换行"),
-                ("complete", "命令补全", "有候选时优先补全"),
-                ("expand", "树展开", "焦点在会话树时"),
-                ("collapse", "树折叠", "焦点在会话树时"),
-                ("rollback", "树回退", "会话树 Ctrl+Z 回退到选中节点；再按取消"),
-                ("scroll_up", "滚动上", "会话历史向上"),
-                ("scroll_down", "滚动下", "会话历史向下"),
-            ]
+            # 字段清单来自 data/settings_schema.json（与网页设置面板共用同一份声明）
             fields = []
-            for key, label, hint in key_defs:
+            for field in settings_schema.fields("shortcuts", config):
                 # current 保留原始绑定值（多绑定为列表），显示经 _binding_text 格式化；
                 # 否则列表会被 str() 成 repr 文本混入 options，选中即写回非法绑定
-                options = list(self.SHORTCUT_OPTIONS.get(key) or [self.keys.get(key, "")])
-                current = self.keys.get(key) or options[0]
+                options = [str(o) for o in (field.get("options") or [])]
+                current = field.get("current") or options[0]
                 if current not in options:
                     options = [current] + options
                 fields.append(
                     {
-                        "key": f"key_{key}",
-                        "label": label,
+                        "key": f"key_{field['key']}",
+                        "label": field.get("label", field["key"]),
                         "type": "choice",
                         "options": options,
                         "current": current,
-                        "hint": hint + " · ←→ 选择",
-                        "shortcut": key,
+                        "hint": (field.get("hint") or "") + " · ←→ 选择",
+                        "shortcut": field["key"],
                     }
                 )
         elif tab == "插件":
@@ -864,48 +804,26 @@ class SettingsPanelMixin:
                             }
                         )
         else:
-            ui_cfg = (config.data or {}).get("ui") or {}
-            mem_cfg = (config.data or {}).get("memory") or {}
-            llm_cfg = (config.data or {}).get("llm") or {}
-            ctx_cfg = (config.data or {}).get("context") or {}
-            wf_cfg = (config.data or {}).get("workflow") or {}
-            tools_cfg = (config.data or {}).get("tools") or {}
-            security_cfg = (config.data or {}).get("security") or {}
-            log_level = str((config.data or {}).get("log", {}).get("level") or "info").strip().lower()
-            if log_level not in ("debug", "info", "warn", "error", "off"):
-                log_level = "info"
-            themes = ["dark"] + [t for t in config.list_themes() if t != "dark"]
-            fields = [
-                {"key": "theme", "label": "主题", "type": "choice", "options": themes, "current": config.theme, "hint": "←→ 切换主题"},
-                {"key": "mode", "label": "访问模式", "type": "choice", "options": list(policy.MODES), "current": config.mode, "hint": "confirm/edit/auto/full"},
-                {"key": "logo", "label": "会话区Logo", "type": "bool", "current": bool(ui_cfg.get("logo", True)), "hint": "←→ 开/关"},
-                {"key": "font_size", "label": "字体大小", "type": "text", "current": getattr(config, "font_size", 16)},
-                {"key": "tip_interval", "label": "提示间隔秒", "type": "text", "current": ui_cfg.get("tip_interval", 5)},
-                {"key": "retry_times", "label": "LLM重试次数", "type": "text", "current": llm_cfg.get("retry_times", 3)},
-                {"key": "retry_delay", "label": "LLM重试延迟", "type": "text", "current": llm_cfg.get("retry_delay", 1.0)},
-                {"key": "request_timeout", "label": "LLM请求超时秒", "type": "text", "current": llm_cfg.get("request_timeout", 180), "hint": "单次请求整体超时（含流式挂起），0=不限时 · 超时自动重试"},
-                {"key": "scroll_v0", "label": "滚动v0", "type": "text", "current": ui_cfg.get("scroll_v0", 1.0)},
-                {"key": "scroll_hold_ms", "label": "长按阈值ms", "type": "text", "current": ui_cfg.get("scroll_hold_ms", 150)},
-                {"key": "scroll_max_step", "label": "滚动最大步长", "type": "text", "current": ui_cfg.get("scroll_max_step", 20)},
-                {"key": "auto_compress", "label": "自动压缩上下文", "type": "bool", "current": bool(mem_cfg.get("auto_compress", True)), "hint": "←→"},
-                {"key": "compress_threshold", "label": "压缩阈值", "type": "text", "current": mem_cfg.get("compress_threshold", 0.8)},
-                {"key": "compress_keep_recent_tokens", "label": "压缩保留尾段token", "type": "text", "current": mem_cfg.get("compress_keep_recent_tokens", 16384)},
-                {"key": "compress_summary_max_tokens", "label": "摘要上限token", "type": "text", "current": mem_cfg.get("compress_summary_max_tokens", 1024)},
-                {"key": "tool_whitelist", "label": "工具白名单", "type": "text", "current": ", ".join(str(x) for x in (ctx_cfg.get("tool_whitelist") or [])), "hint": "逗号分隔 · 白名单工具结果跨回合保留"},
-                {"key": "aggressive_optimization", "label": "激进上下文优化", "type": "bool", "current": bool(ctx_cfg.get("aggressive_optimization", False)), "hint": "←→ 开/关 · 回合末按工具类型整理，保留最近12轮调用"},
-                {"key": "mid_turn_keep_thinking_rounds", "label": "历史思考保留条数", "type": "text", "current": ctx_cfg.get("mid_turn_keep_thinking_rounds", 3), "hint": "0=关闭 · 每轮请求只带最近N条思考，更旧的仅留档不再发送"},
-                {"key": "max_tool_rounds", "label": "最大工具轮数", "type": "text", "current": wf_cfg.get("max_rounds", 0), "hint": "0=用工作流文件值 · 超限后仍有进展会自动续期，不设次数上限"},
-                {"key": "spin_kill_count", "label": "空转计数上限", "type": "text", "current": wf_cfg.get("spin_kill_count", 12), "hint": "重复输出计满即终止回合；未满期间续期不限次"},
-                {"key": "default_shell", "label": "默认命令执行器", "type": "choice", "options": list(shells.SHELL_NAMES), "current": tools_cfg.get("default_shell", shells.DEFAULT_SHELL), "hint": "←→ 切换 · " + _shell_availability_hint()},
-                {"key": "max_tool_timeout", "label": "命令超时上限秒", "type": "text", "current": tools_cfg.get("max_timeout", 600), "hint": "execute_command/run_program 传入超时的钳制上限（1-∞）"},
-                {"key": "ask_user_timeout", "label": "询问自动超时", "type": "bool", "current": bool(tools_cfg.get("ask_user_timeout", True)), "hint": "←→ 开/关 · 开启后询问框 5 分钟未选择自动跳过"},
-                {"key": "delete_guard", "label": "删除安全护栏", "type": "bool", "current": bool(security_cfg.get("delete_guard", True)), "hint": "关闭后 shell 删除命令直接执行；delete_file 始终移入项目回收站"},
-                {"key": "workflow_enabled", "label": "启用工作流", "type": "bool", "current": bool(wf_cfg.get("enabled", False)), "hint": "←→ 关=直接对话 · 开=按工作流节点链运行（下一回合生效）"},
-
-                {"key": "workflow_active", "label": "工作流", "type": "choice", "options": self._settings_workflow_names(config), "current": self._settings_workflow_current(config), "hint": "←→ 选择处理管线（仅在启用工作流时生效）"},
-                {"key": "log_level", "label": "日志等级", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "current": "关闭" if log_level == "off" else log_level, "hint": "←→ 关闭=不记录任何日志（含写盘）"},
-                {"key": "active_model_name", "label": "全局默认模型", "type": "choice", "options": self._settings_model_names(config), "current": config.model_name, "hint": "←→ 非工作流主对话与压缩摘要使用"},
-            ]
+            # 系统：字段清单来自 data/settings_schema.json（与网页设置面板共用）
+            fields = []
+            for field in settings_schema.fields("system", config):
+                ftype = field["type"]
+                item = {
+                    "key": field["key"],
+                    "label": field.get("label", field["key"]),
+                    "hint": field.get("hint") or "",
+                }
+                if ftype == "choice":
+                    options = [str(o) for o in (field.get("options") or [])]
+                    current = field.get("current")
+                    if current is not None and current not in options:
+                        options = [current] + options
+                    item.update({"type": "choice", "options": options, "current": current})
+                elif ftype == "bool":
+                    item.update({"type": "bool", "current": bool(field.get("current"))})
+                else:  # int / float / str / csv：文本行编辑
+                    item.update({"type": "text", "current": field.get("current")})
+                fields.append(item)
         self.settings_fields = fields
         # 初始化 scratch：保留同 key 已编辑值（插件页字段写透持久化，不经 scratch）
         for field in fields:
@@ -1793,134 +1711,21 @@ class SettingsPanelMixin:
             config.set_task_model("code", s["task_code"])
         if s.get("task_review"):
             config.set_task_model("review", s["task_review"])
-        # 系统
+        # 系统 + 快捷键：按 settings_schema 声明写回（类型转换/钳制/副作用在模块内）
         updates = {}
-        if s.get("active_model_name"):
-            config.switch_model(s["active_model_name"])
+        for field in settings_schema.fields("system", config):
+            if field["key"] in s:
+                settings_schema.write_field(config, field, s[field["key"]])
         ui_cfg = config.data.setdefault("ui", {})
-        # 快捷键：scratch 中 key_* 写入 ui 与 self.keys
-        for scratch_key, val in s.items():
-            if not str(scratch_key).startswith("key_"):
-                continue
-            shortcut = str(scratch_key)[4:]
+        for field in settings_schema.fields("shortcuts", config):
+            val = s.get(f"key_{field['key']}")
             if val in (None, ""):
                 continue
             binding = _binding_value(val)
             if not binding:
                 continue
-            ui_cfg[shortcut] = binding
-            self.keys[shortcut] = binding
-        if "theme" in s:
-            ui_cfg["theme"] = str(s["theme"])
-        if "mode" in s:
-            ui_cfg["mode"] = str(s["mode"])
-        if "logo" in s:
-            ui_cfg["logo"] = bool(s["logo"] in (True, "true", "1", 1) if isinstance(s["logo"], str) else bool(s["logo"]))
-        for key, cast in (
-            ("font_size", int),
-            ("tip_interval", float),
-            ("scroll_v0", float),
-            ("scroll_hold_ms", int),
-            ("scroll_max_step", int),
-        ):
-            if key in s and s[key] is not None and str(s[key]) != "":
-                try:
-                    ui_cfg[key] = cast(float(s[key]))
-                except (TypeError, ValueError):
-                    pass
-        if "font_size" in ui_cfg:
-            config.data.setdefault("system", {})["font_size"] = ui_cfg["font_size"]
-        llm_cfg = config.data.setdefault("llm", {})
-        if "retry_times" in s:
-            try:
-                llm_cfg["retry_times"] = int(float(s["retry_times"]))
-            except (TypeError, ValueError):
-                pass
-        if "retry_delay" in s:
-            try:
-                llm_cfg["retry_delay"] = float(s["retry_delay"])
-            except (TypeError, ValueError):
-                pass
-        if "request_timeout" in s:
-            try:
-                llm_cfg["request_timeout"] = max(0, float(s["request_timeout"]))
-            except (TypeError, ValueError):
-                pass
-        mem_cfg = config.data.setdefault("memory", {})
-        if "auto_compress" in s:
-            mem_cfg["auto_compress"] = bool(s["auto_compress"] in (True, "true", "1", 1) if isinstance(s["auto_compress"], str) else bool(s["auto_compress"]))
-        if "compress_threshold" in s:
-            try:
-                mem_cfg["compress_threshold"] = float(s["compress_threshold"])
-            except (TypeError, ValueError):
-                pass
-        if "compress_keep_recent_tokens" in s:
-            try:
-                mem_cfg["compress_keep_recent_tokens"] = max(0, int(float(s["compress_keep_recent_tokens"])))
-            except (TypeError, ValueError):
-                pass
-        if "compress_summary_max_tokens" in s:
-            try:
-                mem_cfg["compress_summary_max_tokens"] = max(100, int(float(s["compress_summary_max_tokens"])))
-            except (TypeError, ValueError):
-                pass
-        ctx_cfg = config.data.setdefault("context", {})
-        if "tool_whitelist" in s:
-            names = [p.strip() for p in str(s["tool_whitelist"] or "").split(",") if p.strip()]
-            ctx_cfg["tool_whitelist"] = names
-        if "aggressive_optimization" in s:
-            raw = s["aggressive_optimization"]
-            ctx_cfg["aggressive_optimization"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
-        if "mid_turn_keep_thinking_rounds" in s:
-            try:
-                ctx_cfg["mid_turn_keep_thinking_rounds"] = max(0, int(float(s["mid_turn_keep_thinking_rounds"])))
-            except (TypeError, ValueError):
-                pass
-        wf_cfg = config.data.setdefault("workflow", {})
-        if "workflow_enabled" in s:
-            raw = s["workflow_enabled"]
-            wf_cfg["enabled"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
-        if "workflow_active" in s and s["workflow_active"]:
-            from core import workflow as workflow_mod
-
-            workflow_mod.set_active(config, str(s["workflow_active"]))
-        if "max_tool_rounds" in s:
-            try:
-                wf_cfg["max_rounds"] = max(0, int(float(s["max_tool_rounds"])))
-            except (TypeError, ValueError):
-                pass
-        if "spin_kill_count" in s:
-            try:
-                wf_cfg["spin_kill_count"] = max(1, int(float(s["spin_kill_count"])))
-            except (TypeError, ValueError):
-                pass
-        if "default_shell" in s:
-            tools_cfg = config.data.setdefault("tools", {})
-            value = shells.resolve_name(s["default_shell"])
-            if shells.is_valid(value):
-                tools_cfg["default_shell"] = value
-        if "max_tool_timeout" in s:
-            tools_cfg = config.data.setdefault("tools", {})
-            try:
-                tools_cfg["max_timeout"] = max(1, int(float(s["max_tool_timeout"])))
-            except (TypeError, ValueError):
-                pass
-        if "ask_user_timeout" in s:
-            tools_cfg = config.data.setdefault("tools", {})
-            raw = s["ask_user_timeout"]
-            tools_cfg["ask_user_timeout"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
-        if "delete_guard" in s:
-            security_cfg = config.data.setdefault("security", {})
-            raw = s["delete_guard"]
-            security_cfg["delete_guard"] = bool(raw in (True, "true", "1", 1) if isinstance(raw, str) else bool(raw))
-        if "log_level" in s and s["log_level"]:
-            level = str(s["log_level"]).strip()
-            level = {"关闭": "off"}.get(level, level.lower())
-            if level in ("debug", "info", "warn", "error", "off"):
-                log_cfg = config.data.setdefault("log", {})
-                if log_cfg.get("level") != level:
-                    log_cfg["level"] = level
-                    init_logging(config.data.get("log") or {})
+            ui_cfg[field["key"]] = binding
+            self.keys[field["key"]] = binding
         config.apply_active()
         config.save()
         updates["model_name"] = config.model_name

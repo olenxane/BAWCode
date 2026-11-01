@@ -218,15 +218,29 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
         ctx["app"].status = policy.MODE_LABELS[ctx["app"].mode]
         return True
 
-    @commands.register("/security", hint="关闭删除安全护栏 · /security [on|off]", usage="/security [on|off]", source="builtin")
+    @commands.register("/security", hint="删除安全护栏 · /security [on|off|strict on|strict off]", usage="/security [on|off|strict on|strict off]", source="builtin")
     def _security(ctx, args):
         security_cfg = ctx["config"].data.setdefault("security", {})
-        arg = (args or "").strip().lower()
-        if arg not in ("", "on", "off"):
-            _echo(ctx, "用法: /security [on|off]")
+        parts = (args or "").strip().lower().split()
+        if parts and parts[0] == "strict":
+            if len(parts) > 2 or (len(parts) == 2 and parts[1] not in ("on", "off")):
+                _echo(ctx, "用法: /security strict [on|off]")
+                return True
+            if len(parts) == 2:
+                security_cfg["strict_delete_guard"] = parts[1] == "on"
+                ctx["config"].save()
+            strict = bool(security_cfg.get("strict_delete_guard", True))
+            state = "开启" if strict else "关闭"
+            ctx["app"].status = f"严格删除护栏{state}"
+            _echo(ctx, f"严格删除护栏已{state}：" + (
+                "git clean、find -delete、cmd /c 删除等写法会被拦截" if strict else "只拦截可识别的 rm/del/Remove-Item 并移入回收站"
+            ))
             return True
-        if arg:
-            security_cfg["delete_guard"] = arg == "on"
+        if len(parts) > 1 or (parts and parts[0] not in ("on", "off")):
+            _echo(ctx, "用法: /security [on|off|strict on|strict off]")
+            return True
+        if parts:
+            security_cfg["delete_guard"] = parts[0] == "on"
             ctx["config"].save()
         enabled = bool(security_cfg.get("delete_guard", True))
         state = "开启" if enabled else "关闭"
@@ -1676,7 +1690,7 @@ def main_headless(args) -> int:
     tools_mod.webfetch_gc()
     pasteboard_mod.gc_temp_images()
     llm = LLM(config)
-    session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
+    session.set_llm_fn(memory_mod.summary_llm_fn(llm))
     session.set_context_reset(llm.meter.reset_context)
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     subagent_mod.register_tools(config)
@@ -1776,7 +1790,7 @@ def main() -> None:
     tools_mod.webfetch_gc()
     pasteboard_mod.gc_temp_images()  #启动回收data/temp过期剪贴板图片（7 天封顶）
     llm = LLM(config)
-    session.set_llm_fn(lambda p: llm.chat([{"role": "user", "content": p}]).get("content", ""))
+    session.set_llm_fn(memory_mod.summary_llm_fn(llm))
     session.set_context_reset(llm.meter.reset_context)
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     subagent_mod.register_tools(config)

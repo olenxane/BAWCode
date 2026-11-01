@@ -3,7 +3,10 @@ from bawcode_sdk import PluginContext
 import time
 from typing import Optional
 
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 try:
     from . import computer_use_backend as backend
@@ -56,6 +59,11 @@ _SCHEMA = {
     },
     "required": ["action"],
 }
+
+
+class _NoPillow(RuntimeError):
+    pass
+
 
 _ctx = None  # PluginContext（setup 注入）
 _last_shot = {"sent": None, "screen": None}  # 最近回注截图的坐标基（换算+钳制依据）
@@ -112,6 +120,8 @@ def _cleanup_shots(d) -> None:
 
 def _take_shot() -> tuple:
     """截图 → 等比缩放到长边上限内 → 落盘 → 记录坐标基。返回 (路径, 说明文本)"""
+    if Image is None:
+        raise _NoPillow("截图需要 Pillow，请执行 pip install Pillow 后重载插件")
     img = backend.cu_screenshot()
     screen = _screen_size()
     try:
@@ -177,11 +187,13 @@ def _act_type(p: dict) -> tuple:
         raise ValueError("text 不能为空")
     restore = bool(_settings().get("clipboard_restore", True))
     old = backend.cu_clipboard_text() if restore else None
-    backend.cu_set_clipboard(text)
-    backend.cu_paste()
-    time.sleep(_PASTE_SLEEP)
-    if restore:
-        backend.cu_set_clipboard(old)
+    try:
+        backend.cu_set_clipboard(text)
+        backend.cu_paste()
+        time.sleep(_PASTE_SLEEP)
+    finally:
+        if restore:
+            backend.cu_set_clipboard(old)
     return f"已通过剪贴板粘贴 {len(text)} 字符（规避输入法干扰，原剪贴板内容{'已恢复' if restore else '未恢复'}）。", None
 
 
@@ -247,6 +259,8 @@ def _computer_use(action: str = "", params: Optional[dict] = None, **_) -> dict:
         text, images = _DISPATCH[action](p)
     except backend.FailSafeException:
         return _err("触发 FAILSAFE 急停（鼠标被移至屏幕角落），动作中止")
+    except _NoPillow as exc:
+        return _err(str(exc))
     except (ValueError, TypeError) as exc:
         return _err(f"参数错误: {exc}")
     except Exception as exc:
@@ -256,7 +270,9 @@ def _computer_use(action: str = "", params: Optional[dict] = None, **_) -> dict:
             settle = int(_settings().get("settle_ms") or 350)
         except (TypeError, ValueError):
             settle = 350
-        if bool(_settings().get("auto_screenshot", True)):
+        if Image is None:
+            text = f"{text} [未自动截图：缺少 Pillow]"
+        elif bool(_settings().get("auto_screenshot", True)):
             time.sleep(max(settle, 50) / 1000)
             try:
                 path, note = _take_shot()
@@ -278,4 +294,4 @@ def setup(ctx: PluginContext) -> None:
     ctx.register_tool(name=_TOOL_NAME, description=_DESC, usage="computer_use(action, params)", schema=_SCHEMA)(
         _computer_use
     )
-    ctx.log.info("computer_use 工具已注册）；动作: %s", "/".join(_DISPATCH))
+    ctx.log.info("computer_use 工具已注册；动作: %s", "/".join(_DISPATCH))

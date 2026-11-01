@@ -229,7 +229,7 @@ def _enable_windows_ansi() -> None:
 def _term_size() -> Tuple[int, int]:
     cols = os.environ.get("COLUMNS") or os.environ.get("BAW_COLS")
     rows = os.environ.get("LINES") or os.environ.get("BAW_LINES")
-    if cols and rows:
+    if cols and rows and cols.strip().isdigit() and rows.strip().isdigit():
         return max(70, int(cols)), max(22, int(rows))
     size = shutil.get_terminal_size(fallback=(100, 30))
     return max(70, size.columns), max(22, size.lines)

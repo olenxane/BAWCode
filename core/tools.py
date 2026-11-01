@@ -146,21 +146,13 @@ def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute
     if not safety_cfg.get("delete_guard", True):
         return None
     shell_name = shells.resolve_name(shell)
-    targets = policy.delete_targets(command, shell_name)
-    if targets is None:
+    check = policy.analyze_delete(command, shell_name, strict=bool(safety_cfg.get("strict_delete_guard", True)))
+    if check is None:
         return None
-    if not targets:
-        if not policy.is_delete_command(command):
-            return None  # 非删除命令：原样执行，不进删除护栏
-        if shell_name == shells.POWERSHELL and shells.powershell_parse(command) == (None, False):
-            return None
-        if shell_name == shells.POWERSHELL or any(ch in command for ch in "*?["):
-            # 已识别为删除但目标含变量/通配符/子表达式：不猜目标，避免误搬整个目录
-            return (
-                "删除命令已被安全策略拦截：目标不是确定的字面路径（含变量、通配符或表达式），"
-                "未执行也未移入回收站。请改用 delete_file 工具逐个删除确定路径。"
-            )
-        return None
+    if check.block:
+        log.info("删除命令被拦截: %s", command)
+        return check.block
+    targets = check.targets
     log.info("删除命令被拦截，改为移入回收站: %s", command)
     base = Path(cwd) if cwd else Path.cwd()
     trash = snapshot.trash_base()

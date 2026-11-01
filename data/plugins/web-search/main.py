@@ -17,6 +17,7 @@ from bawcode_sdk import PluginContext
 import base64
 import binascii
 import re
+import time
 from typing import List, Tuple
 from urllib.parse import quote
 
@@ -54,6 +55,18 @@ def load_deps():
     except ImportError:
         return None
     return requests, BeautifulSoup
+
+
+def make_soup(BeautifulSoup, content: bytes):
+    """
+    优先 lxml 解析，缺失时回落标准库 html.parser
+    """
+    from bs4 import FeatureNotFound
+
+    try:
+        return BeautifulSoup(content, "lxml")
+    except FeatureNotFound:
+        return BeautifulSoup(content, "html.parser")
 
 
 def decode_bing_url(href: str) -> str:
@@ -128,7 +141,7 @@ def setup(ctx: PluginContext):
         """网络搜索：关键词 → 必应结果页 → 结构化结果（标题/链接/摘要）"""
         deps = load_deps()
         if deps is None:
-            return "web_search 依赖缺失（requests/beautifulsoup4/lxml），请安装插件目录 requirements.txt"
+            return "web_search 依赖缺失（requests/beautifulsoup4），请安装插件目录 requirements.txt"
         requests, BeautifulSoup = deps
 
         query = str(query or "").strip()
@@ -153,6 +166,7 @@ def setup(ctx: PluginContext):
         headers["Referer"] = f"{base_url}/"
 
         ctx.log.info("web_search: %s（count=%d timeout=%ds）", query, limit, seconds)
+        deadline = time.monotonic() + seconds
         try:
             with requests.get(
                 url,
@@ -161,10 +175,16 @@ def setup(ctx: PluginContext):
                 allow_redirects=True,
                 stream=True,
             ) as resp:
-                resp.raise_for_status()
+                if resp.status_code != 200:
+                    ctx.log.warn("web_search HTTP %d: %s", resp.status_code, query)
+                    return f"搜索失败：必应返回 HTTP {resp.status_code}（{resp.reason or '无说明'}）"
                 chunks = []
                 total = 0
                 for chunk in resp.iter_content(chunk_size=65536):
+                    if time.monotonic() > deadline:
+                        return f"搜索超时：读取结果页总耗时超过 {seconds}s: {query}"
+                    if not chunk:
+                        continue
                     chunks.append(chunk)
                     total += len(chunk)
                     if total > MAX_BYTES:
@@ -178,9 +198,16 @@ def setup(ctx: PluginContext):
         except requests.exceptions.RequestException as e:
             ctx.log.warn("web_search 失败: %s（%s）", query, e)
             return f"搜索失败: {e}"
+        except Exception as e:
+            ctx.log.warn("web_search 异常: %s（%r）", query, e)
+            return f"搜索失败：{type(e).__name__}: {e}"
 
-        soup = BeautifulSoup(content, "lxml")
-        results = parse_results(soup, limit)
+        try:
+            soup = make_soup(BeautifulSoup, content)
+            results = parse_results(soup, limit)
+        except Exception as e:
+            ctx.log.warn("web_search 解析失败: %s（%r）", query, e)
+            return f"搜索结果页解析失败：{type(e).__name__}: {e}"
         if not results:
             # 0 条多为风控页/结构变化：带页面标题与建议返回，不留空输出
             title = soup.title.get_text(strip=True) if soup.title else ""
