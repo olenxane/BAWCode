@@ -75,6 +75,7 @@ def default_config() -> dict:
             "theme": "dark",
             "mode": "auto",
             "logo": True,
+            "render_mode": "fullscreen",
             "send": "ctrl+enter",
             "newline": "shift+enter",
             "switch_focus": "tab",
@@ -455,15 +456,29 @@ AUTO_FILLED_SIGNATURES = {
 def is_auto_filled_model(entry: dict) -> bool:
     """判定模型参数是否为自动填充（未手动配置）：缺值或与内置回退完全一致"""
     data = entry or {}
-    if "context_window" not in data and "max_tokens" not in data:
-        return True
-    try:
-        ctx = int(float(data.get("context_window")))
-        maxt = int(float(data.get("max_tokens")))
-    except (TypeError, ValueError):
+
+    def _num(key: str):
+        raw = data.get(key)
+        if raw is None or raw == "":
+            return None  # 缺值：与任何签名相容
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            return False  # 有值但解析不了：视为手动配置
+
+    ctx, maxt = _num("context_window"), _num("max_tokens")
+    if ctx is False or maxt is False:
         return False
-    mods = tuple(str(m).strip().lower() for m in (data.get("modalities") or []))
-    return bool(mods) and (ctx, maxt, mods) in AUTO_FILLED_SIGNATURES
+    raw_mods = data.get("modalities")
+    mods = None if raw_mods is None else tuple(str(m).strip().lower() for m in raw_mods)
+    for sctx, smaxt, smods in AUTO_FILLED_SIGNATURES:
+        if (
+            (ctx is None or ctx == sctx)
+            and (maxt is None or maxt == smaxt)
+            and (mods is None or mods == smods)
+        ):
+            return True
+    return False
 
 
 def refill_model_entry(entry: dict) -> dict:

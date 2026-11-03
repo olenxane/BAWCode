@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     from rich.console import Console, Group
@@ -43,6 +43,7 @@ from core import subagent as subagent_mod
 from core import toolstore as toolstore_mod
 from core import tokens as tokenmod
 from core.tools import tool_failure_hint
+from core.ui_state import UiState
 from core.keymap import Action, Context, Keymap
 from core.textbuf import TextBuffer
 from wcwidth import wcwidth
@@ -278,7 +279,8 @@ def _bg(rgb: Tuple[int, int, int]) -> str:
 
 def _mix(c1: Tuple[int, int, int], c2: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
     """c1 向 c2 混合 t（0~1）：由角色饱和色生成浅色正文变体"""
-    return tuple(round(a + (b - a) * t) for a, b in zip(c1, c2))
+    out = [round(a + (b - a) * t) for a, b in zip(c1, c2)]
+    return out[0], out[1], out[2]
 
 def _copy_to_clipboard(text: str) -> bool:
     """CF_UNICODETEXT 写入系统剪贴板（win32；失败静默返回 False 不打断渲染）"""
@@ -671,7 +673,7 @@ def _md_keyinfo(text: str, pal: dict, plain: str, strict: bool = True) -> str:
     for m in rx.finditer(text):
         if m.start() > pos:
             out.append(plain + text[pos:m.start()])
-        key = _MD_GROUP_ALIAS.get(m.lastgroup, m.lastgroup)
+        key = _MD_GROUP_ALIAS.get(m.lastgroup or "", m.lastgroup or "")
         color = pal.get(key) or plain
         out.append(color + m.group(0) + plain)
         pos = m.end()
@@ -845,14 +847,14 @@ def _md_render(text: str, pal: dict, width: int) -> List[str]:
             continue
         heading = _MD_HEADING_RE.match(line)
         if heading:
-            body = _md_inline(heading.group(2).strip(), pal, plain=pal["heading"])
-            rows.extend(_wrap_keep_ansi(body + base, width))
+            inline_body = _md_inline(heading.group(2).strip(), pal, plain=pal["heading"])
+            rows.extend(_wrap_keep_ansi(inline_body + base, width))
             i += 1
             continue
         quote = _MD_QUOTE_RE.match(line)
         if quote:
-            body = _md_inline(quote.group(1), pal, plain=pal["quote"])
-            rows.extend(_wrap_keep_ansi(pal["quote"] + "│ " + body + base, width))
+            inline_body = _md_inline(quote.group(1), pal, plain=pal["quote"])
+            rows.extend(_wrap_keep_ansi(pal["quote"] + "│ " + inline_body + base, width))
             i += 1
             continue
         task = _MD_TASK_RE.match(line)
@@ -1093,8 +1095,12 @@ class TreeNode:
         self.meta = meta
 
 
-class RenderMixin:
+class RenderMixin(UiState):
     """渲染器混入：会话树/分区布局/滚动条/选区/代码高亮等（由 TuiApp 继承）。"""
+
+    # 由 TuiApp / SettingsPanelMixin 提供，此处声明仅供类型检查
+    _set_scroll: Callable[..., Any]
+    _compose_settings: Callable[..., Any]
 
     # ----- 颜色 -----
     def c(self, name: str) -> str:
@@ -1398,7 +1404,7 @@ class RenderMixin:
                             message_id,
                             label,
                             "tool",
-                            default_expanded=False if compact_tool else is_latest,
+                            default_expanded=False if (compact_tool or meta.get("persist_path")) else is_latest,
                             summary=summary,
                             detail="",
                             meta=meta,
@@ -1941,7 +1947,26 @@ class RenderMixin:
         if self._tree_rows_key == key and self._tree_rows_cache is not None:
             return self._tree_rows_cache
         flat = self._flatten_tree()
-        tree_focus = self.focus == "tree"
+        if not flat:
+            self._node_spans = []
+            return [self.c("dim") + _clip("  —", width) + self.RESET]
+        hl = self.tree_cursor if self.focus == "tree" else -1
+        rows, spans = self._rows_for_flat(flat, width, hl)
+        self._node_spans = spans
+        self._tree_rows_key = key
+        self._tree_rows_cache = rows
+        return rows
+
+    def _rows_for_flat(
+        self,
+        flat: List[Tuple[TreeNode, int, bool, str]],
+        width: int,
+        hl: int = -1,
+        force_open: bool = False,
+    ) -> Tuple[List[str], List[Tuple[int, int]]]:
+        """展平节点 → 渲染行与每节点行区间；hl 为高亮节点序号，-1 不高亮
+
+        force_open=True（inline 全局展开）时把节点视为用户手动展开，回读外置全文。"""
         # 双色分层：角色徽标=饱和色加粗，正文=角色色向 ink 混合的浅色变体
         user_text = _fg(_mix(self.colors["user_msg"], self.colors["ink"], 0.45))
         agent_text = _fg(_mix(self.colors["agent"], self.colors["ink"], 0.50))
@@ -1974,9 +1999,6 @@ class RenderMixin:
         # 角色徽标 → 浅色正文 的双色节点
         content_of = {"user": user_text, "assistant": agent_text}
         rows = []
-        if not flat:
-            self._node_spans = []
-            return [self.c("dim") + _clip("  —", width) + self.RESET]
         # 消息类节点：正文在 label 内直接折行展示（同色连续），不另开详情区
         inline_kinds = {"assistant", "user", "system", "tool", "system_prompt"}
         def _marker(has: bool, is_expanded: bool) -> str:
@@ -2003,7 +2025,7 @@ class RenderMixin:
                 if meta and meta.get("tool_kind") in ("cmd", "write", "edit"):
                     # 命令/写入/编辑类：标题行 + 展开正文（命令+折叠输出 / 高亮全文 / 高亮 diff）
                     title_part = f"{_marker(True, expanded)} {label}"
-                    if abs_i == self.tree_cursor and tree_focus:
+                    if abs_i == hl:
                         rows.append(self.C_HL + _pad(f"{indent}{title_part}", width) + self.RESET)
                     else:
                         rows.append(
@@ -2014,8 +2036,8 @@ class RenderMixin:
                             )
                         )
                     if expanded:
-                        # 命令/写入/编辑类：手动展开时回读外置完整输出（默认展开仍用行内 meta 输出）
-                        if node.id in self.expanded and meta.get("persist_path"):
+                        # 命令/写入/编辑类：展开时回读外置完整输出，绝不截断
+                        if (force_open or node.id in self.expanded) and meta.get("persist_path"):
                             session = getattr(self, "_tree_session", None)
                             persisted = toolstore_mod.read_persisted_content(
                                 getattr(session, "config", None),
@@ -2035,11 +2057,11 @@ class RenderMixin:
                 probe_title = f"{indent}· {title}"
                 budget = max(8, width - _display_width(probe_title) - _display_width(" · "))
                 # 正文来源优先级：meta 输出 → label 行内摘要；
-                # 外置完整文件仅在用户手动展开该节点时回读（默认展开态仍看行内预览）
+                # 展开后回读外置完整文件（手动展开，或 inline 全局展开）
                 content_text = str(meta.get("output") or "") if meta is not None else ""
                 if not content_text and sep:
                     content_text = inline_output
-                manual_open = node.id in self.expanded
+                manual_open = force_open or node.id in self.expanded
                 if manual_open and expanded and meta and meta.get("persist_path"):
                     session = getattr(self, "_tree_session", None)
                     persisted = toolstore_mod.read_persisted_content(
@@ -2063,14 +2085,14 @@ class RenderMixin:
                     rest = wrapped[1:]
                     row = (gseg + _clip_keep_ansi(title_ansi, max(1, width - gw))
                            + self.c("tool_content") + _clip(" · " + first, max(8, width - title_w - 3)) + self.RESET)
-                    if abs_i == self.tree_cursor and tree_focus:
+                    if abs_i == hl:
                         rows.append(self.C_HL + _pad(f"{indent}{title_part} · {first}", width) + self.RESET)
                     else:
                         rows.append(row)
                     for wline in rest:
                         rows.append(gseg + self.c("tool_content") + _clip("  " + wline, max(1, width - gw)) + self.RESET)
                 else:
-                    if abs_i == self.tree_cursor and tree_focus:
+                    if abs_i == hl:
                         rows.append(self.C_HL + _pad(f"{indent}{title_part}", width) + self.RESET)
                     else:
                         rows.append(gseg + _clip_keep_ansi(title_ansi, max(1, width - gw)))
@@ -2079,7 +2101,7 @@ class RenderMixin:
             if node.kind == "stream_thinking":
                 # 思考过程（流式进行中）：独立节点，头部 + 折叠时尾部滚动窗 / 展开时全文
                 head_text = f"{_marker(True, expanded)} 思考"
-                if abs_i == self.tree_cursor and tree_focus:
+                if abs_i == hl:
                     rows.append(self.C_HL + _pad(_clip(f"{indent}{head_text}", width), width) + self.RESET)
                 else:
                     rows.append(gseg + color + _clip(head_text, max(1, width - gw)) + self.RESET)
@@ -2092,7 +2114,7 @@ class RenderMixin:
                 # 已完成思考：默认收起为一行摘要，展开显示完整思考内容折行
                 has = bool(node.detail)
                 marker = _marker(has, expanded)
-                if abs_i == self.tree_cursor and tree_focus:
+                if abs_i == hl:
                     rows.append(self.C_HL + _pad(_clip(f"{indent}{marker} {label}", width), width) + self.RESET)
                 else:
                     rows.append(gseg + color + _clip(f"{marker} {label}", max(1, width - gw)) + self.RESET)
@@ -2127,7 +2149,7 @@ class RenderMixin:
                 vis = vis[:_TREE_INLINE_CAP]
             piece_no = 0
             for wline in vis:
-                if abs_i == self.tree_cursor and tree_focus and piece_no == 0:
+                if abs_i == hl and piece_no == 0:
                     raw = first_prefix + badge_plain + wline
                     rows.append(self.C_HL + _pad(_ANSI_RE.sub("", raw), width) + self.RESET)
                 elif piece_no == 0:
@@ -2155,10 +2177,7 @@ class RenderMixin:
                 for dline in _wrap(str(node.detail), max(10, width - gw - 2))[:8]:
                     rows.append(gseg + self.c("dim") + _clip("  " + dline, max(1, width - gw)) + self.RESET)
             spans.append((span_start, len(rows) - span_start))
-        self._node_spans = spans
-        self._tree_rows_key = key
-        self._tree_rows_cache = rows
-        return rows
+        return rows, spans
 
     def _tool_detail_rows(self, meta: dict, gseg: str, width: int, gw: int) -> List[str]:
         """工具节点展开正文：命令（命令 + 折叠输出）/ 写入（行号 + 仅关键词高亮全文）/ 编辑（行号 + 仅关键词高亮 diff）
@@ -2240,7 +2259,8 @@ class RenderMixin:
             return total + cache[1]
         text = str(msg.get("content") or "") + str(msg.get("thinking") or "")
         counter = getattr(meter, "count_text", None)
-        streamed = counter(text) if (callable(counter) and text) else 0
+        counted: Any = counter(text) if (callable(counter) and text) else 0
+        streamed = int(counted)
         self._turn_tok_cache = (now, streamed)
         return total + streamed
 
@@ -2294,44 +2314,10 @@ class RenderMixin:
         if self.sessions_mode:
             return self._compose_sessions(w, h)
 
-        raw = self.buffer.to_text()
-        inner_w = max(10, w - _display_width(self._input_prompt) - 1)
-
-        # 输入 wrap：逻辑行增量（Layout）
-        if self._input_layout_width != inner_w:
-            self._input_layout.set_width(inner_w)
-            self._input_layout_width = inner_w
-        self._input_layout.apply_edit(raw, self.cursor)
-        wrapped = self._input_layout.visual_rows() or [""]
-        text_h = min(3, max(1, len(wrapped)))
-        cand_show = min(3, len(self.candidates)) if self.candidates else 0
-        input_zone_h = min(6, text_h + cand_show)
-        # 确认面板：取代输入框位置，行数更多时向上拓展（压缩会话区）
-        # 确认/询问面板：取代输入框位置，行数更多时向上拓展（压缩会话区）
-        if self.ask_mode:
-            confirm_panel = self._compose_ask(w)
-        elif self.confirm_mode:
-            confirm_panel = self._compose_confirm(w)
-        else:
-            confirm_panel = None
-        if confirm_panel is not None:
-            input_zone_h = len(confirm_panel)
-
-        bottom_rows = []
-        for result in hooks_mod.collect_hook("ui_bottom_rows", {"app": self, "width": w}):
-            items = result if isinstance(result, (list, tuple)) else [result]
-            bottom_rows.extend(str(item) for item in items if item is not None)
-        # todo 清单：本轮进行中且未全部完成时固定在输入框上方；对话框/确认面板期间隐藏
-        todo_lines = self._compose_todo(w) if (confirm_panel is None and not self._dialog_active) else []
-        phase_fixed = 1 + len(todo_lines)  # 树底阶段提示行 + todo 清单
-        top_fixed = 1 + 1
-        max_bottom_rows = max(0, h - top_fixed - 5 - input_zone_h - phase_fixed - 4)
-        bottom_rows = bottom_rows[:max_bottom_rows]
-        bottom_fixed = 1 + 2 + 1 + 1 + len(bottom_rows)  # rule/info/tip/rule/status + plugin rows
-        tree_h = max(4, h - top_fixed - bottom_fixed - input_zone_h - phase_fixed)
+        footer, input_zone_h = self._compose_footer(w, h)
+        tree_h = max(4, h - 1 - len(footer))
         self._row_meta["tree_h"] = tree_h
         tree_focus = self.focus == "tree"
-        mode_label = policy.MODE_LABELS.get(self.mode, self.mode)
 
         lines = []
         # 会话
@@ -2377,6 +2363,69 @@ class RenderMixin:
             else:
                 self._row_meta["scrollbar_on"] = 0
         lines.extend(body)
+        lines.extend(footer)
+
+        if len(lines) > h:
+            lines = lines[: h - 1] + lines[-1:]
+        while len(lines) < h:
+            lines.append(" ")
+        # 记录输入框/状态行号：输入框占 [input_start, input_start + input_h)，
+        # 鼠标右键按该区间判定粘贴（ui._on_mouse）
+        input_start = None
+        # 从后往前找「→项目」信息行，其上为分隔线 + 输入框
+        for i, ln in enumerate(lines):
+            plain = _ANSI_RE.sub("", ln)
+            if plain.startswith("→"):
+                self._row_meta["info"] = i
+                self._row_meta["status"] = min(h - 1, i + 3)
+                self._row_meta["tip"] = min(h - 1, i + 1)
+                input_start = max(0, i - input_zone_h - 1)
+                break
+        if input_start is None:
+            input_start = max(0, h - input_zone_h - 5)
+        self._row_meta["input_start"] = input_start
+        self._row_meta["input_h"] = input_zone_h
+        return lines[:h]
+
+    def _compose_footer(self, w: int, h: int) -> Tuple[List[str], int]:
+        """会话区以下的底部区：阶段提示/todo/输入框或面板/信息行/小贴士/状态栏；全屏与 inline 共用"""
+        raw = self.buffer.to_text()
+        inner_w = max(10, w - _display_width(self._input_prompt) - 1)
+
+        # 输入 wrap：逻辑行增量（Layout）
+        if self._input_layout_width != inner_w:
+            self._input_layout.set_width(inner_w)
+            self._input_layout_width = inner_w
+        self._input_layout.apply_edit(raw, self.cursor)
+        wrapped = self._input_layout.visual_rows() or [""]
+        text_h = min(3, max(1, len(wrapped)))
+        cand_show = min(3, len(self.candidates)) if self.candidates else 0
+        input_zone_h = min(6, text_h + cand_show)
+        # 确认面板：取代输入框位置，行数更多时向上拓展（压缩会话区）
+        # 确认/询问面板：取代输入框位置，行数更多时向上拓展（压缩会话区）
+        if self.ask_mode:
+            confirm_panel = self._compose_ask(w)
+        elif self.confirm_mode:
+            confirm_panel = self._compose_confirm(w)
+        else:
+            confirm_panel = None
+        if confirm_panel is not None:
+            input_zone_h = len(confirm_panel)
+
+        bottom_rows = []
+        for result in hooks_mod.collect_hook("ui_bottom_rows", {"app": self, "width": w}):
+            items = result if isinstance(result, (list, tuple)) else [result]
+            bottom_rows.extend(str(item) for item in items if item is not None)
+        # todo 清单：本轮进行中且未全部完成时固定在输入框上方；对话框/确认面板期间隐藏
+        todo_lines = self._compose_todo(w) if (confirm_panel is None and not self._dialog_active) else []
+        phase_fixed = 1 + len(todo_lines)  # 树底阶段提示行 + todo 清单
+        top_fixed = 1 + 1
+        max_bottom_rows = max(0, h - top_fixed - 5 - input_zone_h - phase_fixed - 4)
+        bottom_rows = bottom_rows[:max_bottom_rows]
+        tree_focus = self.focus == "tree"
+        mode_label = policy.MODE_LABELS.get(self.mode, self.mode)
+
+        lines = []
         # 树底阶段提示（用户规格）：用户消息发出后常驻显示，直至本轮 Agent 结束；
         # 各阶段共用转轮+轮换机制，仅文案池不同（base 匹配 _PHASE_POOLS，后缀保留）；
         # 确认面板/对话框（confirm/ask/choose/line）期间隐藏，空行占位
@@ -2495,30 +2544,16 @@ class RenderMixin:
         lines.append(self.c("dim") + _pad(_clip(status, w), w) + self.RESET)
         for row in bottom_rows:
             lines.append(_clip_keep_ansi(row, w))
-
-        if len(lines) > h:
-            lines = lines[: h - 1] + lines[-1:]
-        while len(lines) < h:
-            lines.append(" ")
-        # 记录输入框/状态行号：输入框占 [input_start, input_start + input_h)，
-        # 鼠标右键按该区间判定粘贴（ui._on_mouse）
-        input_start = None
-        # 从后往前找「→项目」信息行，其上为分隔线 + 输入框
-        for i, ln in enumerate(lines):
-            plain = _ANSI_RE.sub("", ln)
-            if plain.startswith("→"):
-                self._row_meta["info"] = i
-                self._row_meta["status"] = min(h - 1, i + 3)
-                self._row_meta["tip"] = min(h - 1, i + 1)
-                input_start = max(0, i - input_zone_h - 1)
-                break
-        if input_start is None:
-            input_start = max(0, h - input_zone_h - 5)
-        self._row_meta["input_start"] = input_start
-        self._row_meta["input_h"] = input_zone_h
-        return lines[:h]
+        return lines, input_zone_h
 
     def render(self, *args, **kwargs) -> None:
+        inline = getattr(self, "_inline", None)
+        if inline is not None and getattr(self, "_entered", False):
+            inline.render()
+        else:
+            self._render_fullscreen()
+
+    def _render_fullscreen(self) -> None:
         """整帧渲染：行级 diff 直写（替代 rich Live 整帧重写）。
 
         _compose_plain 产出带 ANSI 的行字符串（复用全部现有着色/裁剪/换行

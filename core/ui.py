@@ -18,6 +18,7 @@ try:
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
+    Console = None  # type: ignore
 
 from core import commands as cmdsys
 from core import file as file_mod
@@ -42,6 +43,7 @@ from core.config import (
 )
 from core.log import get_logger, init as init_logging
 from core.settings import SettingsPanelMixin
+from core.inline_render import InlineRenderer
 # 渲染器已独立到 core/render.py：此处完整回导其模块级名字，保持 ui 对外命名空间
 # 与拆分前一致（core/settings.py 等仍按 ui._clip / ui._pad … 访问）。
 from core.render import (
@@ -96,7 +98,7 @@ log = get_logger("ui")
 
 from core.llm import CANCELLED as CANCEL_RESULT
 
-_CONSOLE = Console(soft_wrap=True, force_terminal=True) if HAS_RICH else None
+_CONSOLE = Console(soft_wrap=True, force_terminal=True) if (HAS_RICH and Console is not None) else None
 _app: Optional["TuiApp"] = None
 
 # 对话框串行锁：UI 请求槽（app._ui_req）同一时刻只服务一个请求，并发申请排队弹面板（否则先到的永远等不到应答）
@@ -140,7 +142,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.pending_images: List[str] = []
         self.config = None  # bind_config 时填充；粘贴 gate 提前读
         # _paste_async：后台图片落盘单槽（后台线程单写、帧尾 _tick_paste_async 取回清空）
-        self._paste_async = None
+        self._paste_async: Optional[Tuple[bool, Any]] = None
         self._paste_async_busy = False
         self._paste_window = 0
         self._paste_key_down = False
@@ -261,6 +263,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             "tip_interval": 5,
         }
         self._entered = False
+        self.render_mode = "fullscreen"
+        self._inline: Optional[InlineRenderer] = None
         self._flat_nodes: List[Tuple[TreeNode, int, bool, str]] = []
         self._tree_nodes: Optional[List[TreeNode]] = None
         self._tree_sig: Optional[tuple] = None
@@ -341,6 +345,43 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.token_meter.set_model(config.model_name, getattr(config, "context_window", 0) or 0)
         self.token_meter.context_window = getattr(config, "context_window", 0) or 0
         self.logo_enabled = bool(ui_cfg.get("logo", True))
+        mode = str(ui_cfg.get("render_mode") or "fullscreen").strip().lower()
+        self._apply_render_mode(mode if mode in ("fullscreen", "inline") else "fullscreen")
+
+    def _mouse_seq(self) -> str:
+        """鼠标：1000h 普通 + 1002h 按钮事件 + 1006h SGR 编码。
+
+        WT/ConPTY 实测：仅 1000h+1006h 时终端不转发滚轮加 1002h 后以 MOUSE_EVENT 记录到达。
+        开启鼠标捕获后，终端内文本选择需 Shift+拖拽。关闭用 BAW_MOUSE=0；
+        inline 模式不捕获鼠标，滚动与选字交给终端。"""
+        if self.render_mode == "inline" or os.environ.get("BAW_MOUSE", "1") == "0":
+            return ""
+        return "\033[?1000h\033[?1002h\033[?1006h"
+
+    def _apply_render_mode(self, mode: str) -> None:
+        """切换全屏/inline 渲染；运行中切换时收尾旧模式的屏幕状态"""
+        want_inline = mode == "inline"
+        if mode == self.render_mode and want_inline == (self._inline is not None):
+            return
+        old = self._inline
+        self.render_mode = mode
+        if mode == "inline":
+            self._inline = InlineRenderer(self)
+            self.focus = "input"
+            self._sel_anchor = self._sel_focus = None
+            self._sel_dragging = False
+            if self._entered:
+                sys.stdout.write("\033[?1000l\033[?1002l\033[?1006l")
+                sys.stdout.flush()
+                self._inline.request_reprint()
+        else:
+            self._inline = None
+            if self._entered:
+                tail = old.close() if old is not None else ""
+                sys.stdout.write(tail + "\033[2J\033[3J\033[H" + self._mouse_seq())
+                sys.stdout.flush()
+            self._last_lines = None
+        log.info("渲染模式: %s", mode)
 
     def enter(self) -> None:
         _enable_windows_ansi()
@@ -350,12 +391,9 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         # bracketed-paste 默认关闭（见 docstring）；终端模式直接写 stdout
         _bp = os.environ.get("BAW_BRACKETED_PASTE", "")
         _paste_on = _bp == "1" or (_bp == "" and sys.platform != "win32")
-        # 鼠标：1000h 普通 + 1002h 按钮事件 + 1006h SGR 编码。
-        # WT/ConPTY 实测：仅 1000h+1006h 时终端不转发滚轮加 1002h 后以 MOUSE_EVENT 记录到达。
-        # 开启鼠标捕获后，终端内文本选择需 Shift+拖拽。关闭用 BAW_MOUSE=0
-        _mouse_on = os.environ.get("BAW_MOUSE", "1") != "0"
-        _mouse_seq = "\033[?1000h\033[?1002h\033[?1006h" if _mouse_on else ""
-        sys.stdout.write("\033[2J\033[H\033[?25l" + ("\033[?2004h" if _paste_on else "") + _mouse_seq)
+        # inline 模式不清屏：历史接在 shell 已有输出之后打印
+        clear = "" if self._inline is not None else "\033[2J\033[H"
+        sys.stdout.write(clear + "\033[?25l" + ("\033[?2004h" if _paste_on else "") + self._mouse_seq())
         sys.stdout.flush()
         self._entered = True
         self._paste_window, self._paste_key_down = pasteboard.clipboard_paste_key_state()
@@ -376,7 +414,9 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 self._live = None
         except Exception:
             pass
-        sys.stdout.write("\033[?25h\033[0m\033[2J\033[H\033[?2004l\033[?1000l\033[?1002l\033[?1006l")
+        # inline 模式只擦掉动态区，scrollback 中的对话留在终端里
+        clear = self._inline.close() if self._inline is not None else "\033[2J\033[H"
+        sys.stdout.write(clear + "\033[?25h\033[0m\033[?2004l\033[?1000l\033[?1002l\033[?1006l")
         sys.stdout.flush()
         self._entered = False
 
@@ -727,6 +767,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
 
             def _save_bg():
                 # 单槽协议 (True, 路径|None)：成败都回填并复位 busy，防帧循环永久卡"正在处理"
+                result = None
                 try:
                     result = pasteboard.save_clipboard_image()
                 except Exception as e:
@@ -875,6 +916,19 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 return self._submit_line()
             return None
 
+        # Alt+E：inline 模式展开/收起全部折叠节点（历史需重印，故由渲染器整体重画）
+        if (
+            kind == "hotkey"
+            and str(value).lower() == "alt+e"
+            and self._inline is not None
+            and not self._dialog_active
+            and not (self.settings_mode or self.sessions_mode)
+        ):
+            expanded = self._inline.toggle_expand_all()
+            self.status = "已展开全部折叠节点（Alt+E 收起）" if expanded else "已恢复默认折叠"
+            self.render()
+            return None
+
         # Esc：活动回合打断并保留其已记录上下文（LLM 重试等待态同样打断——
         # 等待桥经 cancelled() 走打断收尾而非挂起）；挂起失败回合收束保留；
         # 没有回合时保持输入框清空语义。
@@ -913,6 +967,14 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 return self._submit_line()
 
         act = self.keymap.resolve(ctx, kind, value)
+        # 未绑定的 Alt+字母按普通字符输入：沿用旧版忽略 Alt 前缀的输入手感
+        if act == Action.IGNORE and kind == "hotkey" and self.focus == "input":
+            from core import keyinput as keyinput_mod
+
+            ch = keyinput_mod.alt_char(kind, value)
+            if ch:
+                self._buf_insert(ch)
+                return None
         # Tab：输入框 complete 优先，再 focus；树上 focus
         if kind == "tab" or act in (Action.COMPLETE, Action.FOCUS_NEXT):
             if self.candidates and (kind == "tab" or act == Action.COMPLETE):
@@ -1080,7 +1142,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             x, y = int(x_s), int(y_s) + _MOUSE_Y_OFFSET
         except (ValueError, IndexError):
             return
-        if self.settings_mode or self.sessions_mode:
+        if self.settings_mode or self.sessions_mode or self._inline is not None:
             return
         tree_h = int(meta.get("tree_h") or 4)
         body_top = int(meta.get("body_top") or 1)
@@ -1154,6 +1216,10 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
 
 
     def _toggle_focus(self) -> None:
+        # inline 下历史已进 scrollback 只读，不提供树焦点
+        if self._inline is not None:
+            self.focus = "input"
+            return
         if self.focus == "input":
             self.focus = "tree"
             flat = self._flatten_tree()
@@ -1763,7 +1829,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                     self.sessions_notice = f"确认删除「{_oneline(str(item.get('title') or ''))}」？再按 d 确认，其它键取消"
                     self.render()
                     continue
-                result = delete_session(item.get("id")) if callable(delete_session) else None
+                result: Any = delete_session(item.get("id")) if callable(delete_session) else None
                 resources = (result or {}).get("resources") or {}
                 removed = bool(result and result.get("ok") and resources.get("session", {}).get("removed"))
                 if removed:

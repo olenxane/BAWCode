@@ -10,6 +10,7 @@ direction_of + KeyEvent NamedTuple。
   Ctrl+J       → newline（同形 ControlJ；VT 路径下 Ctrl+Enter 落为 \n 亦兼容）
   Shift+Enter  → 与 Enter 同形 → submit（事件流固有限制，无法区分）
   Alt+Enter    → newline（同形折叠）
+  Alt+字母     → hotkey alt+<字母>（pt 以 Escape 前缀上报，此处折叠）
   submit_ctrl 事件不产生：keymap 的 send=ctrl+enter 绑定闲置；
 """
 from __future__ import annotations
@@ -20,7 +21,9 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Any, List, NamedTuple, Optional, Tuple
+
+from prompt_toolkit.keys import Keys as _K
 
 from core.log import get_logger
 
@@ -129,15 +132,23 @@ def _fold_paste_run(presses: List, i: int, n: int, cont: bool = False) -> Option
     return "".join(text_parts), j
 
 
+def alt_char(kind: str, value) -> str:
+    """Alt+字母事件对应的字符（输入回退兜底）：hotkey alt+x → "x"，其余返回空"""
+    if kind != "hotkey":
+        return ""
+    tok = str(value or "")
+    if len(tok) == 5 and tok[:4].lower() == "alt+" and tok[4].isprintable():
+        return tok[4]
+    return ""
+
+
 def translate_key_presses(presses: List) -> List[KeyEvent]:
     """一批 KeyPress → KeyEvent 列表。
 
     序列折叠：Escape+ControlM → newline（Ctrl+Enter）；
-    Escape+可见字符 → 该字符（legacy 的 alt 前缀忽略行为）。
+    Escape+可见字符 → hotkey alt+<字符>（pt 的 Alt 前缀形态）。
     粘贴：BracketedPaste（自带 data 或后随同批可见字符）合成单个 paste 事件。
     """
-    if _K is None:  # pragma: no cover - 无 prompt_toolkit 时后端不可选
-        return []
     out: List[KeyEvent] = []
     i, n = 0, len(presses)
     while i < n:
@@ -154,8 +165,8 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
                 i += 2
                 continue
             if _is_char_press(nxt.key, nxt.data):
-                out.append(KeyEvent("char", nxt.key))
-                log.debug("fold: esc+%r -> char", nxt.key)
+                out.append(KeyEvent("hotkey", "alt+" + nxt.key))
+                log.debug("fold: esc+%r -> alt+%r", nxt.key, nxt.key)
                 i += 2
                 continue
 
@@ -181,10 +192,10 @@ def translate_key_presses(presses: List) -> List[KeyEvent]:
         cont = (time.monotonic() - _LAST_PASTE[0]) < _PASTE_CONT_WINDOW
         folded = _fold_paste_run(presses, i, n, cont=cont)
         if folded is not None:
-            text, j = folded
-            out.append(KeyEvent("paste", text))
+            folded_text, j = folded
+            out.append(KeyEvent("paste", folded_text))
             _LAST_PASTE[0] = time.monotonic()
-            log.debug("paste folded len=%d cont=%s", len(text), cont)
+            log.debug("paste folded len=%d cont=%s", len(folded_text), cont)
             i = j
             continue
 
@@ -224,70 +235,61 @@ def _press_to_event(key, data: str) -> Optional[KeyEvent]:
     return None
 
 
-# 枚举映射表在模块级构建（Windows 下必然可导入 prompt_toolkit）
-try:
-    from prompt_toolkit.keys import Keys as _K
+# 枚举映射表在模块级构建
+_KEY_MAP = {
+    _K.Backspace: ("backspace", ""),
+    _K.Delete: ("delete", ""),
+    _K.Insert: ("hotkey", "insert"),
+    _K.Tab: ("tab", ""),
+    _K.BackTab: ("mode_switch", ""),  # Shift+Tab
+    _K.Home: ("home", ""),
+    _K.End: ("end", ""),
+    _K.PageUp: ("scroll_up", ""),  # PageUp/PageDown 与 legacy 同名语义
+    _K.PageDown: ("scroll_down", ""),
+    _K.Escape: ("escape", ""),
+    _K.ControlM: ("submit", ""),  # Enter
+    _K.ControlJ: ("newline", ""),  # Ctrl+J：换行候选（legacy 路径丢弃该键）
+    _K.ControlC: ("interrupt", ""),
+    _K.ControlU: ("clear", ""),
+}
 
-    _KEY_MAP = {
-        _K.Backspace: ("backspace", ""),
-        _K.Delete: ("delete", ""),
-        _K.Insert: ("hotkey", "insert"),
-        _K.Tab: ("tab", ""),
-        _K.BackTab: ("mode_switch", ""),  # Shift+Tab
-        _K.Home: ("home", ""),
-        _K.End: ("end", ""),
-        _K.PageUp: ("scroll_up", ""),  # PageUp/PageDown 与 legacy 同名语义
-        _K.PageDown: ("scroll_down", ""),
-        _K.Escape: ("escape", ""),
-        _K.ControlM: ("submit", ""),  # Enter
-        _K.ControlJ: ("newline", ""),  # Ctrl+J：换行候选（legacy 路径丢弃该键）
-        _K.ControlC: ("interrupt", ""),
-        _K.ControlU: ("clear", ""),
-    }
+# 方向/导航键及其修饰组合：枚举 → 语义名（修饰位从枚举名推导）
+_COMBO_MAP = {}
+for _base, _names in {
+    "up": (_K.Up, _K.ShiftUp, _K.ControlUp, _K.ControlShiftUp),
+    "down": (_K.Down, _K.ShiftDown, _K.ControlDown, _K.ControlShiftDown),
+    "left": (_K.Left, _K.ShiftLeft, _K.ControlLeft, _K.ControlShiftLeft),
+    "right": (_K.Right, _K.ShiftRight, _K.ControlRight, _K.ControlShiftRight),
+    "home": (_K.Home, _K.ShiftHome, _K.ControlHome, _K.ControlShiftHome),
+    "end": (_K.End, _K.ShiftEnd, _K.ControlEnd, _K.ControlShiftEnd),
+}.items():
+    for _k in _names:
+        if _k is not None:
+            _COMBO_MAP[_k] = _base
 
-    # 方向/导航键及其修饰组合：枚举 → 语义名（修饰位从枚举名推导）
-    _COMBO_MAP = {}
-    for _base, _names in {
-        "up": (_K.Up, _K.ShiftUp, _K.ControlUp, _K.ControlShiftUp),
-        "down": (_K.Down, _K.ShiftDown, _K.ControlDown, _K.ControlShiftDown),
-        "left": (_K.Left, _K.ShiftLeft, _K.ControlLeft, _K.ControlShiftLeft),
-        "right": (_K.Right, _K.ShiftRight, _K.ControlRight, _K.ControlShiftRight),
-        "home": (_K.Home, _K.ShiftHome, _K.ControlHome, _K.ControlShiftHome),
-        "end": (_K.End, _K.ShiftEnd, _K.ControlEnd, _K.ControlShiftEnd),
-    }.items():
-        for _k in _names:
-            if _k is not None:
-                _COMBO_MAP[_k] = _base
-
-    # Ctrl+字母组合（C/U/M/J 已在 _KEY_MAP 单列）
-    _CTRL_LETTERS = {
-        _K.ControlA: "a", _K.ControlB: "b", _K.ControlD: "d", _K.ControlE: "e",
-        _K.ControlF: "f", _K.ControlG: "g", _K.ControlH: "h", _K.ControlI: "i",
-        _K.ControlK: "k", _K.ControlL: "l", _K.ControlN: "n", _K.ControlO: "o",
-        _K.ControlP: "p", _K.ControlQ: "q", _K.ControlR: "r", _K.ControlS: "s",
-        _K.ControlT: "t", _K.ControlV: "v", _K.ControlW: "w", _K.ControlX: "x",
-        _K.ControlY: "y", _K.ControlZ: "z",
-    }
-    # 粘贴折叠启发式（translate_key_presses）：分段键与爆发阈值
-    _PASTE_BREAK_KEYS = {_K.Enter, _K.ControlM, _K.Tab, _K.ControlI}
-    _PASTE_BURST_MIN = 20
-    # F1-F24
-    for _idx in range(1, 25):
-        _fkey = getattr(_K, "F%d" % _idx, None)
-        if _fkey is not None:
-            _KEY_MAP[_fkey] = ("hotkey", "f%d" % _idx)
-        _sfkey = getattr(_K, "ShiftF%d" % _idx, None)
-        if _sfkey is not None:
-            _KEY_MAP[_sfkey] = ("hotkey", "shift+f%d" % _idx)
-        _cfkey = getattr(_K, "ControlF%d" % _idx, None)
-        if _cfkey is not None:
-            _COMBO_MAP[_cfkey] = "f%d" % _idx
-except ImportError:  # pragma: no cover - 无 prompt_toolkit 时翻译层不可用
-    _K = None
-    _KEY_MAP, _COMBO_MAP, _CTRL_LETTERS = {}, {}, {}
-    # 折叠启发式兜底常量（_K is None 时 translate 提前返回，永不触达；补全只为模块属性一致）
-    _PASTE_BREAK_KEYS = set()
-    _PASTE_BURST_MIN = 0
+# Ctrl+字母组合（C/U/M/J 已在 _KEY_MAP 单列）
+_CTRL_LETTERS = {
+    _K.ControlA: "a", _K.ControlB: "b", _K.ControlD: "d", _K.ControlE: "e",
+    _K.ControlF: "f", _K.ControlG: "g", _K.ControlH: "h", _K.ControlI: "i",
+    _K.ControlK: "k", _K.ControlL: "l", _K.ControlN: "n", _K.ControlO: "o",
+    _K.ControlP: "p", _K.ControlQ: "q", _K.ControlR: "r", _K.ControlS: "s",
+    _K.ControlT: "t", _K.ControlV: "v", _K.ControlW: "w", _K.ControlX: "x",
+    _K.ControlY: "y", _K.ControlZ: "z",
+}
+# 粘贴折叠启发式（translate_key_presses）：分段键与爆发阈值
+_PASTE_BREAK_KEYS = {_K.Enter, _K.ControlM, _K.Tab, _K.ControlI}
+_PASTE_BURST_MIN = 20
+# F1-F24
+for _idx in range(1, 25):
+    _fkey = getattr(_K, "F%d" % _idx, None)
+    if _fkey is not None:
+        _KEY_MAP[_fkey] = ("hotkey", "f%d" % _idx)
+    _sfkey = getattr(_K, "ShiftF%d" % _idx, None)
+    if _sfkey is not None:
+        _KEY_MAP[_sfkey] = ("hotkey", "shift+f%d" % _idx)
+    _cfkey = getattr(_K, "ControlF%d" % _idx, None)
+    if _cfkey is not None:
+        _COMBO_MAP[_cfkey] = "f%d" % _idx
 
 
 # ----- 强制事件记录路径 -----
@@ -319,8 +321,8 @@ def _baw_win32_input_cls():
 class _PtReader:
     def __init__(self) -> None:
         self._q: "queue.Queue[List]" = queue.Queue()
-        self._input = None
-        self._raw = None
+        self._input: Any = None
+        self._raw: Any = None
         self._started = False
         self._lock = threading.Lock()
         # 暂停协议：内建 input() 临时接管控制台时停泵 + 恢复 cooked 模式
@@ -473,7 +475,7 @@ def paused():
     r._parked.wait(1.0)
     try:
         try:
-            r._raw.__exit__()
+            r._raw.__exit__(None, None, None)
         except Exception:
             pass
         try:

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from core import keyinput
 from core import policy
@@ -24,6 +24,7 @@ from core.config import (
 )
 from core.log import get_logger
 from core.textbuf import TextBuffer
+from core.ui_state import UiState
 
 log = get_logger("settings")
 
@@ -81,8 +82,16 @@ def _remote_model_scope(provider_id: str, base_url: str) -> str:
     return f"{provider_id}\n{normalize_base_url(base_url)}"
 
 
-class SettingsPanelMixin:
+class SettingsPanelMixin(UiState):
     """设置面板状态与方法（由 TuiApp 继承）。"""
+
+    # 由 RenderMixin / TuiApp 提供，此处声明仅供类型检查
+    c: Callable[..., str]
+    _rule: Callable[..., str]
+    render: Callable[..., Any]
+    bind_config: Callable[..., Any]
+    load_theme: Callable[..., Any]
+    _is_mode_switch: Callable[..., bool]
 
     def _init_settings_state(self) -> None:
         self.settings_mode = False
@@ -522,6 +531,7 @@ class SettingsPanelMixin:
         """按当前标签生成字段列表"""
         tab = self.settings_tabs[self.settings_tab]
         fields: List[dict] = []
+        model_list = ""
         scratch_keep = dict(self.settings_scratch)
         if tab == "提供商":
             providers = config.providers() or [{}]
@@ -550,7 +560,7 @@ class SettingsPanelMixin:
                 scratch_keep["adv_custom_body"] = self._provider_custom_body(provider)
             # 实时模型列表 = 配置中已有 + 本页/模型页工作副本
             live_models = self._provider_live_models(config, pid)
-            live_mids = [m.get("model_id") for m in live_models]
+            live_mids = [str(m.get("model_id") or "") for m in live_models if m.get("model_id")]
             model_list = ",".join(live_mids) if live_mids else "（暂无，请在模型页添加后保存）"
             default_id = str(
                 scratch_keep.get("default_model_id")
@@ -1025,7 +1035,7 @@ class SettingsPanelMixin:
                         self.settings_notice = "已删除自定义键"
                         self.render()
                         continue
-                    self._settings_run_action(config, field.get("key"))
+                    self._settings_run_action(config, str(field.get("key") or ""))
                     self.render()
                     continue
                 if ftype in ("body_text", "body_json"):
@@ -1035,8 +1045,8 @@ class SettingsPanelMixin:
                     self.render()
                     continue
                 if ftype in ("text", "advtext"):
-                    key_name = field.get("key")
-                    label = field.get("label", key_name)
+                    key_name = str(field.get("key") or "")
+                    label = str(field.get("label") or key_name)
                     cur = self.settings_scratch.get(key_name, field.get("current"))
                     self._settings_begin_edit(
                         kind="text",
@@ -1319,7 +1329,7 @@ class SettingsPanelMixin:
         s.update(self._provider_advanced_display(provider))
         s["adv_custom_body"] = self._provider_custom_body(provider)
         self._provider_body_by_provider[pid] = [dict(row) for row in s["adv_custom_body"]]
-        live_ids = [m.get("model_id") for m in self._provider_live_models(config, pid)]
+        live_ids = [str(m.get("model_id") or "") for m in self._provider_live_models(config, pid) if m.get("model_id")]
         s["default_model_id"] = provider.get("default_model_id") or (live_ids[0] if live_ids else "")
         s["provider_models_list"] = ",".join(live_ids) if live_ids else "（暂无）"
         s["active_provider_id"] = config.data.get("active_provider_id", s.get("active_provider_id", pid))
@@ -1768,13 +1778,13 @@ class SettingsPanelMixin:
             if ftype in ("body_text", "body_json"):
                 item = self.settings_scratch["adv_custom_body"][field["body_index"]]
                 initial = str(item.get("key") or "") if ftype == "body_text" else self._settings_body_value_text(item, config)
-                self._settings_begin_edit(kind=ftype, label=field.get("label", field["key"]), initial=initial, field=field)
+                self._settings_begin_edit(kind=ftype, label=str(field.get("label") or field.get("key") or ""), initial=initial, field=field)
             else:
-                key_name = field.get("key")
+                key_name = str(field.get("key") or "")
                 cur = self.settings_scratch.get(key_name, field.get("current"))
                 self._settings_begin_edit(
                     kind="text",
-                    label=field.get("label", key_name),
+                    label=str(field.get("label") or key_name),
                     initial="" if cur is None else str(cur),
                     key=key_name,
                 )
@@ -1791,6 +1801,7 @@ class SettingsPanelMixin:
         if edit is None:
             return
         buf: TextBuffer = edit["buf"]
+        alt = keyinput.alt_char(kind, value)
         if kind in ("submit", "submit_ctrl"):
             self._settings_edit_commit(config)
             return
@@ -1806,6 +1817,9 @@ class SettingsPanelMixin:
             buf.set_text("")
         elif kind == "char":
             buf.insert(str(value))
+        elif alt:
+            # Alt+字母沿用旧版忽略前缀的输入手感
+            buf.insert(alt)
         elif kind == "paste":
             # 单行字段：粘贴内容压平为一行
             flat = str(value).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
@@ -1849,9 +1863,10 @@ class SettingsPanelMixin:
                     self.settings_notice = "JSON 值已更新 · Enter 保存退出"
             self._build_settings_fields(config)
         elif kind == "text":
-            key_name = edit.get("key")
+            key_name = str(edit.get("key") or "")
             label = edit["label"]
-            self.settings_scratch[key_name] = raw
+            if key_name:
+                self.settings_scratch[key_name] = raw
             if key_name in self._MODEL_LIST_TEXT_KEYS:
                 self._immediate_settings_refresh(config)
             else:
