@@ -71,7 +71,7 @@
   /* ============ 消息区 ============ */
   main { flex: 1; overflow-y: auto; padding: 14px 14px 18px; scroll-behavior: smooth; }
   #plan-banner {
-    max-width: 860px; margin: 0 auto 10px; padding: 8px 14px; border-radius: 12px;
+    margin: 0 0 10px; padding: 8px 14px; border-radius: 12px;
     background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow);
     display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--dim); cursor: pointer;
   }
@@ -79,13 +79,13 @@
   #plan-banner .p-badge { flex: none; font-size: 11px; padding: 1px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-deep); }
   #plan-banner .p-steps { flex: none; margin-left: auto; color: var(--faint); font-size: 11.5px; }
 
-  .msg { max-width: 860px; margin: 10px auto; }
+  .msg { margin: 10px 0; }
   .msg .who { display: block; font-size: 11px; color: var(--faint); margin: 0 2px 3px; }
 
   .msg.user { display: flex; flex-direction: column; align-items: flex-end; }
   .msg.user .bubble {
     background: var(--accent); color: #fff; border-radius: 16px 16px 4px 16px;
-    padding: 9px 14px; max-width: 82%; white-space: pre-wrap; word-break: break-word;
+    padding: 9px 14px; max-width: min(82%, 705px); white-space: pre-wrap; word-break: break-word;
     box-shadow: var(--shadow);
   }
   .msg.assistant .bubble {
@@ -157,7 +157,7 @@
 
   /* 工具卡片 */
   details.tool {
-    max-width: 860px; margin: 8px auto; background: var(--card); border: 1px solid var(--line);
+    margin: 8px 0; background: var(--card); border: 1px solid var(--line);
     border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
   }
   details.tool summary {
@@ -193,7 +193,7 @@
   .hl.read .rl .rn { flex: none; min-width: 3.2em; padding: 0 8px; text-align: right; color: #9aa0a6; user-select: none; border-right: 1px solid var(--line); margin-right: 8px; }
   .hl.read .rl .rc { flex: 1; min-width: 0; padding-right: 10px; }
   /* 计划 / 步骤时间线节点 */
-  .msg.planblock, .msg.stepsblock, .msg.stepupdate { max-width: 860px; margin: 10px auto; }
+  .msg.planblock, .msg.stepsblock, .msg.stepupdate { margin: 10px 0; }
   .planblock { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; box-shadow: var(--shadow); }
   .planblock .pb-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--amber); }
   .planblock .pb-title { color: var(--ink); }
