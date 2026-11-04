@@ -305,6 +305,7 @@ class Memory:
         self.cleared_at = ""
         self._context_reset = None
         self._llm_fn: Optional[Callable[[str], str]] = None
+        self._dirty = False  # 有未落盘变更（自动保存节流门控，save_session 成功后复位）
         self.messages: List[dict] = []
         self.plan = {
             "title": "",
@@ -371,8 +372,9 @@ class Memory:
         if not facts and not notes:
             return
         facts_left = list(facts)
-        global_agent_path = self.memory_dir_for("global") / "Agent.md"
-        if facts:
+        global_dir = self.memory_dir_for("global")
+        global_agent_path = (global_dir / "Agent.md") if global_dir else None
+        if facts and global_agent_path is not None:
             try:
                 text = global_agent_path.read_text(encoding="utf-8") if global_agent_path.exists() else ""
             except OSError:
@@ -459,6 +461,7 @@ class Memory:
         message = {"role": role, "content": content}
         message.update(extra)
         self.messages.append(message)
+        self._dirty = True
         # message_added 观察链：外部同步/转发方消费（content 可能为多模态数组）；
         # 处理函数异常已在 hooks 内隔离，处理函数内不得再写会话消息（会递归）
         hooks.collect_hook("message_added", {"role": role, "content": content, **extra})
@@ -1257,7 +1260,7 @@ class Memory:
         先按 _api_session_item 转成实际出站消息，思考仅在窗口内并回正文时才计入。"""
         from core import tokens as tokenmod
 
-        model = model or getattr(self.config, "model_name", "") or ""
+        model = model or str(getattr(self.config, "model_name", "") or "")
         payload = [out for out in (self._api_session_item(m) for m in messages) if out]
         try:
             return tokenmod.count_message_tokens(payload, model)
@@ -1566,6 +1569,7 @@ class Memory:
         self._compress_fail_streak = 0
         summary_msg["content"] += f"\n\n[完整历史已归档: {archive_path}]"
         self.messages = [summary_msg] + tail
+        self._dirty = True
         log.info(
             "上下文压缩完成: 旧段%d条(约%d token) -> 摘要%d token(%s) + 尾段%d条原文，归档=%s",
             len(old_segment), old_tokens, summary_tokens,
@@ -1585,7 +1589,12 @@ class Memory:
         list_models = getattr(self.config, "list_models", None)
         if not callable(list_models):
             return window, max_tokens
-        for row in list_models():
+        rows = list_models() or []
+        if not isinstance(rows, list):
+            return window, max_tokens
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
             if model in (row.get("model_name"), row.get("model_id")):
                 return int(row.get("context_window") or window), int(row.get("max_tokens") or max_tokens)
         return window, max_tokens
@@ -1776,7 +1785,7 @@ class Memory:
         """按出站形态计算消息列表 token；tiktoken 不可用时按字符数折半"""
         from core import tokens as tokenmod
 
-        model = model or getattr(self.config, "model_name", "") or ""
+        model = model or str(getattr(self.config, "model_name", "") or "")
         try:
             return tokenmod.count_message_tokens(messages, model)
         except Exception:
@@ -1900,6 +1909,7 @@ class Memory:
     def rename_session(self, title: str) -> str:
         """手动命名当前会话（折叠空白、按显示宽度截断）；随下次 save_session 落盘"""
         self.session_title = self._clip_title(" ".join(str(title or "").split()))
+        self._dirty = True
         log.info("会话已重命名: %s (id=%s)", self.session_title, self.session_id)
         return self.session_title
 
@@ -1926,6 +1936,7 @@ class Memory:
         except OSError as e:
             log.error("会话保存失败 %s: %s", self.session_id, e)
             return None
+        self._dirty = False
         log.debug("会话已保存: %s (%d条消息)", path, len(self.messages))
         return path
 
@@ -1947,6 +1958,7 @@ class Memory:
         if callable(self._context_reset):
             self._context_reset()
         self.ensure_memory_notice()
+        self._dirty = True  # 换入的内容尚未以当前 id 落盘
         log.info("会话已切换: %s · id=%s · %d条消息", self.session_title, self.session_id, len(self.messages))
 
     def start_new_session(self) -> None:
@@ -1959,6 +1971,7 @@ class Memory:
         self.messages.clear()
         self.plan = {"title": "", "complexity": "low", "content": "", "status": "empty"}
         self.steps = []
+        self._dirty = False
         toolstore.ledger_reset()
         if callable(self._context_reset):
             self._context_reset()
@@ -1979,6 +1992,7 @@ class Memory:
         self.session_title = ""
         self.revision += 1
         self.cleared_at = datetime.now().isoformat(timespec="seconds")
+        self._dirty = True
         if callable(self._context_reset):
             self._context_reset()
         self.ensure_memory_notice()

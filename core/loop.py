@@ -13,8 +13,9 @@
 """
 from __future__ import annotations
 
+import time
 import uuid
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from core import memory as memory_mod
 from core import policy
@@ -75,7 +76,8 @@ class TurnContext:
         self.user_text = user_text
         self.io = io
         self.system_prompt_text = ""
-        self.captured: Dict[str, str] = {}
+        self.captured: Dict[str, Any] = {}
+        self._last_autosave = time.monotonic()
 
 
 def check_cancel(turn: TurnContext) -> None:
@@ -92,6 +94,8 @@ def drain_injections(turn: TurnContext) -> int:
     app = turn.app
     take = getattr(app, "take_injections", None)
     pending = take() if callable(take) else []
+    if not isinstance(pending, list):
+        pending = []
     pending.sort(key=lambda item: item.get("_submission_seq", 0) if isinstance(item, dict) else 0)
     for item in pending:
         text = str(item.get("text") or "") if isinstance(item, dict) else str(item or "")
@@ -133,6 +137,25 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
     空转计数器（SpinGuard——重复/近似重复输出才开始计数，整轮全新结果清零）计满config.workflow.spin_kill_count 才终止回合"""
     io, session, llm = turn.io, turn.session, turn.llm
     wf_cfg = (getattr(turn.config, "data", None) or {}).get("workflow") or {}
+
+    def _autosave_tick() -> None:
+        """回合内检查点：memory.autosave_minutes 为距上次落盘的最小间隔（0/缺失=关闭），
+        有未保存变更才写盘；失败仅记日志不炸回合"""
+        cfg = (getattr(turn.config, "data", None) or {}).get("memory") or {}
+        try:
+            minutes = float(cfg.get("autosave_minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 0.0
+        if minutes <= 0 or not getattr(session, "_dirty", True):
+            return
+        if time.monotonic() - turn._last_autosave < minutes * 60:
+            return
+        turn._last_autosave = time.monotonic()
+        try:
+            if session.save_session():
+                log.info("回合内自动保存: %s", session.session_id)
+        except Exception as exc:
+            log.warn("回合内自动保存失败: %r", exc)
     try:
         spin = SpinGuard(int(wf_cfg.get("spin_kill_count", 12)))
     except (TypeError, ValueError):
@@ -166,9 +189,11 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         check_cancel(turn)
         io.status(f"推理 · 第{round_no}轮")
         empty_retries = 0
+        content, reasoning, tool_calls = "", "", []
         while True:
             io.phase("思考中")
             drain_injections(turn)  # 回合中插话：并入本回合，下一轮模型即看到
+            _autosave_tick()
             tool_defs = register.get_tool_defs()
             payload = session.build_messages(extra_system=extra_system, tools=tool_defs, model=model)
             llm.meter.measure_context(payload)
@@ -189,9 +214,9 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     continue
             if response.get("error"):
                 break
-            content = response.get("content") or ""
-            reasoning = response.get("reasoning") or ""
-            tool_calls = response.get("tool_calls") or []
+            content: str = response.get("content") or ""
+            reasoning: str = response.get("reasoning") or ""
+            tool_calls: list = response.get("tool_calls") or []
             if not content.strip() and not reasoning.strip() and not tool_calls:
                 if empty_retries < 2:
                     empty_retries += 1
@@ -298,6 +323,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     round_results.append(msg)
                 check_cancel(turn)
                 io.status(f"工具 {registered}/{len(tool_calls)} 完成 · {call.get('name')}")
+                _autosave_tick()
         finally:
             # 中断或异常时补齐尚未返回的调用，保持协议配对
             for call in tool_calls[registered:]:
