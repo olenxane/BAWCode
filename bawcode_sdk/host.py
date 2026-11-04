@@ -50,7 +50,27 @@ class Service:
 
 
 class HostServices:
-    """Advanced host services for management plugins, injected per context."""
+    """Advanced host services for management plugins, injected per context.
+
+    服务名与服务集合一一对应：新增服务须同步在 SERVICE_METHODS/SERVICE_VALUES
+    声明并在 __init__ 挂载，静态检查才能看到属性。"""
+
+    hooks: Service
+    commands: Service
+    tools: Service
+    sessions: Service
+    files: Service
+    plugins: Service
+    workflows: Service
+    snapshots: Service
+    agents: Service
+    skills: Service
+    mcp: Service
+    models: Service
+    settings: Service
+    runtime: Service
+    logging: Service
+    policy: Service
 
     def __init__(self, host: HostAPI):
         for name in SERVICE_METHODS.keys() | SERVICE_VALUES.keys():

@@ -52,7 +52,7 @@ def save_session_data(directory: Path, data: dict) -> Path:
 
     返回最终会话文件路径。
     """
-    path = session_path(directory, data.get("id"))
+    path = session_path(directory, str(data.get("id") or ""))
     if path is None:
         raise ValueError("会话标识非法")
     payload = json.dumps(data, ensure_ascii=False, indent=2)

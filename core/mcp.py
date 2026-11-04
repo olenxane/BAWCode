@@ -256,7 +256,10 @@ def _streamable_ctx(url: str, headers: dict):
 
         return streamablehttp_client(url, headers=headers or None)
     if headers:
-        from mcp.client.streamable_http import create_mcp_http_client
+        try:
+            from mcp.shared._httpx_utils import create_mcp_http_client
+        except ImportError:
+            from mcp.client.streamable_http import create_mcp_http_client  # type: ignore[no-redef]
 
         return streamable_http_client(url, http_client=create_mcp_http_client(headers=headers))
     return streamable_http_client(url)
@@ -299,7 +302,7 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
             errlog_path.parent.mkdir(parents=True, exist_ok=True)
             errlog = open(errlog_path, "ab")
             stack.callback(errlog.close)
-            read, write = await stack.enter_async_context(stdio_client(params, errlog=errlog))
+            read, write = await stack.enter_async_context(stdio_client(params, errlog=errlog))  # type: ignore[arg-type]
             timeout = cfg["discovery_timeout_stdio"]
         else:
             url = str(entry.get("url") or "")
@@ -617,7 +620,7 @@ def status_listing() -> str:
         return "MCP 未启用或未配置服务器（config.mcp.enabled + config.mcp.servers）"
     lines = [f"MCP 服务器 {len(_STATE)} 个:"]
     for name, state in _STATE.items():
-        icon = _STATUS_ICON.get(state.get("status"), "?")
+        icon = _STATUS_ICON.get(str(state.get("status") or ""), "?")
         line = (
             f"  {name}  {icon} {state.get('status')} · {state.get('transport')}"
             f" · {len(state.get('tools') or [])} 工具"
@@ -653,7 +656,7 @@ def status_line() -> str:
         return ""
     parts = []
     for name, state in sorted(_STATE.items()):
-        icon = _STATUS_ICON.get(state.get("status"), "?")
+        icon = _STATUS_ICON.get(str(state.get("status") or ""), "?")
         seg = f"{name}{icon}"
         if state.get("status") == CONNECTED:
             seg += f" {len(state.get('tools') or [])}"

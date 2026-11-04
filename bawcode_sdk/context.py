@@ -188,12 +188,12 @@ class PluginContext:
             return "[回合调度器未就绪，消息未提交]"
         submit = getattr(runner, "submit_message", None)
         if callable(submit):
-            return submit(text, images)
+            return str(submit(text, images) or "")
         if images:
             return "[调度器不支持图片附件，消息未提交]"
         if runner.start(text):
             return "[已提交，新回合开始]"
-        return runner.submit(text)
+        return str(runner.submit(text) or "")
 
     def run_when_idle(self, callback: Callable) -> Any:
         """在调度器空闲锁内执行会话结构操作。"""
@@ -201,7 +201,8 @@ class PluginContext:
         run = getattr(runner, "run_when_idle", None)
         if not callable(run):
             return {"ok": False, "message": "调度器不支持原子会话操作"}
-        ok, result = run(callback)
+        outcome = run(callback)
+        ok, result = outcome if isinstance(outcome, (tuple, list)) and len(outcome) == 2 else (False, None)
         if not ok:
             return {"ok": False, "message": "回合进行中：请先停止后再操作"}
         return result

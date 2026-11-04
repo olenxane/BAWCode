@@ -266,7 +266,8 @@ def _persisted_settings(pid: str, config=None) -> dict:
     cfg_obj = config
     if cfg_obj is None:
         rec = _loaded.get(pid)
-        cfg_obj = rec.get("context").config if rec and rec.get("context") else None
+        ctx = rec.get("context") if isinstance(rec, dict) else None
+        cfg_obj = getattr(ctx, "config", None) if ctx is not None else None
     data = (getattr(cfg_obj, "data", None) or {})
     return dict((data.get("plugins_config") or {}).get(pid) or {})
 

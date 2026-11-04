@@ -38,8 +38,8 @@ def read_clipboard() -> dict:
     if _CLIPBOARD_BRIDGE is not None:
         try:
             return _CLIPBOARD_BRIDGE() or {"kind": "none"}
-        except Exception:
-            log.error("剪贴板桥异常", exc_info=True)
+        except Exception as e:
+            log.error("剪贴板桥异常: %s", e)
             return {"kind": "none"}
     if sys.platform != "win32":
         return {"kind": "none"}

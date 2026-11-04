@@ -5,7 +5,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from core.log import get_logger
 
@@ -233,7 +233,7 @@ def build_env(name: Optional[str] = None) -> dict:
     return env
 
 
-def build_command(command: str, name: str) -> Tuple[Optional[list], str, bool]:
+def build_command(command: str, name: str) -> Tuple[Union[list, str, None], str, bool]:
     """构造启动方式：返回 (argv, stdin_text, use_shell)
 
     多行命令经 stdin 送入解释器（stderr=STDOUT 让语法/运行错误一并回收），避免命令行换行

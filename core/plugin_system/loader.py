@@ -20,7 +20,7 @@ class _PluginFinder(importlib.abc.MetaPathFinder):
         if not fullname.startswith("bawcode_plugin_") or "." not in fullname:
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
-        if spec is not None and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+        if spec is not None and isinstance(spec.loader, importlib.machinery.SourceFileLoader) and spec.origin:
             spec.loader = _SourceLoader(fullname, spec.origin)
         return spec
 

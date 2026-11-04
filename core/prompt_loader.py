@@ -233,6 +233,7 @@ def load_prompt_file(path: Path, variables: Optional[Dict[str, Any]] = None) -> 
         return None
     # 三级解码：utf-8 → gbk（记事本 ANSI 另存）→ 有损兜底，解码失败不阻塞启动
     raw = None
+    last_err: Optional[Exception] = None
     for enc in ("utf-8", "gbk"):
         try:
             raw = path.read_text(encoding=enc)

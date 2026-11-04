@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -45,7 +45,7 @@ def _init_usage_statistics():
         return None
 
 
-def _sync(app: "ui.TuiApp", session, task: str = "", status: str = "", render: bool = True) -> None:
+def _sync(app, session, task: Optional[str] = "", status: str = "", render: bool = True) -> None:
     if status:
         app.status = status
     app.mode = getattr(app, "mode", policy.MODE_AUTO)
@@ -58,7 +58,7 @@ def _echo(ctx, content: str, mtype: str = "help") -> None:
     ctx["session"].add_message("system", content, type=mtype)
 
 
-def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> None:
+def _register_commands(llm: LLM, session, config: Config, app) -> None:
     def _ctx():
         return {"llm": llm, "session": session, "config": config, "app": app}
 
@@ -569,7 +569,7 @@ def _register_commands(llm: LLM, session, config: Config, app: "ui.TuiApp") -> N
     commands.load_plugins(str(_ROOT / "data" / "commands"))
 
 
-def _handle_mode_switch(app: "ui.TuiApp", config, payload: dict, cancelled=None) -> dict:
+def _handle_mode_switch(app, config, payload: dict, cancelled=None) -> dict:
     """模式切换申请：ask 面板裁决；批准后切换（单一事实源 config.mode）并落盘。
 
     返回 {"approved": bool, "detail": str}，由 request_mode_switch 工具转成给模型的回执。"""
@@ -613,7 +613,7 @@ def _handle_mode_switch(app: "ui.TuiApp", config, payload: dict, cancelled=None)
     return {"approved": True, "detail": "配置已保存。"}
 
 
-def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancelled=None) -> dict:
+def _handle_tool_confirm(llm: LLM, app, session, call: dict, cancelled=None) -> dict:
     """工具确认：先经 tool_confirm 扩展点（插件/外部接口可代答），无处理时
     经 UI 请求桥在主线程弹面板（↑↓ 选择）；取消时按默认拒绝回注"""
     def rejected():
@@ -631,7 +631,7 @@ def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancel
         action = str(hooked.get("action") or "").lower()
         if action in ("allow_once", "allow_always"):
             if action == "allow_always":
-                policy.add_always_allow(call.get("name"), call.get("arguments") or {})
+                policy.add_always_allow(str(call.get("name") or ""), call.get("arguments") or {})
             return llm.execute_approved_tool(call)
         if action in ("deny", "denied", "reject"):
             reason = str(hooked.get("reason") or hooked.get("message") or "")
@@ -668,7 +668,7 @@ def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancel
     if result.get("action") == "allow_once":
         return llm.execute_approved_tool(call)
     if result.get("action") == "allow_always":
-        policy.add_always_allow(call.get("name"), call.get("arguments") or {})
+        policy.add_always_allow(str(call.get("name") or ""), call.get("arguments") or {})
         return llm.execute_approved_tool(call)
     # 拒绝：reason 为用户输入的原因（空则用默认文案）
     return {
@@ -680,13 +680,13 @@ def _handle_tool_confirm(llm: LLM, app: "ui.TuiApp", session, call: dict, cancel
     }
 
 
-def _bridge_choose(app: "ui.TuiApp", options, prompt: str, cancelled=None):
+def _bridge_choose(app, options, prompt: str, cancelled=None):
     with ui.DIALOG_LOCK:
         req = app.request_ui("choose", {"options": options, "prompt": prompt})
         return app.wait_ui(req, cancelled)
 
 
-def _bridge_line(app: "ui.TuiApp", prompt: str, config, cancelled=None):
+def _bridge_line(app, prompt: str, config, cancelled=None):
     with ui.DIALOG_LOCK:
         req = app.request_ui("line", {"prompt": prompt, "config": config})
         return app.wait_ui(req, cancelled)
@@ -739,7 +739,7 @@ def _after_turn(session, user_text: str, failed: bool = False) -> None:
     )
 
 
-def _agent_turn(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
+def _agent_turn(llm: LLM, session, user_text: str, app, runner=None) -> None:
     """回合入口：无论正常结束/出错/中断，回合末执行上下文维护（剥离+预算外置），
     并清掉流式树尾消息（partial 丢弃，与在途回合丢弃语义一致）与子代理运行时/直播槽"""
     snap = None
@@ -952,7 +952,7 @@ def _keep_pending_turn(session, app, pending=None) -> None:
     log.info("挂起回合已收束：保留消息 %d 条", kept)
 
 
-def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner=None) -> None:
+def _agent_turn_impl(llm: LLM, session, user_text: str, app, runner=None) -> None:
     """一个 agent 回合；runner 存在时在后台线程运行——交互弹窗经 UI 请求桥
     移交主线程执行，取消检查贯穿各检查点（中断=结束在途回合并保留其已记录消息）。"""
 
@@ -992,20 +992,21 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
         if kind not in {"reasoning", "content"}:
             return
         msg = getattr(app, "streaming_msg", None)
-        if msg is None:
+        if not isinstance(msg, dict):
             msg = {"role": "assistant", "content": "", "thinking": "", "type": "streaming"}
             app.streaming_msg = msg
+        body: dict = msg
         if kind == "reasoning":
             # 模型已开始输出阶段性正文：后续思考不回显（session 留档不受影响）
-            if msg.get("thinking_sealed"):
+            if body.get("thinking_sealed"):
                 hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
                 return
-            msg["thinking"] += piece
+            body["thinking"] = str(body.get("thinking") or "") + piece
         else:
             # 阶段性正文到达：清掉前面已累积的思考
-            msg["thinking_sealed"] = True
-            msg["thinking"] = ""
-            msg["content"] += piece
+            body["thinking_sealed"] = True
+            body["thinking"] = ""
+            body["content"] = str(body.get("content") or "") + piece
         hooks.collect_hook("stream_delta", {"kind": kind, "piece": piece})
 
     log.info("任务开始: %s", user_text)
@@ -1087,7 +1088,8 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app: "ui.TuiApp", runner
 
     def _bridge_ask(payload: dict) -> dict:
         req = app.request_ui("ask", payload)
-        return app.wait_ui(req, _cancelled)
+        result = app.wait_ui(req, _cancelled)
+        return result if isinstance(result, dict) else {}
 
     tools_mod.set_ask_user_bridge(_bridge_ask)  # ask_user 工具经此弹面板（回合内有效）
     tools_mod.set_mode_bridge(
@@ -1124,7 +1126,7 @@ class _AgentRunner:
       Ctrl+Q     — 排队：当前回合结束后作为新回合发送
     """
 
-    def __init__(self, llm: LLM, session, app: "ui.TuiApp", config: Config):
+    def __init__(self, llm: LLM, session, app, config: Config):
         self.llm = llm
         self.session = session
         self.app = app
@@ -1268,7 +1270,7 @@ class _AgentRunner:
         t.start()
         return True
 
-    def notify_subagent_completion(self, task_id: str, summary: str, origin_turn_id: str = None) -> None:
+    def notify_subagent_completion(self, task_id: str, summary: str, origin_turn_id: Optional[str] = None) -> None:
         """后台子代理完成：忙时排入当前回合注入队列，空闲时排入新回合。"""
         text = (
             f"[子代理完成通知 id={task_id}]\n{summary}\n"
@@ -1276,7 +1278,7 @@ class _AgentRunner:
         )
         self.notify(text, origin_turn_id=origin_turn_id)
 
-    def notify(self, text: str, origin_turn_id: str = None) -> None:
+    def notify(self, text: str, origin_turn_id: Optional[str] = None) -> None:
         """后台事件通知入口（tools.set_background_notifier 注册）：
         idle 开新请求，busy 时并入当前请求；origin_turn_id 标识产生调用的回合。"""
         item = {
@@ -1495,6 +1497,8 @@ class _AgentRunner:
                     # 插话残余兜底：回合结束后才到达的插话，作为新回合接力（极窄竞态）
                     take = getattr(self.app, "take_injections", None)
                     leftover = take() if callable(take) else []
+                    if not isinstance(leftover, list):
+                        leftover = []
                     if leftover:
                         self._queue.extend(
                             item if isinstance(item, dict) else {"text": item, "images": []}
@@ -1546,7 +1550,7 @@ class _AgentRunner:
                 self.turn_images = list(item.get("images") or [])
                 self.app._turn_injected_users = []
                 self.app._turn_injected_background_calls = []
-                text = _before_turn(item["text"])
+                text = str(_before_turn(str(item.get("text") or "")) or "")
                 self.llm.reset_cancel()
                 self.last_error = None
                 _agent_turn(self.llm, self.session, text, self.app, runner=self)
@@ -1562,7 +1566,7 @@ class _AgentRunner:
             finally:
                 failed = getattr(self, "last_turn_failed", False)
                 self.last_turn_failed = False
-                _after_turn(self.session, text, failed=failed)
+                _after_turn(self.session, text if isinstance(text, str) else str(text or ""), failed=failed)
                 try:
                     self.session.save_session()
                 except Exception:
@@ -1594,23 +1598,28 @@ class _HeadlessApp:
         self.mode = mode
         self.status = ""
         self.phase_hint = ""
-        self.token_meter = None
+        self.token_meter: Any = None
         self.busy = False
         self.turn_start_time = 0.0
         self.turn_user_text = ""
         self.restore_input = None
         self.last_failed_text = None
         self.interrupt_turn_handler = None
-        self.inject_queue = []
+        self.inject_queue: list = []
         self.inject_lock = threading.Lock()
         self._submit_queued = False
-        self.pending_tool = None
-        self.streaming_msg = None
+        self.pending_tool: Optional[dict] = None
+        self.streaming_msg: Optional[dict] = None
         self.subagent_stream = None
         self._tree_follow_tail = True
         self.tool_count = 0
-        self.ui_requests = []
+        self.ui_requests: list = []
         self.config = None
+        self.usage_statistics: Optional["statistics_mod.UsageStatistics"] = None
+        self.agent_runner = None
+        self.last_turn_error: Optional[str] = None
+        self._turn_injected_users: list = []
+        self._turn_injected_background_calls: list = []
 
     def bind_config(self, config) -> None:
         self.config = config
@@ -1864,6 +1873,10 @@ def main() -> None:
         session.save_longterm()
         session.save_session()
     finally:
+        try:
+            session.save_session()  # 未捕获异常穿透主循环时同样落盘
+        except Exception:
+            pass
         try:
             mcp_mod.shutdown()  # 先断 MCP（daemon 线程收尾），再恢复终端
         except Exception:

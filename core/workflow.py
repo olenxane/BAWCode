@@ -290,6 +290,8 @@ def _plan_confirm_loop(turn: TurnContext) -> None:
     io, session, llm = turn.io, turn.session, turn.llm
     confirmed = False
     for _edit_round in range(3):
+        if io.choose is None:
+            raise TurnStop()
         choice = str(io.choose(
             [("1", "确认计划"), ("2", "直接改计划"), ("3", "反馈修改"), ("0", "取消")],
             "计划已生成",
@@ -301,6 +303,8 @@ def _plan_confirm_loop(turn: TurnContext) -> None:
             io.status("已取消")
             raise TurnStop()
         if choice == "2":
+            if io.line is None:
+                raise TurnStop()
             lines = []
             while True:
                 line = str(io.line("计划> ") or "")
@@ -311,6 +315,8 @@ def _plan_confirm_loop(turn: TurnContext) -> None:
                 lines.append(line)
             session.plan.update(llm.confirm_plan(session.plan, "manual_edit", feedback="\n".join(lines)))
         elif choice == "3":
+            if io.line is None:
+                raise TurnStop()
             fb = str(io.line("反馈> ") or "")
             if fb == CANCELLED or io.cancelled():
                 raise TurnInterrupt()
@@ -326,6 +332,8 @@ def _plan_confirm_loop(turn: TurnContext) -> None:
             io.status("请重新选择计划操作")
             continue
         # 2/3 修改后必须二次确认，禁止直接执行
+        if io.choose is None:
+            raise TurnStop()
         again = str(io.choose([("1", "确认并执行"), ("2", "继续修改"), ("0", "取消")], "计划已修改") or "").strip()
         if again == CANCELLED or io.cancelled():
             raise TurnInterrupt()
@@ -501,7 +509,7 @@ def _exec_execute(node: dict, turn: TurnContext) -> None:
         model = _role_model(turn.config, node.get("model_role") or "code")
     stage = _node_stage(turn, node)
     if turn.captured.pop("steps_kickoff", None):
-        stage = _combine_system(stage, STEPS_KICKOFF_BUILTIN)
+        stage = _combine_system(stage, STEPS_KICKOFF_BUILTIN) or ""
     result = tool_loop(turn, _stage_system(turn, node, stage), max_rounds, model=model)
     if result["status"] != "complete":
         raise TurnStop()

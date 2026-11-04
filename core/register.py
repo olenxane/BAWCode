@@ -106,11 +106,13 @@ DESCRIPTION_PARAM = {
 
 def _with_description_param(schema: Optional[dict]) -> dict:
     """向工具参数 schema 注入公共 description 属性，幂等不覆盖已有定义"""
-    base = dict(schema or {"type": "object", "properties": {}, "required": []})
-    properties = dict(base.get("properties") or {})
+    base: dict = dict(schema or {"type": "object", "properties": {}, "required": []})
+    props_raw = base.get("properties")
+    properties: dict = dict(props_raw) if isinstance(props_raw, dict) else {}
     properties.setdefault("description", dict(DESCRIPTION_PARAM))
     base["properties"] = properties
-    required = list(base.get("required") or [])
+    req_raw = base.get("required")
+    required: list = list(req_raw) if isinstance(req_raw, list) else []
     if "description" not in required:
         required.append("description")
     base["required"] = required

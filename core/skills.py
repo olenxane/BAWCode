@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from core.log import get_logger
 from core import prompt_loader
@@ -67,7 +67,7 @@ def _parse_frontmatter(path: Path) -> Optional[Dict]:
         log.warn("技能文件读取失败 %s: %s", path, e)
         return None
     match = _FRONTMATTER_RE.match(content)
-    if not match:
+    if not match or yaml is None:
         return None
     try:
         metadata = yaml.safe_load(match.group(1)) or {}
@@ -122,6 +122,7 @@ class SkillLoader:
         # name -> {"description", "path"}（仅元数据）；正文缓存 name -> Skill
         self._metadata: Dict[str, dict] = {}
         self._loaded: Dict[str, Skill] = {}
+        self.signature: tuple = ()
         if self.enabled:
             self.scan()
 
@@ -200,7 +201,7 @@ class SkillLoader:
 
 # 注入过滤（工作流 skill 节点经 set_injection 设置；None=默认不过滤）
 # enabled=False → 清单整段不注入；allow 非空 → 仅注入白名单内技能
-_injection: Dict[str, object] = {"enabled": None, "allow": None}
+_injection: Dict[str, Any] = {"enabled": None, "allow": None}
 
 
 def set_injection(enabled: Optional[bool] = None, allow: Optional[List[str]] = None) -> None:

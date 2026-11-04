@@ -273,9 +273,11 @@ def capture_before(path: Path, tool: str = "") -> None:
         }
         if path.exists():
             rec["existed_before"] = True
+            mtime_ns = 0
             try:
                 stat = path.stat()
                 size = stat.st_size
+                mtime_ns = stat.st_mtime_ns
             except OSError as exc:
                 size = 0
                 rec["skip_reason"] = f"读取失败: {exc}"
@@ -284,7 +286,7 @@ def capture_before(path: Path, tool: str = "") -> None:
                 rec["checkpoint_signature"] = (True, f"unreadable:{size}")
             elif size > limit or turn["bytes_total"] + size > _TURN_BYTES_TOTAL_MAX:
                 rec["skip_reason"] = f"文件 {size} 字节超限未留底"
-                rec["checkpoint_signature"] = (True, f"oversize:{stat.st_mtime_ns}:{size}")
+                rec["checkpoint_signature"] = (True, f"oversize:{mtime_ns}:{size}")
             else:
                 try:
                     data = path.read_bytes()

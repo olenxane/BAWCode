@@ -376,7 +376,7 @@ def load_plugins(directory: Optional[str] = None) -> List[str]:
                 continue
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
-            module.commands = sys.modules[__name__]
+            module.commands = sys.modules[__name__]  # type: ignore[attr-defined]
             spec.loader.exec_module(module)
             setup = getattr(module, "setup", None)
             if callable(setup):

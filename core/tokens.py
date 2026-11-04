@@ -14,7 +14,7 @@ _FALLBACK_ENCODING = "cl100k_base"
 
 
 def _encoding_for_model(model: str):
-    if not HAS_TIKTOKEN:
+    if not HAS_TIKTOKEN or tiktoken is None:
         return None
     model = (model or "").lower()
     try:

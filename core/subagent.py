@@ -760,9 +760,13 @@ def _elevation_execute(llm, call: dict, target: dict) -> dict:
 def _handle_elevation(rt: dict, call: dict) -> dict:
     """提权请求：主代理可自主放行的直接执行；自动模式交 LLM 裁决；其余交用户决定"""
     io, llm = rt["io"], rt["llm"]
-    args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+    args = call.get("arguments") or {}
+    if not isinstance(args, dict):
+        args = {}
     tool = str(args.get("tool") or "")
-    target_args = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+    target_args = args.get("arguments") or {}
+    if not isinstance(target_args, dict):
+        target_args = {}
     reason = str(args.get("reason") or "").strip()
     if tool in _SUBAGENT_EXCLUDED_TOOLS or tool == _ELEVATION_TOOL:
         return _normalize_tool_msg(call, f"该工具不对此子代理开放: {tool}")
@@ -812,11 +816,13 @@ def _execute_one(rt: dict, call: dict, permission: str) -> dict:
     action, reason = policy.evaluate(name, args, permission)
     if action == policy.ALLOW:
         item = llm.execute_approved_tool(call)
-        return _with_images(item) if isinstance(item, dict) and "content" in item else _normalize_tool_msg(call, item)
+        item = item if isinstance(item, dict) else str(item or "")
+        return _with_images(item) if isinstance(item, dict) and "content" in item else _normalize_tool_msg(call, str(item))
     if action == policy.LLM_APPROVE:
         if llm.approve_tool_call(call):
             item = llm.execute_approved_tool(call)
-            return _with_images(item) if isinstance(item, dict) and "content" in item else _normalize_tool_msg(call, item)
+            item = item if isinstance(item, dict) else str(item or "")
+            return _with_images(item) if isinstance(item, dict) and "content" in item else _normalize_tool_msg(call, str(item))
         return _normalize_tool_msg(
             call,
             policy.approval_reject_message(
@@ -836,7 +842,9 @@ def extract_artifacts(messages: List[dict]) -> List[str]:
             if not isinstance(c, dict):
                 continue
             name = str(c.get("name") or "")
-            args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+            args = c.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {}
             label = ""
             if name in ("write", "edit_file"):
                 label = f"修改 {args.get('file_path', '')}"
@@ -1097,26 +1105,28 @@ def _tool_task(
     permission_eff = inherited_permission(_current_mode(rt))
     now = time.strftime("%Y-%m-%d %H:%M:%S")
 
+    src: dict = source if isinstance(source, dict) else {}
+
     def _build(record_id: str) -> dict:
         """组装记录；编号由 create_record 并发分配，或恢复时沿用源编号"""
         if resume_key:
-            messages = copy.deepcopy(source.get("messages") or [])
+            messages = copy.deepcopy(src.get("messages") or [])
             messages.append({"role": "user", "content": task_text})
             return {
                 "id": record_id,
                 "role": role,
                 "task": task_text,
-                "origin_task": str(source.get("task") or ""),
+                "origin_task": str(src.get("task") or ""),
                 "permission": permission_eff,
                 "permission_requested": "",
-                "model": source.get("model") or spec.get("model") or "",
+                "model": src.get("model") or spec.get("model") or "",
                 "status": "running",
                 "rounds": 0,
                 "tools_used": 0,
                 "artifacts": [],
                 "messages": messages,
-                "resumed": (_int(source.get("resumed"), 0) + 1) if resume_id else 0,
-                "created_at": str(source.get("created_at") or now) if resume_id else now,
+                "resumed": (_int(src.get("resumed"), 0) + 1) if resume_id else 0,
+                "created_at": str(src.get("created_at") or now) if resume_id else now,
             }
         user_text = task_text if not context else f"{task_text}\n\n[主代理补充背景]\n{context}"
         return {
@@ -1139,14 +1149,14 @@ def _tool_task(
             "created_at": now,
         }
 
-    requested_id = str(source.get("id")) if resume_id and source else None
+    requested_id = str(src.get("id")) if resume_id and src else None
     record, record_path = create_record(directory, _build, record_id=requested_id)
     record_id = str(record.get("id"))
-    if source and not resume_id:
-        record["origin_task"] = str(source.get("id"))
-        record["source_task"] = str(source.get("id"))
+    if src and not resume_id:
+        record["origin_task"] = str(src.get("id"))
+        record["source_task"] = str(src.get("id"))
         record_path = _save_record(directory, record) or record_path
-    task = submit_task(rt, record, cfg, directory, record_path)
+    _dispatched = submit_task(rt, record, cfg, directory, record_path)
     log.info(
         "异步派发子代理 #%s role=%s permission=%s model=%s resume=%s",
         record_id, role, permission_eff, record.get("model") or "-", bool(resume_key),
@@ -1168,7 +1178,9 @@ def _render_round_block(block: List[dict]) -> List[str]:
             if text:
                 lines.append(f"  [输出] {text[:800]}{'…' if len(text) > 800 else ''}")
             for c in m.get("tool_calls") or []:
-                args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+                args = c.get("arguments") or {}
+                if not isinstance(args, dict):
+                    args = {}
                 try:
                     args_text = json.dumps(args, ensure_ascii=False)
                 except (TypeError, ValueError):

@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     from rich.console import Console, Group
@@ -182,6 +182,14 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self._init_settings_state()
         self.pending_tool: Optional[dict] = None
         self.token_meter = tokenmod.TokenMeter()
+        # 外部装配（main）：使用统计收集器与回合调度器
+        self.usage_statistics: Any = None
+        self.agent_runner: Any = None
+        # 回合末捕获的错误文本（无头 --json 消费；交互模式仅诊断）
+        self.last_turn_error: Optional[str] = None
+        # 回合内插话/后台调用捕获槽：agent 线程写、回合末读
+        self._turn_injected_users: list = []
+        self._turn_injected_background_calls: list = []
         # 流式树尾直播状态（agent 线程单写者、帧循环只读，与 app.status 同模式）：
         # streaming_msg 为 {"role","content","thinking","type":"streaming"} dict，不进 session.messages
         self.streaming_msg = None
@@ -201,9 +209,9 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         # 请求失败回滚后的重发候选（用户原话）：空闲态 Ctrl+Y 直接重发，回合成功后清除
         self.last_failed_text: Optional[str] = None
         # 主循环注册的 Esc 打断回调，返回是否已触发；None=未注册
-        self.interrupt_turn_handler = None
+        self.interrupt_turn_handler: Optional[Callable[[], bool]] = None
         # 回合中插话队列（普通 Enter 提交）：主线程入队、回合循环取走并入当前回合
-        self.inject_queue: List[str] = []
+        self.inject_queue: List[dict] = []
         self.inject_lock = threading.Lock()
         # Ctrl+Q 排队提交标记：read_line 返回后由主循环取回（排队=当前回合结束后新回合）
         self._submit_queued = False
@@ -831,7 +839,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.status = f"已回滚到回合前，原消息已回到输入框{hint}"
         self.render()
 
-    def take_injections(self) -> List[str]:
+    def take_injections(self) -> List[dict]:
         """取走并清空回合中插话队列（线程安全）：回合循环与主循环收尾共用"""
         with self.inject_lock:
             if not self.inject_queue:

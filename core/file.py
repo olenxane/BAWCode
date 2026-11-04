@@ -96,7 +96,7 @@ def _scan_dir(folder: Path, root: Path, query: str, items: List[dict], limit: in
     return following
 
 
-def scan_candidates(prefix: str = "", workspace=None, depth: int = 1, limit: int = MAX_CANDIDATES) -> dict:
+def scan_candidates(prefix: str = "", workspace=None, depth: Optional[int] = 1, limit: int = MAX_CANDIDATES) -> dict:
     """按目录层级分级扫描候选：depth=1 只扫工作区根目录，逐级下钻。
 
     返回 {"items": 候选列表, "more": 是否还有更深层目录未展开}。"""

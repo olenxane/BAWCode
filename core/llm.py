@@ -133,7 +133,7 @@ class _StreamAggregate:
         self.tool_buckets: dict = {}
         self.tool_order: list = []
         self.usage = None
-        self.error = None
+        self.error: Optional[Exception] = None
         self.finished = False
         self.produced = 0      # 已回调增量数
 
@@ -268,7 +268,7 @@ class LLM:
             try:
                 # max_retries=0：重试统一由外层 retry_times 控制（避免 SDK 默认 2 次叠加成 12 次最坏重试）；
                 # timeout 是单次请求整体超时（含流式迭代）
-                self.client = openai.OpenAI(api_key=key, base_url=base, max_retries=0, timeout=timeout)
+                self.client = openai.OpenAI(api_key=key, base_url=base, max_retries=0, timeout=timeout)  # type: ignore[union-attr]
                 self._client_provider_id = pid
                 log.debug("OpenAI 客户端已构建 provider=%s base=%s", pid, base)
             except Exception as e:
@@ -386,7 +386,8 @@ class LLM:
         for i, tc in enumerate(delta.get("tool_calls") or []):
             if isinstance(tc, dict):
                 # 流式 delta 带 index；完整响应无 index 时按位置分桶
-                agg.add_tool_delta(tc.get("index") if tc.get("index") is not None else i, tc)
+                idx = tc.get("index")
+                agg.add_tool_delta(idx if isinstance(idx, int) else i, tc)
 
     def _finish_stream(self, agg: "_StreamAggregate", exc: Optional[Exception]) -> Optional["_StreamAggregate"]:
         """保存原始异常，由 chat 统一分类和重试"""
@@ -435,7 +436,7 @@ class LLM:
     def _native_chat_stream(self, payload: dict, req: dict, on_delta) -> Optional["_StreamAggregate"]:
         """openai SDK 流式：逐 chunk 聚合并回调增量；返回 None 表示已取消"""
         agg = _StreamAggregate(on_delta)
-        resp = self.client.chat.completions.create(
+        resp = self.client.chat.completions.create(  # type: ignore[union-attr]
             **self._sdk_payload(payload, req), stream=True, stream_options={"include_usage": True}
         )
         with self._inflight_lock:
@@ -514,7 +515,8 @@ class LLM:
             if self.client is not None:
                 if on_delta is not None:
                     return self._native_chat_stream(payload, req, on_delta)
-                resp = self.client.chat.completions.create(**self._sdk_payload(payload, req))
+                client = self.client
+                resp = client.chat.completions.create(**self._sdk_payload(payload, req))
                 return resp.model_dump() if hasattr(resp, "model_dump") else resp
         if on_delta is not None:
             return self._http_chat_stream(payload, req, on_delta)
@@ -633,7 +635,9 @@ class LLM:
         req = self.resolve_request(model)
         if req.get("error"):
             return {"content": "", "tool_calls": [], "error": req["error"], "error_fatal": True}
-        advanced = req.get("advanced") if isinstance(req.get("advanced"), dict) else {}
+        advanced = req.get("advanced") or {}
+        if not isinstance(advanced, dict):
+            advanced = {}
         model_id = req.get("model_id") or req.get("model_name") or ""
         payload = {
             "model": model_id,
@@ -729,7 +733,7 @@ class LLM:
                     data = external  # 外部 hook 整段转发，保持非流式语义
                 elif streaming:
                     try:
-                        agg = self._native_chat(payload, req, on_delta=on_delta)
+                        agg: Optional["_StreamAggregate"] = self._native_chat(payload, req, on_delta=on_delta)  # type: ignore[assignment]
                     except Exception as stream_err:
                         if self._cancel.is_set():
                             return {"content": "", "tool_calls": [], "error": CANCELLED}
@@ -753,7 +757,8 @@ class LLM:
                 else:
                     data = self._native_chat(payload, req)
                 result = self._normalize(data, keep_reasoning=bool(tools))
-                usage = result.get("raw", {}).get("usage") if isinstance(result.get("raw"), dict) else None
+                raw_result = result.get("raw")
+                usage = raw_result.get("usage") if isinstance(raw_result, dict) else None
                 self.meter.record_api_usage(usage)
                 self._account_completion(result)
                 log.info(
@@ -868,7 +873,9 @@ class LLM:
         """自动模式的调用审批：只把单条命令/工具调用的简短上下文交给模型裁决，
         不带对话历史；异常、错误或含糊答复一律拒绝（fail-closed）"""
         name = str(call.get("name") or "")
-        args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        args = call.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
         context = policy.command_text(name, args)
         if not context.strip():
             context = f"{name} {json.dumps(args, ensure_ascii=False, sort_keys=True)}"
@@ -929,7 +936,7 @@ class LLM:
             # 工具执行期下发本 LLM 的取消事件：命令等待据此提前终止（子代理各持独立事件）
             proc.set_cancel(getattr(self, "_cancel", None))
             try:
-                output = register.call(name, **args)
+                output = register.call(str(name or ""), **args)
                 log.debug("工具 %s 完成，用时 %.2fs", name, time.monotonic() - started)
             except TypeError as e:
                 output = f"工具参数错误: {e}"

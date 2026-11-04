@@ -27,17 +27,19 @@ class UsageStatistics:
         return {"version": 1, "total_tokens": 0, "daily_starts": {}, "dialogs": {}, "models": {}}
 
     def _save(self) -> None:
+        temp: Optional[Path] = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temp = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
             temp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             os.replace(temp, self.path)
         except OSError:
-            # 统计不得影响主程序
-            try:
-                temp.unlink(missing_ok=True)
-            except (OSError, UnboundLocalError):
-                pass
+            # 统计不得影响主程序；临时文件可能未创建，只清残留的
+            if temp is not None:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def record_start(self, day: Optional[str] = None) -> None:
         with self._lock:

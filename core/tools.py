@@ -40,6 +40,10 @@ class CommandOutput(str):
     消息入库前另外读取真实退出码和原始输出，避免从输出中的任意数字猜测执行状态。
     """
 
+    exit_code: int | None
+    output_text: str
+    exit_status: str
+
     def __new__(cls, text: str, exit_code=None, output_text=None, exit_status="未知"):
         result = super().__new__(cls, text)
         result.exit_code = exit_code
@@ -401,7 +405,7 @@ def _execute_command_background(command: str, cwd: Optional[str], argv, stdin_te
             stderr=subprocess.STDOUT,
             env=shells.build_env(shell_name),
         )
-        if stdin_text:
+        if stdin_text and proc.stdin is not None:
             os.write(proc.stdin.fileno(), stdin_text.encode("utf-8", errors="replace"))
             proc.stdin.close()
     except OSError as e:
@@ -1599,7 +1603,7 @@ def _rg_search(
     # 达到条数上限主动停读时进程会被 kill，退出码不可作为执行失败依据
     hit_limit = False
     try:
-        for line in proc.stdout:
+        for line in proc.stdout or ():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -1697,16 +1701,11 @@ def _render_search(
             continue
         match_nums = {n for n, _t, _full in items}
         blocks = []
-        a = b = None
         for n in sorted(match_nums):
-            if a is None:
-                a = b = n
-            elif n <= b + context + 1:
-                b = max(b, n)
+            if blocks and n <= blocks[-1][1] + context + 1:
+                blocks[-1] = (blocks[-1][0], max(blocks[-1][1], n))
             else:
-                blocks.append((a, b))
-                a = b = n
-        blocks.append((a, b))
+                blocks.append((n, n))
         file_lines = _load_lines(items[0][2])
         for ba, bb in blocks:
             ba, bb = max(1, ba - context), bb + context  # 向外扩 context 行
@@ -2233,7 +2232,7 @@ def webfetch(url: str, timeout: int = 30) -> str:
     if "application/json" in ctype:
         text = content.decode("utf-8", errors="replace")
     elif "html" in ctype or "xml" in ctype or "text" in ctype or not ctype:
-        soup = BeautifulSoup(content, "lxml")
+        soup = BeautifulSoup(content, "lxml")  # type: ignore[arg-type]
         if soup.find("html") is None and b"<html" not in content[:2048].lower():
             # 非 HTML 响应如 text/plain 纯文本，按文本直出
             text = content.decode("utf-8", errors="replace")
@@ -2369,11 +2368,10 @@ def generate_steps(steps: List[str], external_handler=None) -> str:
         handler=external_handler,
         default=None,
     )
-    if isinstance(external_result, dict) and external_result.get("steps"):
-        steps = external_result["steps"]
-    else:
+    steps = external_result["steps"] if isinstance(external_result, dict) else cleaned
+    if not isinstance(steps, list):
         steps = cleaned
-    session.set_steps(steps)
+    session.set_steps(list(steps))
     if session.plan.get("status") in ("draft", "confirmed"):
         session.update_plan_status("executing")
     return json.dumps(session.steps, ensure_ascii=False)
