@@ -1,5 +1,6 @@
 # token 计算：优先读取API usage，否则用 tiktoken 真实分词
-from typing import Iterable, List, Optional
+import json
+from typing import Iterable, List, Optional, Tuple
 
 try:
     import tiktoken
@@ -47,35 +48,68 @@ def count_tokens(text: str, model: str = "") -> int:
     return len(enc.encode(text, disallowed_special=()))
 
 
+def _count_single_message(msg: dict, model: str = "") -> int:
+    """单条消息 token（OpenAI 消息结构，与 count_message_tokens 同口径）"""
+    content = msg.get("content") or ""
+    image_count = 0
+    if isinstance(content, list):
+        # 数组形态（多模态）：text 片段分词计价，图片块按常数计（无法按分辨率精确估算）
+        image_count = sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+        content = "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    elif not isinstance(content, str):
+        content = str(content)
+    total = 768 * image_count  # 单图粗略计价，与 memory._IMAGE_TOKEN_ESTIMATE 同值
+    total += 4  # 每条消息开销
+    total += count_tokens(str(msg.get("role") or ""), model)
+    total += count_tokens(content, model)
+    tool_calls = msg.get("tool_calls") or []
+    if tool_calls:
+        total += count_tokens(str(tool_calls), model)
+    return total
+
+
 def count_message_tokens(messages: Iterable[dict], model: str = "") -> int:
     """按 OpenAI 消息结构估算完整请求 token（分词真实，开销按官方近似公式）"""
     total = 0
     for msg in messages:
-        content = msg.get("content") or ""
-        image_count = 0
-        if isinstance(content, list):
-            # 数组形态（多模态）：text 片段分词计价，图片块按常数计（无法按分辨率精确估算）
-            image_count = sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
-            content = "\n".join(
-                str(part.get("text") or "")
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
-        elif not isinstance(content, str):
-            content = str(content)
-        total += 768 * image_count  # 单图粗略计价，与 memory._IMAGE_TOKEN_ESTIMATE 同值
-        total += 4  # 每条消息开销
-        total += count_tokens(str(msg.get("role") or ""), model)
-        total += count_tokens(content, model)
-        tool_calls = msg.get("tool_calls") or []
-        if tool_calls:
-            total += count_tokens(str(tool_calls), model)
-    total += 2
-    return total
+        total += _count_single_message(msg, model)
+    return total + 2
+
+
+def count_tool_defs_tokens(tools, model: str = "") -> int:
+    """工具定义 token：schema JSON 分词，tiktoken 不可用时按字符数折半"""
+    if not tools:
+        return 0
+    try:
+        text = json.dumps(tools, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return 0
+    try:
+        return count_tokens(text, model)
+    except Exception:
+        return max(1, len(text) // 2)
 
 
 class TokenMeter:
-    """LLM 实例 token 计量：优先记录 API usage，否则用分词器测量上下文"""
+    """LLM 实例 token 计量：优先记录 API usage，否则用分词器测量上下文
+
+    分类预算（breakdown）：请求预算按 system_prompt/tools/mcp/history/memory 分开记录，
+    总数仍以 API usage（缺省本地分词）为准；分项恒为本地分词估算口径，UI 只显示总数，
+    /context 命令查看分项。"""
+
+    # 分类键与展示顺序
+    BREAKDOWN_KEYS = ("system_prompt", "tools", "mcp", "history", "memory")
+    BREAKDOWN_LABELS = {
+        "system_prompt": "系统提示词",
+        "tools": "工具定义(内置)",
+        "mcp": "工具定义(MCP)",
+        "history": "会话历史",
+        "memory": "记忆/补充",
+    }
 
     def __init__(self, model: str = ""):
         self.model = model
@@ -95,6 +129,8 @@ class TokenMeter:
         # 本轮输出累计（本地分词，不依赖提供商 usage）：各轮生成 completion
         self.turn_output_tokens = 0
         self.turn_peak_context_tokens = 0
+        # 分类预算：最近一次请求各来源 token（本地分词）
+        self.breakdown: dict = {k: 0 for k in self.BREAKDOWN_KEYS}
 
     def begin_turn(self) -> None:
         """回合开始：复位本轮输出 token 累计"""
@@ -106,6 +142,7 @@ class TokenMeter:
         self.last_context_tokens = 0
         self.turn_output_tokens = 0
         self.turn_peak_context_tokens = 0
+        self.breakdown = {k: 0 for k in self.BREAKDOWN_KEYS}
         self.source = "none"
         self.last_error = ""
 
@@ -146,17 +183,68 @@ class TokenMeter:
         except (TypeError, ValueError):
             pass
 
-    def measure_context(self, messages: List[dict]) -> int:
-        """用 tiktoken 计算当前上下文 token（API 未返回 usage 时的精确来源）"""
+    def measure_context(
+        self,
+        messages: List[dict],
+        tools_grouped: Optional[tuple] = None,
+        system_parts: Optional[dict] = None,
+    ) -> int:
+        """用 tiktoken 计算当前上下文 token（API 未返回 usage 时的精确来源）
+
+        tools_grouped=(内置定义, MCP定义)：可选，分类记录工具定义分项。
+        system_parts={"core": n, "environment": n, "memory": n}：可选，系统提示词
+        内部拆分（组装方对三段分别计数），并入提示词的记忆块单列 memory 分项。
+        分项失败不影响总数。"""
         try:
             tokens = count_message_tokens(messages, self.model)
             self.last_context_tokens = tokens
             self.turn_peak_context_tokens = max(self.turn_peak_context_tokens, tokens)
             self.source = "tokenizer" if self.source != "api" else self.source
+            self._measure_breakdown(messages, tools_grouped, system_parts)
             return tokens
         except RuntimeError as e:
             self.last_error = str(e)
             return self.last_context_tokens
+
+    def _measure_breakdown(
+        self,
+        messages: List[dict],
+        tools_grouped: Optional[tuple] = None,
+        system_parts: Optional[dict] = None,
+    ) -> None:
+        """分类计量（本地分词）：首条 system=系统提示词，其余 system=记忆/补充，余下=历史"""
+        try:
+            bd: dict = {k: 0 for k in self.BREAKDOWN_KEYS}
+            for i, msg in enumerate(messages):
+                if msg.get("role") != "system":
+                    bd["history"] += _count_single_message(msg, self.model)
+                    continue
+                n = _count_single_message(msg, self.model)
+                if i == 0:
+                    mem = int((system_parts or {}).get("memory") or 0)
+                    if mem > 0:
+                        bd["system_prompt"] += max(0, n - mem)
+                        bd["memory"] += mem
+                    else:
+                        bd["system_prompt"] += n
+                else:
+                    bd["memory"] += n
+            if tools_grouped:
+                builtin, mcp = tools_grouped
+                if builtin:
+                    bd["tools"] += count_tool_defs_tokens(builtin, self.model)
+                if mcp:
+                    bd["mcp"] += count_tool_defs_tokens(mcp, self.model)
+            self.breakdown = bd
+        except Exception as e:  # 分项是辅助信息，失败只留诊断
+            self.last_error = f"breakdown: {e}"
+
+    def breakdown_rows(self) -> List[Tuple[str, int]]:
+        """分项明细（/context 展示用）：按固定顺序返回 (标签, token)"""
+        return [
+            (self.BREAKDOWN_LABELS.get(k, k), int(self.breakdown.get(k, 0) or 0))
+            for k in self.BREAKDOWN_KEYS
+        ]
 
     @property
     def context_tokens(self) -> int:

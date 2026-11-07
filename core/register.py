@@ -135,3 +135,29 @@ def get_tool_defs() -> List[dict]:
             }
         )
     return defs
+
+
+MCP_OWNER_PREFIX = "mcp:"
+
+
+def get_tool_defs_grouped() -> tuple:
+    """按来源分组导出工具定义：(内置, MCP)
+
+    MCP 工具注册时 owner="mcp:{server}"（core/mcp.py），据此拆分供分类预算计量；
+    两组合并即 get_tool_defs() 的完整集合，发送顺序不变。"""
+    builtin: List[dict] = []
+    mcp: List[dict] = []
+    for tool in list(_registry.values()):
+        defn = {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": _with_description_param(tool["schema"]),
+            },
+        }
+        if str(tool.get("owner") or "").startswith(MCP_OWNER_PREFIX):
+            mcp.append(defn)
+        else:
+            builtin.append(defn)
+    return builtin, mcp

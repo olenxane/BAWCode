@@ -295,14 +295,18 @@ class LLM:
         """
         cfg = self.config
         name = model or getattr(cfg, "model_name", None) or cfg.active_model_name()
-        rows = cfg.list_models()
-        if not any(r.get("model_name") == name for r in rows):
-            hits = [r for r in rows if r.get("model_id") == name]
-            if len(hits) > 1:
-                return {"ok": False, "model_name": name, "error": f"模型 ID 有歧义，请使用完整 model_name: {name}"}
+        #先直查；都未命中且为model_id形式时，用生成器计数判定歧义
         row = cfg.resolve_model_row(name)
         if row is None:
             row = cfg.find_model(name)
+        if row is None:
+            hits = 0
+            for provider in cfg.providers():
+                for m in provider.get("models") or []:
+                    if (m.get("model_id") or "") == name:
+                        hits += 1
+                        if hits > 1:
+                            return {"ok": False, "model_name": name, "error": f"模型 ID 有歧义，请使用完整 model_name: {name}"}
         if row is None or not row.get("api_key"):
             active_name = cfg.active_model_name()
             active_row = cfg.find_model(active_name)

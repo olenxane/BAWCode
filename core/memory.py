@@ -29,7 +29,7 @@ from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
 import threading
-from typing import Callable, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 from core import hooks
 from core import prompt_loader
@@ -1586,17 +1586,13 @@ class Memory:
         max_tokens = int(getattr(self.config, "max_tokens", 0) or 0)
         if not model:
             return window, max_tokens
-        list_models = getattr(self.config, "list_models", None)
-        if not callable(list_models):
+        # 每轮请求的预算判断走这里：万级模型下必须直查（list_models 全量展开是分配热点）
+        find_model = getattr(self.config, "find_model", None)
+        if not callable(find_model):
             return window, max_tokens
-        rows = list_models() or []
-        if not isinstance(rows, list):
-            return window, max_tokens
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if model in (row.get("model_name"), row.get("model_id")):
-                return int(row.get("context_window") or window), int(row.get("max_tokens") or max_tokens)
+        row = find_model(model)
+        if isinstance(row, dict):
+            return int(row.get("context_window") or window), int(row.get("max_tokens") or max_tokens)
         return window, max_tokens
 
     def request_budget(self, model: Optional[str] = None) -> int:
@@ -1647,25 +1643,28 @@ class Memory:
         )
         self.compress(llm_fn=llm_fn, keep_recent_tokens=keep_recent)
 
-    def build_context_supplements(self) -> List[dict]:
-        """关键词记忆（全局全量+项目索引）+ 计划/步骤（队首 system 区域）"""
-        supplements = []
-        parts = []
-        # 全局记忆：每轮全量常驻注入（每回合重建，不参与回合末剥离/压缩，不设预算）
+    def memory_prompt_variables(self) -> Dict[str, str]:
+        """系统提示词记忆占位符内容（会话初始化时读一次，之后不再刷新）
+
+        全局记忆全量注入（关键词做三级标题），项目记忆只注入关键词索引，
+        正文由模型按需 read_memory 取用。"""
         global_blocks = []
         for kw in self.list_memory_keywords("global"):
             text = (self.read_memory_file("global", kw) or "").strip()
             if text:
-                global_blocks.append(f"## {kw}\n{text}")
-        if global_blocks:
-            parts.append("[全局记忆]\n" + "\n\n".join(global_blocks))
-        # 项目记忆：只注入关键词索引，正文按需 read_memory（结果入工具白名单不被剥离）
+                global_blocks.append(f"### {kw}\n{text}")
+        global_text = "\n\n".join(global_blocks) if global_blocks else "（暂无全局记忆）"
         project_keywords = self.list_memory_keywords("project")
-        if project_keywords:
-            parts.append(
-                "[项目记忆索引] " + "、".join(project_keywords)
-                + "\n（正文不自动注入；需要时用 read_memory 工具按关键词读取）"
-            )
+        index_text = "、".join(project_keywords) if project_keywords else "（暂无项目记忆）"
+        return {"global_memory": global_text, "project_memory_index": index_text}
+
+    def build_context_supplements(self) -> List[dict]:
+        """计划/步骤 + 技能清单 + 插件补充（队首 system 区域）
+
+        记忆块已并入系统提示词环境段（会话初始化时注入后固定），不再在此重建；
+        计划/步骤仍随回合动态刷新，技能清单与插件补充（RAG 主动召回）每回合重建。"""
+        supplements = []
+        parts = []
         if self.plan.get("status") not in ("empty", ""):
             parts.append(
                 f"当前计划[{self.plan.get('status')}]: {self.plan.get('title')}\n{self.plan.get('content')}"
@@ -1795,18 +1794,9 @@ class Memory:
     @staticmethod
     def _tool_defs_tokens(tools, model: Optional[str] = None) -> int:
         """工具定义 token：schema 作为请求的一部分计入预算"""
-        if not tools:
-            return 0
         from core import tokens as tokenmod
 
-        try:
-            text = json.dumps(tools, ensure_ascii=False)
-        except (TypeError, ValueError):
-            return 0
-        try:
-            return tokenmod.count_tokens(text, model or "")
-        except Exception:
-            return max(1, len(text) // 2)
+        return tokenmod.count_tool_defs_tokens(tools, model or "")
 
     @staticmethod
     def _drop_orphan_tools(messages: List[dict]) -> List[dict]:
@@ -1840,6 +1830,12 @@ class Memory:
             if mapped:
                 messages.append(mapped)
         return messages
+
+    def assemble_payload(self, extra_system: Optional[str] = None) -> List[dict]:
+        """无副作用出站组装：不触发维护/压缩/剥离判断，供回合管线完成后计量刷新
+
+        与 build_messages 不同，本方法只读当前状态组包，绝不改写会话。"""
+        return self._assemble_messages(extra_system)
 
     def build_messages(
         self,
@@ -1957,6 +1953,7 @@ class Memory:
         toolstore.ledger_reset()  # 台账不跨会话：resume 后首次 edit 需重新 read（安全优先）
         if callable(self._context_reset):
             self._context_reset()
+        self._reset_system_prompt_cache()
         self.ensure_memory_notice()
         self._dirty = True  # 换入的内容尚未以当前 id 落盘
         log.info("会话已切换: %s · id=%s · %d条消息", self.session_title, self.session_id, len(self.messages))
@@ -1975,12 +1972,19 @@ class Memory:
         toolstore.ledger_reset()
         if callable(self._context_reset):
             self._context_reset()
+        self._reset_system_prompt_cache()
         self.ensure_memory_notice()
         log.info("已开启新会话: %s", self.session_id)
 
     def set_context_reset(self, callback) -> None:
         """绑定宿主当前上下文计量重置回调。"""
         self._context_reset = callback
+
+    def _reset_system_prompt_cache(self) -> None:
+        """清空系统提示词会话缓存：记忆在会话初始化时读入并固定，
+        切换/新建/清空会话视为重新初始化，下回合重新生成并读入最新记忆"""
+        self.system_prompt_cache = {}
+        self.system_prompt_parts_cache = {}
 
     def clear(self) -> dict:
         """清空当前会话内容并清理会话级衍生存储，保留 ID 与创建时间。"""
@@ -1995,6 +1999,7 @@ class Memory:
         self._dirty = True
         if callable(self._context_reset):
             self._context_reset()
+        self._reset_system_prompt_cache()
         self.ensure_memory_notice()
         saved = self.save_session()
         result["revision"] = self.revision

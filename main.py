@@ -183,11 +183,21 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
     def _model(ctx, args):
         name = (args or "").strip()
         if not name:
-            rows = ctx["config"].list_models()
-            lines = ["模型列表 (model_name = provider_id-model_id):"]
-            for row in rows:
+            # 迭代原始结构取前80行+总数计数，全量展开会爆炸
+            config = ctx["config"]
+            total = 0
+            shown = []
+            for provider in config.providers():
+                for model in provider.get("models") or []:
+                    total += 1
+                    if len(shown) < 80:
+                        shown.append(config._model_row(provider, model))
+            lines = [f"模型列表 (model_name = provider_id-model_id，共 {total} 个，Tab 补全或 /model <名称>)："]
+            for row in shown:
                 mark = " *" if row["is_active"] else ""
                 lines.append(f"  {row['model_name']}{mark}")
+            if total > len(shown):
+                lines.append(f"  …（其余 {total - len(shown)} 个省略，请用 Tab 补全选择）")
             _echo(ctx, "\n".join(lines))
             return True
         row = ctx["config"].switch_model(name)
@@ -510,6 +520,27 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
         amount = ctx["llm"].query_balance()
         ctx["app"].token_meter = ctx["llm"].meter
         ctx["app"].status = "余额可用" if amount is not None else "当前接口未提供余额"
+        return True
+
+    @commands.register("/context", hint="上下文构成 · 分类预算分项", source="builtin")
+    def _context(ctx, args):
+        meter = ctx["llm"].meter
+        rows = meter.breakdown_rows()
+        total = sum(n for _, n in rows)
+        window = int(getattr(meter, "context_window", 0) or 0)
+        lines = ["上下文分类预算:"]
+        if total <= 0:
+            lines.append("  （尚无计量数据，发送一条消息后生成）")
+        for label, n in rows:
+            pct = f" {n * 100 / total:.1f}%" if total > 0 else ""
+            bar = "█" * max(1, int(n * 20 / total)) if n and total > 0 else ""
+            lines.append(f"  {label:<12} {n:>8}{pct:<7} {bar}")
+        if total > 0:
+            lines.append(f"  {'合计':<12} {total:>8}")
+        if window > 0 and total > 0:
+            lines.append(f"  窗口占用: {total}/{window} ({total * 100 / window:.1f}%)")
+        _echo(ctx, "\n".join(lines), mtype="help")
+        ctx["app"].token_meter = meter
         return True
 
     @commands.register("/commands", hint="命令系统", source="builtin")

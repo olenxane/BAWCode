@@ -624,34 +624,36 @@ class Config:
         mid = self.data.get("active_model_id") or ""
         return make_model_name(pid, mid)
 
+    def _model_row(self, provider: dict, model: dict) -> dict:
+        """单个模型展开行"""
+        pid = provider.get("provider_id") or ""
+        mid = model.get("model_id") or ""
+        return {
+            "provider_id": pid,
+            "model_id": mid,
+            "model_name": make_model_name(pid, mid),
+            "context_window": model.get("context_window", 0),
+            "max_tokens": model.get("max_tokens", 0),
+            "temperature": model.get("temperature", provider.get("temperature", 1.0)),
+            "modalities": list(model.get("modalities") or ["text"]),
+            "thinking_effort": model.get("thinking_effort", "none"),
+            "thinking_effort_explicit": bool(model.get("thinking_effort_explicit", False)),
+            "base_url": normalize_base_url(provider.get("base_url", "")),
+            "api_key": provider.get("api_key", ""),
+            "balance_url": provider.get("balance_url", ""),
+            "is_active": (
+                pid == self.data.get("active_provider_id")
+                and mid == self.data.get("active_model_id")
+            ),
+        }
+
     def list_models(self) -> List[dict]:
-        """展开全部模型项：含 model_name 与模型参数"""
-        rows = []
-        for provider in self.providers():
-            pid = provider.get("provider_id") or ""
-            for model in provider.get("models") or []:
-                mid = model.get("model_id") or ""
-                rows.append(
-                    {
-                        "provider_id": pid,
-                        "model_id": mid,
-                        "model_name": make_model_name(pid, mid),
-                        "context_window": model.get("context_window", 0),
-                        "max_tokens": model.get("max_tokens", 0),
-                        "temperature": model.get("temperature", provider.get("temperature", 1.0)),
-                        "modalities": list(model.get("modalities") or ["text"]),
-                        "thinking_effort": model.get("thinking_effort", "none"),
-                        "thinking_effort_explicit": bool(model.get("thinking_effort_explicit", False)),
-                        "base_url": normalize_base_url(provider.get("base_url", "")),
-                        "api_key": provider.get("api_key", ""),
-                        "balance_url": provider.get("balance_url", ""),
-                        "is_active": (
-                            pid == self.data.get("active_provider_id")
-                            and mid == self.data.get("active_model_id")
-                        ),
-                    }
-                )
-        return rows
+        """展开全部模型项：含 model_name 与模型参数（低频场景用——面板/导出/远控；高频查找走 find_model/match_models 直查原始结构，尽可能避免全量展开）"""
+        return [
+            self._model_row(provider, model)
+            for provider in self.providers()
+            for model in (provider.get("models") or [])
+        ]
 
     def resolve_model_row(self, model_name: str) -> Optional[dict]:
         """解析 model_name；不存在或所属 provider 无 api_key 时返回 None"""
@@ -991,16 +993,27 @@ class Config:
         text = (name or "").strip()
         if not text:
             return None
-        rows = self.list_models()
-        for row in rows:
-            if row["model_name"] == text:
-                return row
-        hits = [r for r in rows if r["model_id"] == text]
-        if len(hits) == 1:
-            return hits[0]
-        if len(hits) > 1:
-            log.warn("模型 ID 有歧义，请使用完整 model_name: %s", text)
-        return None
+        exact = None
+        by_id: List[tuple] = []
+        for provider in self.providers():
+            pid = provider.get("provider_id") or ""
+            for model in provider.get("models") or []:
+                mid = model.get("model_id") or ""
+                if exact is None and make_model_name(pid, mid) == text:
+                    exact = (provider, model)
+                elif mid == text:
+                    by_id.append((provider, model))
+            if exact is not None:
+                break
+        if exact is None:
+            if len(by_id) == 1:
+                exact = by_id[0]
+            elif len(by_id) > 1:
+                log.warn("模型 ID 有歧义，请使用完整 model_name: %s", text)
+                return None
+        if exact is None:
+            return None
+        return self._model_row(exact[0], exact[1])
 
     def switch_model(self, name: str) -> Optional[dict]:
         row = self.find_model(name)
@@ -1017,16 +1030,22 @@ class Config:
         """补全：先 model_name，再 model_id/provider_id；model_name 结果在上"""
         prefix = (prefix or "").strip().lower()
         name_hits, other_hits = [], []
-        for row in self.list_models():
-            model_name = row["model_name"].lower()
-            model_id = row["model_id"].lower()
-            provider_id = row["provider_id"].lower()
-            if prefix and model_name.startswith(prefix):
-                name_hits.append(row)
-            elif prefix and (model_id.startswith(prefix) or provider_id.startswith(prefix) or prefix in model_name):
-                other_hits.append(row)
-            elif not prefix:
-                other_hits.append(row)
+        for provider in self.providers():
+            pid_raw = provider.get("provider_id") or ""
+            pid = pid_raw.lower()
+            for model in provider.get("models") or []:
+                mid_raw = model.get("model_id") or ""
+                full = make_model_name(pid_raw, mid_raw).lower()
+                if prefix and full.startswith(prefix):
+                    bucket = name_hits
+                elif prefix and (mid_raw.lower().startswith(prefix) or pid.startswith(prefix) or prefix in full):
+                    bucket = other_hits
+                elif not prefix:
+                    bucket = other_hits
+                else:
+                    continue
+                row = self._model_row(provider, model)
+                bucket.append(row)
         name_hits.sort(key=lambda r: (len(r["model_name"]), r["model_name"]))
         other_hits.sort(key=lambda r: (len(r["model_name"]), r["model_name"]))
         return (name_hits + other_hits)[:limit]

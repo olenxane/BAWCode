@@ -359,6 +359,18 @@ def _summon_fingerprint(session, scope: str) -> str:
     return digest.hexdigest()
 
 
+def _memory_prompt_vars(session) -> Dict[str, str]:
+    """系统提示词记忆占位符内容：会话有记忆库时取真值，否则走 prompt_loader 缺省"""
+    fn = getattr(session, "memory_prompt_variables", None)
+    try:
+        raw = fn() if callable(fn) else None
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()}
+
+
 def _recent_summon_result(fingerprint: str) -> Optional[Dict]:
     """取短时间内已完成的同请求结果；顺带清理过期项"""
     now = time.monotonic()
@@ -413,7 +425,10 @@ def summon(session, llm, config, scope: str = "global", system_prompt: Optional[
                 for node in workflow_data.get("nodes") or []:
                     if node.get("enabled", True) and node.get("type") == "system_prompt":
                         system_files = node.get("files") or ["system_prompt.md"]
-            system_prompt = prompt_loader.get_system_prompt(config=config, files=system_files)
+            system_prompt = prompt_loader.get_system_prompt(
+                config=config, files=system_files,
+                extra_variables=_memory_prompt_vars(session),
+            )
         messages = session.build_messages(extra_system=system_prompt)
         messages.append({"role": "user", "content": prompt_loader.get_skill_prompt(config=config)})
         result = llm.chat(messages)

@@ -23,7 +23,7 @@ from core import prompt_loader
 from core import register
 from core import snapshot as snapshot_mod
 from core import subagent as subagent_mod
-from core.llm import CANCELLED, get_system_prompt
+from core.llm import CANCELLED
 from core.log import get_logger
 from core.tools import SpinGuard
 
@@ -76,6 +76,7 @@ class TurnContext:
         self.user_text = user_text
         self.io = io
         self.system_prompt_text = ""
+        self.system_prompt_parts: Optional[Dict[str, int]] = None
         self.captured: Dict[str, Any] = {}
         self._last_autosave = time.monotonic()
 
@@ -113,9 +114,53 @@ def drain_injections(turn: TurnContext) -> int:
 
 
 def ensure_system_prompt(turn: TurnContext, files=None) -> None:
-    """注入系统提示词：写入 turn.system_prompt_text，会话无 system_prompt 记录时补一条"""
-    # get_system_prompt 内部已带兜底回落，不会向外抛错
-    turn.system_prompt_text = get_system_prompt(config=turn.config, files=files)
+    """注入系统提示词：写入 turn.system_prompt_text，会话无 system_prompt 记录时补一条两段式（core + environment 目录动态拼装 + 记忆占位符），会话首次生成后按 files
+    缓存于 session——记忆在会话初始化时读入并固定，本会话后续回合不再重读/刷新；新会话随新 session 对象自然重建。"""
+    cache_key = tuple(files or [])
+    cache = getattr(turn.session, "system_prompt_cache", None)
+    parts_cache = getattr(turn.session, "system_prompt_parts_cache", None)
+    if isinstance(cache, dict) and cache_key in cache:
+        turn.system_prompt_text = cache[cache_key]
+        turn.system_prompt_parts = (parts_cache or {}).get(cache_key)
+        log.debug("系统提示词命中会话缓存: %s", cache_key or ("default",))
+    else:
+        extra_vars: Dict[str, str] = {}
+        mem_vars_fn = getattr(turn.session, "memory_prompt_variables", None)
+        if callable(mem_vars_fn):
+            try:
+                mem_vars = mem_vars_fn()
+                if isinstance(mem_vars, dict):
+                    extra_vars.update(mem_vars)
+                else:
+                    log.debug("记忆占位符类型异常（非 dict），忽略: %r", type(mem_vars))
+            except Exception as e:
+                log.debug("记忆占位符构建失败（空占位兜底）: %s", e)
+        variables = prompt_loader.build_variable_context(config=turn.config, extra=extra_vars)
+        parts = prompt_loader.get_system_prompt_parts(
+            config=turn.config, files=files, variables=variables
+        )
+        turn.system_prompt_text = "\n\n".join(p for p in parts.values() if p)
+        # 记忆段单独计量：分类预算里从系统提示词拆出 memory 分项
+        mem_tokens = 0
+        try:
+            mem_text = prompt_loader.load_environment_sections(
+                variables, config=turn.config, files=["memory.md"]
+            )
+            mem_tokens = turn.llm.meter.count_text(mem_text)
+        except Exception as e:
+            log.debug("记忆段计量失败（并入系统提示词计）: %s", e)
+        turn.system_prompt_parts = {"memory": mem_tokens}
+        if not isinstance(cache, dict):
+            cache, parts_cache = {}, {}
+            turn.session.system_prompt_cache = cache
+            turn.session.system_prompt_parts_cache = parts_cache
+        cache[cache_key] = turn.system_prompt_text
+        if isinstance(parts_cache, dict):
+            parts_cache[cache_key] = turn.system_prompt_parts
+        log.info(
+            "生成系统提示词: %s（core+environment 两段式，记忆已并入并固定）",
+            ", ".join(files or prompt_loader.system_prompt_files(turn.config)),
+        )
     if not any(m.get("type") == "system_prompt" for m in turn.session.messages):
         names = files or list(prompt_loader.system_prompt_files(turn.config))
         turn.session.add_message(
@@ -126,6 +171,22 @@ def ensure_system_prompt(turn: TurnContext, files=None) -> None:
         )
         log.info("注入系统提示词: %s", ", ".join(names or ["system_prompt.md"]))
         turn.io.status("注入系统提示词")
+
+
+def _remeasure(turn: TurnContext) -> None:
+    """回合管线完成点补计量：无副作用重组包后分类计量，刷新 UI/远控的上下文数字
+
+    每轮工具结果入库后与回合收尾（剥离/外置/压缩）后各调一次——空闲时数字反映
+    管线处理后的最新上下文，而不是停留在最后一次请求前。失败静默（辅助信息）。"""
+    try:
+        msgs = turn.session.assemble_payload(turn.system_prompt_text or None)
+        turn.llm.meter.measure_context(
+            msgs,
+            tools_grouped=register.get_tool_defs_grouped(),
+            system_parts=turn.system_prompt_parts,
+        )
+    except Exception as e:
+        log.debug("管线后计量刷新失败: %s", e)
 
 
 def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, model: Optional[str]) -> dict:
@@ -194,9 +255,14 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             io.phase("思考中")
             drain_injections(turn)  # 回合中插话：并入本回合，下一轮模型即看到
             _autosave_tick()
-            tool_defs = register.get_tool_defs()
+            builtin_defs, mcp_defs = register.get_tool_defs_grouped()
+            tool_defs = builtin_defs + mcp_defs
             payload = session.build_messages(extra_system=extra_system, tools=tool_defs, model=model)
-            llm.meter.measure_context(payload)
+            llm.meter.measure_context(
+                payload,
+                tools_grouped=(builtin_defs, mcp_defs),
+                system_parts=turn.system_prompt_parts,
+            )
             response = llm.chat(payload, tools=tool_defs, model=model, on_delta=io.on_delta)
             io.clear_stream()  # 树尾直播收口：正式消息按现有路径入库
             if turn.app is not None:
@@ -254,6 +320,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 if callable(finalize):
                     finalize()
                 session.maybe_compress(llm_fn=memory_mod.summary_llm_fn(llm))
+            _remeasure(turn)  # 回合收尾（剥离/外置/压缩）后刷新上下文数字
             io.status("就绪")
             return {"status": "complete", "content": content}
 
@@ -329,11 +396,12 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             for call in tool_calls[registered:]:
                 session.add_tool_result(call, "[回合中断，该调用未获得结果]")
 
-        # 空转计数：本轮结果喂入计数器（重复才计，整轮全新清零）
+        # 空转计数：本轮结果喂入计数器
         spin.feed(round_results)
 
         if turn.app is not None:
             turn.app.token_meter = llm.meter
+        _remeasure(turn)  # 每轮管线完成后刷新上下文数字
         io.status("继续")
     # while 循环不可达出口：轮次终止统一在循环内 max_rounds 分支返回
 

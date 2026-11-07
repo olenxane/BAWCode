@@ -54,6 +54,27 @@ def system_prompt_files(config=None) -> List[str]:
     return _prompt_files(config, "system_files", ["system_prompt.md"])
 
 
+def environment_dir(config=None) -> Path:
+    """环境段目录：config.prompt.environment_dir，缺省 core/prompts/environment"""
+    if config is not None:
+        rel = ((config.data or {}).get("prompt") or {}).get("environment_dir") or "core/prompts/environment"
+        p = Path(rel)
+        return p if p.is_absolute() else _ROOT / rel
+    return DEFAULT_PROMPT_DIR / "environment"
+
+
+def environment_files(config=None) -> List[str]:
+    """环境段文件清单：config.prompt.environment_files 显式指定；缺省扫描目录 *.md 按名排序"""
+    if config is not None:
+        files = ((config.data or {}).get("prompt") or {}).get("environment_files")
+        if files is not None:
+            return [str(f) for f in files]
+    base = environment_dir(config)
+    if not base.is_dir():
+        return []
+    return sorted(p.name for p in base.glob("*.md"))
+
+
 def plan_prompt_files(config=None) -> List[str]:
     return _prompt_files(config, "plan_files", ["plan.md"])
 
@@ -200,6 +221,10 @@ def build_variable_context(
         "project_memory_path": str(project_md),
         "project_identity_path": str(ws / ".bawcode" / "identity.json"),
         "project_memory_exists": "true" if project_md.exists() else "false",
+        # 记忆内容占位符（环境段 memory.md 用）：由会话初始化时经 extra_variables 注入，
+        # 缺省占位文本避免"未知占位符"警告
+        "global_memory": "（暂无全局记忆）",
+        "project_memory_index": "（暂无项目记忆）",
         "user_codename": user_codename,
         "plan_title": "",
         "plan_complexity": "",
@@ -273,31 +298,137 @@ def join_segments(segments: List[PromptSegment]) -> str:
     return "\n\n".join(parts)
 
 
+_SECTION_TITLE_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+
+
+_FENCE_RE = re.compile(r"^```", re.MULTILINE)
+
+
+def _split_outside_fences(text: str) -> List[tuple]:
+    """按 ``` 围栏切分文本，返回围栏外 (偏移, 片段) 列表（围栏内的 # 行不作标题、不删改）"""
+    parts: List[tuple] = []
+    in_fence = False
+    start = 0
+    for m in _FENCE_RE.finditer(text):
+        if not in_fence:
+            parts.append((start, text[start:m.start()]))
+        else:
+            start = m.end()
+        in_fence = not in_fence
+    if not in_fence:
+        parts.append((start, text[start:]))
+    return parts
+
+
+def _extract_first_heading(text: str) -> tuple:
+    """提取围栏外首个一级标题，返回 (标题, 删去标题行后的全文)；无标题返回 ("", 原文)"""
+    for offset, part in _split_outside_fences(text):
+        m = _SECTION_TITLE_RE.search(part)
+        if not m:
+            continue
+        line = m.group(0)
+        idx = offset + m.start()
+        return m.group(1).strip(), (text[:idx] + text[idx + len(line):]).strip()
+    return "", text
+
+
+def load_environment_sections(
+    variables: Optional[Dict[str, Any]] = None,
+    config=None,
+    files: Optional[List[str]] = None,
+) -> str:
+    """加载环境段目录：每个 md 文件渲染后以其中首个一级标题转为 "## 标题" 拼接
+
+    文件无一级标题时用文件名（去扩展名）作标题；标题匹配跳过 ``` 代码围栏区间。
+    动态加载：目录下全部 *.md 按文件名排序；config.prompt.environment_files 可
+    显式指定清单，空列表=关闭环境段（get_system_prompt_parts 不再兜底）。
+    目录缺失/无文件返回空串。"""
+    if variables is None:
+        variables = build_variable_context()
+    names = files if files is not None else environment_files(config)
+    base = environment_dir(config)
+    blocks: List[str] = []
+    for name in names:
+        path = Path(name)
+        if not path.is_absolute():
+            path = base / name
+        seg = load_prompt_file(path, variables)
+        if seg is None:
+            continue
+        text = seg.content_rendered.strip()
+        title, body = _extract_first_heading(text)
+        if not title:
+            title = path.stem
+        if not body:
+            continue
+        blocks.append(f"## {title}\n\n{body}")
+    if not blocks:
+        return ""
+    return "# 运行环境\n\n" + "\n\n".join(blocks)
+
+
+def _fallback_environment(variables: Dict[str, Any]) -> str:
+    """环境段兜底：目录缺失/为空时以代码拼装最小环境信息"""
+    get = lambda k: str(variables.get(k) or "")  # noqa: E731
+    git = f"- Git 分支：{get('git_branch')}\n" if get("git_branch") else ""
+    return (
+        "# 运行环境\n\n"
+        "## 工作区\n"
+        f"- 当前工作目录：{get('cwd')}（文件操作的相对路径均基于此目录）\n"
+        f"{git}"
+        "\n## 运行时\n"
+        f"- 操作系统：{get('os_name')} {get('os_release')}（{get('cpu_arch')}）\n"
+        f"- Shell：{get('shell_hint')}\n"
+        f"- 日期：{get('current_date')}\n"
+    )
+
+
+def get_system_prompt_parts(
+    config=None,
+    files: Optional[List[str]] = None,
+    extra_variables: Optional[Dict[str, Any]] = None,
+    variables: Optional[Dict[str, Any]] = None,
+    **ctx_kwargs,
+) -> Dict[str, str]:
+    """两段式系统提示词：core（用户可替换）+ environment（动态拼装），分段返回
+
+    组装方对分段分别计量（分类预算）；get_system_prompt 返回拼接结果。
+    variables 可传入已构建的变量表（调用方需同时用记忆占位符时避免二次构建）。"""
+    variables = variables or build_variable_context(config=config, extra=extra_variables, **ctx_kwargs)
+    core_segs = load_prompt_bundle(files or system_prompt_files(config), variables, config=config)
+    core = join_segments(core_segs) if core_segs else ""
+    # 显式 environment_files=[] 表示用户关闭环境段：不加载也不兜底；
+    # 其余空结果（目录缺失/无文件）才回落 _fallback_environment
+    env_cfg = ((getattr(config, "data", None) or {}).get("prompt") or {}) if config is not None else {}
+    env_disabled = env_cfg.get("environment_files", None) == []
+    environment = "" if env_disabled else load_environment_sections(variables, config=config)
+    if not environment and not env_disabled:
+        environment = _fallback_environment(variables)
+    if not core:
+        log.warn("核心提示词文件均为空/缺失，使用内置兜底")
+        core = (
+            f"你是 {variables.get('harness_name', 'BAWCode')} 编码 Agent。"
+            f"工作区：{variables.get('workspace_path', '')}。"
+            "复杂任务先规划再执行。回复使用简洁中文。"
+        )
+    # cwd 保底注入：环境段（自定义目录/清单）未包含工作目录且核心模板未引用时，
+    # 防模型自造绝对路径把文件写到工作区之外；内置环境段与兜底均已含 cwd，不重复
+    ws = str(variables.get("workspace_path") or "")
+    referenced = any("workspace_path" in s.content_raw or "^{cwd}^" in s.content_raw for s in core_segs)
+    if ws and not referenced and (ws not in environment):
+        core += f"\n\n当前工作目录：{ws}。文件操作的相对路径均基于此目录。"
+    return {"core": core.strip(), "environment": environment.strip()}
+
+
 def get_system_prompt(
     config=None,
     files: Optional[List[str]] = None,
     extra_variables: Optional[Dict[str, Any]] = None,
     **ctx_kwargs,
 ) -> str:
-    """供 llm/main/workflow 使用：渲染系统提示词（多文件拼接）
-
-    files 显式传入时覆盖 config.prompt.system_files（工作流 system_prompt 节点用）。
-    """
-    variables = build_variable_context(config=config, extra=extra_variables, **ctx_kwargs)
-    segs = load_prompt_bundle(files or system_prompt_files(config), variables, config=config)
-    if not segs:
-        log.warn("系统提示词文件均为空/缺失，使用内置兜底")
-        return (
-            f"你是 {variables.get('harness_name', 'BAWCode')} 编码 Agent。"
-            f"工作区：{variables.get('workspace_path', '')}。"
-            "复杂任务先规划再执行。回复使用简洁中文。"
-        )
-    out = join_segments(segs)
-    # cwd 注入：模板未引用 workspace_path，缺它会自造绝对路径把文件写到工作区之外
-    ws = str(variables.get("workspace_path") or "")
-    if ws:
-        out += f"\n\n当前工作目录：{ws}。文件操作的相对路径均基于此目录。"
-    return out
+    """供 llm/main/workflow 使用：两段式系统提示词（core + environment 拼接）"""
+    parts = get_system_prompt_parts(config=config, files=files, extra_variables=extra_variables, **ctx_kwargs)
+    return "\n\n".join(p for p in parts.values() if p)
 
 
 def get_plan_prompt(
