@@ -155,6 +155,16 @@ def default_config() -> dict:
             "strip_digest_chars": 200,
             # 激进模式下每个文件最多保留多少个不同读取范围的记录（同范围只保留最新一次）
             "aggressive_keep_reads_per_file": 3,
+            # 全会话最多保留几张图片读取原图（两种模式、回合中/回合末均生效；0=不保护，超龄即剥）
+            "keep_recent_images": 3,
+            # 工具结果被剥离时，同步把对应调用参数里的大段字符串（write.content 等）换成占位；0=关闭
+            "strip_call_args_min_chars": 512,
+            # 读图前把长边缩到该像素（需 Pillow，缺失则原样发送）；0=不缩放
+            "image_max_edge": 1568,
+            # 单张图片的 token 估算（影响压缩触发与白名单预算，宁高勿低）
+            "image_token_estimate": 1600,
+            # 完整请求超压缩阈值时，压缩前先驱逐受保护的大消息（最近一个工具轮除外）
+            "evict_protected_overflow": True,
         },
         #技能加载系统（core/skills.py + tools.load_skill），参考了helloAgent和qwen code的实现
         "skills": {

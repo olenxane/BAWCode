@@ -13,6 +13,9 @@ except ImportError:
 # model → encoding 名称
 _FALLBACK_ENCODING = "cl100k_base"
 
+# 单张图片的 token 估算；Memory 初始化/维护时按 context.image_token_estimate 同步
+IMAGE_TOKEN_ESTIMATE = 1600
+
 
 def _encoding_for_model(model: str):
     if not HAS_TIKTOKEN or tiktoken is None:
@@ -62,7 +65,7 @@ def _count_single_message(msg: dict, model: str = "") -> int:
         )
     elif not isinstance(content, str):
         content = str(content)
-    total = 768 * image_count  # 单图粗略计价，与 memory._IMAGE_TOKEN_ESTIMATE 同值
+    total = IMAGE_TOKEN_ESTIMATE * image_count  # 单图粗略计价，无法按分辨率精确估算
     total += 4  # 每条消息开销
     total += count_tokens(str(msg.get("role") or ""), model)
     total += count_tokens(content, model)

@@ -724,18 +724,23 @@ def _bridge_line(app, prompt: str, config, cancelled=None):
 
 
 def _launch_workflow_editor(ctx, name: str = "") -> None:
-    """子进程拉起 PySide6 工作流编辑器（独立事件循环，不阻塞 TUI）"""
-    import PySide6#此处不进行错误处理，pyside6作为必须依赖库不会发生不存在的情况，不要过度防御
+    """子进程拉起 WebUI 工作流编辑器（本地 HTTP 服务 + 自动打开浏览器，不阻塞 TUI）"""
+    import socket
     import subprocess
 
     kwargs = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    # 主进程预探测空闲端口传给子进程（存在竞态，子进程被占时自动回落系统分配）
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
     cmd = [sys.executable, "-m", "gui.workflow_editor"]
     if name:
         cmd.append(name)
+    cmd += ["--port", str(port)]
     subprocess.Popen(cmd, cwd=str(_ROOT), **kwargs)
-    _echo(ctx, f"工作流编辑器已启动: {name or '（新工作流）'}")
+    _echo(ctx, f"工作流编辑器已在浏览器打开: {name or '（新工作流）'}（未弹出可手动运行 python -m gui.workflow_editor）")
 
 
 def _headless_task_wait_seconds(config) -> float:
@@ -1812,10 +1817,12 @@ def main_headless(args) -> int:
     return 0 if ok else 1
 
 
-def main() -> None:
+def main(args=None) -> None:
     #开启windowsVT以便捕获输入事件
     ui._enable_windows_ansi()
-    config = Config()
+    if args is not None and args.cd:
+        os.chdir(args.cd)  # 与无头模式一致：--cd 须先于项目身份/插件/会话初始化生效
+    config = Config(config_path=args.config) if args is not None and args.config else Config()
     if config.load_error:
         print(f"[配置] {config.load_error}", file=sys.stderr)
     identity = project_identity.ensure_project_identity(Path.cwd())
@@ -1928,7 +1935,7 @@ def cli() -> None:
     args = _parse_args()
     if args.prompt is not None:
         sys.exit(main_headless(args))
-    main()
+    main(args)
 
 
 if __name__ == "__main__":

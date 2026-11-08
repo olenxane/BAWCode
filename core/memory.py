@@ -34,6 +34,7 @@ from typing import Callable, Dict, List, Optional, Union
 from core import hooks
 from core import prompt_loader
 from core import session_store
+from core import tokens as tokenmod
 from core import toolstore
 from core.log import get_logger
 from wcwidth import wcwidth as _char_width
@@ -57,8 +58,9 @@ _IMAGE_MIME = {
     ".bmp": "image/bmp",
 }
 _IMAGE_MAX_BYTES = 4 * 1024 * 1024  # 单图原始字节上限（base64 后约 5.4MB，兼容主流网关请求体限制）
+_IMAGE_DECODE_LIMIT = 32 * 1024 * 1024  # 允许尝试缩放的原图字节上限，超过直接拒绝
 _IMAGE_MAX_COUNT = 4                # 单条工具结果最多携带图片数
-_IMAGE_TOKEN_ESTIMATE = 768
+_IMAGE_MAX_EDGE = 1568              # 读图缩放长边像素（context.image_max_edge 覆盖；0=不缩放）
 
 
 def content_text(content) -> str:
@@ -81,11 +83,38 @@ def count_image_parts(content) -> int:
     return 0
 
 
-def build_image_parts(paths) -> tuple:
+def _shrink_image(raw: bytes, suffix: str, max_edge: int) -> bytes:
+    """长边超过 max_edge 时等比缩小并按原格式重编码；无 Pillow/动图/解码失败/没变小都原样返回"""
+    if max_edge <= 0 or suffix not in (".png", ".jpg", ".jpeg", ".webp"):
+        return raw
+    try:
+        import io
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as img:
+            if max(img.size) <= max_edge:
+                return raw
+            scale = max_edge / max(img.size)
+            small = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            if suffix in (".jpg", ".jpeg"):
+                small.convert("RGB").save(buffer, "JPEG", quality=88)
+            else:
+                small.save(buffer, "PNG" if suffix == ".png" else "WEBP")
+        # 缩放的目的是降分辨率（视觉 token 随像素走），不是省字节：平滑渐变类 PNG 重编码后
+        # 可能比原文件还大，仍然采用；体积上限由调用方（_IMAGE_MAX_BYTES）兜底
+        return buffer.getvalue()
+    except Exception:
+        return raw
+
+
+def build_image_parts(paths, max_edge: Optional[int] = None) -> tuple:
     """本地图片路径列表 → API 图片块（data URL base64）；越界/缺失/超限项降级为文字说明。
+    max_edge 为读图缩放长边像素（None 取模块默认，0=不缩放）。
     返回 (parts, notes)：parts 追加在 text 块之后，notes 由调用方并入正文说明"""
     import base64
 
+    max_edge = _IMAGE_MAX_EDGE if max_edge is None else max_edge
     parts, notes = [], []
     path_list = [str(p) for p in (paths or []) if p]
     if len(path_list) > _IMAGE_MAX_COUNT:
@@ -98,11 +127,15 @@ def build_image_parts(paths) -> tuple:
             notes.append(f"{path.name}: 不支持的图片格式（{suffix or '无后缀'}）")
             continue
         try:
-            size = path.stat().st_size
-            if size > _IMAGE_MAX_BYTES:
+            # 先缩放再判上限：超大截图缩小后常能落进上限；原图过大（>32MB）仍直接拒绝，免得整张解码吃内存
+            if path.stat().st_size > _IMAGE_DECODE_LIMIT:
+                notes.append(f"{path.name}: 超过单图 {_IMAGE_DECODE_LIMIT // (1024 * 1024)}MB 上限")
+                continue
+            raw = _shrink_image(path.read_bytes(), suffix, max_edge)
+            if len(raw) > _IMAGE_MAX_BYTES:
                 notes.append(f"{path.name}: 超过单图 {_IMAGE_MAX_BYTES // (1024 * 1024)}MB 上限")
                 continue
-            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            data = base64.b64encode(raw).decode("ascii")
         except OSError as exc:
             notes.append(f"{path.name}: 读取失败（{exc.__class__.__name__}）")
             continue
@@ -296,6 +329,8 @@ class Memory:
         self.strip_digest_chars = int(ctx_cfg.get("strip_digest_chars", 200))
         # 激进模式下每个文件保留的不同读取范围数
         self.aggressive_keep_reads_per_file = int(ctx_cfg.get("aggressive_keep_reads_per_file", 3))
+        self._sync_image_cfg(ctx_cfg)
+        self._sync_strip_cfg(ctx_cfg)
         toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
@@ -841,7 +876,8 @@ class Memory:
                 timeline_snapshot = snapshot
             elif tool_name == "update_step_status" and isinstance(snapshot, dict):
                 timeline_snapshot = snapshot
-        image_parts, image_notes = build_image_parts(images)
+        self._sync_image_cfg()
+        image_parts, image_notes = build_image_parts(images, self.image_max_edge)
         if image_notes:
             content = (content.rstrip() + "\n" if content.strip() else "") + "[图片说明] " + "；".join(image_notes)
         total_lines = len(content.splitlines())
@@ -886,6 +922,27 @@ class Memory:
             message["total_lines"] = total_lines
         return message
 
+    def _context_cfg(self) -> dict:
+        """context 配置节；config.data 异常形态时回落空 dict"""
+        data = getattr(self.config, "data", None)
+        context = data.get("context") if isinstance(data, dict) else None
+        return context if isinstance(context, dict) else {}
+
+    def _sync_image_cfg(self, ctx_cfg: Optional[dict] = None) -> None:
+        """图片相关配置：保留张数、读图缩放长边、单图 token 估算（后者同步到 tokens 模块全局）"""
+        if ctx_cfg is None:
+            ctx_cfg = self._context_cfg()
+        self.keep_recent_images = max(0, int(ctx_cfg.get("keep_recent_images", 3)))
+        self.image_max_edge = max(0, int(ctx_cfg.get("image_max_edge", _IMAGE_MAX_EDGE)))
+        tokenmod.IMAGE_TOKEN_ESTIMATE = max(0, int(ctx_cfg.get("image_token_estimate", tokenmod.IMAGE_TOKEN_ESTIMATE)))
+
+    def _sync_strip_cfg(self, ctx_cfg: Optional[dict] = None) -> None:
+        """剥离联动配置：调用参数压缩阈值、受保护项兜底驱逐开关"""
+        if ctx_cfg is None:
+            ctx_cfg = self._context_cfg()
+        self.strip_call_args_min_chars = max(0, int(ctx_cfg.get("strip_call_args_min_chars", 512)))
+        self.evict_protected_overflow = bool(ctx_cfg.get("evict_protected_overflow", True))
+
     def mid_turn_maintenance(self) -> None:
         """回合中工具结果维护：每次 LLM 请求前收敛早期的工具输出，防止单回合内上下文无界膨胀
 
@@ -917,6 +974,8 @@ class Memory:
         self.strip_digest_chars = int(
             ctx_cfg.get("strip_digest_chars", getattr(self, "strip_digest_chars", 200))
         )
+        self._sync_image_cfg(ctx_cfg)
+        self._sync_strip_cfg(ctx_cfg)
         model = getattr(self.config, "model_name", "")
         # 思考滑窗不依赖工具记录：没有工具结果的回合同样要收敛历史思考
         self._mid_turn_strip_old_thinking()
@@ -924,12 +983,22 @@ class Memory:
         if not tool_indexes:
             return
         protected = self._mid_turn_protected_tool_indexes(tool_indexes)
+        protected_images = self._protected_image_indexes(tool_indexes)
         stripped = 0
         for index in tool_indexes:
             message = self.messages[index]
-            if message.get("stripped") or index in protected:
+            if message.get("stripped"):
                 continue
             tool_name = message.get("tool_name")
+            if message.get("image_read"):
+                # 图片只受张数规则保护（不吃尾部条数/白名单），超龄原图转摘要+路径
+                if index not in protected_images and self._strip_tool_message(
+                    message, prefix="已省略·较早图片", force=True
+                ):
+                    stripped += 1
+                continue
+            if index in protected:
+                continue
             # 激进模式下 read/write 先于白名单判定：白名单工具的超龄结果按预算外置兜底，
             # 与回合末 finalize_turn 的分支顺序一致
             if self.aggressive_optimization and tool_name in ("read", "write"):
@@ -995,7 +1064,8 @@ class Memory:
                 tool_name = message.get("tool_name")
                 if index > last_user_index and tool_name in ("write", "delete_file"):
                     protected.add(index)
-                if tool_name == "read" and message.get("file_path"):
+                # 图片读取不进按文件分组（每张图是不同文件，会各自成为"最新"而永久受保护），改由张数规则管
+                if tool_name == "read" and message.get("file_path") and not message.get("image_read"):
                     path = os.path.normcase(os.path.normpath(str(message["file_path"])))
                     scope = (message.get("read_offset") or 0, message.get("read_limit") or 0)
                     reads_by_file.setdefault(path, {})[scope] = index
@@ -1008,6 +1078,12 @@ class Memory:
         for scopes in reads_by_file.values():
             protected.update(sorted(scopes.values())[-keep_reads:] if keep_reads else [])
         return protected
+
+    def _protected_image_indexes(self, tool_indexes: List[int]) -> set:
+        """全会话最近 keep_recent_images 张图片读取受保护；两种模式、回合中/回合末共用"""
+        keep = max(0, int(getattr(self, "keep_recent_images", 3)))
+        images = [i for i in tool_indexes if self.messages[i].get("image_read")]
+        return set(images[-keep:]) if keep else set()
 
     def finalize_turn(self) -> None:
         """回合末工具结果维护：普通模式按白名单/最近消息规则剥离；激进模式额外按
@@ -1026,6 +1102,8 @@ class Memory:
         self.aggressive_keep_reads_per_file = int(
             ctx_cfg.get("aggressive_keep_reads_per_file", getattr(self, "aggressive_keep_reads_per_file", 3))
         )
+        self._sync_image_cfg(ctx_cfg)
+        self._sync_strip_cfg(ctx_cfg)
         model = getattr(self.config, "model_name", "")
         tool_indexes = [i for i, m in enumerate(self.messages) if m.get("role") == "tool"]
         recent_tool_indexes = tool_indexes[-self.strip_keep_recent:] if self.strip_keep_recent > 0 else []
@@ -1037,12 +1115,20 @@ class Memory:
         aggressive_protected = set()
         if self.aggressive_optimization:
             aggressive_protected = self._aggressive_protected_tool_indexes(tool_indexes)
+        protected_images = self._protected_image_indexes(tool_indexes)
         stripped = 0
         for index in tool_indexes:
             message = self.messages[index]
             if message.get("stripped"):
                 continue
             tool_name = message.get("tool_name")
+            if message.get("image_read"):
+                # 图片只受张数规则保护：不吃尾部条数/白名单，两种模式一致
+                if index not in protected_images and self._strip_tool_message(
+                    message, prefix="已省略·较早图片", force=True
+                ):
+                    stripped += 1
+                continue
             if self.aggressive_optimization and tool_name in ("read", "write"):
                 if index in aggressive_protected:
                     continue
@@ -1088,8 +1174,8 @@ class Memory:
             default=-1,
         )
         current_write_indexes = set()
-        # 读取记录按“文件 + 版本指纹 + 读取范围”分组：文件修改后旧版本片段不再受保护，
-        # 不同范围各自保留最新一次，避免只保护最后一个片段
+        # 读取记录按“文件 + 读取范围”分组：同范围只保留最新一次（含文件改动后的重读），
+        # 不同范围各自保留，避免只保护最后一个片段；图片读取不入组，由张数规则管
         reads_by_file = {}
         for index, message in enumerate(self.messages):
             if message.get("role") == "assistant" and message.get("tool_calls"):
@@ -1100,13 +1186,9 @@ class Memory:
                     tool_to_round[index] = current_round
                 if index > last_user_index and message.get("tool_name") == "write":
                     current_write_indexes.add(index)
-                if message.get("tool_name") == "read" and message.get("file_path"):
+                if message.get("tool_name") == "read" and message.get("file_path") and not message.get("image_read"):
                     path = os.path.normcase(os.path.normpath(str(message["file_path"])))
-                    scope = (
-                        message.get("read_fingerprint") or "",
-                        message.get("read_offset") or 0,
-                        message.get("read_limit") or 0,
-                    )
+                    scope = (message.get("read_offset") or 0, message.get("read_limit") or 0)
                     reads_by_file.setdefault(path, {})[scope] = index
         keep_rounds = max(0, self.aggressive_keep_tool_rounds)
         recent_rounds = set(range(max(0, len(round_indexes) - keep_rounds), len(round_indexes)))
@@ -1166,12 +1248,15 @@ class Memory:
         # 带图片的记录不受短文本守卫保护
         if not force and len(text) < _CONCISE_CONTENT_CHARS and not count_image_parts(content):
             return False
+        call = self._find_tool_call(str(message.get("tool_call_id") or ""))
+        call_args = call.get("arguments") if call else None
         if not message.get("persisted"):
             path = toolstore.persist(
                 self.config, self.project_id, self.session_id,
                 str(message.get("tool_call_id") or ""),
                 str(message.get("tool_name") or ""),
-                {}, str(message.get("description") or ""), text,
+                call_args if isinstance(call_args, dict) else {},
+                str(message.get("description") or ""), text,
             )
             if path is None:
                 return False
@@ -1204,7 +1289,77 @@ class Memory:
             parts.append(f"[{toolstore.ledger_fresh_hint(Path(message['file_path']))}]")
         message["content"] = " ".join(parts)
         message["stripped"] = True
+        self._compact_call_arguments(call, message)
         return True
+
+    def _find_tool_call(self, call_id: str) -> Optional[dict]:
+        """按 id 反查 assistant 消息里的工具调用（从新到旧，id 带随机后缀基本唯一）"""
+        if not call_id:
+            return None
+        for m in reversed(self.messages):
+            if m.get("role") != "assistant":
+                continue
+            for call in m.get("tool_calls") or []:
+                if isinstance(call, dict) and call.get("id") == call_id:
+                    return call
+        return None
+
+    def _compact_call_arguments(self, call: Optional[dict], result_message: dict) -> bool:
+        """结果被剥离后，同步把对应调用参数里的大段字符串换成占位，保持参数仍是合法的 dict。
+
+        write.content、edit_file.old_str/new_str 这类参数即正文，只剥结果等于没剥；
+        原文已随结果外置文件的 arguments 头保留，占位里带指针供回读。"""
+        min_chars = int(getattr(self, "strip_call_args_min_chars", 512))
+        if min_chars <= 0 or not call or call.get("args_compacted"):
+            return False
+        args = call.get("arguments")
+        if not isinstance(args, dict):
+            return False
+        pointer = result_message.get("persist_path") or ""
+        changed = False
+        compacted = dict(args)
+        for key, value in args.items():
+            if isinstance(value, str) and len(value) >= min_chars:
+                note = f"[已省略·参数{key}共{len(value)}字符"
+                compacted[key] = note + (f"，原文见 {pointer}" if pointer else "") + "]"
+                changed = True
+        if not changed:
+            return False
+        call["arguments"] = compacted
+        call["args_compacted"] = True
+        return True
+
+    def _evict_protected_overflow(self, model: Optional[str], need_tokens: int) -> int:
+        """完整请求逼近压缩阈值时，从受保护的未剥离工具结果里驱逐，至少释放 need_tokens。
+
+        最后一个工具轮的结果不动（模型正在用）；先图片、再体积从大到小。返回驱逐条数。"""
+        model = model or ""
+        if not getattr(self, "evict_protected_overflow", True) or need_tokens <= 0:
+            return 0
+        last_round_start = max(
+            (i for i, m in enumerate(self.messages) if m.get("role") == "assistant" and m.get("tool_calls")),
+            default=-1,
+        )
+        candidates = []
+        for index, message in enumerate(self.messages):
+            if message.get("role") != "tool" or message.get("stripped") or index > last_round_start:
+                continue
+            content = message.get("content") or ""
+            images = count_image_parts(content)
+            tokens = toolstore.count_tokens_safe(content_text(content), model) + tokenmod.IMAGE_TOKEN_ESTIMATE * images
+            if tokens >= 256:
+                candidates.append((0 if images else 1, -tokens, index, tokens))
+        evicted = freed = 0
+        for _kind, _neg, index, tokens in sorted(candidates):
+            if freed >= need_tokens:
+                break
+            message = self.messages[index]
+            if self._strip_tool_message(message, prefix="已省略·超预算驱逐", force=True):
+                freed += tokens
+                evicted += 1
+        if evicted:
+            log.info("受保护项兜底驱逐: %d条 释放约%d token（目标%d）", evicted, freed, need_tokens)
+        return evicted
 
     def _evict_whitelist_overflow(self, model: str, protected_indexes=None) -> int:
         """白名单工具历史会话累计超预算时，最老的未保护结果先外置"""
@@ -1222,11 +1377,11 @@ class Memory:
             ):
                 # 图片块按常数计入预算防图片记录挤占上下文
                 tokens = toolstore.count_tokens_safe(content_text(message.get("content") or ""), model)
-                tokens += _IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
+                tokens += tokenmod.IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
                 entries.append((index, tokens))
         protected_total = sum(
             toolstore.count_tokens_safe(content_text(message.get("content") or ""), model)
-            + _IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
+            + tokenmod.IMAGE_TOKEN_ESTIMATE * count_image_parts(message.get("content"))
             for index, message in enumerate(self.messages)
             if index in protected_indexes
             and message.get("role") == "tool"
@@ -1864,6 +2019,12 @@ class Memory:
         maintain_line = int(budget * self.compress_threshold * 0.75) if budget > 0 else 0
         if not aggressive and (maintain_line <= 0 or payload_tokens >= maintain_line):
             self.mid_turn_maintenance()
+            messages = self._assemble_messages(extra_system)
+            payload_tokens = self._payload_tokens(messages, model) + tools_tokens
+        # 保护集本身可能撑爆预算（图片/大 read 都是"最新"）：压缩前先驱逐受保护的大消息，
+        # 压缩的尾段保留这些消息，不先驱逐则压缩后仍会超限
+        limit = int(budget * self.compress_threshold) if budget > 0 else 0
+        if limit > 0 and payload_tokens >= limit and self._evict_protected_overflow(model, payload_tokens - int(limit * 0.75)):
             messages = self._assemble_messages(extra_system)
             payload_tokens = self._payload_tokens(messages, model) + tools_tokens
         history_tokens = self._count_tokens(self.messages, model)
