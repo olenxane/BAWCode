@@ -1,6 +1,7 @@
 # Agent 核心：LLM 调用、工具策略、token/余额
 import json
 import http.client
+import re
 import threading
 import time
 import traceback
@@ -84,6 +85,154 @@ def _reasoning_of(mapping) -> str:
         if value:
             return value if isinstance(value, str) else str(value)
     return ""
+
+
+# 中转站偶发把 GLM 分段特殊 token 以明文漏进 content（实测形态：思考 + <|close|>think<|sep|><|open|>response<|sep|> + 回复）；
+# 漏出段改道思考侧，正文只留 response 之后的文本。标记串见即拆（正文裸写的概率趋近零，且误拆不丢文本只挪显示位）
+_GLM_SEG_RE = re.compile(
+    r"<\|open\|>\s*think\s*<\|sep\|>|<\|close\|>\s*think\s*<\|sep\|>|<\|open\|>\s*response\s*<\|sep\|>"
+)
+# R1/Qwen 系漏法：content 开头成对的 <think>/<thinking> 块。严格防误伤：开头（允许前导空白）+小写+开闭同名+必须闭合，
+# 四条件缺一不动；正文中部、不成对、大小写变体一律视为正文
+_THINK_PAIR_RE = re.compile(r"\A\s*<(think|thinking)>(.*?)</\1>", re.S)
+
+
+def _split_leaked_thinking(text: str) -> tuple:
+    """从 content 拆出漏出的思考文本 → (thinking, content)。
+
+    GLM 标记走状态机按段拆；无标记时仅剥开头成对的 <think> 块，其余位置不碰。"""
+    if not text:
+        return "", text
+    leaked = ""
+    if _GLM_SEG_RE.search(text):
+        think_parts, content_parts = [], []
+        mode = "plain"  # plain=首标记前 / think / closed=思考已关（其后文本按协议属回复侧）/ response
+        pos = 0
+        for m in _GLM_SEG_RE.finditer(text):
+            before = text[pos:m.start()]
+            if mode == "think":
+                think_parts.append(before)
+            elif mode in ("closed", "response"):
+                content_parts.append(before)
+            else:
+                # plain 段归属由首标记语义定：close 开头即实测形态（标记前的裸文本是思考）
+                (think_parts if m.group(0).startswith("<|close|>") else content_parts).append(before)
+            pos = m.end()
+            seg = m.group(0)
+            if seg.startswith("<|open|>think") and mode != "response":
+                mode = "think"
+            elif seg.startswith("<|close|>") and mode in ("think", "plain"):
+                mode = "closed"
+            elif seg.startswith("<|open|>response") and mode != "response":
+                mode = "response"
+        tail = text[pos:]
+        (think_parts if mode == "think" else content_parts).append(tail)
+        text, leaked = "".join(content_parts), "".join(think_parts)
+    pair = _THINK_PAIR_RE.match(text)
+    if pair:
+        leaked = leaked + ("\n" + pair.group(2) if leaked else pair.group(2))
+        text = text[pair.end():].lstrip()
+    return leaked, text
+
+
+# 413 请求体过大的渐进缩重参数：每步相对原图再缩 10%，压到 50% 后转回合间维护兜底
+_PAYLOAD_SHRINK_MAX = 5
+_PAYLOAD_SHRINK_STEP = 0.10
+_PAYLOAD_SHRINK_FLOOR = 0.50
+_PAYLOAD_TOO_LARGE_MARKERS = ("entity too large", "payload too large", "content too large")
+
+
+def _is_payload_too_large(e: BaseException) -> bool:
+    """HTTP 413 / 请求体过大判定：网关裸 413（nginx 无 provider 措辞）与包装异常都认；
+    urllib HTTPError 顺带读响应体补判，无状态码的包装错误按短语兜底"""
+    status = e.code if isinstance(e, urllib.error.HTTPError) else getattr(e, "status_code", None)
+    if status == 413:
+        return True
+    text = str(e)
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            text += " " + e.read(8192).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    tl = text.lower()
+    return any(marker in tl for marker in _PAYLOAD_TOO_LARGE_MARKERS) or (
+        not isinstance(status, int) and "too large" in tl
+    )
+
+
+def _rescale_data_url(url: str, scale: float) -> Optional[str]:
+    """data URL 图片按 scale 缩边重编码（JPEG/PNG/WebP，JPEG 转 RGB）；失败或无须缩返回 None"""
+    if not isinstance(url, str) or not url.startswith("data:") or ";base64," not in url:
+        return None
+    try:
+        import base64
+        import io
+        from PIL import Image
+
+        head, b64 = url.split(";base64,", 1)
+        mime = head[5:]
+        with Image.open(io.BytesIO(base64.b64decode(b64))) as img:
+            w, h = img.size
+            nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+            if nw >= w and nh >= h:
+                return None
+            small = img.resize((nw, nh), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            if "jpeg" in mime or "jpg" in mime:
+                small.convert("RGB").save(buf, "JPEG", quality=88)
+                out_mime = "image/jpeg"
+            elif "webp" in mime:
+                small.save(buf, "WEBP")
+                out_mime = "image/webp"
+            else:
+                # 其余格式统一重出 PNG（gif 只取首帧），mime 一并改写保证自洽
+                small.save(buf, "PNG")
+                out_mime = "image/png"
+        return f"data:{out_mime};base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
+    except Exception:
+        return None
+
+
+def _shrink_payload_images(messages: list, scale: float, originals: dict) -> int:
+    """把当前回合（最后一条 user 起）的 image_url 块按 scale 相对原图缩边；
+    当前回合无图时全量兜底。originals 记录原 URL 保证逐次相对原图而非逐级压缩；
+    复制 part 对象再改写，避免污染会话存档里的共享块。返回实际处理的图片数"""
+    def _img_parts(content) -> list:
+        if not isinstance(content, list):
+            return []
+        return [
+            (i, p) for i, p in enumerate(content)
+            if isinstance(p, dict) and p.get("type") == "image_url"
+            and isinstance((p.get("image_url") or {}).get("url"), str)
+            and (p["image_url"]["url"]).startswith("data:")
+        ]
+
+    targets, cur = [], []
+    for m in messages or []:
+        if m.get("role") == "user":
+            cur = []
+        if _img_parts(m.get("content")):
+            cur.append(m)
+    targets = cur or [m for m in messages or [] if _img_parts(m.get("content"))]
+
+    done = 0
+    for m in targets:
+        new_c = None
+        for i, p in _img_parts(m.get("content")):
+            iu = p.get("image_url") or {}
+            base = originals.get(id(p)) or iu.get("url")
+            new_url = _rescale_data_url(base, scale)
+            if not new_url:
+                continue
+            if new_c is None:
+                new_c = list(m["content"])  # 复制列表与块，不动会话共享对象
+                m["content"] = new_c
+            np_ = dict(p)
+            np_["image_url"] = {**iu, "url": new_url}
+            new_c[i] = np_
+            originals[id(np_)] = base
+            done += 1
+    return done
 
 
 def _tri_state(value) -> Optional[bool]:
@@ -626,11 +775,14 @@ class LLM:
         temperature: Optional[float] = None,
         model: Optional[str] = None,
         on_delta=None,
+        on_payload_overflow=None,
     ) -> dict:
         """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型。
 
         on_delta 接收 reasoning/content 增量和 reset 清空事件。
         config.llm.stream 开启时走 SSE 流式，网络中断按配置重试。
+        HTTP 413（请求体过大）走渐进缩图重发：本轮图片每步相对原图再缩 10%、
+        最多 5 次；仍超则调 on_payload_overflow() 做回合间维护换一组新消息再发一次。
         失败尝试不计成功用量，不返回未完成工具调用。
         """
         if self._cancel.is_set():
@@ -716,6 +868,9 @@ class LLM:
         attempt = 0
         last_error = None
         error_fatal = False
+        shrink_step = 0          # 413 渐进缩图已用步数（不占用网络重试预算）
+        maintenance_used = False  # 回合间维护一次性标记
+        img_originals: dict = {}  # id(part)→原图 URL，逐次缩放相对原图
         start = time.monotonic()
         log.debug(
             "LLM 请求 provider=%s model=%s messages=%d tools=%d",
@@ -781,6 +936,36 @@ class LLM:
                 attempt += 1
                 log.warn("LLM 调用失败(第%d/%d次): %s", attempt, max(retry_times, 0) + 1, e)
                 log.debug("异常详情:\n%s", traceback.format_exc())
+                if _is_payload_too_large(e):
+                    # 渐进缩图重发：每步相对原图再缩 10%、最多 5 次到 50%，不消耗网络重试
+                    if shrink_step < _PAYLOAD_SHRINK_MAX:
+                        scale = max(
+                            _PAYLOAD_SHRINK_FLOOR,
+                            round(1.0 - _PAYLOAD_SHRINK_STEP * (shrink_step + 1), 2),
+                        )
+                        n_img = _shrink_payload_images(payload["messages"], scale, img_originals)
+                        if n_img:
+                            shrink_step += 1
+                            log.warn(
+                                "请求体超限(413)，图片缩至原尺寸%d%%重发（第%d/%d次，缩 %d 张）",
+                                int(scale * 100), shrink_step, _PAYLOAD_SHRINK_MAX, n_img,
+                            )
+                            attempt -= 1  # 本次重发不计网络重试
+                            continue
+                    # 缩到 50% 仍超（或无图可缩）：回合间维护一次性兜底
+                    if callable(on_payload_overflow) and not maintenance_used:
+                        maintenance_used = True
+                        try:
+                            new_messages = on_payload_overflow()
+                        except Exception as mw:
+                            log.warn("回合间维护回调失败: %s", mw)
+                            new_messages = None
+                        if new_messages:
+                            payload["messages"] = new_messages
+                            img_originals.clear()
+                            log.warn("请求体仍超限，执行回合间维护后重发一次")
+                            attempt -= 1
+                            continue
                 if not _is_retryable_error(e):
                     # 401/404/400 等确定性失败：不做自动重试；error_fatal 供回合层跳过
                     # 手动重试等待（重发同一请求必然复现，直接走失败回滚）
@@ -799,10 +984,13 @@ class LLM:
                     base_url=req.get("base_url"),
                 )
         log.error("LLM 调用最终失败: %s", last_error)
+        error_text = f"LLM 调用失败: {last_error}"
+        if last_error is not None and _is_payload_too_large(last_error):
+            error_text += "（请求体超网关体积上限：已缩图/维护后仍被拒，建议 /clear 或减小本轮请求内容）"
         return {
             "content": "",
             "tool_calls": [],
-            "error": f"LLM 调用失败: {last_error}",
+            "error": error_text,
             "error_fatal": error_fatal,
         }
 
@@ -814,8 +1002,10 @@ class LLM:
                 if not isinstance(c, dict):
                     continue
                 normalized_calls.append({**c, "id": self._ensure_call_id(c.get("id"))})
+            leaked, content = _split_leaked_thinking(data.get("content") or "")
             return {
-                "content": data.get("content") or "",
+                "content": content,
+                "reasoning": leaked,
                 "tool_calls": normalized_calls,
                 "raw": data.get("raw", data),
                 "error": data.get("error"),
@@ -855,6 +1045,10 @@ class LLM:
             )
         content = message.get("content") or ""
         reasoning = _reasoning_of(message)
+        # 中转站泄漏兜底：content 内的思考段/标记改道思考侧（reasoning_content 通常为空或为思考前段）
+        leaked, content = _split_leaked_thinking(content)
+        if leaked:
+            reasoning = f"{reasoning}\n{leaked}" if reasoning else leaked
         if reasoning and not content and not keep_reasoning:
             # 无工具的内部文本调用（计划/压缩/判定/refine）：仅思考时顶替 content，保住下游取得到文本；
             # agent 工具轮（keep_reasoning=True）不顶替——思考进 thinking 字段，回合末可整体剥离

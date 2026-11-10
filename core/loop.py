@@ -263,7 +263,16 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                 tools_grouped=(builtin_defs, mcp_defs),
                 system_parts=turn.system_prompt_parts,
             )
-            response = llm.chat(payload, tools=tool_defs, model=model, on_delta=io.on_delta)
+
+            def _payload_maintenance():
+                """413 缩图仍超限时：执行一次回合间维护并返回重装配的消息（同 build_messages 层级）"""
+                session.mid_turn_maintenance()
+                return session.build_messages(extra_system=extra_system, tools=tool_defs, model=model)
+
+            response = llm.chat(
+                payload, tools=tool_defs, model=model,
+                on_delta=io.on_delta, on_payload_overflow=_payload_maintenance,
+            )
             io.clear_stream()  # 树尾直播收口：正式消息按现有路径入库
             if turn.app is not None:
                 turn.app.token_meter = llm.meter
