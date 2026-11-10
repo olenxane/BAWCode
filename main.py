@@ -654,6 +654,7 @@ def _handle_tool_confirm(llm: LLM, app, session, call: dict, cancelled=None) -> 
     if callable(cancelled) and cancelled():
         return rejected()
     confirm_payload = {"name": call.get("name"), "arguments": call.get("arguments") or {},
+                       "description": call.get("description") or "",
                        "request_id": uuid.uuid4().hex, "cancelled": cancelled}
     hooked = hooks.call_hook("tool_confirm", confirm_payload, default=None)
     if callable(cancelled) and cancelled():
@@ -673,13 +674,15 @@ def _handle_tool_confirm(llm: LLM, app, session, call: dict, cancelled=None) -> 
                 "content": policy.default_reject_message(reason or f"tool_confirm 扩展点拒绝（{hooked.get('source', 'plugin')}）"),
                 "type": "tool",
             }
-    app.pending_tool = {"name": call.get("name"), "arguments": call.get("arguments") or {}}
+    app.pending_tool = {"name": call.get("name"), "arguments": call.get("arguments") or {},
+                        "description": call.get("description") or ""}
     try:
         # 对话框串行：并发子代理同时请求确认时逐个弹面板
         with ui.DIALOG_LOCK:
             req = app.request_ui(
                 "confirm",
-                {"name": str(call.get("name") or ""), "arguments": call.get("arguments") or {}},
+                {"name": str(call.get("name") or ""), "arguments": call.get("arguments") or {},
+                 "description": call.get("description") or ""},
             )
             result = app.wait_ui(req, cancelled)
     finally:

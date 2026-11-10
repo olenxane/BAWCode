@@ -1308,7 +1308,11 @@ class RenderMixin(UiState):
                 args = c.get("arguments") or {}
                 if not isinstance(args, dict):
                     args = {}
-                call_info[cid] = {"name": name, "args": args}
+                call_info[cid] = {
+                    "name": name,
+                    "args": args,
+                    "desc": _oneline(str(c.get("description") or "").strip(), 120),
+                }
                 head = ""
                 if name == "execute_command":
                     head = _command_head(memory_mod.content_text(args.get("command")))
@@ -1391,6 +1395,7 @@ class RenderMixin(UiState):
                     compact_tool = self._is_compact_tool(tool_call, command)
                     is_git = tool_call in _TOOL_CMD and bool(re.match(r"^\s*git(?:\s|$)", command))
                     summary = self._tool_compact_summary(tool_call, args, content, failed) if compact_tool else ""
+                    desc = _oneline(str(item.get("description") or ""), 80)
                     if meta is not None:
                         base = tool_name or tool_call or "tool"
                         if meta.get("tool_kind") == "cmd":
@@ -1400,6 +1405,8 @@ class RenderMixin(UiState):
                             label = f"⚙ {base} {path} {icon}" if path else f"⚙ {base} {icon}"
                         if is_git:
                             label = f"⚙ git {icon}"
+                        if desc:
+                            label = f"{label} · {desc}"
                         node = TreeNode(
                             message_id,
                             label,
@@ -1413,6 +1420,8 @@ class RenderMixin(UiState):
                         result_text = content.strip()
                         display = tool_name or "tool"
                         label = f"⚙ {display} {icon}{image_note}"
+                        if desc:
+                            label = f"{label} · {desc}"
                         if not compact_tool and result_text:
                             label = f"{label} · {result_text}"
                         node = TreeNode(
@@ -1458,8 +1467,11 @@ class RenderMixin(UiState):
                 names = []
                 for c in item.get("tool_calls") or []:
                     if isinstance(c, dict):
+                        cid = str(c.get("id") or "")
+                        c_name = str(c.get("name") or "")
+                        c_desc = _oneline(str(c.get("description") or ""), 60)
                         # execute_command/run_program 优先显示命令头
-                        names.append(cmd_heads.get(str(c.get("id") or "")) or str(c.get("name") or ""))
+                        names.append(cmd_heads.get(cid) or (f"{c_name} · {c_desc}" if c_desc else c_name))
                 text = content.strip()
                 if text:
                     _parent().children.append(
@@ -1518,6 +1530,9 @@ class RenderMixin(UiState):
                     elif t_role == "tool" or tm.get("type") == "tool":
                         icon = _GLYPH_FAIL if tool_failure_hint(t_content) else _GLYPH_OK
                         label = f"⚙ {tm.get('tool_name') or 'tool'} {icon}"
+                        t_desc = _oneline(str(tm.get("description") or ""), 60)
+                        if t_desc:
+                            label = f"{label} · {t_desc}"
                         if t_text:
                             label = f"{label} · {t_text}"
                         child = TreeNode(
@@ -2721,6 +2736,9 @@ class RenderMixin(UiState):
             arg_line = str(args)
         rows: List[str] = []
         rows.append(self.c("warn") + " ⚠ " + self.RESET + self.c("accent") + _clip(f"工具确认: {name}", w - 4) + self.RESET)
+        purpose = _oneline(str(tool.get("description") or ""), w - 6)
+        if purpose:
+            rows.append(self.c("dim") + _clip(f" 目的: {purpose}", w - 2) + self.RESET)
         if arg_line and arg_line != "{}":
             rows.append(self.c("dim") + " " + _clip(_oneline(arg_line, w - 3), w - 2) + self.RESET)
         if self.confirm_reason_mode:

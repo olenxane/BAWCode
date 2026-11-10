@@ -354,6 +354,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     "name": c.get("name"),
                     "arguments": c.get("arguments") or {},
                     "type": c.get("type") or "function",
+                    "description": c.get("description") or "",
                 }
                 for c in tool_calls
             ],

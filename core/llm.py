@@ -8,7 +8,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 
 try:
     import openai
@@ -221,6 +221,8 @@ def _shrink_payload_images(messages: list, scale: float, originals: dict) -> int
         for i, p in _img_parts(m.get("content")):
             iu = p.get("image_url") or {}
             base = originals.get(id(p)) or iu.get("url")
+            if not isinstance(base, str) or not base:
+                continue
             new_url = _rescale_data_url(base, scale)
             if not new_url:
                 continue
@@ -943,7 +945,9 @@ class LLM:
                             _PAYLOAD_SHRINK_FLOOR,
                             round(1.0 - _PAYLOAD_SHRINK_STEP * (shrink_step + 1), 2),
                         )
-                        n_img = _shrink_payload_images(payload["messages"], scale, img_originals)
+                        n_img = _shrink_payload_images(
+                            cast(list, payload.get("messages") or []), scale, img_originals
+                        )
                         if n_img:
                             shrink_step += 1
                             log.warn(
@@ -1077,8 +1081,9 @@ class LLM:
         context = policy.command_text(name, args)
         if not context.strip():
             context = f"{name} {json.dumps(args, ensure_ascii=False, sort_keys=True)}"
-        # 附带 execute_command 接收到的 description（模型对命令意图的自述），供审批模型参考
-        description = str(args.get("description") or "").strip()
+        # 附带 execute_command 接收到的 description（模型对命令意图的自述），供审批模型参考；
+        # 主路径 description 已被调用循环剥离到 call 顶层，args 内形态留给提权等直传路径
+        description = str(call.get("description") or args.get("description") or "").strip()
         if description and name == "execute_command":
             context = f"{context}\n说明: {description}"
         context = context.strip()[:APPROVAL_CONTEXT_CAP]
@@ -1108,10 +1113,13 @@ class LLM:
         args = call.get("arguments") or {}
         if not isinstance(args, dict):
             args = {}
+        description = str(call.get("description") or args.get("description") or "")
         args = {k: v for k, v in args.items() if k != "description"}
         # before_tool（变换链）：返回 {"args": {...}} 改写参数；
         # 返回 {"decision": "deny", "message": "..."} 拒绝执行（不进工具本体）
-        hooked = hooks.call_hook("before_tool", {"name": name, "args": args}, default=None)
+        hooked = hooks.call_hook(
+            "before_tool", {"name": name, "args": args, "description": description}, default=None
+        )
         if isinstance(hooked, dict):
             if str(hooked.get("decision") or "").lower() in ("deny", "denied", "block", "blocked"):
                 message = str(hooked.get("message") or f"工具 {name} 被 before_tool 钩子拒绝")
@@ -1156,7 +1164,8 @@ class LLM:
         # after_tool（观察链）：通知执行结果（处理函数异常已在 hooks 内隔离）
         hooks.collect_hook(
             "after_tool",
-            {"name": name, "args": args, "output": text, "elapsed": round(time.monotonic() - started, 3)},
+            {"name": name, "args": args, "output": text,
+             "elapsed": round(time.monotonic() - started, 3), "description": description},
         )
         result = {
             "role": "tool",

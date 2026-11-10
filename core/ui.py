@@ -1493,7 +1493,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             payload = req["payload"] or {}
             if kind == "confirm":
                 result = self.show_confirm_form(
-                    str(payload.get("name") or ""), payload.get("arguments") or {}
+                    str(payload.get("name") or ""), payload.get("arguments") or {},
+                    str(payload.get("description") or ""),
                 )
             elif kind == "ask":
                 result = self.show_ask_form(payload or {})
@@ -1643,14 +1644,16 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self.ask_deadline = None
             self.render()
 
-    def show_confirm_form(self, tool_name: str, tool_args: Optional[dict] = None) -> dict:
+    def show_confirm_form(self, tool_name: str, tool_args: Optional[dict] = None,
+                          tool_description: str = "") -> dict:
         """工具确认面板（阻塞）：↑↓ 选择 · Enter 确认 · Esc 拒绝。
 
         选中「拒绝并输入原因」回车后进入行内输入状态，Enter 提交（空=默认理由）。
         返回 {"action": "allow_once"|"allow_always"|"reject", "reason": str}。"""
         options = ("allow_once", "allow_always", "reject", "reason")
         self.confirm_mode = True
-        self.confirm_tool = {"name": tool_name, "arguments": tool_args or {}}
+        self.confirm_tool = {"name": tool_name, "arguments": tool_args or {},
+                             "description": tool_description}
         self.confirm_index = 0
         self.confirm_reason_mode = False
         self._confirm_buf = TextBuffer()

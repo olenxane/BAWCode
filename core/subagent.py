@@ -710,13 +710,16 @@ def _sub_tool_defs() -> List[dict]:
 
 
 def _normalize_tool_msg(call: dict, content: str) -> dict:
-    return {
+    msg = {
         "role": "tool",
         "tool_call_id": str(call.get("id") or ""),
         "tool_name": call.get("name"),
         "content": str(content or ""),
         "type": "tool",
     }
+    if call.get("description"):
+        msg["description"] = str(call["description"])
+    return msg
 
 
 def _with_images(item: dict) -> dict:
@@ -787,7 +790,8 @@ def _handle_elevation(rt: dict, call: dict) -> dict:
     if getattr(io, "tool_confirm", None) is None:
         return _normalize_tool_msg(call, f"提权请求被拒绝: {tool}（无确认通道）")
     note = f"子代理提权请求：{reason}" if reason else "子代理提权请求"
-    confirm_target = {**target, "arguments": {**target_args, "description": note}}
+    confirm_target = {**target, "arguments": {**target_args, "description": note},
+                      "description": note}
     item = io.tool_confirm(confirm_target)
     if isinstance(item, dict) and "content" in item:
         return _elevation_result(call, item)
@@ -1017,15 +1021,19 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
             if content:
                 messages.append({"role": "assistant", "content": content})
             return ("done", content)
-        norm_calls = [
-            {
+        norm_calls = []
+        for c in tool_calls:
+            args = c.get("arguments") if isinstance(c.get("arguments"), dict) else {}
+            # description（调用意图）在执行层从 args 剥离；这里提前取出挂到调用体，
+            # 落库的 arguments 保持干净（中断兜底写结果时与主循环语义一致）
+            description = str(args.pop("description", "") or "")
+            norm_calls.append({
                 "id": str(c.get("id") or f"call_{uuid.uuid4().hex[:12]}"),
                 "name": c.get("name"),
-                "arguments": c.get("arguments") if isinstance(c.get("arguments"), dict) else {},
+                "arguments": args,
                 "type": "function",
-            }
-            for c in tool_calls
-        ]
+                "description": description,
+            })
         messages.append({"role": "assistant", "content": content, "tool_calls": norm_calls})
         _live_phase(rt, rid, f"工具调用中 · 第{rounds}轮")
         round_results = []
@@ -1035,6 +1043,8 @@ def _run_loop(rt: dict, record: dict, messages: List[dict], tool_defs: List[dict
                 permission = inherited_permission(_current_mode(rt))
                 record["permission"] = permission
                 item = _execute_one(rt, call, permission)
+                if isinstance(item, dict) and call.get("description") and not item.get("description"):
+                    item["description"] = str(call["description"])
                 messages.append(item)
                 round_results.append(item)
                 processed.append(call)
