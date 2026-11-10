@@ -304,7 +304,7 @@ def active_reference(text: str, cursor: int) -> Optional[dict]:
     """返回光标前正在输入的 @ 引用及替换范围。"""
     before = str(text or "")[: max(0, cursor)]
     at = before.rfind("@")
-    if at < 0 or (at > 0 and not before[at - 1].isspace()):
+    if at < 0:
         return None
     token = before[at + 1 :]
     if token.startswith('"'):

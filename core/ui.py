@@ -556,21 +556,22 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         # 传整段光标前文本：cmdsys.complete 依据空格区分命令名/参数补全，
         # 只传当前词会让 /model deep 之类的参数补全永远无法触发
         frag = text[: self.cursor]
-        if frag.startswith("/"):
-            self.candidates = cmdsys.complete(frag, config=config)
-        else:
-            active = file_mod.active_reference(text, self.cursor)
+        # @ 任意位置可触发：先查文件引用，/ 命令参数里的 @ 也走文件补全
+        active = file_mod.active_reference(text, self.cursor)
+        if active is not None:
             workspace = getattr(getattr(self, "config", None), "workspace", None)
             if workspace is None:
                 session = memory_mod.get_session()
                 workspace = getattr(session, "workspace", None) if session is not None else None
-            if active is not None:
-                # 分级扫描在后台按秒推进；结果由帧尾 _tick_file_candidates 取回
-                self._file_query = active["query"]
-                self.candidates = []
-                self.file_scan.submit(active["query"], workspace)
-            else:
-                self._cancel_file_scan()
+            # 分级扫描在后台按秒推进；结果由帧尾 _tick_file_candidates 取回
+            self._file_query = active["query"]
+            self.candidates = []
+            self.file_scan.submit(active["query"], workspace)
+        elif frag.startswith("/"):
+            self._cancel_file_scan()
+            self.candidates = cmdsys.complete(frag, config=config)
+        else:
+            self._cancel_file_scan()
         if self.candidate_index >= len(self.candidates):
             self.candidate_index = 0
 
