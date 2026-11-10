@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BAWCode 工作流编辑器</title>
+<style>
+/* 简洁清新浅色风格：与原 PySide6 版同色板 —— 米白暖底 #FAF9F5 + 绿色主色 #16A34A + 深墨文字 */
+:root {
+  --bg: #FAF9F5; --panel-bg: #F6F4EE; --border: #E9E5DB; --card-border: #E7E3D9;
+  --field-border: #DEDACF; --text: #1F1E1C; --text2: #3D3B35;
+  --muted: #6B675E; --muted2: #8A857B; --accent: #16A34A;
+  --accent-soft: #E3F3EA; --hover: #F0EDE5; --edge: #C6C1B5;
+}
+* { box-sizing: border-box; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 13px; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+body { display: flex; flex-direction: column; overflow: hidden; }
+
+/* ---- 工具栏 ---- */
+#toolbar { display: flex; align-items: center; gap: 4px; padding: 6px 10px;
+  border-bottom: 1px solid var(--border); flex: none; }
+#toolbar button { background: transparent; color: var(--text2); border: 1px solid transparent;
+  border-radius: 7px; padding: 6px 14px; cursor: pointer; }
+#toolbar button:hover { background: var(--hover); }
+#toolbar button:active { background: #E8E4DA; }
+#dirty-dot { color: #C0392B; font-size: 12px; margin-left: 8px; }
+
+/* ---- 主区 ---- */
+#main { flex: 1; display: flex; min-height: 0; }
+
+#palette { width: 140px; flex: none; background: var(--panel-bg);
+  border-right: 1px solid var(--border); padding: 8px; overflow-y: auto; }
+.palette-item { background: #fff; border: 1px solid var(--card-border); border-radius: 8px;
+  padding: 10px 12px; margin: 3px 0; display: flex; align-items: center; gap: 8px;
+  cursor: grab; user-select: none; }
+.palette-item:hover { border-color: var(--accent); background: #F4FAF6; }
+.palette-item:active { cursor: grabbing; }
+.palette-dot { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+
+#canvas-scroll { flex: 1; min-width: 0; overflow: auto; position: relative; }
+#world { position: relative; width: 2400px; height: 1600px; background-color: #F7F5F0;
+  background-image: radial-gradient(circle, #E4E0D4 1.5px, transparent 1.7px);
+  background-size: 26px 26px; }
+#edges-svg { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 0; }
+#rubber-svg { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 2; }
+
+/* ---- 画布节点 ---- */
+.node { position: absolute; width: 168px; height: 64px; background: #fff;
+  border: 1px solid #E5E1D8; border-radius: 10px; cursor: move; user-select: none;
+  box-shadow: 0 3px 10px rgba(60, 55, 45, 0.11); z-index: 1; }
+.node:hover { border-color: #D3CEC2; }
+.node.sel { outline: 2px solid var(--accent); outline-offset: 3px; }
+.node.drag-src { border-color: var(--accent); }
+.node .bar { position: absolute; left: 0; top: 12px; width: 4px; height: 40px; border-radius: 2px; }
+.node .title { position: absolute; left: 14px; top: 6px; right: 8px; font-weight: bold;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node .sub { position: absolute; left: 14px; top: 30px; right: 8px; font-size: 11px;
+  color: var(--muted2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 输出端口：右边缘中点，悬停节点浮现；命中区（22×22）比可视圆大，方便点按 */
+.node .port-hit { position: absolute; right: -11px; top: calc(50% - 11px); width: 22px; height: 22px;
+  display: none; cursor: crosshair; }
+.node:hover .port-hit, .node.drag-src .port-hit { display: block; }
+.node .port { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--accent); background: #fff; }
+.node .port-hit:hover .port { width: 14px; height: 14px; background: var(--accent); }
+
+/* ---- 连线 ---- */
+.edge .hit { stroke: transparent; stroke-width: 10; fill: none; pointer-events: stroke; cursor: pointer; }
+.edge .line { stroke: var(--edge); stroke-width: 2; fill: none; }
+.edge .head { fill: var(--edge); }
+.edge.sel .line { stroke: var(--accent); stroke-width: 3; }
+.edge.sel .head { fill: var(--accent); }
+.rubber .line { stroke: var(--accent); stroke-width: 2; fill: none; stroke-dasharray: 6 4; }
+.rubber .head { fill: var(--accent); }
+
+/* ---- 参数面板 ---- */
+#panel { width: 360px; flex: none; background: var(--bg); border-left: 1px solid var(--border);
+  overflow-y: auto; padding: 12px 14px; }
+#panel .tip { color: var(--muted2); white-space: pre-wrap; }
+.form-row { margin-top: 8px; }
+.form-row .cap { color: var(--muted); margin-bottom: 3px; word-break: break-all; }
+.form-row input[type="text"], .form-row input[type="number"], .form-row textarea, .form-row select {
+  width: 100%; background: #fff; border: 1px solid var(--field-border); border-radius: 7px;
+  padding: 6px 9px; color: var(--text); }
+.form-row input:focus, .form-row textarea:focus, .form-row select:focus {
+  outline: none; border-color: var(--accent); }
+.form-row textarea { resize: vertical; min-height: 96px; }
+.form-row input[type="checkbox"] { accent-color: var(--accent); }
+.type-label { font-weight: bold; font-size: 15px; }
+
+/* ---- 状态栏 ---- */
+#statusbar { flex: none; background: var(--panel-bg); border-top: 1px solid var(--border);
+  color: var(--muted); padding: 6px 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- 弹窗 ---- */
+#modal-mask { position: fixed; inset: 0; background: rgba(30, 28, 24, 0.35);
+  display: flex; align-items: center; justify-content: center; z-index: 100; }
+#modal-mask[hidden] { display: none; }  /* author display:flex 会压过 UA 的 [hidden]，须显式关断 */
+#modal { background: #fff; border: 1px solid var(--card-border); border-radius: 10px;
+  padding: 16px 18px; width: 420px; max-width: 90vw; max-height: 70vh;
+  display: flex; flex-direction: column; box-shadow: 0 8px 30px rgba(60, 55, 45, 0.18); }
+#modal h3 { margin: 0 0 10px; font-size: 15px; }
+#modal .body { overflow: auto; white-space: pre-wrap; }
+#modal .body input[type="text"] { width: 100%; background: #fff; border: 1px solid var(--field-border);
+  border-radius: 7px; padding: 7px 10px; color: var(--text); }
+#modal .body input:focus { outline: none; border-color: var(--accent); }
+#modal .actions { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }
+#modal button { background: #fff; border: 1px solid var(--field-border); border-radius: 7px;
+  padding: 7px 16px; cursor: pointer; color: var(--text); }
+#modal button:hover { border-color: var(--accent); background: #F4FAF6; }
+#modal button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+#modal button.primary:hover { background: #15803D; }
+.modal-list { max-height: 320px; overflow: auto; }
+.modal-list .item { padding: 8px 12px; border: 1px solid var(--card-border); border-radius: 7px;
+  margin: 4px 0; cursor: pointer; }
+.modal-list .item:hover { border-color: var(--accent); background: #F4FAF6; }
+.modal-list .item.cur { background: var(--accent-soft); border-color: var(--accent); }
+
+/* ---- 右键菜单 ---- */
+#ctxmenu { position: fixed; background: #fff; border: 1px solid var(--card-border);
+  border-radius: 8px; padding: 5px; z-index: 120; min-width: 130px;
+  box-shadow: 0 4px 16px rgba(60, 55, 45, 0.15); }
+#ctxmenu .mi { padding: 7px 26px 7px 14px; border-radius: 5px; cursor: pointer; }
+#ctxmenu .mi:hover { background: var(--accent-soft); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #D8D3C7; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #C3BDB0; }
+::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<header id="toolbar">
+  <button id="btn-new">新建</button>
+  <button id="btn-open">打开…</button>
+  <button id="btn-save">保存</button>
+  <button id="btn-saveas">另存为…</button>
+  <button id="btn-validate">校验</button>
+  <button id="btn-delete">删除选中</button>
+  <span id="dirty-dot" hidden>● 未保存</span>
+</header>
+<div id="main">
+  <aside id="palette"></aside>
+  <div id="canvas-scroll">
+    <div id="world">
+      <svg id="edges-svg" width="2400" height="1600" xmlns="http://www.w3.org/2000/svg"></svg>
+      <svg id="rubber-svg" width="2400" height="1600" xmlns="http://www.w3.org/2000/svg"></svg>
+      <!-- 节点卡片动态挂载：z-index 分层（连线 0 / 卡片 1 / 橡皮筋 2），与画布 z 序一致 -->
+    </div>
+  </div>
+  <aside id="panel"><div id="panel-body"></div></aside>
+</div>
+<footer id="statusbar"><span id="status-text"></span></footer>
+<div id="modal-mask" hidden><div id="modal"></div></div>
+<div id="ctxmenu" hidden></div>
+
+<script>
+"use strict";
+/* BAWCode 工作流编辑器（WebUI 版）—— 与原 PySide6 版交互对齐：
+   面板双击/拖拽加节点 · 端口拖出连线（必须单链）· 单击选中 / Ctrl+点选多选 ·
+   Delete 删除选中 · 右侧参数面板即时写回 · 保存为 data/workflows/<名称>.json（节点按链顺序写出） */
+
+// ---------------------------------------------------------------------------
+// 常量（与 gui/workflow_editor.py / core/workflow.py 对齐）
+
+const TYPE_LABELS = {
+  system_prompt: ["系统提示词", "#3A6EA5"],
+  skill: ["技能清单", "#5E8C31"],
+  understand: ["任务理解", "#2C7A7B"],
+  analyze: ["复杂度判定", "#B96A1B"],
+  plan: ["任务规划", "#7D4AA0"],
+  execute: ["编码执行", "#2E7D52"],
+  review: ["审查修正", "#C0392B"],
+  llm: ["通用LLM", "#4682B4"],
+};
+const MODEL_TYPES = new Set(["understand", "analyze", "plan", "execute", "review", "llm"]);
+const PROMPT_TYPES = new Set(["understand", "analyze", "execute", "review", "llm"]);
+const BOOL = "bool", INT = "int", STR = "str", LIST = "list", CHOICE = "choice";
+const FIELD_SCHEMAS = {
+  system_prompt: [["files", "系统提示词文件（逗号分隔）", LIST, null]],
+  skill: [["list", "技能白名单（逗号分隔，空=不注入）", LIST, null]],
+  understand: [
+    ["max_rounds", "理解循环轮数（ask_user 澄清）", INT, [1, 100]],
+    ["capture", "捕获输出为变量名（可空）", STR, null],
+  ],
+  analyze: [["default_level", "判定失败/不可解析时默认", CHOICE, ["low", "high"]]],
+  plan: [
+    ["confirm", "计划生成后需用户确认", BOOL, null],
+    ["steps", "执行前强制拆解步骤（主 LLM 经 generate_steps 工具）", BOOL, null],
+    ["retry_times", "计划生成失败重试次数", INT, [0, 10]],
+  ],
+  execute: [
+    ["max_rounds", "工具循环轮数", INT, [1, 200]],
+    ["capture", "捕获输出为变量名（可空）", STR, null],
+  ],
+  review: [
+    ["max_rounds", "审查循环轮数", INT, [1, 100]],
+    ["capture", "捕获输出为变量名（可空）", STR, null],
+  ],
+  llm: [
+    ["max_rounds", "工具循环轮数（0=单次无工具）", INT, [0, 200]],
+    ["capture", "捕获输出为变量名（可空）", STR, null],
+  ],
+};
+const NODE_DEFAULTS = {
+  system_prompt: { files: ["system_prompt.md"] },
+  skill: { list: [] },
+  understand: { prompt_files: ["understand.md"], capture: "understanding", max_rounds: 8, model_role: "" },
+  analyze: { default_level: "low", prompt_files: [], prompt: "", model_role: "plan" },
+  plan: { confirm: true, steps: true, retry_times: 2 },
+  execute: { max_rounds: 12, model_role: "code", prompt_files: [], capture: "" },
+  review: { prompt_files: ["review.md"], capture: "review_result", max_rounds: 8, model_role: "review" },
+  llm: { prompt_files: [], capture: "", model_role: "plan", max_rounds: 0 },
+};
+const NODE_W = 168, NODE_H = 64;
+const NAME_SANITIZE = /[\\/:*?"<>|]+/g;
+const STATUS_HINT = "双击/拖拽面板添加节点 · 从节点右侧端口拖出连线到目标节点 · 单击选中节点/连线 · Delete 删除选中";
+
+// ---------------------------------------------------------------------------
+// 运行时状态
+
+let name = "";        // 当前工作流名（"" = 未保存）
+let nodes = [];       // [{id, type, enabled, ...字段, x, y, _el, _sub}]（x/y/_ 开头为运行时字段，保存时剥离）
+let edges = [];       // [{src, dst, _g, _line, _head, _hit}]（节点 id 引用）
+let models = [];      // 可用模型名（/api/state）
+let dirty = false;    // 未保存标记（浏览器关页前提醒，桌面版无此概念）
+let pingTimer = null;
+
+const $ = id => document.getElementById(id);
+const worldEl = $("world"), edgesSvg = $("edges-svg"), rubberSvg = $("rubber-svg"), canvasScroll = $("canvas-scroll");
+const panelBody = $("panel-body"), statusText = $("status-text");
+const modalMask = $("modal-mask"), modalEl = $("modal"), ctxMenu = $("ctxmenu");
+const KEY = new URLSearchParams(location.search).get("key") || "";
+
+// ---------------------------------------------------------------------------
+// 基础工具
+
+function el(tag, cls) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  return e;
+}
+function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+function nodeById(id) { return nodes.find(n => n.id === id) || null; }
+function worldPos(ev) {
+  const r = worldEl.getBoundingClientRect();
+  return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+}
+function setStatus(msg, timeout) {
+  statusText.textContent = msg;
+  if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+  if (timeout) statusTimer = setTimeout(() => { statusText.textContent = STATUS_HINT; }, timeout);
+}
+let statusTimer = null;
+
+async function api(path, opts) {
+  // 全部 API 携带 ?key=（服务端强制校验）；网络/服务异常归一为 {ok:false}
+  const sep = path.includes("?") ? "&" : "?";
+  try {
+    const res = await fetch(path + sep + "key=" + encodeURIComponent(KEY), Object.assign({}, opts));
+    return await res.json();
+  } catch (e) {
+    return { ok: false, message: "编辑器服务无响应（可能已退出），请重新运行 /workflow edit 打开" };
+  }
+}
+function apiPost(path, data) {
+  return api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+function markDirty() {
+  if (!dirty) { dirty = true; $("dirty-dot").hidden = false; }
+}
+function clearDirty() { dirty = false; $("dirty-dot").hidden = true; }
+function refreshTitle() {
+  document.title = `BAWCode 工作流编辑器 · ${name || "（未保存）"}`;
+}
+
+// ---------------------------------------------------------------------------
+// 弹窗 / 右键菜单
+
+function closeModal() { modalMask.hidden = true; modalEl.textContent = ""; }
+modalMask.addEventListener("mousedown", ev => { if (ev.target === modalMask) closeModal(); });
+
+function showModal(title, text) {
+  modalEl.textContent = "";
+  const h = el("h3"); h.textContent = title;
+  const body = el("div", "body"); body.textContent = text;
+  const actions = el("div", "actions");
+  const ok = el("button", "primary"); ok.textContent = "确定"; ok.addEventListener("click", closeModal);
+  actions.appendChild(ok);
+  modalEl.append(h, body, actions);
+  modalMask.hidden = false;
+}
+
+function showPromptModal(title, label, initial, onOk) {
+  modalEl.textContent = "";
+  const h = el("h3"); h.textContent = title;
+  const body = el("div", "body");
+  const cap = el("div"); cap.textContent = label;
+  const input = el("input"); input.type = "text"; input.value = initial || "";
+  body.append(cap, input);
+  const actions = el("div", "actions");
+  const cancel = el("button"); cancel.textContent = "取消"; cancel.addEventListener("click", closeModal);
+  const ok = el("button", "primary"); ok.textContent = "确定";
+  const confirm = () => {
+    const v = input.value.trim();
+    if (!v) return;
+    closeModal();
+    onOk(v);
+  };
+  ok.addEventListener("click", confirm);
+  input.addEventListener("keydown", ev => {
+    if (ev.key === "Enter") { ev.preventDefault(); confirm(); }
+  });  // Esc/Ctrl+S 透传全局（关闭弹窗 / 保存）
+  actions.append(cancel, ok);
+  modalEl.append(h, body, actions);
+  modalMask.hidden = false;
+  input.focus(); input.select();
+}
+
+function showListModal(title, names, current, onPick) {
+  modalEl.textContent = "";
+  const h = el("h3"); h.textContent = title;
+  const body = el("div", "body");
+  const list = el("div", "modal-list");
+  for (const n of names) {
+    const item = el("div", "item" + (n === current ? " cur" : ""));
+    item.textContent = n;
+    item.addEventListener("click", () => { closeModal(); onPick(n); });
+    list.appendChild(item);
+  }
+  body.appendChild(list);
+  const actions = el("div", "actions");
+  const cancel = el("button"); cancel.textContent = "取消"; cancel.addEventListener("click", closeModal);
+  actions.appendChild(cancel);
+  modalEl.append(h, body, actions);
+  modalMask.hidden = false;
+}
+
+function hideMenu() { ctxMenu.hidden = true; }
+function showMenu(x, y, items) {
+  ctxMenu.textContent = "";
+  for (const [label, fn] of items) {
+    const mi = el("div", "mi");
+    mi.textContent = label;
+    mi.addEventListener("click", () => { hideMenu(); fn(); });
+    ctxMenu.appendChild(mi);
+  }
+  ctxMenu.style.left = Math.min(x, window.innerWidth - 150) + "px";
+  ctxMenu.style.top = Math.min(y, window.innerHeight - 90) + "px";
+  ctxMenu.hidden = false;
+}
+window.addEventListener("mousedown", ev => {
+  if (!ctxMenu.hidden && !ctxMenu.contains(ev.target)) hideMenu();
+});
+window.addEventListener("blur", hideMenu);
+
+// ---------------------------------------------------------------------------
+// 连线几何：贝塞尔路径 + 终点箭头（与原版 _edge_geometry 对齐）
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, cls) {
+  const e = document.createElementNS(SVG_NS, tag);
+  if (cls) e.setAttribute("class", cls);
+  return e;
+}
+function edgeGeometry(start, end) {
+  // 反向连线（目标在源左侧）时控制点跟随方向，避免生硬的交叉大回环
+  let dx = (end.x - start.x) / 2;
+  if (Math.abs(dx) < 40) dx = dx >= 0 ? 40 : -40;
+  const c1x = start.x + dx, c1y = start.y;
+  const c2x = end.x - dx, c2y = end.y;
+  const d = `M ${start.x} ${start.y} C ${c1x} ${c1y} ${c2x} ${c2y} ${end.x} ${end.y}`;
+  const ang = Math.atan2(end.y - start.y, end.x - start.x);
+  const wing = s => ({
+    x: end.x + (-12 * Math.cos(ang) - s * Math.sin(ang)),
+    y: end.y + (-12 * Math.sin(ang) + s * Math.cos(ang)),
+  });
+  const w1 = wing(5), w2 = wing(-5);
+  const head = `${end.x},${end.y} ${w1.x},${w1.y} ${w2.x},${w2.y}`;
+  return { d, head };
+}
+function portPos(node) {
+  return { x: node.x + NODE_W, y: node.y + NODE_H / 2 };
+}
+function setEdgeAttrs(line, head, start, end) {
+  const g = edgeGeometry(start, end);
+  line.setAttribute("d", g.d);
+  head.setAttribute("points", g.head);
+}
+function updateEdgeGeometry(edge) {
+  const src = nodeById(edge.src), dst = nodeById(edge.dst);
+  if (!src || !dst) return;
+  setEdgeAttrs(edge._line, edge._head, portPos(src), { x: dst.x, y: dst.y + NODE_H / 2 });
+  edge._hit.setAttribute("d", edge._line.getAttribute("d"));
+}
+function updateEdgeGeometryAll() { for (const e of edges) updateEdgeGeometry(e); }
+
+// ---------------------------------------------------------------------------
+// 画布节点渲染
+
+function createNodeEl(node) {
+  const [, color] = TYPE_LABELS[node.type] || [node.type, "#8A857B"];
+  const nodeEl = el("div", "node");
+  const bar = el("div", "bar"); bar.style.background = color;
+  const title = el("div", "title");
+  title.textContent = (TYPE_LABELS[node.type] || [node.type])[0];
+  const sub = el("div", "sub");
+  const portHit = el("div", "port-hit");
+  portHit.appendChild(el("div", "port"));
+  nodeEl.append(bar, title, sub, portHit);
+
+  nodeEl.addEventListener("mousedown", ev => {
+    if (ev.button !== 0) return;
+    ev.stopPropagation();
+    if (ev.target.closest(".port-hit")) { beginEdgeDrag(node, ev); return; }
+    if (ev.ctrlKey || ev.metaKey) toggleNode(node);
+    else if (!selNodes.has(node)) selectNode(node);  // 按下未选中节点才塌缩多选；已选中保持（组拖动，同原版）
+    beginNodeDrag(node, ev);
+  });
+  nodeEl.addEventListener("dblclick", ev => { ev.stopPropagation(); focusPanel(node); });
+  nodeEl.addEventListener("contextmenu", ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    selectNode(node);
+    showMenu(ev.clientX, ev.clientY, [
+      ["参数面板…", () => focusPanel(node)],
+      ["删除节点", () => deleteNodes([node])],
+    ]);
+  });
+
+  node._el = nodeEl;
+  node._sub = sub;
+  worldEl.appendChild(nodeEl);
+  updateNodeEl(node);
+}
+function updateNodeEl(node) {
+  node._el.style.left = node.x + "px";
+  node._el.style.top = node.y + "px";
+  let sub = String(node.id || "");
+  if (node.enabled === false) sub += " · 已停用";
+  node._sub.textContent = sub;
+}
+function refreshSelClasses() {
+  for (const n of nodes) n._el.classList.toggle("sel", selNodes.has(n));
+  for (const e of edges) e._g.classList.toggle("sel", selEdges.has(e));
+}
+
+// ---------------------------------------------------------------------------
+// 选中 / 删除（Ctrl+点选多选，对齐原版 QGraphicsScene 多选删除）
+
+let selNodes = new Set();   // 多选节点集合
+let selEdges = new Set();   // 多选连线集合
+let panelNode = null;       // 参数面板展示节点（最后一次选中的节点）
+
+function clearSelection() {
+  selNodes.clear(); selEdges.clear(); panelNode = null;
+  refreshSelClasses(); renderPanel();
+}
+function selectNode(node, additive) {
+  if (!additive) { selNodes.clear(); selEdges.clear(); }
+  selNodes.add(node);
+  panelNode = node;
+  refreshSelClasses(); renderPanel();
+}
+function toggleNode(node) {
+  if (selNodes.has(node)) {
+    selNodes.delete(node);
+    if (panelNode === node) panelNode = [...selNodes].pop() || null;
+  } else {
+    selNodes.add(node);
+    // 面板跟随正在编辑的节点：已有面板节点仍在选中集内时，追加多选不打断编辑
+    if (!panelNode || !selNodes.has(panelNode)) panelNode = node;
+  }
+  refreshSelClasses(); renderPanel();
+}
+function selectEdge(edge, additive) {
+  if (!additive) { selNodes.clear(); selEdges.clear(); panelNode = null; }
+  selEdges.add(edge);
+  refreshSelClasses(); renderPanel();
+}
+function focusPanel(node) {
+  selectNode(node);
+  const first = panelBody.querySelector("input, textarea, select");
+  if (first) first.focus();
+}
+
+function removeEdgeRaw(edge) {
+  const idx = edges.indexOf(edge);
+  if (idx >= 0) edges.splice(idx, 1);
+  if (edge._g) edge._g.remove();
+  selEdges.delete(edge);
+  markDirty();
+}
+function removeEdge(edge) {  // 右键/单边删除，带状态反馈
+  removeEdgeRaw(edge);
+  refreshSelClasses();
+  setStatus("已删除连线", 3000);
+}
+function deleteNodes(items) {
+  for (const node of items) {
+    if (dragSrc === node) cancelEdgeDrag();
+    // 顺带删除关联连线（不入状态栏，与原版一致）
+    for (const e of edges.filter(e => e.src === node.id || e.dst === node.id)) removeEdgeRaw(e);
+    if (node._el) node._el.remove();
+    const idx = nodes.indexOf(node);
+    if (idx >= 0) nodes.splice(idx, 1);
+    selNodes.delete(node);
+  }
+  if (panelNode && !nodes.includes(panelNode)) panelNode = null;
+  refreshSelClasses();
+  renderPanel();  // 展示对象变化时才真正重建（renderPanel 内有守卫）
+  markDirty();
+}
+function deleteSelected() {
+  const edgeList = [...selEdges], nodeList = [...selNodes];
+  if (!edgeList.length && !nodeList.length) { setStatus("未选中节点或连线", 3000); return; }
+  for (const e of edgeList) removeEdgeRaw(e);  // 桌面版先删边后删节点
+  if (edgeList.length) setStatus("已删除连线", 3000);
+  deleteNodes(nodeList);
+}
+
+// ---------------------------------------------------------------------------
+// 节点拖动 / 端口连线拖拽
+
+function beginNodeDrag(node, ev) {
+  // 已在多选集合时整组移动（对齐原版选中项同动）
+  const targets = selNodes.has(node) ? [...selNodes] : [node];
+  const start = worldPos(ev);
+  const orig = targets.map(t => ({ t, x: t.x, y: t.y }));
+  const onMove = e2 => {
+    const p = worldPos(e2);
+    const dx = p.x - start.x, dy = p.y - start.y;
+    for (const o of orig) {
+      o.t.x = clamp(o.x + dx, 0, 2400 - NODE_W);
+      o.t.y = clamp(o.y + dy, 0, 1600 - NODE_H);
+      updateNodeEl(o.t);
+    }
+    updateEdgeGeometryAll();
+  };
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+  };
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+}
+
+let dragSrc = null;   // 正在从其端口拖线的源节点
+let rubber = null;    // 拖拽中的橡皮筋预览 {line, head}（画在 rubber-svg，压在节点之上）
+function beginEdgeDrag(node, ev) {
+  cancelEdgeDrag();
+  dragSrc = node;
+  node._el.classList.add("drag-src");
+  const g = svgEl("g", "rubber");
+  const line = svgEl("path", "line");
+  const head = svgEl("polygon", "head");
+  g.append(line, head);
+  rubberSvg.appendChild(g);
+  rubber = { line, head };
+  updateRubber(worldPos(ev));
+}
+function updateRubber(p) {
+  if (rubber && dragSrc) setEdgeAttrs(rubber.line, rubber.head, portPos(dragSrc), p);
+}
+function cancelEdgeDrag() {
+  if (rubber) { rubber.line.parentNode.remove(); rubber = null; }
+  if (dragSrc) { dragSrc._el.classList.remove("drag-src"); dragSrc = null; }
+}
+function endEdgeDrag(p) {
+  const src = dragSrc;
+  cancelEdgeDrag();
+  if (!src) return;
+  const target = nodeAt(p);
+  if (!target) { setStatus("连线已取消（落点不在节点上）", 3000); return; }
+  if (target === src) { setStatus("不允许节点自连", 3000); return; }
+  // 两点间任一方向已有边 → 拒绝重复，提示而非静默改动
+  const dup = edges.some(e =>
+    (e.src === src.id && e.dst === target.id) || (e.src === target.id && e.dst === src.id));
+  if (dup) {
+    setStatus(`${src.id} 与 ${target.id} 间已存在连线（选中边后 Delete 可删除）`, 5000);
+    return;
+  }
+  edges.push({ src: src.id, dst: target.id });
+  rebuildEdges();
+  markDirty();
+  setStatus(`连线 ${src.id} → ${target.id}`, 5000);
+}
+function nodeAt(p) {
+  // 后添加的在上层，优先命中（与原版 reversed 遍历一致）；±24px 容差对齐原版
+  // sceneBoundingRect（投影外扩）的落点判定，连线落点更宽容
+  const TOL = 24;
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (p.x >= n.x - TOL && p.x <= n.x + NODE_W + TOL && p.y >= n.y - TOL && p.y <= n.y + NODE_H + TOL) return n;
+  }
+  return null;
+}
+
+document.addEventListener("mousemove", ev => { if (rubber && dragSrc) updateRubber(worldPos(ev)); });
+document.addEventListener("mouseup", ev => { if (rubber && dragSrc) endEdgeDrag(worldPos(ev)); });
+
+// ---------------------------------------------------------------------------
+// 连线渲染
+
+function rebuildEdges() {
+  edgesSvg.textContent = "";
+  for (const e of edges) {
+    const g = svgEl("g", "edge");
+    const hit = svgEl("path", "hit");
+    const line = svgEl("path", "line");
+    const head = svgEl("polygon", "head");
+    g.append(hit, line, head);
+    g.addEventListener("mousedown", ev => {
+      if (ev.button !== 0) return;
+      ev.stopPropagation();
+      selectEdge(e, ev.ctrlKey || ev.metaKey);
+    });
+    g.addEventListener("contextmenu", ev => {
+      ev.preventDefault(); ev.stopPropagation();
+      selectEdge(e);
+      showMenu(ev.clientX, ev.clientY, [["删除连线", () => removeEdge(e)]]);
+    });
+    e._g = g; e._hit = hit; e._line = line; e._head = head;
+    updateEdgeGeometry(e);
+    edgesSvg.appendChild(g);
+  }
+  refreshSelClasses();
+}
+
+// ---------------------------------------------------------------------------
+// 节点增删 / 工作流装载
+
+function gridPos(i) {
+  // 与原版默认摆放一致：8 列网格
+  return { x: 80 + 220 * (i % 8), y: 60 + 140 * Math.floor(i / 8) };
+}
+function uniqueId(ntype) {
+  const ids = new Set(nodes.map(n => n.id));
+  if (!ids.has(ntype)) return ntype;
+  let index = 2;
+  while (ids.has(`${ntype}${index}`)) index++;
+  return `${ntype}${index}`;
+}
+function addNode(ntype, nodeData, pos) {
+  if (!TYPE_LABELS[ntype]) return null;
+  let node;
+  if (!nodeData) {
+    node = Object.assign({ id: uniqueId(ntype), type: ntype, enabled: true }, clone(NODE_DEFAULTS[ntype] || {}));
+  } else {
+    node = clone(nodeData);  // 加载保留缺省字段，面板按运行时默认展示
+  }
+  const gp = gridPos(nodes.length);
+  node.x = pos ? pos.x : gp.x;
+  node.y = pos ? pos.y : gp.y;
+  createNodeEl(node);
+  nodes.push(node);
+  selectNode(node);  // 新节点默认选中并载入参数面板
+  markDirty();
+  return node;
+}
+
+function newWorkflow(keepName) {
+  cancelEdgeDrag();
+  for (const n of nodes) if (n._el) n._el.remove();
+  nodes = [];
+  edges = [];
+  clearSelection();  // 清选择集+面板（对齐原版 _panel_clear，防孤儿表单）
+  rebuildEdges();
+  name = keepName || "";
+  clearDirty();
+  refreshTitle();
+}
+async function loadWorkflow(wfName) {
+  const resp = await api("/api/workflow?name=" + encodeURIComponent(wfName));
+  if (!resp.ok) {
+    showModal("加载失败", (resp.message || "") + (resp.errors ? "\n" + resp.errors.join("\n") : ""));
+    return false;
+  }
+  const data = resp.data;
+  newWorkflow(data.name || wfName);
+  const list = data.nodes || [];
+  for (const nd of list) {
+    const item = addNode(nd.type, nd);
+    if (!item) continue;
+  }
+  // 文件按链顺序存储 → 相邻节点两两连边
+  for (let i = 1; i < list.length; i++) edges.push({ src: list[i - 1].id, dst: list[i].id });
+  rebuildEdges();
+  canvasScroll.scrollLeft = 0;
+  canvasScroll.scrollTop = 0;
+  clearDirty();
+  refreshTitle();
+  setStatus(`已加载 ${wfName}（${list.length} 节点）`, 5000);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 链计算与校验（与原版 compute_chain 对齐）
+
+function computeChain() {
+  if (!nodes.length) return { order: [], errors: ["画布为空"] };
+  const ids = nodes.map(n => n.id);
+  if (new Set(ids).size !== ids.length) return { order: null, errors: ["节点 id 重复"] };
+  const outgoing = {}, incoming = {};
+  for (const e of edges) {
+    if (outgoing[e.src]) return { order: null, errors: [`节点 ${e.src} 有多条出边（必须单链）`] };
+    if (incoming[e.dst]) return { order: null, errors: [`节点 ${e.dst} 有多条入边（必须单链）`] };
+    outgoing[e.src] = e.dst;
+    incoming[e.dst] = e.src;
+  }
+  const starts = ids.filter(id => !incoming[id]);
+  if (starts.length !== 1) {
+    return { order: null, errors: [`起点不唯一：${starts.length} 个无入边节点（${starts.join(", ") || "无"}）`] };
+  }
+  const order = [starts[0]];
+  let cur = starts[0];
+  while (outgoing[cur]) {
+    cur = outgoing[cur];
+    if (order.includes(cur)) return { order: null, errors: ["链中存在环"] };
+    order.push(cur);
+  }
+  if (order.length !== ids.length) {
+    const missing = ids.filter(id => !order.includes(id));
+    return { order: null, errors: [`未连入主链的节点: ${missing.join(", ")}`] };
+  }
+  return { order, errors: [] };
+}
+
+function buildData() {
+  // 仅在单链校验通过后调用：节点按链顺序写出，剥离 x/y/_ 前缀运行时字段
+  const { order } = computeChain();
+  if (!order) return null;
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const out = order.map(id => {
+    const { x, y, _el, _sub, ...rest } = byId.get(id);
+    return clone(rest);
+  });
+  return { name: name || "untitled", description: "", nodes: out };
+}
+
+async function validateChain() {
+  const { errors } = computeChain();
+  if (errors.length) { showModal("校验未通过", errors.join("\n")); return; }
+  const data = buildData();
+  if (!data) return;
+  const resp = await apiPost("/api/validate", { data });
+  if (!resp.ok) { showModal("校验未通过", (resp.errors || []).join("\n")); return; }
+  showModal("校验通过", "单链完整，节点字段合法。\n执行顺序：\n" + data.nodes.map(n => n.id).join(" → "));
+}
+
+// ---------------------------------------------------------------------------
+// 保存 / 另存为 / 打开 / 新建
+
+async function saveWorkflow() {
+  if (!name) { saveAsDialog(); return; }
+  const { errors } = computeChain();
+  if (errors.length) { showModal("校验未通过", errors.join("\n")); return; }  // 空画布显示"画布为空"，对齐原版
+  const data = buildData();
+  if (!data) return;
+  const resp = await apiPost("/api/save", { name, data });
+  if (!resp.ok) { showModal("校验未通过", (resp.errors || [resp.message]).join("\n")); return; }
+  clearDirty();
+  refreshTitle();
+  setStatus(`已保存 ${resp.path}`, 5000);
+}
+function saveAsDialog() {
+  showPromptModal("另存为", "工作流名称（文件名）:", name, v => {
+    name = v.replace(NAME_SANITIZE, "_");
+    refreshTitle();
+    saveWorkflow();
+  });
+}
+async function openDialog() {
+  const st = await api("/api/state");
+  if (!st.ok) { showModal("打开失败", st.message || ""); return; }
+  if (!st.workflows.length) { showModal("打开", "data/workflows 下暂无工作流文件"); return; }
+  showListModal("打开工作流", st.workflows, name, n => loadWorkflow(n));
+}
+
+// ---------------------------------------------------------------------------
+// 参数面板（与原版 _panel_load 对齐：修改即时写回节点数据）
+
+function fieldDefaults(ntype) {
+  return {
+    enabled: true, confirm: true, steps: true, retry_times: 2,
+    default_level: "low",
+    max_rounds: { understand: 8, execute: 12, review: 8 }[ntype] || 0,
+    model_role: { plan: "plan", execute: "code", review: "review" }[ntype] || "",
+  };
+}
+let panelShownFor;  // 面板当前已渲染的节点（undefined=从未渲染）；同节点不重建以保留输入焦点
+function renderPanel() {
+  const node = panelNode && selNodes.has(panelNode) ? panelNode : null;
+  if (node === panelShownFor) return;  // 展示对象未变（含 null 提示语）：跳过重建
+  panelShownFor = node;
+  panelBody.textContent = "";
+  if (!node) {
+    const tip = el("div", "tip");
+    tip.textContent = "单击节点在此处查看 / 编辑参数\n（修改即时写回节点数据）";
+    panelBody.appendChild(tip);
+    return;
+  }
+  const ntype = String(node.type || "");
+  const defaults = fieldDefaults(ntype);
+  const [label, color] = TYPE_LABELS[ntype] || [ntype, "#888"];
+
+  const addRow = (capText, widget) => {
+    const row = el("div", "form-row");
+    const cap = el("div", "cap"); cap.textContent = capText;
+    row.append(cap, widget);
+    panelBody.appendChild(row);
+    return widget;
+  };
+  const addText = (key, title, placeholder, toList) => {
+    const input = el("input"); input.type = "text";
+    const val = node[key];
+    input.value = Array.isArray(val) ? val.map(x => String(x)).join(", ") : String(val || "");
+    if (placeholder) input.placeholder = placeholder;
+    input.addEventListener("input", () => {
+      const text = input.value.trim();
+      if (toList) {
+        node[key] = text.split(",").map(p => p.trim()).filter(Boolean);
+      } else {
+        node[key] = text;
+      }
+      updateNodeEl(node);
+      markDirty();
+    });
+
+    return addRow(title, input);
+  };
+  const addBool = (key, title) => {
+    const box = el("input"); box.type = "checkbox";
+    box.checked = Boolean(node[key] !== undefined ? node[key] : (defaults[key] !== undefined ? defaults[key] : false));
+    box.addEventListener("change", () => { node[key] = box.checked; updateNodeEl(node); markDirty(); });
+    return addRow(title, box);
+  };
+  const addInt = (key, title, lo, hi) => {
+    const input = el("input"); input.type = "number";
+    input.min = String(lo); input.max = String(hi);
+    const fallback = () => (defaults[key] !== undefined ? defaults[key] : lo);
+    let cur = parseInt(node[key] !== undefined ? node[key] : fallback(), 10);
+    if (isNaN(cur)) cur = fallback();
+    input.value = String(clamp(cur, lo, hi));
+    input.addEventListener("change", () => {
+      let v = parseInt(input.value, 10);
+      if (isNaN(v)) v = fallback();
+      v = clamp(v, lo, hi);
+      input.value = String(v);
+      node[key] = v;
+      markDirty();
+    });
+
+    return addRow(title, input);
+  };
+  const addChoice = (key, title, options) => {
+    const sel = el("select");
+    const appendOpt = (value, text) => {
+      const opt = el("option"); opt.value = value; opt.textContent = text;
+      sel.appendChild(opt);
+    };
+    appendOpt("", "（默认）");
+    for (const o of options) appendOpt(o, o);
+    let curVal = String(node[key] !== undefined ? node[key] : (defaults[key] !== undefined ? defaults[key] : "")) || "";
+    if (curVal && ![...sel.options].some(o => o.value === curVal)) appendOpt(curVal, curVal);
+    sel.value = curVal;
+    sel.addEventListener("change", () => { node[key] = sel.value || ""; markDirty(); });
+    return addRow(title, sel);
+  };
+  const addPromptBlock = () => {
+    const ta = el("textarea");
+    ta.placeholder = "内联提示词（优先于提示词文件；支持 ^{var}^ 变量）";
+    ta.value = String(node.prompt || "");
+    ta.addEventListener("input", () => { node.prompt = ta.value; markDirty(); });
+
+    addRow("提示词（内联）", ta);
+    addBool("override_system", "替换系统提示词");
+    addText("prompt_files", "提示词文件（逗号分隔）", "逗号分隔", true);
+  };
+
+  const typeLabel = el("div", "type-label");
+  typeLabel.textContent = label;
+  typeLabel.style.color = color;
+  addRow("类型", typeLabel);
+
+  const idInput = el("input"); idInput.type = "text"; idInput.value = String(node.id || "");
+  idInput.addEventListener("input", () => {
+    // 改 id 同步重定向连线（桌面版连线绑定节点对象，改名天然跟随）
+    const old = node.id;
+    node.id = idInput.value.trim() || ntype;
+    for (const e of edges) {
+      if (e.src === old) e.src = node.id;
+      if (e.dst === old) e.dst = node.id;
+    }
+    updateNodeEl(node);
+    markDirty();
+  });
+
+  addRow("节点 id", idInput);
+  addBool("enabled", "启用节点");
+
+  if (MODEL_TYPES.has(ntype)) {
+    const sel = el("select");
+    const appendOpt = (value, text) => {
+      const opt = el("option"); opt.value = value; opt.textContent = text;
+      sel.appendChild(opt);
+    };
+    appendOpt("", "（跟随角色/激活模型）");
+    for (const m of models) appendOpt(m, m);
+    const curModel = String(node.model || "");
+    if (curModel && ![...sel.options].some(o => o.value === curModel)) appendOpt(curModel, curModel);
+    sel.value = curModel;
+    sel.addEventListener("change", () => { node.model = sel.value || ""; markDirty(); });
+    addRow("模型", sel);
+    addChoice("model_role", "模型角色", ["plan", "code", "review"]);
+  }
+  if (PROMPT_TYPES.has(ntype)) addPromptBlock();
+
+  for (const [key, title, kind, extra] of FIELD_SCHEMAS[ntype] || []) {
+    if (kind === BOOL) addBool(key, title);
+    else if (kind === INT) addInt(key, title, (extra || [0, 999])[0], (extra || [0, 999])[1]);
+    else if (kind === CHOICE) addChoice(key, title, extra || []);
+    else addText(key, title, kind === LIST ? "逗号分隔" : "", kind === LIST);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 面板 / 画布事件
+
+function buildPalette() {
+  const palette = $("palette");
+  for (const [ntype, [label, color]] of Object.entries(TYPE_LABELS)) {
+    const item = el("div", "palette-item");
+    item.draggable = true;
+    const dot = el("span", "palette-dot"); dot.style.background = color;
+    const lab = el("span"); lab.textContent = label;
+    item.append(dot, lab);
+    item.addEventListener("dblclick", () => addNode(ntype));
+    item.addEventListener("dragstart", ev => {
+      ev.dataTransfer.setData("text/bawcode-node", ntype);
+      ev.dataTransfer.setData("text/plain", ntype);
+      ev.dataTransfer.effectAllowed = "copy";
+    });
+    palette.appendChild(item);
+  }
+}
+worldEl.addEventListener("mousedown", ev => {
+  if (ev.button !== 0) return;
+  clearSelection();  // 点击空白清除选择（节点/连线事件均已 stopPropagation）
+});
+canvasScroll.addEventListener("dragover", ev => { ev.preventDefault(); ev.dataTransfer.dropEffect = "copy"; });
+canvasScroll.addEventListener("drop", ev => {
+  ev.preventDefault();
+  const ntype = ev.dataTransfer.getData("text/bawcode-node") || ev.dataTransfer.getData("text/plain");
+  if (!TYPE_LABELS[ntype]) return;
+  const p = worldPos(ev);
+  addNode(ntype, null, { x: p.x - NODE_W / 2, y: p.y - NODE_H / 2 });
+});
+
+document.addEventListener("keydown", ev => {
+  if (!modalMask.hidden) {
+    if (ev.key === "Escape") { ev.preventDefault(); closeModal(); }
+    else if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") ev.preventDefault();  // 弹窗内吞掉 Ctrl+S，不弹浏览器保存
+    return;
+  }
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
+    ev.preventDefault();
+    saveWorkflow();
+    return;
+  }
+  if (rubber && dragSrc && ev.key === "Escape") { cancelEdgeDrag(); return; }
+  const t = document.activeElement;
+  const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+  if (ev.key === "Delete" && !typing) { ev.preventDefault(); deleteSelected(); }
+});
+window.addEventListener("beforeunload", ev => {
+  if (dirty) { ev.preventDefault(); ev.returnValue = ""; }
+});
+
+$("btn-new").addEventListener("click", () => newWorkflow(""));
+$("btn-open").addEventListener("click", openDialog);
+$("btn-save").addEventListener("click", saveWorkflow);
+$("btn-saveas").addEventListener("click", saveAsDialog);
+$("btn-validate").addEventListener("click", validateChain);
+$("btn-delete").addEventListener("click", deleteSelected);
+
+// ---------------------------------------------------------------------------
+// 启动：状态拉取 → 按需载入当前工作流 → 心跳保活
+
+async function boot() {
+  buildPalette();
+  setStatus(STATUS_HINT);
+  refreshTitle();
+  if (!KEY) {
+    showModal("缺少访问密钥", "请从主程序 /workflow edit 或启动命令打开编辑器（URL 需携带 ?key=…）");
+    return;
+  }
+  const st = await api("/api/state");
+  if (!st.ok) { showModal("编辑器不可用", st.message || ""); return; }
+  models = st.models || [];
+  if (st.name && st.has_current) {
+    await loadWorkflow(st.name);
+  } else if (st.name) {
+    showModal("加载失败", `工作流文件不存在: ${st.name}`);
+    refreshTitle();
+  }
+  pingTimer = setInterval(async () => {
+    const resp = await api("/api/ping");
+    if (!resp.ok) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+      setStatus("编辑器服务已退出，请重新运行 /workflow edit 打开");
+    }
+  }, 30000);
+}
+boot();
+</script>
+</body>
+</html>
