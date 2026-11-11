@@ -75,16 +75,35 @@ def _stream_unsupported(e: BaseException) -> bool:
 
 
 # 思考文本字段名各厂商不同，按序取首个非空
-_REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking_content", "thinking")
-def _reasoning_of(mapping) -> str:
-    """从响应 message 或流式 delta 依次探测思考字段，取首个非空值"""
+_REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text", "thinking_content", "thinking")
+# 会话历史回放允许透传出站的 reasoning 字段（_map_api_messages 白名单，assistant 限定）；
+# reasoning_details 为 OpenRouter 结构化形态，存储路径不产出，留作透传兼容
+REASONING_PASSTHROUGH_KEYS = ("reasoning_content", "reasoning", "reasoning_text", "reasoning_details", "thinking_content", "thinking")
+
+def _reasoning_entry(mapping) -> tuple:
+    """探测思考字段，返回 (wire 字段名, 值)；无则 ("", "")"""
     if not isinstance(mapping, dict):
-        return ""
+        return "", ""
     for key in _REASONING_FIELDS:
         value = mapping.get(key)
         if value:
-            return value if isinstance(value, str) else str(value)
-    return ""
+            return key, (value if isinstance(value, str) else str(value))
+    return "", ""
+
+def _reasoning_of(mapping) -> str:
+    """从响应 message 或流式 delta 依次探测思考字段，取首个非空值"""
+    return _reasoning_entry(mapping)[1]
+
+def reasoning_field_of(response: dict) -> Optional[str]:
+    """响应思考文本实际所在的 wire 字段名（与 _reasoning_of 同序探测），无则 None
+
+    供会话留档 thinking_field，回放时按原字段名写回（pi-ai 同款机制）"""
+    raw = response.get("raw") if isinstance(response, dict) else None
+    choices = raw.get("choices") if isinstance(raw, dict) else None
+    message = choices[0].get("message") if choices and isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        return None
+    return _reasoning_entry(message)[0] or None
 
 
 # 中转站偶发把 GLM 分段特殊 token 以明文漏进 content（实测形态：思考 + <|close|>think<|sep|><|open|>response<|sep|> + 回复）；
@@ -140,6 +159,44 @@ _PAYLOAD_SHRINK_MAX = 5
 _PAYLOAD_SHRINK_STEP = 0.10
 _PAYLOAD_SHRINK_FLOOR = 0.50
 _PAYLOAD_TOO_LARGE_MARKERS = ("entity too large", "payload too large", "content too large")
+
+# schema 严格端点对未知消息字段的 400 特征词（qwen-code 实证 Cerebras 返回 wrong_api_format）
+_REASONING_REJECT_MARKERS = (
+    "wrong_api_format", "unknown field", "unexpected field", "unexpected property",
+    "additional property", "unknown parameter", "unrecognized", "unexpected keyword",
+    "extra field", "extra_fields",
+)
+
+
+def _is_reasoning_schema_rejection(e: BaseException) -> bool:
+    """端点对 messages[].reasoning_* 字段做 schema 校验拒收的 400/422 判定"""
+    status = e.code if isinstance(e, urllib.error.HTTPError) else getattr(e, "status_code", None)
+    if status not in {400, 422}:
+        return False
+    text = str(e) + " " + str(getattr(e, "body", "") or "")
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            text += " " + e.read(8192).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    text = text.lower()
+    return any(marker in text for marker in _REASONING_REJECT_MARKERS)
+
+
+def _has_reasoning_key(messages) -> bool:
+    """出站消息里是否携带 reasoning 字段（verbatim 回放产物）"""
+    for m in messages or []:
+        if isinstance(m, dict) and any(m.get(k) for k in REASONING_PASSTHROUGH_KEYS):
+            return True
+    return False
+
+
+def _strip_reasoning_keys(messages) -> None:
+    """就地剥掉所有消息上的 reasoning 字段（400 拒收后的一次性降级重发）"""
+    for m in messages or []:
+        if isinstance(m, dict):
+            for key in REASONING_PASSTHROUGH_KEYS:
+                m.pop(key, None)
 
 
 def _is_payload_too_large(e: BaseException) -> bool:
@@ -281,6 +338,7 @@ class _StreamAggregate:
         self.on_delta = on_delta
         self.content_parts: list = []
         self.reasoning_parts: list = []
+        self.reasoning_field: Optional[str] = None  # 首个思考增量所在的 wire 字段名
         self.tool_buckets: dict = {}
         self.tool_order: list = []
         self.usage = None
@@ -298,9 +356,11 @@ class _StreamAggregate:
                 log.warn("流式回调异常（忽略）: %s", e)
         self.produced += 1
 
-    def add_reasoning(self, piece: str) -> None:
+    def add_reasoning(self, piece: str, field: Optional[str] = None) -> None:
         if not piece:
             return
+        if field and not self.reasoning_field:
+            self.reasoning_field = field
         self.reasoning_parts.append(piece)
         self._emit("reasoning", piece)
 
@@ -351,7 +411,7 @@ class _StreamAggregate:
                     "message": {
                         "role": "assistant",
                         "content": "".join(self.content_parts),
-                        "reasoning_content": "".join(self.reasoning_parts),
+                        self.reasoning_field or "reasoning_content": "".join(self.reasoning_parts),
                         "tool_calls": tool_calls,
                     },
                     "finish_reason": "tool_calls" if tool_calls else "stop",
@@ -536,7 +596,8 @@ class LLM:
         if head.get("finish_reason") is not None:
             agg.finished = True
         delta = head.get("delta") or head.get("message") or {}
-        agg.add_reasoning(_reasoning_of(delta))
+        field, reasoning_value = _reasoning_entry(delta)
+        agg.add_reasoning(reasoning_value, field=field)
         agg.add_content(delta.get("content") or "")
         for i, tc in enumerate(delta.get("tool_calls") or []):
             if isinstance(tc, dict):
@@ -737,6 +798,12 @@ class LLM:
             item: dict = {"role": role, "content": content if isinstance(content, (str, list)) else str(content)}
             if m.get("name"):
                 item["name"] = m["name"]
+            if role == "assistant":
+                # verbatim 回放的 reasoning 字段白名单透传（_api_session_item 按 thinking_field 产出）
+                for key in REASONING_PASSTHROUGH_KEYS:
+                    value = m.get(key)
+                    if value:
+                        item[key] = value
             if role == "tool":
                 # DeepSeek：tool 消息必须携带 tool_call_id；缺 id 不降级为 system（会破坏配对）
                 tcid = m.get("tool_call_id")
@@ -872,6 +939,7 @@ class LLM:
         error_fatal = False
         shrink_step = 0          # 413 渐进缩图已用步数（不占用网络重试预算）
         maintenance_used = False  # 回合间维护一次性标记
+        reasoning_degrade_used = False  # reasoning 字段被端点拒收后剥键重发的一次性标记
         img_originals: dict = {}  # id(part)→原图 URL，逐次缩放相对原图
         start = time.monotonic()
         log.debug(
@@ -970,6 +1038,17 @@ class LLM:
                             log.warn("请求体仍超限，执行回合间维护后重发一次")
                             attempt -= 1
                             continue
+                if (
+                    not reasoning_degrade_used
+                    and _has_reasoning_key(payload.get("messages"))
+                    and _is_reasoning_schema_rejection(e)
+                ):
+                    # verbatim 回放字段被 schema 严格端点拒收：剥键重发一次（不占网络重试预算）
+                    reasoning_degrade_used = True
+                    _strip_reasoning_keys(payload.get("messages"))
+                    attempt -= 1
+                    log.warn("端点拒收 reasoning 字段，剥离后重发一次: %s", e)
+                    continue
                 if not _is_retryable_error(e):
                     # 401/404/400 等确定性失败：不做自动重试；error_fatal 供回合层跳过
                     # 手动重试等待（重发同一请求必然复现，直接走失败回滚）

@@ -1412,11 +1412,16 @@ class Memory:
     def _count_tokens(self, messages: List[dict], model: Optional[str] = None) -> int:
         """tiktoken 计消息列表 token；不可用时字符数减半兜底（estimate_context_tokens 共用）
 
-        先按 _api_session_item 转成实际出站消息，思考仅在窗口内并回正文时才计入。"""
+        先按 _api_session_item 转成实际出站消息（含 verbatim 回放的 reasoning 字段）再计入。"""
         from core import tokens as tokenmod
 
         model = model or str(getattr(self.config, "model_name", "") or "")
-        payload = [out for out in (self._api_session_item(m) for m in messages) if out]
+        replay = self._resolve_replay()
+        reasoning_on = self._reasoning_on()
+        payload = [
+            out for out in (self._api_session_item(m, replay=replay, reasoning_on=reasoning_on) for m in messages)
+            if out
+        ]
         try:
             return tokenmod.count_message_tokens(payload, model)
         except Exception:
@@ -1885,9 +1890,60 @@ class Memory:
             )
         return supplements
 
+    def _active_model_row(self) -> Optional[dict]:
+        """激活模型的配置行（不校验 api_key：回放档位属协议行为，与凭证无关；查询失败返回 None）"""
+        try:
+            name = getattr(self.config, "model_name", None) or self.config.active_model_name()
+            return self.config.find_model(name)
+        except Exception:
+            return None
+
+    def _resolve_replay(self) -> str:
+        """思考出站档位：模型条目 reasoning_replay > provider advanced.reasoning_replay > verbatim"""
+        from core.config import REASONING_REPLAY_OPTIONS
+
+        row = self._active_model_row()
+        if row:
+            value = str(row.get("reasoning_replay") or "").strip().lower()
+            if value in REASONING_REPLAY_OPTIONS:
+                return value
+            provider = self.config.find_provider(row.get("provider_id") or "") or {}
+            advanced = provider.get("advanced") if isinstance(provider.get("advanced"), dict) else {}
+            value = str(advanced.get("reasoning_replay") or "").strip().lower()
+            if value in REASONING_REPLAY_OPTIONS:
+                return value
+        return "verbatim"
+
+    def _reasoning_on(self) -> bool:
+        """当前模型是否按 reasoning 模型出站（verbatim 档空字段补齐开关）
+
+        与 chat() 实际发送的思考开关同口径：复用 _thinking_effort_of 解析最终 effort。"""
+        from core.config import THINKING_OPTIONS, model_preset_defaults
+        from core.llm import _thinking_effort_of
+
+        row = self._active_model_row()
+        if not row:
+            return True
+        provider = self.config.find_provider(row.get("provider_id") or "") or {}
+        advanced = provider.get("advanced") if isinstance(provider.get("advanced"), dict) else {}
+        effort = str(row.get("thinking_effort") or "").strip().lower()
+        if effort not in THINKING_OPTIONS:
+            effort = str(model_preset_defaults(row.get("model_id") or "").get("thinking_effort") or "").lower()
+        final = _thinking_effort_of(
+            effort, advanced, model_override=bool(row.get("thinking_effort_explicit", False)),
+        )
+        return final != "none"
+
     @staticmethod
-    def _api_session_item(item: dict) -> dict:
-        """会话消息 → API 消息（DeepSeek Tool Calls 协议）"""
+    def _api_session_item(item: dict, replay: str = "verbatim", reasoning_on: bool = True) -> dict:
+        """会话消息 → API 消息（DeepSeek Tool Calls 协议）
+
+        思考出站三档（默认 verbatim，与 pi-ai/qwen-code 对齐）：
+        verbatim=按留档的 thinking_field 原字段名回传，忽略 thinking_stripped（协议要求
+        思考在场，如 DeepSeek tools 场景缺字段直接 400）；reasoning_on 时无思考的
+        assistant 消息补空字段（DeepSeek 校验字段存在性，空串即可，pi-ai 同款）。
+        merge=旧行为，窗口内并回 content。strip=不出站。
+        """
         role = item.get("role") or "user"
         content = item.get("content") or ""
         mtype = item.get("type") or ""
@@ -1903,11 +1959,17 @@ class Memory:
             else:
                 # 缺 id 的 tool 不进 API（降级为 system 会破坏 tool_calls 配对）
                 return {}
-        # thinking 字段（思维链留档）回合内出站时并回 content；回合末 finalize_turn 打
-        # thinking_stripped 标后仅留档不再并回——下一轮对话起模型不可见
         thinking = item.get("thinking")
-        if thinking and not item.get("thinking_stripped") and isinstance(out["content"], str):
-            out["content"] = f"{thinking}\n\n{out['content']}" if out["content"] else thinking
+        if role == "assistant" and (thinking or replay == "verbatim"):
+            field = item.get("thinking_field") or "reasoning_content"
+            if replay == "verbatim":
+                if thinking:
+                    out[field] = thinking
+                elif reasoning_on:
+                    out[field] = ""
+            elif replay == "merge" and thinking and not item.get("thinking_stripped") and isinstance(out["content"], str):
+                out["content"] = f"{thinking}\n\n{out['content']}" if out["content"] else thinking
+            # strip：思考不出站
         if role == "assistant" and item.get("tool_calls"):
             import json as _json
             from uuid import uuid4
@@ -1980,8 +2042,10 @@ class Memory:
         if extra_system:
             messages.append({"role": "system", "content": extra_system})
         messages.extend(self.build_context_supplements())
+        replay = self._resolve_replay()
+        reasoning_on = self._reasoning_on()
         for item in self.messages:
-            mapped = self._api_session_item(item)
+            mapped = self._api_session_item(item, replay=replay, reasoning_on=reasoning_on)
             if mapped:
                 messages.append(mapped)
         return messages

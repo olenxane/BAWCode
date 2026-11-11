@@ -322,6 +322,9 @@ def normalize_base_url(url: str) -> str:
 # 模型/系统枚举（设置页 ←→ 切换）
 MODALITY_OPTIONS = ["text", "vision", "audio", "video", "embedding"]
 THINKING_OPTIONS = ["none", "low", "medium", "high", "xhigh", "max"]
+# 思考历史回放档位：verbatim=按原字段名回传（默认，DeepSeek tools 场景必需）、
+# merge=并回正文（旧行为）、strip=不出站；模型条目/提供商 advanced.reasoning_replay 覆盖
+REASONING_REPLAY_OPTIONS = ["verbatim", "merge", "strip"]
 TASK_ROLES = {
     "plan": "任务规划",
     "code": "代码编写",
@@ -453,6 +456,8 @@ def normalize_model_entry(entry: dict) -> dict:
     data["thinking_effort"] = effort if effort in THINKING_OPTIONS else preset["thinking_effort"]
     if "thinking_effort_explicit" in data:
         data["thinking_effort_explicit"] = bool(data["thinking_effort_explicit"])
+    replay = str(data.get("reasoning_replay") or "").strip().lower()
+    data["reasoning_replay"] = replay if replay in REASONING_REPLAY_OPTIONS else None
     return data
 
 
@@ -648,6 +653,7 @@ class Config:
             "modalities": list(model.get("modalities") or ["text"]),
             "thinking_effort": model.get("thinking_effort", "none"),
             "thinking_effort_explicit": bool(model.get("thinking_effort_explicit", False)),
+            "reasoning_replay": model.get("reasoning_replay"),
             "base_url": normalize_base_url(provider.get("base_url", "")),
             "api_key": provider.get("api_key", ""),
             "balance_url": provider.get("balance_url", ""),

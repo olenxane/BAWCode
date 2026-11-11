@@ -23,7 +23,7 @@ from core import prompt_loader
 from core import register
 from core import snapshot as snapshot_mod
 from core import subagent as subagent_mod
-from core.llm import CANCELLED
+from core.llm import CANCELLED, reasoning_field_of
 from core.log import get_logger
 from core.tools import SpinGuard
 
@@ -313,8 +313,12 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             io.status("出错")
             return {"status": "error", "content": ""}
         if (content or reasoning) and not tool_calls:
-            # thinking 与正文并存时以 thinking 字段随消息留档（回合内出站并回 content，回合末剥离）
+            # thinking 与正文并存时以 thinking 字段随消息留档；thinking_field 记录原始 wire 字段名，
+            # 供 verbatim 回放按原名写回（回合内出站按档位处理，不再无条件并回 content）
             extra = {"thinking": reasoning} if reasoning else {}
+            field = reasoning_field_of(response)
+            if field:
+                extra["thinking_field"] = field
             session.add_message("assistant", content, **extra)
         if not tool_calls:
             if drain_injections(turn):
@@ -344,6 +348,9 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         for call in tool_calls:
             call["id"] = call.get("id") or f"call_{uuid.uuid4().hex[:12]}"
         thinking_extra = {"thinking": response["reasoning"]} if response.get("reasoning") else {}
+        field = reasoning_field_of(response)
+        if field:
+            thinking_extra["thinking_field"] = field
         session.add_message(
             "assistant",
             response.get("content") or "",
