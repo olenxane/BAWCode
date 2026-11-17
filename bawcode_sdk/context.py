@@ -159,15 +159,20 @@ class PluginContext:
     # ---- tools（模型可见）----
 
     def register_tool(
-        self, name: Optional[str] = None, description: str = "", usage: str = "", schema: Optional[dict] = None
+        self, name: Optional[str] = None, description: str = "", usage: str = "", schema: Optional[dict] = None,
+        safe: bool = False,
     ):
         """注册模型可见工具（进工具清单，走统一权限/确认/限额管线）；装饰器用法：
             @ctx.register_tool(name="my_tool", description="...", schema={...})
             def my_tool(**kwargs): ...
+
+        safe=True 声明免确认工具（纯交互/无副作用类）：所有访问模式直接放行，
+        与宿主 SAFE_TOOLS 成员同待遇——问用户/委派任务类工具先确认"能调用"纯属打扰。
+        仅对确无副作用的工具使用；标志随插件卸载自动消失。
         """
         def decorator(func: Callable) -> Callable:
             self._ensure_active()
-            self.host.tools.register(name=name or func.__name__, description=description, usage=usage, schema=schema, owner=self.plugin_id)(func)
+            self.host.tools.register(name=name or func.__name__, description=description, usage=usage, schema=schema, owner=self.plugin_id, safe=safe)(func)
             return func
 
         return decorator

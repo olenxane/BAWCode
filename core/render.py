@@ -345,6 +345,26 @@ def _clip(text: str, width: int) -> str:
         used += w
     return "".join(out)
 
+def _wrap_width(text: str, width: int, max_rows: int = 0) -> List[str]:
+    """按显示宽度折行（CJK 宽度感知，保留显式换行）；max_rows>0 时只留末 N 行"""
+    if width <= 0:
+        return [""]
+    rows: List[str] = []
+    for raw in safe_text(str(text or "")).split("\n"):
+        cur, used = "", 0
+        for ch in raw:
+            w = _char_width(ch)
+            if used + w > width and cur:
+                rows.append(cur)
+                cur, used = ch, w
+            else:
+                cur += ch
+                used += w
+        rows.append(cur)
+    if max_rows > 0 and len(rows) > max_rows:
+        return ["…"] + rows[-(max_rows - 1):]
+    return rows
+
 def _clip_keep_ansi(text: str, width: int) -> str:
     if width <= 0:
         return ""
@@ -2774,29 +2794,63 @@ class RenderMixin(UiState):
         return rows
 
     def _compose_ask(self, w: int) -> List[str]:
-        """询问用户面板内容：问题+选项（概述+描述）+末位自由输入+倒计时"""
+        """询问用户面板内容：问题+选项（概述+描述）+末位自由输入+倒计时；
+        multiline 模式（payload 带 multiline）问题折行渲染、输入态多行显示"""
         spec = self.ask_spec or {}
         options = list(spec.get("options") or [])
         rows: List[str] = []
-        rows.append(
-            self.c("accent") + " ❓ " + self.RESET
-            + self.c("warn") + _clip(f"询问用户: {spec.get('question') or ''}", w - 6) + self.RESET
-        )
+        question = str(spec.get("question") or "")
+        if self.ask_multiline:
+            rows.append(self.c("accent") + " ❓ " + self.RESET
+                        + self.c("warn") + _clip("询问用户:", w - 6) + self.RESET)
+            for qr in _wrap_width(question, w - 7, max_rows=6):
+                rows.append("   " + self.c("warn") + _clip(qr, w - 6) + self.RESET)
+        else:
+            rows.append(
+                self.c("accent") + " ❓ " + self.RESET
+                + self.c("warn") + _clip(f"询问用户: {question}", w - 6) + self.RESET
+            )
         if self.ask_input_mode:
-            # 自由输入态：块光标跟随文本（同 confirm 拒绝原因输入）
+            # 自由输入态：块光标跟随文本（同 confirm 拒绝原因输入）；多行模式逐行渲染
             text = self._ask_buf.to_text()
             cur = max(0, min(self._ask_buf.cursor, len(text)))
-            left, right = text[:cur], text[cur:]
             prompt = " 你的意见> "
             inner = max(4, w - _display_width(prompt) - 3)
-            left_c = _clip(left, inner)
-            used = _display_width(left_c)
-            right_c = _clip(right, max(0, inner - used))
-            rows.append(
-                f"{self.c('accent')}{prompt}{self.RESET}"
-                f"{self.c('ink')}{left_c}{self.C_HL} {self.RESET}{right_c}{self.RESET}"
-            )
-            rows.append(self.c("dim") + _clip(" Enter 提交 · Esc 返回选项", w - 1) + self.RESET)
+            if self.ask_multiline:
+                lines = text.split("\n")
+                line_no = text.count("\n", 0, cur)
+                col = cur - (text.rfind("\n", 0, cur) + 1)
+                window = 6
+                start = max(0, line_no - (window - 1))
+                shown = lines[start:][:window]
+                if start > 0:
+                    rows.append(self.c("dim") + _clip("   …", w - 6) + self.RESET)
+                for i, ln in enumerate(shown):
+                    abs_no = start + i
+                    lead = prompt if i == 0 else " " * _display_width(prompt)
+                    if abs_no == line_no:
+                        left_c = _clip(ln[:col], inner)
+                        right_c = _clip(ln[col:], max(0, inner - _display_width(left_c)))
+                        rows.append(
+                            f"{self.c('accent')}{lead}{self.RESET}"
+                            f"{self.c('ink')}{left_c}{self.C_HL} {self.RESET}{right_c}{self.RESET}"
+                        )
+                    else:
+                        rows.append(
+                            f"{self.c('accent')}{lead}{self.RESET}"
+                            f"{self.c('ink')}{_clip(ln, inner)}{self.RESET}"
+                        )
+            else:
+                left, right = text[:cur], text[cur:]
+                left_c = _clip(left, inner)
+                used = _display_width(left_c)
+                right_c = _clip(right, max(0, inner - used))
+                rows.append(
+                    f"{self.c('accent')}{prompt}{self.RESET}"
+                    f"{self.c('ink')}{left_c}{self.C_HL} {self.RESET}{right_c}{self.RESET}"
+                )
+            hint = " Enter 换行 · Ctrl+Enter 提交 · Esc 返回选项" if self.ask_multiline else " Enter 提交 · Esc 返回选项"
+            rows.append(self.c("dim") + _clip(hint, w - 1) + self.RESET)
             return rows
         for i, opt in enumerate(options):
             title = str(opt.get("title") or "")

@@ -377,7 +377,8 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
                 register.unregister(reg_name)
             else:
                 register.register(name=reg_name, description=old["description"], usage=old["usage"],
-                                  schema=old["schema"], owner=old["owner"])(old["func"])
+                                  schema=old["schema"], owner=old["owner"],
+                                  safe=old.get("safe", False))(old["func"])
         # 未成形的 stack 自行收尾；已成形的留给 disconnect 流程
         try:
             if handle.get("stack") is not stack:

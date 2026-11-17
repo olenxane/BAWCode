@@ -18,6 +18,7 @@ def register(
     usage: str = "",
     schema: Optional[dict] = None,
     owner: str = "",
+    safe: bool = False,
 ) -> Callable[[Callable], Callable]:
     """工具注册装饰器
 
@@ -26,6 +27,8 @@ def register(
     :param usage: 用法说明
     :param schema: JSON Schema 参数结构
     :param owner: 归属标识即插件 id，便于整体注销
+    :param safe: 免确认声明（纯交互/无副作用类，与 policy.SAFE_TOOLS 同待遇；
+        标志随注册表条目存亡，插件卸载自动消失）
     """
 
     def decorator(func: Callable) -> Callable:
@@ -41,7 +44,10 @@ def register(
             "usage": usage,
             "schema": schema or {"type": "object", "properties": {}, "required": []},
             "owner": owner or "",
+            "safe": safe is True,  # 严格布尔：仅显式 True 生效，防 "false" 等真值误声明
         }
+        if safe is True:
+            log.info("注册免确认工具(safe): %s (owner=%s)", tool_name, owner or "-")
         log.debug("注册工具: %s", tool_name)
         return func
 

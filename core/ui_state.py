@@ -56,6 +56,7 @@ class UiState:
     ask_spec: Any
     ask_deadline: Optional[float]
     ask_input_mode: bool
+    ask_multiline: bool
     _ask_buf: Any
     _confirm_buf: Any
     _dialog_active: bool

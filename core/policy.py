@@ -624,6 +624,11 @@ def is_safe_call(tool_name: str, args: Optional[dict]) -> bool:
     args = args or {}
     if tool_name in SAFE_TOOLS:
         return True
+    # 注册表 safe 声明（SDK register_tool(safe=True)）：插件自证的纯交互/无副作用
+    # 工具，与 SAFE_TOOLS 同待遇；标志随注册表条目存亡，插件卸载自动消失
+    entry = register.get_tool(tool_name)
+    if entry is not None and entry.get("safe"):
+        return True
     if tool_name in ("execute_command", "run_program"):
         cmd = command_text(tool_name, args)
         if not cmd.strip():
@@ -675,6 +680,11 @@ def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pa
             and path_in_scope(tool_name, fp, root)
         ):
             return ALLOW, f"allowlist:{pattern}"
+
+    # 注册表 safe 声明单独放行并区分来源（safe:declared=插件自证；safe=内置 SAFE_TOOLS），审计可辨
+    entry = register.get_tool(tool_name)
+    if entry is not None and entry.get("safe"):
+        return ALLOW, "safe:declared"
 
     if is_safe_call(tool_name, args):
         return ALLOW, "safe"

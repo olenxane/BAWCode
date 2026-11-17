@@ -240,6 +240,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.ask_spec: dict = {}
         self.ask_index = 0
         self.ask_input_mode = False
+        self.ask_multiline = False  # 多行模式：Enter 换行、Ctrl+Enter 提交、粘贴保换行
         self._ask_buf = TextBuffer()
         self.ask_deadline: Optional[float] = None
         self._ask_last_sec = -1
@@ -1537,6 +1538,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.ask_spec = {"question": question, "options": options}
         self.ask_index = 0
         self.ask_input_mode = False
+        self.ask_multiline = bool((payload or {}).get("multiline"))
         self._ask_buf = TextBuffer()
         self.ask_deadline = (time.monotonic() + timeout) if timeout > 0 else None
         self._ask_last_sec = -1
@@ -1574,7 +1576,14 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                         self._ask_buf.clear()
                         self.render()
                         continue
-                    if kind in ("submit", "newline"):
+                    if kind == "newline":
+                        # Ctrl+Enter：多行模式的提交键（单行模式与 Enter 同义）
+                        return {"status": "answer", "answer": self._ask_buf.to_text().strip()}
+                    if kind == "submit":
+                        if self.ask_multiline:
+                            self._ask_buf.insert("\n")
+                            self.render()
+                            continue
                         return {"status": "answer", "answer": self._ask_buf.to_text().strip()}
                     if kind == "char":
                         if isinstance(value, str) and value and all(ord(c) >= 32 for c in value):
@@ -1586,8 +1595,11 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                         self.render()
                         continue
                     if kind == "paste":
-                        flat = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
-                        self._ask_buf.insert(flat)
+                        if self.ask_multiline:
+                            self._ask_buf.insert(str(value))  # 多行模式保留换行
+                        else:
+                            flat = str(value).replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+                            self._ask_buf.insert(flat)
                         self.render()
                         continue
                     continue
