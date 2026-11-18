@@ -24,6 +24,7 @@ from core import plugins as plugins_mod
 from core import policy
 from core import project_identity
 from core import register
+from core import scheduler as scheduler_mod
 from core import session_store
 from core import snapshot as snapshot_mod
 from core import statistics as statistics_mod
@@ -1763,6 +1764,7 @@ def main_headless(args) -> int:
     try:
         runner = _AgentRunner(llm, session, app, config)
         tools_mod.set_background_notifier(runner.notify)
+        scheduler_mod.set_notifier(runner.notify)
         plugins_mod.bind_runtime(app=app, runner=runner)
         # busy 置位：无头下同步跑回合，若不置位，后台子代理完成通知会另起线程并发跑回合
         runner._set_busy(True)
@@ -1856,6 +1858,7 @@ def main(args=None) -> None:
         runner = _AgentRunner(llm, session, app, config)
         app.agent_runner = runner
         tools_mod.set_background_notifier(runner.notify)  # 后台命令完成 → runner.notify 自动开新回合
+        scheduler_mod.set_notifier(runner.notify)          # 定时任务到点 → 同通道开新回合
         plugins_mod.bind_runtime(app=app, runner=runner)  # 插件类用户操作 API（submit_turn/notify/ctx.ui）载体
         app.interrupt_turn_handler = runner.interrupt_turn  # Esc 打断当前回合并保留其已记录上下文
         llm.query_balance()

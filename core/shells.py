@@ -1,5 +1,6 @@
 #命令执行器适配层：解析默认/单次执行器，构造 argv，调用解释器自身做语法预检（只解析不执行）
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -254,6 +255,84 @@ def build_command(command: str, name: str) -> Tuple[Union[list, str, None], str,
             return [binary, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"], text, False
         return [binary, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", text], "", False
     return text, "", True
+
+
+# powershell 子调用改道：cmd 解析整行时，powershell -c "..." 的嵌套双引号会翻转 cmd 的
+# 引号状态，脚本内的 | & 落进未引号区被 cmd 当成自己的管道（典型错误：'Measure-Object'
+# 不是内部或外部命令）。识别纯 powershell 调用行并提取脚本，交 PowerShell 执行器直启绕开二次解析
+
+_PS_EXE_RE = re.compile(
+    r'^(?:[A-Za-z]:\\[^\s"\']*\\)?(?:powershell|pwsh)(?:\.exe)?(?=\s|$)',
+    re.IGNORECASE,
+)
+_PS_FLAGLESS = {"noprofile", "nologo", "noninteractive", "sta", "mta", "nop", "nol", "noni"}
+_PS_FLAG_VALUE = {"executionpolicy", "inputformat", "outputformat", "version", "windowstyle"}
+
+
+def _unescape_argv(text: str) -> str:
+    """按 powershell.exe 的 argv 规则解转义（\\\\ 与 \\" 还原为单字符），与经 cmd 传递的实际结果一致"""
+    out = []
+    i, total = 0, len(text)
+    while i < total:
+        if text[i] == "\\" and i + 1 < total and text[i + 1] in ("\\", '"'):
+            out.append(text[i + 1])
+            i += 2
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def extract_embedded_powershell(command: str) -> Optional[str]:
+    """识别 cmd 行首的纯 powershell 子调用 powershell [全局参数] -Command "脚本"，返回脚本；不匹配返回 None
+
+    只认引号包裹且占满剩余整行的形态：裸脚本、-File、脚本后还有其它参数或重定向的
+    语义不同（cmd 管道/重定向可能是故意的），一律不启用。提取后按 argv 规则解转义，
+    与 powershell.exe 经 cmd 实际收到的脚本一致。"""
+    text = str(command or "").strip()
+    match = _PS_EXE_RE.match(text)
+    if match is None:
+        return None
+    rest = text[match.end():].lstrip()
+    script_part = ""
+    while True:
+        if not rest.startswith("-"):
+            return None
+        end = len(rest)
+        for i, ch in enumerate(rest):
+            if ch.isspace():
+                end = i
+                break
+        body = rest[:end].lower()[1:]
+        tail = rest[end:].lstrip()
+        if body[:1] == "c" and "command".startswith(body):
+            script_part = tail
+            break
+        if body in _PS_FLAGLESS:
+            rest = tail
+            continue
+        if body in _PS_FLAG_VALUE:
+            stop = len(tail)
+            for i, ch in enumerate(tail):
+                if ch.isspace():
+                    stop = i
+                    break
+            if stop == len(tail):
+                return None
+            rest = tail[stop:].lstrip()
+            continue
+        return None
+    script_part = script_part.rstrip()
+    if len(script_part) < 2 or not (script_part.startswith('"') and script_part.endswith('"')):
+        return None
+    inner = script_part[1:-1]
+    if inner.count('"') % 2:
+        return None  # 引号不配平说明模型意图不明，交 cmd 原样执行由报错自纠
+    # cmd 连接符只可能来自复合命令或 PS7 专属语法：前者是 cmd 语义，后者 5.1 预检必拒，都不改道
+    if "&&" in inner or "||" in inner:
+        return None
+    inner = _unescape_argv(inner)
+    return inner if inner.strip() else None
 
 
 # 语法预检脚本：只解析不执行。内嵌脚本经 -EncodedCommand 传递，命令经环境变量送入，

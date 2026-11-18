@@ -21,6 +21,7 @@ from core import memory as memory_mod
 from core import policy
 from core import proc
 from core import register
+from core import scheduler as scheduler_mod
 from core import shells
 from core import snapshot
 from core import toolstore
@@ -213,6 +214,12 @@ def _with_notice(text: str, notice: str) -> str:
     return f"{notice}\n{text}" if notice else text
 
 
+_PS_ROUTE_NOTICE = (
+    "注意：检测到 powershell 子调用，为避免 cmd.exe 解析嵌套引号破坏脚本，"
+    "本次已改用 PowerShell 执行器直跑。"
+)
+
+
 def _resolve_shell(shell: str) -> Tuple[str, str, str]:
     """解析执行器：返回 (执行器, 回退提示, 错误文本)
 
@@ -297,8 +304,22 @@ def execute_command(
     shell_name, fallback_notice, shell_error = _resolve_shell(shell)
     if shell_error:
         return shell_error
-    # 语法预检必须按回退后的执行器做：否则会用 bash 规则检查将交给 cmd 的命令
-    issue = shells.syntax_issue(command, shell_name)
+    # powershell 子调用改道：候选脚本先按 PowerShell 预检，通过才换执行器，未过按 cmd 原样执行
+    routed = False
+    if shell_name == shells.CMD:
+        script = shells.extract_embedded_powershell(command)
+        if script is not None:
+            gate = shells.syntax_issue(script, shells.POWERSHELL)
+            if gate:
+                log.warn("powershell 子调用预检未过，交 cmd 原样执行: %s", command)
+            else:
+                log.info("powershell 子调用改道 PowerShell 执行器直跑: %s", command)
+                command = script
+                shell_name = shells.POWERSHELL
+                fallback_notice = "\n".join(n for n in (fallback_notice, _PS_ROUTE_NOTICE) if n)
+                routed = True
+    # 语法预检必须按回退后的执行器做：否则会用 bash 规则检查将交给 cmd 的命令；改道时已按 PowerShell 预检过
+    issue = "" if routed else shells.syntax_issue(command, shell_name)
     if issue:
         log.warn("命令语法与执行器 %s 不匹配，已拦下: %s", shell_name, command)
         return f"{fallback_notice}\n{issue}".strip() if fallback_notice else issue
@@ -565,6 +586,74 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
     if isinstance(idx, int):
         return f"用户选择了: {answer}"
     return f"用户自行输入: {answer}"
+
+
+# schedule：待机巡检（登记一个到点触发的任务，一次性或周期，时间满足时唤起回合）
+# 单例——同时只允许一个巡检；内存态不持久化（实例重启即丢、不补触发）；
+# 任务绑定创建时会话，会话切换自销。适合"后台下载/编译等长任务，Agent 待机后到点查看"
+
+@register.register(
+    name="schedule",
+    description=(
+        "Arm a single standby check-in: when a long-running background job (download, "
+        "build) is in flight, register a wake-up so the agent can go idle and get a "
+        "turn injected at fire time to inspect progress. action='create' registers a "
+        "one-shot (delay_minutes or run_at) or recurring (every_minutes) check-in; "
+        "only ONE inspection may exist — a second create is rejected until you cancel "
+        "the current one. action='list' shows it; action='cancel' removes it (id "
+        "optional). Memory-only: lost on process restart, never replayed, bound to "
+        "the current session"
+    ),
+    usage="schedule <action> [text] [delay_minutes|run_at|every_minutes|id]",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "list", "cancel"],
+                "description": "create=登记巡检; list=查看本会话巡检; cancel=取消（id 可省）",
+            },
+            "text": {
+                "type": "string",
+                "description": "Task content injected as the new turn's instruction when it fires (create only)",
+            },
+            "delay_minutes": {
+                "type": "number",
+                "description": "One-shot: fire after N minutes (mutually exclusive)",
+            },
+            "run_at": {
+                "type": "string",
+                "description": "One-shot: absolute local time 'YYYY-MM-DD HH:MM' (mutually exclusive)",
+            },
+            "every_minutes": {
+                "type": "number",
+                "description": "Recurring: fire every N minutes (mutually exclusive)",
+            },
+            "id": {
+                "type": "string",
+                "description": "Task id for cancel (optional, single slot)",
+            },
+        },
+        "required": ["action"],
+    },
+)
+def schedule(
+    action: str,
+    text: str = "",
+    delay_minutes: float = 0,
+    run_at: str = "",
+    every_minutes: float = 0,
+    id: str = "",
+) -> str:
+    """巡检入口：create 登记、list 查看、cancel 取消，委托 core.scheduler"""
+    action = str(action or "").strip().lower()
+    if action == "create":
+        return scheduler_mod.create(text, run_at=run_at, delay_minutes=delay_minutes, every_minutes=every_minutes)
+    if action == "list":
+        return scheduler_mod.list_tasks()
+    if action == "cancel":
+        return scheduler_mod.cancel(id)
+    return "参数错误: action 必须是 create/list/cancel"
 
 
 # request_mode_switch：申请切换访问模式（纯交互，切换由用户面板批准）
