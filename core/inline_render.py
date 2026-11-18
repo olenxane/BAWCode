@@ -26,7 +26,7 @@ _SKIP_PREFIXES = ("fallback:",)
 _NO_DESCEND = {"subagent", "step"}
 _COLLAPSED = {"thinking", "subagent", "step", "stream_thinking"}
 
-# 默认折叠时工具节点打印进 scrollback 的行数上限，超出以指示行代替；全局展开不受限
+# 默认折叠时工具节点打印进 scrollback 的行数上限，超出以指示行代替；展开（全部/仅工具）不受限
 TOOL_ROW_CAP = 8
 
 Entry = Tuple[TreeNode, int, bool, str]
@@ -98,6 +98,8 @@ class InlineRenderer:
         self._size_key: Optional[Tuple[int, int]] = None
         self._reprint = False
         self._expand_all = False
+        self._expand_thinking = False
+        self._expand_tools = False
         self._last_live: Optional[List[str]] = None
         self._stream_cache: Tuple[str, int, List[str]] = ("", 0, [])
         self._reset_state()
@@ -120,6 +122,18 @@ class InlineRenderer:
         self._expand_all = not self._expand_all
         self.request_reprint()
         return self._expand_all
+
+    def toggle_expand_thinking(self) -> bool:
+        """Alt+T：展开全部思维链节点；再按一次回到默认折叠"""
+        self._expand_thinking = not self._expand_thinking
+        self.request_reprint()
+        return self._expand_thinking
+
+    def toggle_expand_tools(self) -> bool:
+        """Alt+O：展开全部工具调用节点（含输出回读）；再按一次回到默认折叠"""
+        self._expand_tools = not self._expand_tools
+        self.request_reprint()
+        return self._expand_tools
 
     def close(self) -> str:
         """退出时的收尾序列：离开备用屏并擦掉动态区，scrollback 中的对话保留"""
@@ -212,7 +226,9 @@ class InlineRenderer:
             if self._expand_all:
                 expanded = True
             elif node.kind == "tool":
-                expanded = not node.summary
+                expanded = self._expand_tools or not node.summary
+            elif self._expand_thinking and node.kind in ("thinking", "stream_thinking"):
+                expanded = True
             else:
                 expanded = node.kind not in _COLLAPSED
             (dynamic if dyn else static).append((node, depth, expanded, "  " * max(0, depth - 1)))
@@ -231,9 +247,11 @@ class InlineRenderer:
         if not entries:
             return []
         app = self.app
-        rows, spans = app._rows_for_flat(entries, width, force_open=self._expand_all)
-        # 全局展开时不再截工具输出的行数
-        tool_cap = TOOL_ROW_CAP if (cap and not self._expand_all) else 0
+        rows, spans = app._rows_for_flat(
+            entries, width, force_open=self._expand_all or self._expand_tools
+        )
+        # 展开（全部或仅工具）时不再截工具输出的行数；force_open 只作用于工具节点
+        tool_cap = TOOL_ROW_CAP if (cap and not (self._expand_all or self._expand_tools)) else 0
         out: List[str] = []
         for (node, depth, _expanded, _guide), (start, count) in zip(entries, spans):
             chunk = rows[start : start + count]

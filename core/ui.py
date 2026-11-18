@@ -926,16 +926,22 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 return self._submit_line()
             return None
 
-        # Alt+E：inline 模式展开/收起全部折叠节点（历史需重印，故由渲染器整体重画）
+        # Alt+E/T/O：inline 模式分组展开/收起折叠节点（历史需重印，故由渲染器整体重画）
+        _expand_keys = {
+            "alt+e": ("toggle_expand_all", "已展开全部折叠节点（Alt+E 收起）"),
+            "alt+t": ("toggle_expand_thinking", "已展开全部思维链（Alt+T 收起）"),
+            "alt+o": ("toggle_expand_tools", "已展开全部工具调用（Alt+O 收起）"),
+        }
+        _expand_key = _expand_keys.get(str(value).lower()) if kind == "hotkey" else None
         if (
-            kind == "hotkey"
-            and str(value).lower() == "alt+e"
+            _expand_key is not None
             and self._inline is not None
             and not self._dialog_active
             and not (self.settings_mode or self.sessions_mode)
         ):
-            expanded = self._inline.toggle_expand_all()
-            self.status = "已展开全部折叠节点（Alt+E 收起）" if expanded else "已恢复默认折叠"
+            method, open_msg = _expand_key
+            expanded = getattr(self._inline, method)()
+            self.status = open_msg if expanded else "已恢复默认折叠"
             self.render()
             return None
 

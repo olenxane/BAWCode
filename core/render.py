@@ -2001,7 +2001,7 @@ class RenderMixin(UiState):
     ) -> Tuple[List[str], List[Tuple[int, int]]]:
         """展平节点 → 渲染行与每节点行区间；hl 为高亮节点序号，-1 不高亮
 
-        force_open=True（inline 全局展开）时把节点视为用户手动展开，回读外置全文。"""
+        force_open=True（inline 全局/工具展开）时把节点视为用户手动展开，回读外置全文。"""
         # 双色分层：角色徽标=饱和色加粗，正文=角色色向 ink 混合的浅色变体
         user_text = _fg(_mix(self.colors["user_msg"], self.colors["ink"], 0.45))
         agent_text = _fg(_mix(self.colors["agent"], self.colors["ink"], 0.50))
