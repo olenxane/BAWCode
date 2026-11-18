@@ -105,6 +105,46 @@ def list_sessions(directory: Path) -> List[dict]:
     return items
 
 
+def session_has_user_turns(data: dict) -> bool:
+    """会话是否"被使用过"：存在至少一条 user 消息。
+
+    system 注入（记忆清单、插件链接提示等）不算使用——新会话启动即带 system
+    消息，按条数判空会把未使用的会话也落盘成垃圾历史记录。"""
+    return any(
+        isinstance(m, dict) and m.get("role") == "user"
+        for m in data.get("messages") or []
+    )
+
+
+def prune_unused_sessions(directory: Path) -> int:
+    """删除目录内未使用的会话文件：0 条 user 消息且 revision=0。
+
+    /clear 留下的空会话带 revision>0（用户主动清空的标记记录）保留。
+    返回删除数量；损坏文件跳过不删。"""
+    removed = 0
+    if not directory.exists():
+        return 0
+    for path in directory.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        # 压缩留档（kind=precompact-archive / 文件名带 -precompact-）不是会话记录，不清理
+        if data.get("kind") or "-precompact-" in path.name:
+            continue
+        if session_has_user_turns(data) or revision_of(data) > 0:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+            log.info("未使用会话已清理: %s", path.name)
+        except OSError as e:
+            log.warn("未使用会话清理失败 %s: %s", path.name, e)
+    return removed
+
+
 def heal_orphan_tool_calls(messages: list) -> int:
     """补齐孤儿 tool_calls：assistant 带 tool_calls 但缺配对 tool 结果时（历史中断所致）
     在该 assistant 的 tool 结果段末尾合成占位结果，否则后续每次请求会被 API 以

@@ -236,6 +236,10 @@ def init_session(config, project_identity_data: Optional[dict] = None) -> "Memor
     """初始化全局记忆会话"""
     global _session
     _session = Memory(config, project_identity=project_identity_data)
+    try:
+        session_store.prune_unused_sessions(_session.sessions_dir)
+    except Exception as exc:
+        log.warn("未使用会话清理失败: %r", exc)
     hooks.collect_hook(
         "session_start",
         {
@@ -2135,8 +2139,10 @@ class Memory:
         return self.session_title
 
     def save_session(self) -> Optional[Path]:
-        """自动保存当前会话；未清空的空会话不写盘。"""
-        if not self.messages and not self.revision:
+        """自动保存当前会话；未使用的会话（0 条 user 消息且未清空过）不写盘，
+        并顺手清掉盘上同 id 残留文件（新会话启动即注入的 system 提示不算使用）。"""
+        if not self.revision and not session_store.session_has_user_turns({"messages": self.messages}):
+            session_store.delete_session_data(self.sessions_dir, self.session_id)
             return None
         data = {
             "version": session_store.SESSION_VERSION,
