@@ -1,6 +1,7 @@
 """main.py:程序核心入口"""
 import json
 import os
+import shlex
 import sys
 import threading
 import time
@@ -57,6 +58,210 @@ def _sync(app, session, task: Optional[str] = "", status: str = "", render: bool
 def _echo(ctx, content: str, mtype: str = "help") -> None:
     """命令反馈写入 session，避免 _sync 用 session 覆盖 app.messages 时丢失"""
     ctx["session"].add_message("system", content, type=mtype)
+
+
+def _mcp_ask(app, payload: dict):
+    """询问一步：主线程直接弹面板（/settings 同款嵌套模态），远程线程经 UI
+    请求桥让插件代答——命令执行在主线程内，request_ui 桥只在帧循环被服务，
+    主线程走桥会死锁。远程侧轮询请求槽：被无锁请求方顶掉后不再空等"""
+    if threading.current_thread() is threading.main_thread():
+        return app.show_ask_form(payload)
+    with ui.DIALOG_LOCK:
+        req = app.request_ui("ask", payload)
+        while not req["event"].wait(0.05):
+            if app._ui_req is not req:
+                return {"status": "cancelled"}
+        return req["result"]
+
+
+def _mcp_answer(result) -> Optional[str]:
+    """统一取 ask 回执文本；非 answer 一律视为中断"""
+    if not isinstance(result, dict) or result.get("status") != "answer":
+        return None
+    answer = result.get("answer")
+    return str(answer).strip() if answer is not None else ""
+
+
+def _mcp_parse_kv(text: str) -> dict:
+    """env/headers 多行输入解析：K=V 或 K: V 每行一条，取最先出现的分隔符
+    （Cookie: session=abc 这类值含 = 的头按冒号切）"""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        eq, co = line.find("="), line.find(":")
+        if eq == -1 and co == -1:
+            continue
+        sep = eq if co == -1 else (co if eq == -1 else min(eq, co))
+        k, v = line[:sep], line[sep + 1:]
+        if k.strip():
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _mcp_add_wizard(app, preset_name: str = ""):
+    """/mcp add 面板向导：逐项 ask 收集服务器条目，返回 (name, entry)；中断返回 (None, None)"""
+    result = _mcp_ask(
+        app,
+        {
+            "question": "MCP 服务器名称（作为 mcp.servers 键与工具前缀）",
+            "options": [{"title": preset_name, "description": "直接回车使用"}] if preset_name else [],
+        },
+    )
+    answer = _mcp_answer(result)
+    if answer is None:
+        return None, None
+    name = answer or preset_name
+    if not name.strip():
+        return None, {"_invalid": "服务器名不能为空"}
+    result = _mcp_ask(
+        app,
+        {
+            "question": f"{name}：选择传输方式",
+            "options": [
+                {"title": "stdio", "description": "本地进程：command + args + env"},
+                {"title": "http", "description": "Streamable HTTP：url + headers"},
+                {"title": "sse", "description": "SSE 长连接：url + headers"},
+            ],
+        },
+    )
+    answer = _mcp_answer(result)
+    if answer is None:
+        return None, None
+    transport = answer.strip().lower()
+    if transport not in ("stdio", "http", "sse"):
+        return name, {"_invalid": f"未知传输: {transport}"}
+    entry: dict = {}
+    if transport == "stdio":
+        result = _mcp_ask(
+            app,
+            {
+                "question": f"{name}：启动命令行（例 npx -y @mcp/server，含参数整体一行）",
+                "options": [],
+            },
+        )
+        answer = _mcp_answer(result)
+        if answer is None or not answer:
+            return None, None
+        try:
+            # posix=False：保留反斜杠（Windows 路径）与引号字符归位，
+            # posix 模式会把 D:\path 的 \ 当转义吃掉且不报错
+            argv = [a for a in shlex.split(answer, posix=False)]
+            argv = [a[1:-1] if len(a) >= 2 and a[0] == a[-1] and a[0] in "\"'" else a for a in argv]
+        except ValueError:
+            argv = answer.split()
+        if not argv:
+            return name, {"_invalid": "命令行为空"}
+        entry = {"command": argv[0], "args": argv[1:], "transport": "stdio"}
+        result = _mcp_ask(
+            app,
+            {
+                "question": f"{name}：环境变量（可选 · 每行 K=V · 跳过直接回车）",
+                "options": [],
+                "multiline": True,
+            },
+        )
+        answer = _mcp_answer(result)
+        if answer is None:
+            return None, None
+        if answer:
+            entry["env"] = _mcp_parse_kv(answer)
+        result = _mcp_ask(
+            app,
+            {"question": f"{name}：工作目录 cwd（可选 · 跳过直接回车）", "options": []},
+        )
+        answer = _mcp_answer(result)
+        if answer is None:
+            return None, None
+        if answer:
+            entry["cwd"] = answer
+    else:
+        result = _mcp_ask(app, {"question": f"{name}：服务 URL（http:// 或 https://）", "options": []})
+        answer = _mcp_answer(result)
+        if answer is None or not answer:
+            return None, None
+        entry = {"transport": transport, "url": answer}
+        result = _mcp_ask(
+            app,
+            {
+                "question": f"{name}：请求头（可选 · 每行 K: V 或 K=V · 跳过直接回车）",
+                "options": [],
+                "multiline": True,
+            },
+        )
+        answer = _mcp_answer(result)
+        if answer is None:
+            return None, None
+        if answer:
+            entry["headers"] = _mcp_parse_kv(answer)
+    result = _mcp_ask(
+        app,
+        {
+            "question": f"{name}：高级字段 JSON（可选 · include_tools/exclude_tools/timeout 等 · 跳过直接回车）",
+            "options": [],
+        },
+    )
+    answer = _mcp_answer(result)
+    if answer is None:
+        return None, None
+    if answer:
+        try:
+            extra = json.loads(answer)
+        except json.JSONDecodeError as exc:
+            return name, {"_invalid": f"高级字段 JSON 解析失败: {exc}"}
+        if not isinstance(extra, dict):
+            return name, {"_invalid": "高级字段必须是 JSON 对象"}
+        entry.update(extra)
+    result = _mcp_ask(
+        app,
+        {
+            "question": f"{name}：立即启用该服务器？",
+            "options": [
+                {"title": "启用", "description": "写入后即后台连接发现"},
+                {"title": "仅写入禁用", "description": "entry.enabled=false，需手动改配置后 /mcp reload"},
+            ],
+        },
+    )
+    answer = _mcp_answer(result)
+    if answer is None:
+        return None, None
+    # 选项题优先看 index（远程代答与 TUI 都会带），自由输入兜底按字面禁用词判
+    if isinstance(result, dict) and result.get("index") == 1:
+        entry["enabled"] = False
+    elif str(answer).strip().lower() in ("仅写入禁用", "禁用", "disable", "disabled", "no", "0"):
+        entry["enabled"] = False
+    return name, entry
+
+
+def _mcp_add(ctx, arg: str) -> str:
+    """/mcp add 入口：JSON 直写 或 面板向导"""
+    cfg = ctx["config"]
+    app = ctx["app"]
+    arg = (arg or "").strip()
+    if arg.startswith("{"):
+        try:
+            doc = json.loads(arg)
+        except json.JSONDecodeError as exc:
+            return f"JSON 解析失败: {exc}"
+        if not isinstance(doc, dict) or not doc:
+            return "JSON 需为 {\"名字\": {条目}} 或 {\"名字\": \"...\", 字段…}"
+        if len(doc) == 1 and isinstance(next(iter(doc.values())), dict):
+            name, entry = next(iter(doc.items()))
+        else:
+            name = doc.pop("名字", None)
+            if name is None:
+                name = doc.pop("name", "")
+            entry = doc
+        ok, msg = mcp_mod.set_server(cfg, str(name), dict(entry or {}))
+        return msg
+    name, entry = _mcp_add_wizard(app, preset_name=arg)
+    if name is None or entry is None:
+        return "已取消"
+    if entry.get("_invalid"):
+        return f"添加失败: {entry['_invalid']}"
+    ok, msg = mcp_mod.set_server(cfg, name, entry)
+    return msg
 
 
 def _register_commands(llm: LLM, session, config: Config, app) -> None:
@@ -371,20 +576,105 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
         )
         return True
 
-    @commands.register("/mcp", hint="MCP 服务器 · 列表/工具/重连", usage="/mcp [tools 名称|reconnect 名称]", source="builtin")
+    _MCP_USAGE = (
+        "/mcp [list] · tools [名] · desc <工具> · reconnect <名|all> · disconnect <名>\n"
+        "     add [名|JSON] · remove <名> · enable [名] · disable [名] · reload"
+    )
+
+    def _mcp_busy(ctx) -> bool:
+        """变更类子命令回合中闸门：连接重建/工具增删会让在途请求的工具集变动"""
+        runner = getattr(ctx["app"], "agent_runner", None)
+        return runner is not None and runner.busy
+
+    @commands.register(
+        "/mcp", hint="MCP 服务器 · 列表/工具/详情/连接管理/运行时增删", usage=_MCP_USAGE, source="builtin"
+    )
     def _mcp(ctx, args):
         arg = (args or "").strip()
         parts = arg.split(maxsplit=1)
         head = parts[0].lower() if parts else ""
-        if head == "reconnect":
-            ok, msg = mcp_mod.reconnect(parts[1].strip() if len(parts) > 1 else "")
-            _echo(ctx, msg)
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if head in ("", "list", "ls", "status", "列表"):
+            _echo(ctx, mcp_mod.status_listing())
             return True
         if head == "tools":
-            _echo(ctx, mcp_mod.tools_listing(parts[1].strip() if len(parts) > 1 else ""))
+            _echo(ctx, mcp_mod.tools_listing(rest))
             return True
-        _echo(ctx, mcp_mod.status_listing())
+        if head in ("desc", "describe", "describe_tool", "详情"):
+            _echo(ctx, mcp_mod.desc_listing(rest))
+            return True
+        if head == "reconnect":
+            ok, msg = mcp_mod.reconnect(rest)
+            _echo(ctx, msg)
+            return True
+        if head == "disconnect":
+            if _mcp_busy(ctx):
+                _echo(ctx, "回合进行中：请先停止后再断开（工具注销会打断在途调用）")
+                return True
+            ok, msg = mcp_mod.disconnect(rest)
+            _echo(ctx, msg)
+            return True
+        if head in ("enable", "disable", "remove", "rm", "del", "reload", "add"):
+            if _mcp_busy(ctx):
+                _echo(ctx, "回合进行中：请先停止后再变更 MCP（连接重建会变更工具集）")
+                return True
+        if head == "reload":
+            ok, msg = mcp_mod.reload(ctx["config"])
+            _echo(ctx, msg)
+            return True
+        if head in ("enable", "disable"):
+            ok, msg = mcp_mod.set_enabled(ctx["config"], head == "enable", name=rest)
+            _echo(ctx, msg)
+            return True
+        if head in ("remove", "rm", "del"):
+            ok, msg = mcp_mod.remove_server(ctx["config"], rest)
+            _echo(ctx, msg)
+            return True
+        if head == "add":
+            _echo(ctx, _mcp_add(ctx, rest))
+            return True
+        _echo(ctx, f"未知子命令: {head}\n用法: {_MCP_USAGE}")
         return True
+
+    def _complete_mcp(config, arg: str):
+        parts = (arg or "").split()
+        trailing_space = bool(arg) and arg[-1].isspace()
+        if len(parts) <= 1 and not trailing_space:
+            rows = [
+                ("list", "服务器状态总览"), ("tools", "列出桥接工具"), ("desc", "工具详情+schema"),
+                ("reconnect", "重连（all=全部）"), ("disconnect", "断开并注销工具"),
+                ("add", "面板向导/JSON 添加"), ("remove", "移除服务器"),
+                ("enable", "启用（无参=总开关 · 带名=单服务器）"), ("disable", "禁用（无参=总开关）"),
+                ("reload", "按当前 config 增量 reconcile"),
+            ]
+            items = [{"name": f"/mcp {s}", "hint": h, "source": "arg", "callable": True} for s, h in rows]
+            return commands._filter_arg_items(items, arg)
+        sub = parts[0].lower()
+        token = "" if trailing_space else parts[-1]
+        items = []
+        if sub in ("tools", "reconnect", "disconnect", "remove", "rm", "del", "enable", "disable"):
+            names = list(mcp_mod.statuses())
+            if sub == "reconnect":
+                names = names + ["all"]
+            items = [
+                {"name": f"/mcp {sub} {n}", "hint": "服务器", "source": "arg", "callable": True}
+                for n in names
+            ]
+        elif sub in ("desc", "describe", "describe_tool"):
+            for tool in register.list_tools():
+                if str(tool.get("owner") or "").startswith(register.MCP_OWNER_PREFIX):
+                    desc = str(tool.get("description") or "")
+                    desc = desc.split("] ", 1)[-1] if desc.startswith("[mcp:") else desc
+                    items.append(
+                        {"name": f"/mcp {sub} {tool['name']}", "hint": desc[:40],
+                         "source": "arg", "callable": True}
+                    )
+        if not token:
+            return items
+        low = token.lower()
+        return [i for i in items if i["name"].split()[-1].lower().startswith(low)]
+
+    commands.register_arg_completer("/mcp", _complete_mcp)
 
     @commands.register("/undo", hint="回滚回合文件改动 /undo [list|序号]", usage="/undo [list|序号]", source="builtin")
     def _undo(ctx, args):

@@ -21,7 +21,8 @@ ALT_ENTER = "\033[?1049h\033[2J\033[H"
 ALT_LEAVE = "\033[?1049l"
 
 # 直播类节点只在动态区显示；fallback 节点会随新事件换位置，inline 下不显示
-_DYNAMIC_PREFIXES = ("stream:", "subagent:live:", "mcp:")
+# （MCP 状态已改挂底部信息行，树内不再有 mcp: 前缀节点）
+_DYNAMIC_PREFIXES = ("stream:", "subagent:live:")
 _SKIP_PREFIXES = ("fallback:",)
 _NO_DESCEND = {"subagent", "step"}
 _COLLAPSED = {"thinking", "subagent", "step", "stream_thinking"}

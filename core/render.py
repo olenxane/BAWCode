@@ -1654,10 +1654,6 @@ class RenderMixin(UiState):
             for i, tline in enumerate(live.get("tools") or []):
                 live_node.children.append(TreeNode(f"subagent:live:{key}:t{i}", str(tline), "tool"))
             _parent().children.append(live_node)
-        # MCP 状态行（进程级常驻，core/mcp.py 后台线程维护；未启用/无配置时为空串不渲染）
-        mcp_text = self._mcp_line()
-        if mcp_text:
-            _parent().children.append(TreeNode("mcp:status", mcp_text, "mcp", default_expanded=True))
         return roots
 
     def _plan_node_from(self, id_base: str, data: dict) -> TreeNode:
@@ -1849,6 +1845,8 @@ class RenderMixin(UiState):
         return out
 
     def _mcp_line(self) -> str:
+        """MCP 状态摘要（进程级常驻，core/mcp.py 后台线程维护；无配置时为空串）：
+        渲染在底部状态栏行尾右对齐，格式 mcp:<连接数>-<工具数>"""
         return mcp_mod.status_line()
 
     def _tree_signature(self) -> tuple:
@@ -1899,7 +1897,6 @@ class RenderMixin(UiState):
             len(streaming.get("thinking") or "") if streaming else -1,
             len(streaming.get("content") or "") if streaming else -1,
             live_sig,
-            self._mcp_line(),
         )
 
     def _flatten_tree(self) -> List[Tuple[TreeNode, int, bool, str]]:
@@ -2548,7 +2545,7 @@ class RenderMixin(UiState):
             lines.extend(input_rows[:input_zone_h])
         lines.append(self._rule(w))
 
-        # 底部：项目 · git · 模型 · 模式（同一行；分段配色，模式按语义着色）
+        # 底部：项目 · git · 模型 · 模式 · MCP（同一行；分段配色，模式按语义着色）
         mode_c = {
             policy.MODE_AUTO: self.c("ok"),
             policy.MODE_EDIT: self.c("warn"),
@@ -2572,11 +2569,21 @@ class RenderMixin(UiState):
         lines.append(self.c("dim") + _clip(self._rotating_tip(), w) + self.RESET)
         lines.append(self._rule(w))
 
-        # 状态栏：token / 余额
+        # 状态栏：token / 余额；右侧 mcp:<连接数>-<工具数>（无 MCP 不占位）
         focus_tag = "会话" if tree_focus else "输入"
         token_txt = self.token_meter.status_text()
         status = f" {self.status or '就绪'} · {focus_tag} · {len(self.messages)}msg · {token_txt} "
-        lines.append(self.c("dim") + _pad(_clip(status, w), w) + self.RESET)
+        mcp_seg = self._mcp_line()
+        if mcp_seg:
+            if _display_width(mcp_seg) > w - 20:
+                mcp_seg = _clip(mcp_seg, w - 20)
+            left = _clip(status, max(0, w - _display_width(mcp_seg) - 1))
+            lines.append(
+                self.c("dim") + _pad(left, w - _display_width(mcp_seg)) + self.RESET
+                + self.c("mcp") + mcp_seg + self.RESET
+            )
+        else:
+            lines.append(self.c("dim") + _pad(_clip(status, w), w) + self.RESET)
         for row in bottom_rows:
             lines.append(_clip_keep_ansi(row, w))
         return lines, input_zone_h
@@ -2617,7 +2624,7 @@ class RenderMixin(UiState):
         """归一化选区 (r0, c0, r1, c1)：文档行号 + 单元格，两端含端点；失效返回 None
 
         失效比对用帧内已算好的 _tree_sig（_tree_rows 每帧先于叠加更新，且缓存
-        命中时与当前签名等值），避免每帧重算 _tree_signature（内含 mcp.status_line）。"""
+        命中时与当前签名等值），避免每帧重算 _tree_signature。"""
         if self._sel_anchor is None or self._sel_focus is None:
             return None
         if self._tree_sig is not None and self._sel_sig != self._tree_sig:

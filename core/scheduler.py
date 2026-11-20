@@ -85,7 +85,7 @@ def create(text: str, run_at: str = "", delay_minutes: float = 0, every_minutes:
     threading.Thread(target=_run, args=(task,), daemon=True, name=f"bawcode-sched-{task['id']}").start()
     log.info("巡检任务登记: %s", _describe(task))
     return (
-        f"已登记巡检（内存态单例，实例重启即丢；仅限当前会话）\n{_describe(task)}\n"
+        f"已登记巡检\n{_describe(task)}\n"
         "到点后系统会自动唤起回合执行；用 schedule action=list|cancel 查看或取消。"
     )
 

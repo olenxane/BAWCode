@@ -319,6 +319,14 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
         session = await stack.enter_async_context(ClientSession(read, write))
         await asyncio.wait_for(session.initialize(), timeout=timeout)
         listing = await asyncio.wait_for(session.list_tools(), timeout=timeout)
+        # 管理操作墓碑：连接期间被断开/移除/替换（stale）或状态已删时，
+        # 不注册工具不写状态，仅收尾本地 stack——防僵尸服务器复活
+        if name not in _STATE or handle.get("stale"):
+            try:
+                await asyncio.wait_for(stack.aclose(), timeout=3)
+            except Exception:
+                pass
+            return
 
         include = [str(x) for x in (entry.get("include_tools") or [])]
         exclude = [str(x) for x in (entry.get("exclude_tools") or [])]
@@ -356,6 +364,14 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
                 meta = register.get_tool(stale)
                 if meta is not None and meta.get("owner") == f"mcp:{name}":
                     register.unregister(stale)
+        # 覆盖旧 stack 前先收尾：_disconnect_quiet 失败遗留的孤儿栈在此兜底 aclose，
+        # 防 stdio 子进程/errlog 句柄泄漏
+        prev_stack = handle.get("stack")
+        if prev_stack is not None and prev_stack is not stack:
+            try:
+                await asyncio.wait_for(prev_stack.aclose(), timeout=3)
+            except Exception:
+                pass
         handle["stack"] = stack
         handle["session"] = session
         handle["entry"] = entry
@@ -373,12 +389,16 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
             if meta is None or meta.get("owner") != f"mcp:{name}" or meta.get("func") is not wrappers[reg_name]:
                 continue
             old = previous[reg_name]
+            # previous 是注册前快照；管理操作（disconnect/remove/disable）打下
+            # stale 墓碑后不复活已注销工具——正常失败回滚仍恢复旧条目
             if old is None:
                 register.unregister(reg_name)
-            else:
+            elif not handle.get("stale"):
                 register.register(name=reg_name, description=old["description"], usage=old["usage"],
                                   schema=old["schema"], owner=old["owner"],
                                   safe=old.get("safe", False))(old["func"])
+            else:
+                register.unregister(reg_name)
         # 未成形的 stack 自行收尾；已成形的留给 disconnect 流程
         try:
             if handle.get("stack") is not stack:
@@ -417,7 +437,9 @@ def _connect_once(name: str, entry: dict, cfg: dict) -> None:
     inflight 互斥由调用方负责（_connect_attempt 或 reconnect 的前置闸）"""
     state = _init_state(name, entry)
     state["status"] = CONNECTING
-    _RUNTIME["handles"].setdefault(name, {})["entry"] = copy.deepcopy(entry)
+    handle = _RUNTIME["handles"].setdefault(name, {})
+    handle["entry"] = copy.deepcopy(entry)
+    handle.pop("stale", None)  # 新一轮连接解除管理操作墓碑
     try:
         _submit(_connect_coro(name, entry, cfg), timeout=cfg.get("discovery_timeout_stdio", 30) + 30)
     except BaseException as exc:
@@ -473,6 +495,8 @@ def _tool_error_state(name: str, message: str, cfg: dict) -> None:
 
 def _reconnect_after_failure(name: str) -> None:
     handle = _RUNTIME["handles"].get(name) or {}
+    if handle.get("stale"):
+        return  # 管理操作（disconnect/remove/disable）期间禁止自动重连复活
     entry = handle.get("entry")
     if not entry:
         return
@@ -580,10 +604,21 @@ def shutdown() -> None:
 
 
 def reconnect(name: str) -> tuple:
-    """/mcp reconnect <名字>：手动重连；返回 (ok, 提示文本)"""
+    """/mcp reconnect <名字|all>：手动重连；返回 (ok, 提示文本)"""
     name = (name or "").strip()
     if not name:
-        return False, "用法: /mcp reconnect <服务器名>"
+        return False, "用法: /mcp reconnect <服务器名|all>"
+    if name.lower() == "all":
+        if not _STATE:
+            return False, "MCP 未启用或未配置服务器"
+        queued, skipped = [], []
+        for n in list(_STATE):
+            ok, msg = reconnect(n)
+            (queued if ok else skipped).append((n, msg))
+        parts = [f"{len(queued)} 个服务器重连中"]
+        for n, msg in skipped:
+            parts.append(f"{n} 跳过（{msg}）")
+        return True, "；".join(parts) + "（稍后 /mcp 查看结果）"
     if name not in _STATE:
         return False, f"未配置 MCP 服务器: {name}（可用: {', '.join(_STATE) or '无'}）"
     with _LOCK:
@@ -597,8 +632,10 @@ def reconnect(name: str) -> tuple:
             handle = _RUNTIME["handles"].get(name) or {}
             entry = handle.get("entry")
             if entry is None:
-                _STATE[name]["status"] = DISCONNECTED
-                _STATE[name]["last_error"] = "无连接配置缓存，请重启程序"
+                state = _STATE.get(name)
+                if state is not None:
+                    state["status"] = DISCONNECTED
+                    state["last_error"] = "无连接配置缓存，请重启程序"
                 return
             cfg = mcp_cfg(_LAST_CONFIG[0]) if _LAST_CONFIG[0] else dict(_MCP_DEFAULTS)
             # inflight 闸由 reconnect 前置持有，此处直接尝试连接
@@ -612,15 +649,338 @@ def reconnect(name: str) -> tuple:
 
 
 def statuses() -> Dict[str, dict]:
-    return {name: dict(state) for name, state in _STATE.items()}
+    # 快照迭代：remove_server/reload 的 _STATE.pop 与插件线程读并发时防
+    # "dictionary changed size during iteration"
+    return {name: dict(state) for name, state in list(_STATE.items())}
+
+
+# ---------------------------------------------------------------------------
+# 管理 API：/mcp 子命令运行时增删改/开关/断连/增量重载
+
+
+def _drop_server_tools(name: str) -> None:
+    """注销某服务器注册的全部工具并清状态表条目（断开/移除/换配置时的统一收尾）"""
+    state = _STATE.get(name)
+    removed = set(register.unregister_owner(f"mcp:{name}"))
+    if state is not None:
+        state["tools"] = [t for t in (state.get("tools") or []) if t not in removed]
+        state["server_tool"] = {k: v for k, v in (state.get("server_tool") or {}).items() if k not in removed}
+
+
+def disconnect(name: str) -> tuple:
+    """/mcp disconnect <名字>：断开连接并注销工具（保留配置与状态条目）；返回 (ok, 文本)。
+    连接中的服务器允许断开——stale 墓碑让在途 _connect_coro 完成后静默收尾不复活"""
+    name = (name or "").strip()
+    if not name:
+        return False, "用法: /mcp disconnect <服务器名>"
+    if name not in _STATE:
+        return False, f"未配置 MCP 服务器: {name}（可用: {', '.join(list(_STATE)) or '无'}）"
+    with _LOCK:
+        _RUNTIME["handles"].setdefault(name, {})["stale"] = True
+        inflight = name in _INFLIGHT
+    _disconnect_quiet(name)
+    _drop_server_tools(name)
+    state = _STATE.get(name)
+    if state is not None:
+        state["status"] = DISCONNECTED
+        state["last_error"] = ""
+    suffix = "（连接中已中止）" if inflight else ""
+    return True, f"{name} 已断开{suffix}"
+
+
+_ENTRY_KEYS = {
+    "command", "args", "env", "cwd", "url", "headers", "transport",
+    "include_tools", "exclude_tools", "timeout", "enabled",
+}
+_TRUE_WORDS = ("true", "1", "on", "yes")
+_FALSE_WORDS = ("false", "0", "off", "no")
+
+
+def _normalize_entry(entry):
+    """服务器条目规范化 + 校验：白名单键、类型矫正、非法值报错。
+    返回 (dict, err)——err 非空时 dict 为已矫正部分。未知键剔除，防语义相同却判变更"""
+    out: dict = {}
+    err = ""
+    if not isinstance(entry, dict):
+        return {}, "服务器条目必须是对象"
+    transport = str(entry.get("transport") or "").strip().lower()
+    if transport:
+        if transport not in ("stdio", "http", "sse"):
+            return out, f"transport 仅支持 stdio|http|sse（收到 {transport}）"
+        out["transport"] = transport
+    if entry.get("command") is not None:
+        if isinstance(entry["command"], (list, tuple)):
+            return out, "command 必须是字符串（命令主体），数组请拆 command+args"
+        out["command"] = str(entry["command"])
+    if entry.get("url") is not None:
+        out["url"] = str(entry["url"])
+    if entry.get("args") is not None:
+        if not isinstance(entry["args"], (list, tuple)):
+            return out, "args 必须是数组，例如 [\"-y\", \"pkg\"]"
+        out["args"] = [str(a) for a in entry["args"]]
+    for key in ("env", "headers"):
+        if entry.get(key) is not None:
+            if not isinstance(entry[key], dict):
+                return out, f"{key} 必须是对象（K=V 映射）"
+            out[key] = {str(k): str(v) for k, v in entry[key].items()}
+    for key in ("include_tools", "exclude_tools"):
+        if entry.get(key) is not None:
+            if not isinstance(entry[key], (list, tuple)):
+                return out, f"{key} 必须是数组"
+            out[key] = [str(x) for x in entry[key]]
+    if entry.get("cwd") is not None:
+        out["cwd"] = str(entry["cwd"])
+    if entry.get("timeout") is not None:
+        timeout = _int(entry["timeout"], -1)
+        if timeout < 1:
+            return out, "timeout 必须是正整数秒"
+        out["timeout"] = timeout
+    if entry.get("enabled") is not None:
+        raw = entry["enabled"]
+        if isinstance(raw, str):
+            low = raw.strip().lower()
+            if low in _TRUE_WORDS:
+                out["enabled"] = True
+            elif low in _FALSE_WORDS:
+                out["enabled"] = False
+            else:
+                return out, f"enabled 必须是 true/false（收到 {raw}）"
+        else:
+            out["enabled"] = bool(raw)
+    for key in entry:
+        if key not in _ENTRY_KEYS:
+            log.debug("MCP 条目忽略未知键: %s", key)
+    if not (out.get("command") or out.get("url")):
+        err = err or "服务器条目需要 command（stdio）或 url（http/sse）之一"
+    return out, err
+
+
+def _normalize_cmp(entry: dict) -> dict:
+    """reconcile 的"是否变更"判据：仅规范化，忽略校验失败（失败交 set_server 拦）"""
+    return _normalize_entry(entry)[0]
+
+
+def _mcp_data(config) -> dict:
+    """config.data['mcp'] 取回并补默认键；非 dict 的脏数据整体重置"""
+    data = config.data.setdefault("mcp", {})
+    if not isinstance(data, dict):
+        data = {}
+        config.data["mcp"] = data
+    if not isinstance(data.get("servers"), dict):
+        data["servers"] = {}
+    return data
+
+
+def set_enabled(config, flag: bool, name: str = "") -> tuple:
+    """/mcp enable|disable [名]：无参=总开关写 config.data.mcp.enabled；带名=按服务器
+    enabled 字段。两者都落盘并 reconcile 即时生效"""
+    name = (name or "").strip()
+    data = _mcp_data(config)
+    if name:
+        servers = data["servers"]
+        if name not in servers or not isinstance(servers[name], dict):
+            return False, f"未配置 MCP 服务器: {name}（可用: {', '.join(servers) or '无'}）"
+        if bool(servers[name].get("enabled", True)) == flag:
+            return True, f"服务器 {name} 已是{'启用' if flag else '禁用'}状态"
+        servers[name]["enabled"] = flag
+        config.save()
+        ok, detail = reload(config)
+        suffix = f"\n{detail}" if detail else ""
+        return ok, f"服务器 {name} 已{'启用' if flag else '禁用'}（config 已保存）{suffix}"
+    if bool(data.get("enabled")) == flag:
+        return True, f"MCP 总开关已是{'启用' if flag else '禁用'}"
+    data["enabled"] = bool(flag)
+    config.save()
+    ok, detail = reload(config)
+    return ok, f"{'已启用' if flag else '已禁用'} MCP（config 已保存）\n{detail}"
+
+
+def set_server(config, name: str, entry: dict) -> tuple:
+    """/mcp add 写入：校验+规范化条目 → 落 config.data.mcp.servers → 保存 → reconcile 生效"""
+    name = (name or "").strip()
+    if not name:
+        return False, "服务器名不能为空"
+    if any(c in name for c in " \t\r\n"):
+        return False, "服务器名不能含空白字符"
+    if name.lower() == "all":
+        return False, "all 为保留名（/mcp reconnect all），请换名"
+    norm, err = _normalize_entry(entry or {})
+    if err:
+        return False, f"添加失败: {err}"
+    _mcp_data(config)["servers"][name] = norm
+    config.save()
+    ok, detail = reload(config)
+    suffix = f"\n{detail}" if detail else ""
+    return ok, f"服务器 {name} 已写入配置{suffix}"
+
+
+def remove_server(config, name: str) -> tuple:
+    """/mcp remove <名字>：断开 + 注销工具 + 从 config 删除并落盘；返回 (ok, 文本)。
+    连接中的服务器允许移除——stale 墓碑让在途 _connect_coro 完成后静默收尾不复活"""
+    name = (name or "").strip()
+    if not name:
+        return False, "用法: /mcp remove <服务器名>"
+    servers = _mcp_data(config)["servers"]
+    if name not in servers and name not in _STATE:
+        return False, f"未配置 MCP 服务器: {name}（可用: {', '.join(list(servers) or list(_STATE)) or '无'}）"
+    with _LOCK:
+        _RUNTIME["handles"].setdefault(name, {})["stale"] = True
+        inflight = name in _INFLIGHT
+    _disconnect_quiet(name)
+    _drop_server_tools(name)
+    _STATE.pop(name, None)
+    _RUNTIME["handles"].pop(name, None)
+    existed = name in servers
+    servers.pop(name, None)
+    if existed:
+        config.save()
+    suffix = "（连接中已中止）" if inflight else ""
+    return True, f"服务器 {name} 已移除{suffix}" + ("（config 已保存）" if existed else "")
+
+
+def _deferred_connect(config, name: str, entry: dict, cfg: dict) -> None:
+    """延迟连接：等在途 _INFLIGHT 释放后再 _connect_attempt（变更替换连接中服务器的场景）"""
+
+    def _defer():
+        for _ in range(600):  # 最多等 60s，超时也照常尝试（_connect_attempt 自会互斥跳过）
+            with _LOCK:
+                if name not in _INFLIGHT:
+                    break
+            threading.Event().wait(0.1)
+        _connect_attempt(name, entry, cfg)
+
+    threading.Thread(target=_defer, daemon=True, name=f"mcp-defer-{name}").start()
+
+
+def reload(config) -> tuple:
+    """/mcp reload：按当前 config.data.mcp 增量 reconcile——新增即连、移除即断、
+    配置变更即重连、disabled 条目断开；连接中的服务器经 stale 墓碑中止。
+    返回 (ok, 摘要文本)"""
+    cfg = mcp_cfg(config)
+    _LAST_CONFIG[0] = config
+    if not cfg["enabled"]:
+        had = [n for n in list(_STATE)]
+        for n in had:
+            with _LOCK:
+                _RUNTIME["handles"].setdefault(n, {})["stale"] = True
+                inflight = n in _INFLIGHT
+            _disconnect_quiet(n)
+            _drop_server_tools(n)
+            state = _STATE.get(n)
+            if state is not None:
+                state["status"] = DISCONNECTED
+                if inflight:
+                    state["last_error"] = "连接中已中止（总开关关闭）"
+        return True, f"MCP 总开关关闭：{len(had)} 个服务器已断开（/mcp enable 启用）"
+    try:
+        import mcp  # noqa: F401
+    except ImportError:
+        return False, "缺少 mcp 包：pip install mcp 后重试"
+    with _LOCK:
+        _RUNTIME["started"] = True
+    _ensure_loop()
+    entries = {
+        str(k): v for k, v in (cfg.get("servers") or {}).items()
+        if isinstance(v, dict) and str(k).strip()
+    }
+    changed = []
+    for name in list(_STATE):
+        if name in entries:
+            continue
+        with _LOCK:
+            _RUNTIME["handles"].setdefault(name, {})["stale"] = True
+            inflight = name in _INFLIGHT
+        _disconnect_quiet(name)
+        _drop_server_tools(name)
+        _STATE.pop(name, None)
+        _RUNTIME["handles"].pop(name, None)
+        changed.append(f"已移除 {name}" + ("（连接中已中止）" if inflight else ""))
+    for name, raw_entry in entries.items():
+        entry, norm_err = _normalize_entry(raw_entry)
+        if norm_err:
+            changed.append(f"{name} 配置无效已跳过（{norm_err}）")
+            continue
+        if not entry.get("enabled", True):
+            if name in _STATE:
+                with _LOCK:
+                    _RUNTIME["handles"].setdefault(name, {})["stale"] = True
+                    inflight = name in _INFLIGHT
+                _disconnect_quiet(name)
+                _drop_server_tools(name)
+                state = _STATE.get(name)
+                if state is not None:
+                    state["status"] = DISCONNECTED
+                was_enabled = str((_RUNTIME["handles"].get(name) or {}).get("entry", {}).get("enabled", True)) != "False"
+                if inflight or was_enabled or (state or {}).get("tools"):
+                    changed.append(f"已停用 {name}" + ("（连接中已中止）" if inflight else ""))
+            continue
+        handle = _RUNTIME["handles"].get(name) or {}
+        old_entry = handle.get("entry")
+        state = _STATE.get(name)
+        if state is not None and old_entry is not None and entry == _normalize_cmp(old_entry):
+            status = str(state.get("status") or "")
+            if status == CONNECTED:
+                continue  # 配置未变且在线，不动
+            if status == CONNECTING:
+                changed.append(f"{name} 连接中，跳过")
+                continue
+            changed.append(f"{name} 重试中")  # 配置未变但已断开：reload 顺带重拉
+            _init_state(name, entry)
+            threading.Thread(target=_worker, args=(config, name, entry, cfg), daemon=True, name=f"mcp-{name}").start()
+            continue
+        if state is not None:
+            with _LOCK:
+                _RUNTIME["handles"].setdefault(name, {})["stale"] = True
+                inflight = name in _INFLIGHT
+            _disconnect_quiet(name)
+            _drop_server_tools(name)
+            _init_state(name, entry)
+            if inflight:
+                # 在途 _connect_coro 会因 stale 静默收尾；延迟到 inflight 释放后重连
+                _deferred_connect(config, name, entry, cfg)
+                changed.append(f"已变更 {name}（中止旧连接后重连中）")
+            else:
+                threading.Thread(target=_worker, args=(config, name, entry, cfg), daemon=True, name=f"mcp-{name}").start()
+                changed.append(f"已变更 {name}（重连中）")
+        else:
+            changed.append(f"新增 {name}（连接中）")
+            _init_state(name, entry)
+            threading.Thread(target=_worker, args=(config, name, entry, cfg), daemon=True, name=f"mcp-{name}").start()
+    summary = "、".join(changed) if changed else "配置无变化"
+    return True, f"reconcile: {summary}"
+
+
+def desc_listing(tool_name: str) -> str:
+    """/mcp desc <注册名或原始名>：打印工具完整描述与 inputSchema"""
+    tool_name = (tool_name or "").strip()
+    if not tool_name:
+        return "用法: /mcp desc <工具名>（/mcp tools 查看注册名）"
+    meta = register.get_tool(tool_name)
+    if meta is None:
+        # 允许按原始名查找（usage 字段保存原始工具名）
+        for tool in register.list_tools():
+            if str(tool.get("owner") or "").startswith(register.MCP_OWNER_PREFIX) and tool.get("usage") == tool_name:
+                meta = tool
+                break
+    if meta is None or not str(meta.get("owner") or "").startswith(register.MCP_OWNER_PREFIX):
+        return f"MCP 工具不存在: {tool_name}（/mcp tools 列出已桥接工具）"
+    schema = meta.get("schema") or {}
+    try:
+        schema_text = json.dumps(schema, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        schema_text = str(schema)
+    return (
+        f"{meta['name']}（原始名 {meta.get('usage') or meta['name']} · {meta.get('owner')}）\n"
+        f"{meta.get('description') or '（无描述）'}\ninputSchema:\n{schema_text}"
+    )
 
 
 def status_listing() -> str:
     """/mcp 命令输出"""
     if not _STATE:
-        return "MCP 未启用或未配置服务器（config.mcp.enabled + config.mcp.servers）"
+        return "MCP 未启用或未配置服务器（/mcp add 添加 · /mcp enable 启用 · 或编辑 config.mcp 后 /mcp reload）"
     lines = [f"MCP 服务器 {len(_STATE)} 个:"]
-    for name, state in _STATE.items():
+    for name, state in list(_STATE.items()):
         icon = _STATUS_ICON.get(str(state.get("status") or ""), "?")
         line = (
             f"  {name}  {icon} {state.get('status')} · {state.get('transport')}"
@@ -629,7 +989,7 @@ def status_listing() -> str:
         if state.get("last_error"):
             line += f"\n      └ {state['last_error']}"
         lines.append(line)
-    lines.append("提示: /mcp tools [名字] 列工具 · /mcp reconnect <名字> 重连")
+    lines.append("提示: /mcp tools [名] · desc <工具> · reconnect <名|all> · disconnect <名> · add/remove/reload · enable/disable")
     return "\n".join(lines)
 
 
@@ -652,16 +1012,13 @@ def tools_listing(name: str = "") -> str:
 
 
 def status_line() -> str:
-    """树尾状态行（UI 每帧读取）：无 MCP 活动时返回空串不占渲染"""
+    """底部状态栏摘要（UI 每帧读取）：mcp:<已连接服务器数>-<工具总数>；
+    无 MCP 配置返回空串不占位，详情经 /mcp 查看"""
     if not _STATE:
         return ""
-    parts = []
-    for name, state in sorted(_STATE.items()):
-        icon = _STATUS_ICON.get(str(state.get("status") or ""), "?")
-        seg = f"{name}{icon}"
+    connected = tools = 0
+    for state in list(_STATE.values()):
         if state.get("status") == CONNECTED:
-            seg += f" {len(state.get('tools') or [])}"
-        elif state.get("last_error"):
-            seg += " " + state["last_error"][:40]
-        parts.append(seg)
-    return "⧉ MCP " + " · ".join(parts)
+            connected += 1
+            tools += len(state.get("tools") or [])
+    return f"mcp:{connected}-{tools}"
