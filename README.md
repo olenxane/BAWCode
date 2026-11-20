@@ -43,7 +43,8 @@ python main.py                    # 进入 TUI
 ```
 
 可选功能组（见 `pyproject.toml` `[project.optional-dependencies]`）：
-`gui`（工作流编辑器）/ `webfetch`（网页抓取）/ `rag`（结构索引）/ `qbridge`（QQ 桥）。
+`webfetch`（网页抓取）/ `rag`（结构索引）/ `qbridge`（QQ 桥）。工作流编辑器是本地
+WebUI（`python -m gui.workflow_editor`），不再依赖 PySide6。
 
 ## 常用命令
 
@@ -64,7 +65,7 @@ python main.py                    # 进入 TUI
 ```
 main.py               入口：TUI 主循环 / 无头模式 / AgentRunner 后台调度
 core/                 核心模块
-gui/workflow_editor.py  PySide6 工作流可视化编辑器（python -m gui.workflow_editor）
+gui/workflow_editor.py  本地 WebUI 工作流编辑器（python -m gui.workflow_editor）
 data/                 运行时数据
 docs/                 文档
 ```

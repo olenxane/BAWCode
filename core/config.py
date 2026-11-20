@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from core import policy
 from core.log import get_logger, init as init_logging
+from core.plugin_system.defaults import DEFAULT_DISABLED_PLUGINS
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -177,12 +178,13 @@ def default_config() -> dict:
         # （项目级 {workspace}/.bawcode/plugins 同名覆盖全局）。插件可注册 hooks/commands/tools/skills/上下文补充；
         # enabled=false 全局关闭；disable 按 id 禁用单个插件（/plugin disable 写入）。
         # plugins_config.<id> 为插件私有配置（插件经 ctx.settings 读取，宿主不解释其内容）。
-        # 插件目录可带 requirements.txt 声明独有依赖：装载时缺失项经 pip 静默补齐；
-        # auto_install_deps=false 时只检查不安装，缺依赖记入 /plugin 诊断。
+        # 插件目录可带 requirements.txt 声明独有依赖：启用插件缺依赖时后台 pip 补装
+        # （TUI 底部显示进度，不阻塞使用）；auto_install_deps=false 时只检查不安装。
+        # disable 缺省为内置非必要插件清单：禁用插件不装载、也不检查/安装依赖。
         "plugins": {
             "enabled": True,
             "dir": "data/plugins",
-            "disable": [],
+            "disable": list(DEFAULT_DISABLED_PLUGINS),
             "auto_install_deps": True,
         },
         "plugins_config": {},

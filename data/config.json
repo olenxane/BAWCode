@@ -61,14 +61,41 @@
           "thinking_effort": "high"
         }
       ]
+    },
+    {
+      "provider_id": "qwen",
+      "name": "Qwen Local",
+      "api_key": "666666",
+      "base_url": "http://192.168.101.53:8001/v1",
+      "default_model_id": "qwen1.5-0.1b",
+      "temperature": 1.0,
+      "balance_url": "",
+      "advanced": {
+        "send_temperature": false,
+        "thinking_enabled": false,
+        "thinking_effort": "none",
+        "send_stream_options": false
+      },
+      "models": [
+        {
+          "model_id": "qwen1.5-0.1b",
+          "context_window": 32768,
+          "max_tokens": 2048,
+          "temperature": 1.0,
+          "modalities": [
+            "text"
+          ],
+          "thinking_effort": "none"
+        }
+      ]
     }
   ],
-  "active_provider_id": "deepseek",
-  "active_model_id": "deepseek-flash",
+  "active_provider_id": "qwen",
+  "active_model_id": "qwen1.5-0.1b",
   "task_models": {
-    "plan": "deepseek-deepseek-flash",
-    "code": "deepseek-deepseek-flash",
-    "review": "deepseek-deepseek-flash"
+    "plan": "qwen-qwen1.5-0.1b",
+    "code": "qwen-qwen1.5-0.1b",
+    "review": "qwen-qwen1.5-0.1b"
   },
   "prompt": {
     "dir": "core/prompts",
@@ -179,7 +206,15 @@
   "plugins": {
     "enabled": true,
     "dir": "data/plugins",
-    "disable": [],
+    "disable": [
+      "music-player",
+      "computer-use",
+      "qbridge",
+      "remote-control",
+      "emotion-detector",
+      "hello-plugin",
+      "bottom-banter"
+    ],
     "auto_install_deps": true
   },
   "plugins_config": {},

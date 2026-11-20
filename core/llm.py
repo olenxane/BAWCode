@@ -649,12 +649,20 @@ class LLM:
             body["extra_body"] = {**(existing if isinstance(existing, dict) else {}), **extra}
         return body
 
+    def _include_stream_usage(self, req: Optional[dict]) -> bool:
+        """是否携带 stream_options.include_usage；部分中转/本地端点会因此挂起，
+        可在 provider.advanced.send_stream_options=false 关闭（默认开启）"""
+        advanced = (req or {}).get("advanced") or {}
+        return advanced.get("send_stream_options", True) is not False
+
     def _native_chat_stream(self, payload: dict, req: dict, on_delta) -> Optional["_StreamAggregate"]:
         """openai SDK 流式：逐 chunk 聚合并回调增量；返回 None 表示已取消"""
         agg = _StreamAggregate(on_delta)
-        resp = self.client.chat.completions.create(  # type: ignore[union-attr]
-            **self._sdk_payload(payload, req), stream=True, stream_options={"include_usage": True}
-        )
+        kwargs = dict(self._sdk_payload(payload, req))
+        kwargs["stream"] = True
+        if self._include_stream_usage(req):
+            kwargs["stream_options"] = {"include_usage": True}
+        resp = self.client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
         with self._inflight_lock:
             self._inflight_resps.add(resp)
         try:
@@ -679,7 +687,8 @@ class LLM:
         agg = _StreamAggregate(on_delta)
         stream_payload = dict(payload)
         stream_payload["stream"] = True
-        stream_payload["stream_options"] = {"include_usage": True}
+        if self._include_stream_usage(req):
+            stream_payload["stream_options"] = {"include_usage": True}
         body = json.dumps(stream_payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             self._chat_url(req), data=body, headers=self._headers(req), method="POST"

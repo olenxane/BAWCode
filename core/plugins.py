@@ -8,6 +8,7 @@ from .plugin_system.discovery import discover
 from .plugin_system.manager import (
     load, unload_all, reload, loaded_ids, summary, statuses, status_listing,
     set_enabled, declared_configs, config_values, get_setting, set_setting, reset,
+    tick, dependency_progress, pending_installs,
 )
 
 # Historical module-level binding retained for callers which used the old private API.
@@ -50,4 +51,5 @@ __all__ = [
     "PluginContext", "PluginUI", "CONFIG_TYPES", "discover", "bind_runtime", "runtime",
     "load", "unload_all", "reload", "loaded_ids", "summary", "statuses", "status_listing",
     "set_enabled", "declared_configs", "config_values", "get_setting", "set_setting", "reset",
+    "tick", "dependency_progress", "pending_installs",
 ]

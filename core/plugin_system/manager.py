@@ -7,16 +7,29 @@ from bawcode_sdk import PluginContext
 from bawcode_sdk.configuration import CONFIG_TYPES, _parse_config_decls, _coerce_decl_value
 from .adapter import BAWCodeHost
 from .discovery import discover, _enabled_of
-from .dependencies import _ensure_requirements, _NO_DEPS
+from .dependencies import (
+    _ensure_requirements,
+    _NO_DEPS,
+    cancel_all,
+    cancel_install,
+    inspect_requirements,
+    progress_text as _deps_progress_text,
+    start_install,
+    take_completed,
+)
 from .loader import import_entry as _import_entry, unload_entry
 from .runtime import reset_runtime
 
 log = get_logger("plugins")
 _loaded: Dict[str, dict] = {}
 _last_workspace: Optional[Path] = None
+# 等待依赖安装完成后补装载的插件：pid -> discover() 返回的条目
+_pending_loads: Dict[str, dict] = {}
+# 最近一次 load() 是否使用异步依赖安装（TUI=True；无头=False）
+_async_deps = False
 
 
-def _load_one(item: dict, config, workspace: Path) -> None:
+def _load_one(item: dict, config, workspace: Path, prechecked_deps: Optional[dict] = None) -> None:
     pid = item["id"]
     manifest = item["manifest"]
     # 配置声明先于启用判定解析：禁用/失败插件同样可在设置面板展开查看/编辑
@@ -51,8 +64,38 @@ def _load_one(item: dict, config, workspace: Path) -> None:
         }
         log.debug("插件跳过（%s）: %s", reason, pid)
         return
-    # 依赖先于 import：requirements.txt 缺失项在此静默补齐，失败不阻断，插件可自行降级
-    deps = _ensure_requirements(pid, item["dir"], config)
+    # 依赖先于 import：缺失项在 TUI 下后台补装（不阻塞），无头模式同步补齐；
+    # 安装失败不阻断装载，插件可自行降级。
+    if prechecked_deps is not None:
+        deps = dict(prechecked_deps)
+    elif _async_deps:
+        info = inspect_requirements(item["dir"])
+        if info["status"] == "missing":
+            started = start_install(pid, item["dir"], config)
+            if started.get("status") in ("started", "installing"):
+                missing = started.get("missing") or info.get("missing") or []
+                _loaded[pid] = {
+                    "manifest": manifest,
+                    "dir": item["dir"],
+                    "source": item["source"],
+                    "status": "installing",
+                    "error": "",
+                    "context": None,
+                    "module": None,
+                    "config_decls": decls,
+                    "deps": {"status": "installing", "missing": missing, "error": ""},
+                }
+                _pending_loads[pid] = item
+                log.info(
+                    "插件 %s 缺依赖 %d 项，后台安装中（完成后自动装载）: %s",
+                    pid, len(missing), ", ".join(missing),
+                )
+                return
+            deps = started
+        else:
+            deps = info
+    else:
+        deps = _ensure_requirements(pid, item["dir"], config)
     ctx = PluginContext(pid, item["dir"], manifest, item["source"], config, workspace, host=BAWCodeHost())
     record = {
         "manifest": manifest,
@@ -119,9 +162,15 @@ def _sync_plugin_skills(workspace: Path) -> None:
     skills.reset_loader()
 
 
-def load(config, workspace: Optional[Path] = None) -> dict:
-    """发现并装载全部插件（幂等：先卸载已有）。返回 {loaded, disabled, failed, total}"""
-    global _last_workspace
+def load(config, workspace: Optional[Path] = None, async_deps: Optional[bool] = None) -> dict:
+    """发现并装载全部插件（幂等：先卸载已有）。返回 {loaded, disabled, failed, installing, total}
+
+    async_deps=True 时缺失依赖交给后台安装，插件先记为 installing，完成后由 tick()
+    在主线程补装载；None 保持上一次 load 的选择。
+    """
+    global _last_workspace, _async_deps
+    if async_deps is not None:
+        _async_deps = bool(async_deps)
     unload_all()
     ws = Path(workspace or Path.cwd())
     _last_workspace = ws
@@ -138,6 +187,8 @@ def load(config, workspace: Optional[Path] = None) -> dict:
 
 def unload_all() -> None:
     """卸载全部插件：按 owner 注销登记、清理 sys.modules/sys.path、清空插件技能目录"""
+    cancel_all()
+    _pending_loads.clear()
     for pid in reversed(list(_loaded.keys())):
         _unload_registrations(pid)
         record = _loaded.pop(pid, None)
@@ -152,12 +203,54 @@ def reload(config, workspace: Optional[Path] = None) -> dict:
     return load(config, workspace or _last_workspace)
 
 
+def tick(config) -> List[str]:
+    """主线程帧轮询：收走已完成的依赖安装，补装载对应插件。
+
+    返回需要提示给用户的消息（安装完成/失败）；加载本身在主线程执行，
+    避免后台线程注册命令/工具与前台操作并发。
+    """
+    if not _pending_loads:
+        return []
+    notices: List[str] = []
+    for job in take_completed():
+        pid = job.get("pid") or ""
+        item = _pending_loads.pop(pid, None)
+        if item is None or job.get("cancelled"):
+            continue
+        missing = job.get("missing") or []
+        if job.get("ok"):
+            deps = {"status": "installed" if missing else "ok", "missing": missing, "error": ""}
+            _load_one(item, config, _last_workspace, prechecked_deps=deps)
+            row = _loaded.get(pid) or {}
+            if row.get("status") == "loaded":
+                notices.append(f"插件 {pid} 依赖安装完成，已装载")
+            else:
+                notices.append(f"插件 {pid} 依赖安装完成，但装载失败：{row.get('error') or '未知原因'}")
+        else:
+            error = (job.get("error") or "未知错误").strip().splitlines()[-1]
+            deps = {"status": "failed", "missing": missing, "error": job.get("error") or ""}
+            # 安装失败仍尝试装载，插件可自行降级（与同步路径一致）
+            _load_one(item, config, _last_workspace, prechecked_deps=deps)
+            notices.append(f"插件 {pid} 依赖安装失败：{error}")
+    return notices
+
+
+def dependency_progress() -> str:
+    """底部状态栏读取的依赖安装进度文案（无安装时为空串）"""
+    return _deps_progress_text()
+
+
+def pending_installs() -> List[str]:
+    """仍在等待依赖安装完成的插件 id（诊断/测试用）"""
+    return sorted(_pending_loads.keys())
+
+
 def loaded_ids() -> List[str]:
     return [pid for pid, rec in _loaded.items() if rec["status"] == "loaded"]
 
 
 def summary() -> dict:
-    counts = {"loaded": 0, "disabled": 0, "failed": 0, "total": len(_loaded)}
+    counts = {"loaded": 0, "disabled": 0, "failed": 0, "installing": 0, "total": len(_loaded)}
     for rec in _loaded.values():
         counts[rec["status"]] = counts.get(rec["status"], 0) + 1
     return counts
@@ -168,6 +261,8 @@ def _deps_note(deps: Optional[dict]) -> str:
     deps = deps or {}
     st = deps.get("status")
     missing = deps.get("missing") or []
+    if st == "installing":
+        return f" · 依赖后台安装中({len(missing)})"
     if st == "installed":
         return f" · 依赖已补装({len(missing)})"
     if st == "failed":
@@ -207,7 +302,7 @@ def status_listing() -> str:
     rows = statuses()
     if not rows:
         return "当前无插件。放置到 data/plugins/<id>/（含 plugin.json + main.py）后执行 /plugin reload。"
-    label = {"loaded": "装载", "disabled": "禁用", "failed": "失败"}
+    label = {"loaded": "装载", "disabled": "禁用", "failed": "失败", "installing": "安装中"}
     lines = ["插件:"]
     for r in rows:
         line = f"  {r['id']:20} v{r['version'] or '-':8} [{label.get(r['status'], r['status'])}] {r['source']}"
@@ -235,6 +330,10 @@ def set_enabled(pid: str, enabled: bool, config) -> bool:
     # statuses() 完全派生自 _loaded，存在性判断以此为准
     if pid not in _loaded:
         return False
+    if not enabled:
+        # 禁用即停掉进行中的依赖安装，避免禁用插件继续装包
+        cancel_install(pid)
+        _pending_loads.pop(pid, None)
     data = config.data
     plugins_cfg = data.setdefault("plugins", {})
     disable = list(plugins_cfg.get("disable") or [])

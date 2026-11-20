@@ -1396,7 +1396,9 @@ class SettingsPanelMixin(UiState):
         counts = plugins_mod.reload(config)
         row = next((r for r in plugins_mod.statuses() if r["id"] == pid), {})
         status = row.get("status")
-        if target and status != "loaded":
+        if target and status == "installing":
+            self.settings_notice = f"插件 {pid} 依赖正在后台安装，完成后自动装载"
+        elif target and status != "loaded":
             self.settings_notice = f"插件 {pid} 启用后仍为[{status}]：{row.get('error') or '未知原因'}"
         else:
             self.settings_notice = (

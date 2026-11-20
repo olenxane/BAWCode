@@ -27,6 +27,7 @@ from core import keymap as keymap_mod
 from core import mcp as mcp_mod
 from core import memory as memory_mod
 from core import pasteboard
+from core import plugins as plugins_mod
 from core import policy
 from core import snapshot as snapshot_mod
 from core import subagent as subagent_mod
@@ -722,6 +723,13 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
             self._tick_file_candidates()
             self._tick_restore_input()
             self._selection_tick()
+            if config is not None:
+                try:
+                    notices = plugins_mod.tick(config)
+                    if notices:
+                        self.status = notices[-1]
+                except Exception as exc:  # 后台依赖安装收尾失败不应打断 TUI
+                    log.debug("插件后台任务轮询失败: %r", exc)
             self.render()
             frame_deadline += self._frame_time
             sleep_left = frame_deadline - time.time()

@@ -38,6 +38,7 @@ from core import mcp as mcp_mod
 from core import memory as memory_mod
 from core import pasteboard
 from core import policy
+from core.plugin_system import dependencies as deps_mod
 from core import snapshot as snapshot_mod
 from core import subagent as subagent_mod
 from core import toolstore as toolstore_mod
@@ -2572,7 +2573,10 @@ class RenderMixin(UiState):
         # 状态栏：token / 余额；右侧 mcp:<连接数>-<工具数>（无 MCP 不占位）
         focus_tag = "会话" if tree_focus else "输入"
         token_txt = self.token_meter.status_text()
-        status = f" {self.status or '就绪'} · {focus_tag} · {len(self.messages)}msg · {token_txt} "
+        # 插件依赖后台安装时优先展示进度（含转轮/耗时，逐帧刷新）
+        progress = deps_mod.progress_text()
+        lead = progress or self.status or "就绪"
+        status = f" {lead} · {focus_tag} · {len(self.messages)}msg · {token_txt} "
         mcp_seg = self._mcp_line()
         if mcp_seg:
             if _display_width(mcp_seg) > w - 20:

@@ -860,10 +860,16 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
                 return True
             if plugins_mod.set_enabled(pid, sub == "enable", cfg):
                 counts = plugins_mod.reload(cfg)
+                row = next((r for r in plugins_mod.statuses() if r["id"] == pid), {})
+                extra = (
+                    "，依赖后台安装中，完成后自动装载"
+                    if sub == "enable" and row.get("status") == "installing"
+                    else ""
+                )
                 _echo(
                     ctx,
-                    f"已{('启用' if sub == 'enable' else '禁用')}插件 {pid}（写入 config.plugins.disable）· "
-                    f"装载 {counts['loaded']} / 失败 {counts['failed']}",
+                    f"已{('启用' if sub == 'enable' else '禁用')}插件 {pid}（写入 config.plugins.disable）"
+                    f"{extra} · 装载 {counts['loaded']} / 安装中 {counts.get('installing', 0)} / 失败 {counts['failed']}",
                 )
             else:
                 _echo(ctx, f"未找到插件: {pid}")
@@ -2024,7 +2030,8 @@ def main_headless(args) -> int:
         config.model_name,
         identity.get("project_id"),
     )
-    plugins_mod.load(config, workspace=Path.cwd())
+    # 无头模式不依赖底部进度条：同步补齐依赖，保证本次任务能看到插件工具
+    plugins_mod.load(config, workspace=Path.cwd(), async_deps=False)
     session = memory_mod.init_session(config, project_identity_data=identity)
     tools_mod.webfetch_gc()
     pasteboard_mod.gc_temp_images()
@@ -2127,7 +2134,8 @@ def main(args=None) -> None:
         config.model_name,
         identity.get("project_id"),
     )
-    plugins_mod.load(config, workspace=Path.cwd())  # 外部插件装载（先于会话初始化，插件可收到 session_start）
+    # TUI：缺失依赖后台安装，底部状态栏显示进度；安装完成后由帧循环补装载
+    plugins_mod.load(config, workspace=Path.cwd(), async_deps=True)
     session = memory_mod.init_session(config, project_identity_data=identity)
     tools_mod.webfetch_gc()
     pasteboard_mod.gc_temp_images()  #启动回收data/temp过期剪贴板图片（7 天封顶）
@@ -2151,7 +2159,8 @@ def main(args=None) -> None:
         scheduler_mod.set_notifier(runner.notify)          # 定时任务到点 → 同通道开新回合
         plugins_mod.bind_runtime(app=app, runner=runner)  # 插件类用户操作 API（submit_turn/notify/ctx.ui）载体
         app.interrupt_turn_handler = runner.interrupt_turn  # Esc 打断当前回合并保留其已记录上下文
-        llm.query_balance()
+        # 余额查询可能因网络/密钥问题阻塞到 15s 超时；放后台线程，避免拖慢 TUI 就绪
+        threading.Thread(target=llm.query_balance, name="bawcode-balance", daemon=True).start()
         app.token_meter = llm.meter
         _sync(app, session, status="就绪")
         while True:

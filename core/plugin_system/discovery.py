@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from core.log import get_logger
 from bawcode_sdk import API_VERSION
+from .defaults import DEFAULT_DISABLED_PLUGINS
 
 log = get_logger("plugins.discovery")
 _ROOT = Path(__file__).resolve().parents[2]
@@ -88,7 +89,11 @@ def _enabled_of(manifest: dict, config) -> tuple:
     if not cfg.get("enabled", True):
         return False, "插件系统全局关闭（config.plugins.enabled=false）"
     pid = manifest.get("id") or ""
-    if pid in set(cfg.get("disable") or []):
+    disable = cfg.get("disable")
+    if disable is None:
+        # 未显式配置时套用内置默认禁用清单（非必要插件不装载、不装依赖）
+        disable = DEFAULT_DISABLED_PLUGINS
+    if pid in set(disable):
         return False, "已被禁用（config.plugins.disable）"
     if not manifest.get("enabled", True):
         return False, "清单声明 enabled=false"
