@@ -39,6 +39,7 @@
 """
 
 from bawcode_sdk import PluginContext
+import base64
 import copy
 import difflib
 import functools
@@ -57,7 +58,7 @@ import uuid
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
 try:  # 语法高亮 / diff：与 TUI（core/render.py）同源 pygments，缺失时降级为纯文本
@@ -357,8 +358,8 @@ class _State:
         self.login_fails = []     # 近期密码错误时刻（达 LOGIN_MAX_FAILS 即短暂锁定）
         self.login_block_until = 0.0  # 密码登录锁定截止时刻（time.monotonic 口径）
         self.shutdown_flag = threading.Event()
-        self.httpd = None
-        self.thread = None
+        self.httpd: Optional[ThreadingHTTPServer] = None
+        self.thread: Optional[threading.Thread] = None
 
 
 def setup(ctx: PluginContext):
@@ -481,7 +482,8 @@ def setup(ctx: PluginContext):
 
     def _on_before_tool(payload):
         _broadcast({"t": "tool_before", "name": payload.get("name"),
-                    "arguments": _trunc_args(payload.get("args"))})
+                    "arguments": _trunc_args(payload.get("args")),
+                    "description": str(payload.get("description") or "")[:200]})
 
     def _on_after_tool(payload):
         name = str(payload.get("name") or "")
@@ -492,6 +494,7 @@ def setup(ctx: PluginContext):
         # 实时事件只带输出预览（完整输出随回合结束的快照下发）；截断时显式标记，页面据此提示
         evt = {"t": "tool_after", "name": payload.get("name"),
                "arguments": _trunc_args(payload.get("args")),
+               "description": str(payload.get("description") or "")[:200],
                "output": output[:_TOOL_OUT_PREVIEW], "elapsed": payload.get("elapsed"), "failed": failed}
         if len(output) > _TOOL_OUT_PREVIEW:
             evt["truncated"] = True
@@ -557,18 +560,21 @@ def setup(ctx: PluginContext):
             return None  # 无浏览器在线：立即交回 TUI 确认面板，不空等
         name = str(payload.get("name") or "")
         arguments = payload.get("arguments") or {}
+        description = str(payload.get("description") or arguments.get("description") or "")
         item = {
             "id": uuid.uuid4().hex,
             "request_id": payload.get("request_id"),
             "name": name,
             "arguments": arguments,
+            "description": description,
             "event": threading.Event(),
             "response": None,
         }
         with st.lock:
             st.confirms.append(item)
         _broadcast({"t": "confirm", "id": item["id"], "name": name,
-                    "arguments": _trunc_args(arguments, 500)})
+                    "arguments": _trunc_args(arguments, 500),
+                    "description": description})
         ctx.notify(f"[远程控制] 工具 {name} 等待远程确认（{confirm_timeout:.0f}s 内未响应将转回终端面板）")
         try:
             answered = item["event"].wait(timeout=confirm_timeout)
@@ -604,16 +610,18 @@ def setup(ctx: PluginContext):
             for o in (payload.get("options") or [])
             if isinstance(o, dict) and str(o.get("title") or "").strip()
         ]
+        multiline = bool(payload.get("multiline"))
         item = {
             "id": uuid.uuid4().hex,
             "question": question,
             "options": options,
+            "multiline": multiline,
             "event": threading.Event(),
             "response": None,
         }
         with st.lock:
             st.asks.append(item)
-        _broadcast({"t": "ask", "id": item["id"], "question": question, "options": options})
+        _broadcast({"t": "ask", "id": item["id"], "question": question, "options": options, "multiline": multiline})
         ctx.notify(f"[远程控制] 询问已推送浏览器等待回答（{confirm_timeout:.0f}s 内未响应将转回终端面板）")
         try:
             answered = item["event"].wait(timeout=confirm_timeout)
@@ -628,7 +636,7 @@ def setup(ctx: PluginContext):
             answer = str(resp.get("answer") or "").strip()
             if answer:
                 ctx.notify(f"[远程控制] 浏览器已回答: {answer}")
-                out = {"status": "answer", "answer": answer}
+                out: dict[str, Any] = {"status": "answer", "answer": answer}
                 index = resp.get("index")
                 if isinstance(index, int):
                     out["index"] = index
@@ -640,13 +648,13 @@ def setup(ctx: PluginContext):
 
     # ---- 宿主运行时访问（缺载体/缺属性时降级为 None，端点各自兜底）----
 
-    def _session():
+    def _session() -> Any:
         return ctx.host.sessions.get_session() if ctx.host.sessions else None
 
-    def _runner():
+    def _runner() -> Any:
         return ctx.runtime.get("runner") if ctx.host.plugins else None
 
-    def _app():
+    def _app() -> Any:
         return ctx.runtime.get("app") if ctx.host.plugins else None
 
     def _llm():
@@ -665,7 +673,7 @@ def setup(ctx: PluginContext):
         runner = _runner()
         inject = getattr(runner, "inject_turn", None)
         if mode == "inject" and callable(inject) and getattr(runner, "busy", False):
-            result = inject(text)
+            result: Any = inject(text)  # callable 窄化丢 Any，显式标回
             return {"result": result, "injected": result.startswith("[已接收，")}
         return {"result": ctx.submit_turn(text), "injected": False}
 
@@ -690,6 +698,10 @@ def setup(ctx: PluginContext):
             "context_scope": "current_session",
             "billed_scope": "llm_instance",
         }
+        # 分类预算分项（本地分词估算）：总数仍以 API usage 为准，/context 命令查看明细
+        breakdown = getattr(meter, "breakdown", None)
+        if isinstance(breakdown, dict) and any(int(v or 0) > 0 for v in breakdown.values()):
+            out["breakdown"] = {k: int(v or 0) for k, v in breakdown.items()}
         if getattr(meter, "balance", None) is not None:
             out["balance"] = meter.balance
             out["balance_currency"] = getattr(meter, "balance_currency", "") or ""
@@ -699,12 +711,14 @@ def setup(ctx: PluginContext):
 
     def _pending_confirms() -> list:
         with st.lock:
-            return [{"id": c["id"], "name": c["name"], "arguments": _trunc_args(c["arguments"], 500)}
+            return [{"id": c["id"], "name": c["name"], "arguments": _trunc_args(c["arguments"], 500),
+                     "description": str(c.get("description") or "")}
                     for c in list(st.confirms)]
 
     def _pending_asks() -> list:
         with st.lock:
-            return [{"id": a["id"], "question": a["question"], "options": a["options"]}
+            return [{"id": a["id"], "question": a["question"], "options": a["options"],
+                     "multiline": a["multiline"]}
                     for a in list(st.asks)]
 
     def _status_fields(session) -> dict:
@@ -828,11 +842,16 @@ def setup(ctx: PluginContext):
                 render = _plan_render(name, text) or _tool_render(name, args, text, failed)
                 if render:
                     entry["render"] = render
-            # 工具调用信封：附被调用的工具名（TUI 显示「⚙ a,b」节点）
+            # 工具调用信封：附被调用的工具名与调用目的（TUI 显示「⚙ a,b」节点）
             if m.get("type") == "tool_call":
-                names = [str(c.get("name") or "") for c in (m.get("tool_calls") or []) if isinstance(c, dict)]
-                if names:
-                    entry["calls"] = names
+                calls = [
+                    {"name": str(c.get("name") or ""),
+                     "description": str(c.get("description") or "")[:120]}
+                    for c in (m.get("tool_calls") or []) if isinstance(c, dict)
+                ]
+                calls = [c for c in calls if c["name"]]
+                if calls:
+                    entry["calls"] = calls
             # 子代理：附角色/状态，前端渲染为独立节点
             if m.get("type") == "subagent":
                 entry["subagent"] = {
@@ -857,7 +876,7 @@ def setup(ctx: PluginContext):
 
     # ---- 远程操作：会话管理 / 运行控制 / 信息面板 / 斜杠命令 ----
 
-    def _require_session():
+    def _require_session() -> tuple[Any, Optional[dict]]:
         session = _session()
         if session is None:
             return None, {"ok": False, "message": "会话未就绪（宿主仍在启动）"}
@@ -900,7 +919,8 @@ def setup(ctx: PluginContext):
         runner = _runner()
         clear_idle = getattr(runner, "clear_session_when_idle", None)
         if callable(clear_idle):
-            idle, cleanup = clear_idle()
+            ret: Any = clear_idle()  # callable 窄化丢 Any，显式标回
+            idle, cleanup = ret
             if not idle:
                 return {"ok": False, "message": "回合进行中：请先停止后再清空会话"}
         else:
@@ -967,7 +987,8 @@ def setup(ctx: PluginContext):
         app = _app()
         if app is not None:
             app._tree_follow_tail = True  # 切换后贴底显示恢复的消息
-            app.status = f"已切换: {session.session_title or session.session_id}"
+            # 状态栏显示按显示宽裁剪（标题落库已全量，显示层统一口径）
+            app.status = f"已切换: {session._clip_title(session.session_title or session.session_id)}"
         _app_refresh(session)
         _broadcast({"t": "reset"})
         return {"ok": True, "result": f"已切换: {session.session_title or session.session_id}"}
@@ -1306,6 +1327,62 @@ def setup(ctx: PluginContext):
             "count": len(items),
         }
 
+    _FILE_PREVIEW_MAX_BYTES = 5 * 1024 * 1024
+    _FILE_IMAGE_EXT = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+        ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml",
+    }
+    _FILE_TEXT_EXT = {
+        ".txt", ".md", ".markdown", ".rst", ".log", ".json", ".yaml", ".yml", ".toml", ".ini",
+        ".cfg", ".csv", ".py", ".js", ".ts", ".jsx", ".tsx", ".css", ".html", ".htm", ".xml",
+        ".sql", ".sh", ".bat", ".ps1", ".c", ".h", ".cpp", ".hpp", ".java", ".kt", ".go", ".rs",
+        ".rb", ".php", ".swift", ".vue", ".tex",
+    }
+
+    def _file_preview(ws_root: Path, raw: str) -> dict:
+        """工作区文件预览读取：越界 403、不存在 404、超限 413、类型/编码不支持 415；
+        图片/pdf base64 回传，文本 utf-8 直传（失败回退 gbk，再失败按不支持）"""
+        p = Path(str(raw or "").strip().strip('"'))
+        try:
+            candidate = (p if p.is_absolute() else ws_root / p).resolve()
+            candidate.relative_to(ws_root)
+        except (ValueError, OSError):
+            return {"ok": False, "status": 403, "message": "路径超出工作区"}
+        if not candidate.is_file():
+            return {"ok": False, "status": 404, "message": "文件不存在"}
+        try:
+            size = candidate.stat().st_size
+        except OSError:
+            return {"ok": False, "status": 404, "message": "文件不可读"}
+        if size > _FILE_PREVIEW_MAX_BYTES:
+            return {"ok": False, "status": 413, "message": "文件超过预览大小上限（5MB）"}
+        ext = candidate.suffix.lower()
+        name = candidate.name
+        if ext in _FILE_IMAGE_EXT or ext == ".pdf":
+            # stat 与读取间文件可能被删/占用/增长（Windows 文件锁常见），读取统一兜底
+            try:
+                raw = candidate.read_bytes()
+            except OSError:
+                return {"ok": False, "status": 404, "message": "文件不可读"}
+            if len(raw) > _FILE_PREVIEW_MAX_BYTES:
+                return {"ok": False, "status": 413, "message": "文件超过预览大小上限（5MB）"}
+            data = base64.b64encode(raw).decode("ascii")
+            if ext == ".pdf":
+                return {"ok": True, "category": "pdf", "mime": "application/pdf", "name": name, "data": data}
+            return {"ok": True, "category": "image", "mime": _FILE_IMAGE_EXT[ext], "name": name, "data": data}
+        if ext in _FILE_TEXT_EXT or not ext:
+            try:
+                text = candidate.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = candidate.read_text(encoding="gbk")
+                except (UnicodeDecodeError, OSError):
+                    return {"ok": False, "status": 415, "message": "不支持的文件编码"}
+            except OSError:
+                return {"ok": False, "status": 404, "message": "文件不可读"}
+            return {"ok": True, "category": "text", "mime": "text/plain", "name": name, "data": text}
+        return {"ok": False, "status": 415, "message": "不支持的文件类型"}
+
     @_idle_operation
     def _provider_refill(provider_id: str) -> dict:
         """按预置表重填该提供商未手动配置的模型参数（手动配置的保留）"""
@@ -1535,7 +1612,8 @@ def setup(ctx: PluginContext):
                 if v:
                     cfg.set_task_model(task_key.replace("task_", ""), v)
             active_model = str(values.get("active_model_name") or "").strip()
-            if active_model == select_model:
+            # row 未命中时 updates 未定义且 row 不可下标，必须随 row 联动
+            if row and active_model == select_model:
                 active_model = ctx.host.models.make_model_name(row["provider_id"], updates.get("model_id", row["model_id"]))
             if active_model:
                 cfg.switch_model(active_model)
@@ -1608,7 +1686,7 @@ def setup(ctx: PluginContext):
             return {"ok": False,
                     "message": f"{head} 需要终端交互，远程不可用（对应功能请用网页侧栏面板）"}
         if head == "/workflow" and "edit" in [p.lower() for p in line.split()[1:]]:
-            return {"ok": False, "message": "工作流编辑器是桌面 GUI，远程不可用"}
+            return {"ok": False, "message": "工作流编辑器在宿主机浏览器打开（本地 WebUI），远程会话不可用"}
         if head in _CMD_BUSY_BLOCKED and _busy():
             return {"ok": False, "message": "回合进行中：请先停止，或发送新消息按设置中断/排队后再操作"}
         if head in _CMD_BUSY_BLOCKED:
@@ -1630,7 +1708,7 @@ def setup(ctx: PluginContext):
         except Exception as e:
             return {"ok": False, "message": f"命令执行异常: {e}"}
         # 命令反馈多数经 _echo 写入会话 system 消息；部分 handler 返回说明文本
-        payload = {"ok": True}
+        payload: dict[str, Any] = {"ok": True}
         if str(getattr(session, "session_id", "") or "") == origin_id:
             echoed = [str(m.get("content") or "") for m in session.messages[before:]
                       if m.get("role") == "system"]
@@ -1902,6 +1980,19 @@ def setup(ctx: PluginContext):
                         self._json(200, {"ok": True, "output": text})
                     else:
                         self._json(404, {"ok": False, "message": "外置输出不存在或不可读"})
+                elif path == "/api/file":
+                    # 工作区文件预览：图片/文本/pdf，超限与不支持类型由前端弹窗仅显文件名；
+                    # 路径按 workspace 根归一化并拒绝越界（绝对路径/.. 均不允许出根）
+                    params = parse_qs(urlparse(self.path).query)
+                    unknown = [k for k in params if k not in {"path", "key", "token"}]
+                    if unknown:
+                        self._json(400, {"ok": False, "message": f"未知参数: {', '.join(sorted(unknown))}"})
+                        return
+                    session = _session()
+                    ws_root = Path(getattr(session, "workspace", root_workspace)).resolve()
+                    result = _file_preview(ws_root, (params.get("path") or [""])[0])
+                    status = result.pop("status", None)
+                    self._json(200 if status is None else status, result)
                 elif path == "/api/settings":
                     self._json(200, _settings_get())
                 else:

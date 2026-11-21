@@ -69,6 +69,10 @@ def default_config() -> dict:
             "dir": "core/prompts",
             "system_files": ["system_prompt.md"],
             "plan_files": ["plan.md"],
+            # 人格库：personas_dir 下 *.md（整文件=core 段人格正文，支持 ^{var}^ 占位符）；
+            # active_persona 为文件名去后缀，空=内置 system_prompt.md，切换后下一回合重新注入
+            "personas_dir": "data/personas",
+            "active_persona": "",
         },
         "system": {"font_size": 16},
         "security": {"delete_guard": True, "strict_delete_guard": True},

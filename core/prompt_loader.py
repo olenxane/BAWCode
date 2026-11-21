@@ -54,6 +54,57 @@ def system_prompt_files(config=None) -> List[str]:
     return _prompt_files(config, "system_files", ["system_prompt.md"])
 
 
+def personas_dir(config=None) -> Path:
+    """人格库目录：config.prompt.personas_dir，缺省 data/personas"""
+    if config is not None:
+        rel = ((config.data or {}).get("prompt") or {}).get("personas_dir") or "data/personas"
+        p = Path(rel)
+        return p if p.is_absolute() else _ROOT / rel
+    return _ROOT / "data" / "personas"
+
+
+def list_personas(config=None) -> List[dict]:
+    """扫描人格库：[{name(文件名去后缀), description(首个一级标题，无则空)}]，按文件名排序；
+    描述只读文件头部 2KB（人格正文可能很长，标题总在开头）"""
+    base = personas_dir(config)
+    if not base.is_dir():
+        return []
+    out: List[dict] = []
+    for p in sorted(base.glob("*.md")):
+        desc = ""
+        try:
+            for line in p.read_text(encoding="utf-8", errors="ignore")[:2048].splitlines():
+                s = line.strip()
+                if not s or s.startswith("<!--"):
+                    continue
+                if s.startswith("#"):
+                    desc = s.lstrip("#").strip()
+                break
+        except OSError:
+            pass
+        out.append({"name": p.stem, "description": desc})
+    return out
+
+
+def persona_files(config=None) -> Optional[List[str]]:
+    """激活人格的文件清单（绝对路径，供 load_prompt_bundle 直载）；
+    未激活/文件缺失返回 None（回退内置 system_prompt.md）。
+    active_persona 来自 config（可手改），拒绝带路径分隔符的名字防指向人格库之外"""
+    if config is None:
+        return None
+    name = str(((config.data or {}).get("prompt") or {}).get("active_persona") or "").strip()
+    if not name:
+        return None
+    if "/" in name or "\\" in name or name in (".", ".."):
+        log.warn("人格名含非法路径字符: %r，回退默认系统提示词", name)
+        return None
+    p = personas_dir(config) / f"{name}.md"
+    if not p.is_file():
+        log.warn("人格 %s 文件缺失（%s），回退默认系统提示词", name, p)
+        return None
+    return [str(p)]
+
+
 def environment_dir(config=None) -> Path:
     """环境段目录：config.prompt.environment_dir，缺省 core/prompts/environment"""
     if config is not None:

@@ -5,6 +5,7 @@ tiktoken>=0.7.0
 wcwidth>=0.8.0
 prompt_toolkit>=3.0.53
 pyyaml>=6.0
+# 工作流编辑器为本地 WebUI（gui/workflow_editor.py + gui/web/），零第三方依赖
 # MCP 客户端桥接（core/mcp.py；pyproject 中列为核心依赖）
 mcp>=1.2.0
 # webfetch 工具（core/tools.py；缺失时主程序可用，仅 webfetch 返回依赖提示）

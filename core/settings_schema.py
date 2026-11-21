@@ -88,6 +88,10 @@ def dynamic_options(source: str, config) -> List[Any]:
         return names or ["default"]
     if source == "@models":
         return config.list_model_names() or [config.model_name]
+    if source == "@personas":
+        from core import prompt_loader
+
+        return ["默认"] + [p["name"] for p in prompt_loader.list_personas(config)]
     log.warn("未知的设置选项动态源: %s", source)
     return []
 
@@ -191,11 +195,17 @@ def _read_log_level(config):
     return level if level in LOG_LEVELS else "info"
 
 
+def _read_persona(config):
+    name = str(((config.data or {}).get("prompt") or {}).get("active_persona") or "").strip()
+    return name or "默认"
+
+
 special_read: Dict[str, Callable] = {
     "mode": _read_mode,
     "workflow_active": _read_workflow_active,
     "active_model_name": _read_active_model,
     "log_level": _read_log_level,
+    "persona": _read_persona,
 }
 
 
@@ -250,6 +260,19 @@ def _write_default_shell(config, raw) -> bool:
     return True
 
 
+def _write_persona(config, raw) -> bool:
+    raw = str(raw or "").strip()
+    if not raw or raw == "默认":
+        config.data.setdefault("prompt", {})["active_persona"] = ""
+        return True
+    from core import prompt_loader
+
+    if raw not in {p["name"] for p in prompt_loader.list_personas(config)}:
+        return False
+    config.data.setdefault("prompt", {})["active_persona"] = raw
+    return True
+
+
 special_write: Dict[str, Callable] = {
     "mode": _write_mode,
     "font_size": _write_font_size,
@@ -257,4 +280,5 @@ special_write: Dict[str, Callable] = {
     "workflow_active": _write_workflow_active,
     "active_model_name": _write_active_model,
     "default_shell": _write_default_shell,
+    "persona": _write_persona,
 }

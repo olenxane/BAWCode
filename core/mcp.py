@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import copy
 import json
+import os
 import re
 import threading
 from pathlib import Path
@@ -43,6 +44,9 @@ _MCP_DEFAULTS = {
     "discovery_timeout_http": 5,
     "call_timeout": 600,
     "auto_reconnect": True,
+    # 心跳监控：纯空闲下子进程死亡/连接断开时纠正状态（原本只在工具调用失败时落地）
+    "heartbeat_interval": 30,
+    "heartbeat_timeout": 10,
 }
 
 
@@ -382,6 +386,7 @@ async def _connect_coro(name: str, entry: dict, cfg: dict):
             "tools": registered,
             "server_tool": server_tool,
         }
+        _save_last_tools(name, registered)
         log.info("MCP 已连接: %s（%s，%d 个工具）", name, transport, len(registered))
     except BaseException as exc:
         for reg_name in registered:
@@ -425,11 +430,58 @@ async def _disconnect_coro(name: str):
 
 
 def _init_state(name: str, entry: dict) -> dict:
-    """服务器状态条目取回/初始化（缺省 CONNECTING，transport 由配置推导）"""
-    return _STATE.setdefault(
+    """服务器状态条目取回/初始化（缺省 CONNECTING，transport 由配置推导）；
+    新条目预填持久化的 last-known 工具清单（启动期底栏即显示 0/N 而非 0/0）"""
+    state = _STATE.setdefault(
         name,
         {"status": CONNECTING, "last_error": "", "transport": _transport_of(entry), "tools": [], "server_tool": {}},
     )
+    if not state.get("tools") and not state.get("server_tool"):
+        state["tools"] = list(_load_last_tools().get(name) or [])
+    return state
+
+
+# ----- last-known 工具清单持久化（进程重启后启动期仍可显示上次发现的工具数）-----
+
+_LAST_TOOLS_PATH = _ROOT / "data" / "mcp" / "last_tools.json"
+
+
+def _load_last_tools() -> dict:
+    try:
+        data = json.loads(_LAST_TOOLS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_last_tools(name: str, tools: List[str]) -> None:
+    """原子写合并（全程持锁防多服务器并发连接互相覆盖）：连接成功发现工具后记录；
+    断开/死亡不删（保留 last-known）"""
+    try:
+        _LAST_TOOLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _LOCK:
+            data = _load_last_tools()
+            data[name] = list(tools)
+            tmp = _LAST_TOOLS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, _LAST_TOOLS_PATH)
+    except Exception as e:
+        log.warn("MCP last-known 工具持久化失败: %s", e)
+
+
+def _forget_last_tools(name: str) -> None:
+    try:
+        with _LOCK:
+            data = _load_last_tools()
+            if name not in data:
+                return
+            data.pop(name, None)
+            _LAST_TOOLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _LAST_TOOLS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, _LAST_TOOLS_PATH)
+    except Exception as e:
+        log.warn("MCP last-known 工具清理失败: %s", e)
 
 
 def _connect_once(name: str, entry: dict, cfg: dict) -> None:
@@ -541,6 +593,51 @@ def _make_wrapper(server: str, handle: dict, original: str, schema: dict, call_t
 _LAST_CONFIG: list = [None]
 
 
+async def _monitor_coro(cfg: dict):
+    """已连接服务器心跳巡检（常驻）：ping 失败判死 → 落状态+注销工具+收尾连接栈。
+
+    原先只有工具调用失败才落 DISCONNECTED，纯空闲的服务器子进程死亡后状态永远陈旧；
+    auto_reconnect 开启时由 _tool_error_state 的既有路径自动重连。
+    本协程运行在 MCP loop 线程：收尾必须直接 await（_submit 会在 loop 线程内
+    阻塞等同一 loop 的协程造成自锁）；单服务器异常吞掉保巡检存活；
+    每轮重读配置（/mcp reload 改心跳参数即时生效）"""
+    while True:
+        cfg = mcp_cfg(_LAST_CONFIG[0]) if _LAST_CONFIG[0] else dict(_MCP_DEFAULTS)
+        interval = max(5, _int(cfg.get("heartbeat_interval"), 30))
+        timeout = max(3, _int(cfg.get("heartbeat_timeout"), 10))
+        await asyncio.sleep(interval)
+        for name, state in list(_STATE.items()):
+            try:
+                if state.get("status") != CONNECTED:
+                    continue
+                handle = _RUNTIME["handles"].get(name) or {}
+                if handle.get("stale"):
+                    continue  # 管理操作在途，让位
+                session = handle.get("session")
+                if session is None:
+                    continue
+                try:
+                    await asyncio.wait_for(session.send_ping(), timeout=timeout)
+                except Exception as exc:
+                    # 双重确认仍未被管理操作/重连改写后再判死
+                    with _LOCK:
+                        live = (
+                            state.get("status") == CONNECTED
+                            and (_RUNTIME["handles"].get(name) or {}).get("session") is session
+                            and not (_RUNTIME["handles"].get(name) or {}).get("stale")
+                        )
+                    if not live:
+                        continue
+                    log.warn("MCP 心跳失败 %s: %s", name, _brief_error(exc))
+                    _tool_error_state(name, f"心跳失败: {_brief_error(exc)}", cfg)
+                    _drop_server_tools(name)
+                    await asyncio.wait_for(_disconnect_coro(name), timeout=8)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warn("MCP 心跳巡检单服务器异常（巡检继续）: %s %r", name, exc)
+
+
 def register_tools(config) -> bool:
     """main 启动挂钩：enabled 且配置了服务器时启动桥接并后台连接发现；
     不阻塞——连接/注册在后台线程完成，工具随注册进度逐个对模型可见"""
@@ -561,6 +658,7 @@ def register_tools(config) -> bool:
         _RUNTIME["started"] = True
     _LAST_CONFIG[0] = config
     _ensure_loop()
+    _submit(_monitor_coro(cfg))  # 心跳巡检常驻（shutdown 经 _cancel_pending 统一取消）
     for name, entry in entries.items():
         name = str(name)
         _init_state(name, entry)
@@ -659,12 +757,10 @@ def statuses() -> Dict[str, dict]:
 
 
 def _drop_server_tools(name: str) -> None:
-    """注销某服务器注册的全部工具并清状态表条目（断开/移除/换配置时的统一收尾）"""
+    """注销某服务器运行时注册的全部工具（断开/移除/换配置时的统一收尾）；
+    state["tools"]/["server_tool"] 保留 last-known 清单供状态栏计数与 /mcp 展示"""
     state = _STATE.get(name)
-    removed = set(register.unregister_owner(f"mcp:{name}"))
-    if state is not None:
-        state["tools"] = [t for t in (state.get("tools") or []) if t not in removed]
-        state["server_tool"] = {k: v for k, v in (state.get("server_tool") or {}).items() if k not in removed}
+    register.unregister_owner(f"mcp:{name}")
 
 
 def disconnect(name: str) -> tuple:
@@ -830,6 +926,7 @@ def remove_server(config, name: str) -> tuple:
     _drop_server_tools(name)
     _STATE.pop(name, None)
     _RUNTIME["handles"].pop(name, None)
+    _forget_last_tools(name)
     existed = name in servers
     servers.pop(name, None)
     if existed:
@@ -894,6 +991,7 @@ def reload(config) -> tuple:
         _drop_server_tools(name)
         _STATE.pop(name, None)
         _RUNTIME["handles"].pop(name, None)
+        _forget_last_tools(name)
         changed.append(f"已移除 {name}" + ("（连接中已中止）" if inflight else ""))
     for name, raw_entry in entries.items():
         entry, norm_err = _normalize_entry(raw_entry)
@@ -1004,21 +1102,29 @@ def tools_listing(name: str = "") -> str:
             continue
         lines.append(f"{server}（{state.get('status')}）:")
         for reg_name in state.get("tools") or []:
-            meta = register.get_tool(reg_name) or {}
-            lines.append(f"  {reg_name}: {meta.get('description', '')}")
+            meta = register.get_tool(reg_name)
+            if meta is None:
+                lines.append(f"  {reg_name}: （上次会话发现，当前未连接不可调用）")
+            else:
+                lines.append(f"  {reg_name}: {meta.get('description', '')}")
     if not lines:
         return "MCP 未启用或未配置服务器"
     return "\n".join(lines)
 
 
 def status_line() -> str:
-    """底部状态栏摘要（UI 每帧读取）：mcp:<已连接服务器数>-<工具总数>；
+    """底部状态栏摘要（UI 每帧读取）：mcp(在线/配置-可用工具/工具总数)；
+    已配置数含停用服务器，断连服务器按 last-known 工具清单计入总数；
     无 MCP 配置返回空串不占位，详情经 /mcp 查看"""
-    if not _STATE:
+    cfg = mcp_cfg(_LAST_CONFIG[0]) if _LAST_CONFIG[0] else None
+    configured = len((cfg or {}).get("servers") or {}) if cfg is not None else len(_STATE)
+    if not configured and not _STATE:
         return ""
-    connected = tools = 0
+    connected = tools_total = tools_avail = 0
     for state in list(_STATE.values()):
+        n = len(state.get("tools") or [])
+        tools_total += n
         if state.get("status") == CONNECTED:
             connected += 1
-            tools += len(state.get("tools") or [])
-    return f"mcp:{connected}-{tools}"
+            tools_avail += n
+    return f"mcp({connected}/{configured}-{tools_avail}/{tools_total})"

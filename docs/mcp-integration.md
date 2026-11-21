@@ -203,8 +203,9 @@ stdio 的 env 采用 SDK 默认安全环境 + 用户 env 覆盖的合并策略�
 ### 4.7 UI 与命令
 
 - 工具调用/确认：零改动自动获得。
-- 树尾部状态行：`app.mcp_status_line` 字符串槽（照 subagent_stream 的槽位机制：`_tree_signature` 计入 + `_build_tree` 尾部渲染），内容如 `⧉ MCP fetch✔ 3工具 · db✘ spawn ENOENT`；`DEFAULT_COLORS` 增 `mcp` 键（主题安全），单一颜色降低视觉风险。
-- `/mcp` 命令：无参=列表（状态/传输/工具数/last_error）；`/mcp reconnect <名字>` 手动重连；`/mcp tools [名字]` 列工具。
+- 底部状态栏：MCP 摘要直接**追加在状态文本之后**（不右对齐贴行尾）：`就绪 · 输入 · 2msg · tokens … mcp(1/2-3/5)`，格式 `mcp(在线服务器数/已配置服务器数-可用工具数/工具总数)`；已配置数含停用服务器，断连/死亡服务器按 last-known 清单计入工具总数（清单持久化于 `data/mcp/last_tools.json`，启动期即显示 0/N）；随帧重算自动刷新，无 MCP 配置时不占位，连接失败/错误详情经 `/mcp` 查看。`DEFAULT_COLORS` 的 `mcp` 键（主题安全）供其着色。（原树内 `mcp:status` 节点已移除——曾挂在最新用户请求节点下，视觉上每条请求都带连接信息。）
+- 心跳巡检：`mcp.heartbeat_interval`（默认 30s）/`mcp.heartbeat_timeout`（默认 10s）——对已连接服务器定期 ping，纯空闲下子进程死亡/断开即落 DISCONNECTED 并注销工具（原先只在工具调用失败时纠正）；`auto_reconnect` 开启时自动重连。
+- `/mcp` 命令：无参=列表（状态/传输/工具数/last_error）；`/mcp list` 同义；`/mcp reconnect <名字|all>` 手动重连；`/mcp tools [名字]` 列工具；`/mcp desc <工具>` 看完整描述与 inputSchema；`/mcp disconnect <名字>` 断开并注销工具；`/mcp add [名|JSON]` 面板向导/JSON 添加；`/mcp remove <名字>` 移除；`/mcp enable|disable [名字]`（无参=总开关、带名=单服务器 `enabled` 字段）；`/mcp reload` 按内存中 `config.data.mcp` 增量 reconcile（不重读磁盘文件，add/remove/enable/disable 内部已调它生效）。变更类子命令回合中（runner.busy）拒绝。
 
 ### 4.8 上下文与子代理
 

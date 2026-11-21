@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # 可选功能组：缺失时对应功能降级提示，主程序可用（与 requirements.txt 分组注释一致）
+# 工作流编辑器为本地 WebUI（stdlib http.server），无 GUI 依赖组
 webfetch = ["requests>=2.31.0", "beautifulsoup4>=4.12.0", "lxml>=5.0.0"]
 rag = ["tree_sitter>=0.26,<0.27", "tree-sitter-language-pack>=1.20,<1.21"]
 qbridge = ["websockets>=13", "Pillow>=10"]

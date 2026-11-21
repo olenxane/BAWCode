@@ -7,7 +7,9 @@ import shutil
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
@@ -96,6 +98,42 @@ from core.render import (
 )
 
 log = get_logger("ui")
+
+# open_link 拒绝直接执行的高危扩展（消息内链接可被注入，Ctrl+单击不得运行程序）
+_EXECUTABLE_EXTS = {
+    ".exe", ".bat", ".cmd", ".com", ".scr", ".pif", ".msi", ".lnk",
+    ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".jar",
+}
+
+
+def open_link(url: str) -> bool:
+    """打开链接：http(s) 走浏览器；本地文件（相对 cwd/绝对路径/file://）走系统默认程序；
+    可执行类扩展一律拒绝（消息正文可被注入链接，Ctrl+单击不得直接运行程序）"""
+    u = str(url or "").strip()
+    if not u:
+        return False
+    low = u.lower()
+    try:
+        if low.startswith(("http://", "https://")):
+            return bool(webbrowser.open(u))
+        if low.startswith("file://"):
+            path = unquote(urlparse(u).path)
+            if len(path) > 2 and path[0] == "/" and path[2] == ":":
+                path = path[1:]  # "/D:/x" → "D:/x"
+            u = path
+        p = Path(u)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if p.suffix.lower() in _EXECUTABLE_EXTS:
+            log.warn("open_link 拒绝可执行文件: %s", p)
+            return False
+        if p.exists() and hasattr(os, "startfile"):
+            os.startfile(str(p))  # noqa: S606 - 用户显式 Ctrl+单击触发
+            return True
+        return False
+    except Exception as exc:
+        log.debug("open_link 失败: %r (%r)", u, exc)
+        return False
 
 from core.llm import CANCELLED as CANCEL_RESULT
 
@@ -228,6 +266,8 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self._sessions_current_id = ""
         self._sessions_confirm_delete = False
         self.sessions_notice = ""
+        # markdown 链接命中表（Ctrl+单击打开）：doc 行号 → [(列0, 列1, url)]，随树行重建刷新
+        self._frame_links: Dict[int, List[Tuple[int, int, str]]] = {}
         # 工具确认面板：取代输入框位置，↑↓ 选择 · Enter 确认 · 可输入拒绝原因
         self.confirm_mode = False
         # 树底阶段提示的隐藏信号：confirm/ask/choose/line 弹窗执行期间为 True（_serve_ui_request 维护）
@@ -1161,6 +1201,10 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         btn, coord = "", text
         if kind == "mouse_down" and ":" in text:
             btn, coord = text.split(":", 1)
+        ctrl = False
+        if btn.startswith("ctrl+"):
+            ctrl = True
+            btn = btn[len("ctrl+"):]
         try:
             x_s, y_s = coord.split(",", 1)
             x, y = int(x_s), int(y_s) + _MOUSE_Y_OFFSET
@@ -1190,6 +1234,14 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 else:
                     self._set_scroll(self.scroll + tree_h)  # 轨道下段：下翻页
                 return
+            # Ctrl+左键：命中 markdown 链接则打开（不进入选区）；未命中回落普通单击行为
+            if ctrl and btn == "left":
+                y_rel = y - body_top
+                if 0 <= y_rel < tree_h:
+                    total = len(self._tree_rows_cache or [])
+                    row = max(0, min(self.scroll + y_rel, max(0, total - 1)))
+                    if self._open_link_at(row, x):
+                        return
             # 会话区左键按下：开启/重开选区（文档坐标锚定）
             y_rel = y - body_top
             if not (0 <= y_rel < tree_h):
@@ -1235,6 +1287,14 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 self._sel_dragging = False
             self._sel_edge = 0
             self._scroll_drag_grab = None
+
+    def _open_link_at(self, row: int, x: int) -> bool:
+        """Ctrl+单击命中 markdown 链接则打开（命中区随树行重建刷新）；成功返回 True"""
+        for a, b, url in self._frame_links.get(row) or []:
+            if a <= x < b and open_link(url):
+                self.status = f"已打开: {url[:80]}"
+                return True
+        return False
 
     # ----- 自绘选区 -----
 

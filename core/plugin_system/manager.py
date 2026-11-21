@@ -220,7 +220,7 @@ def tick(config) -> List[str]:
         missing = job.get("missing") or []
         if job.get("ok"):
             deps = {"status": "installed" if missing else "ok", "missing": missing, "error": ""}
-            _load_one(item, config, _last_workspace, prechecked_deps=deps)
+            _load_one(item, config, _last_workspace or Path.cwd(), prechecked_deps=deps)
             row = _loaded.get(pid) or {}
             if row.get("status") == "loaded":
                 notices.append(f"插件 {pid} 依赖安装完成，已装载")
@@ -230,7 +230,7 @@ def tick(config) -> List[str]:
             error = (job.get("error") or "未知错误").strip().splitlines()[-1]
             deps = {"status": "failed", "missing": missing, "error": job.get("error") or ""}
             # 安装失败仍尝试装载，插件可自行降级（与同步路径一致）
-            _load_one(item, config, _last_workspace, prechecked_deps=deps)
+            _load_one(item, config, _last_workspace or Path.cwd(), prechecked_deps=deps)
             notices.append(f"插件 {pid} 依赖安装失败：{error}")
     return notices
 

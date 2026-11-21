@@ -317,7 +317,7 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
         sess.save_session()
         sess.switch_to(data)
         ctx["app"]._tree_follow_tail = True  # 切换后贴底显示恢复的消息
-        ctx["app"].status = f"已切换: {sess.session_title or sess.session_id}"
+        ctx["app"].status = f"已切换: {memory_mod.Memory._clip_title(sess.session_title or sess.session_id)}"
         return True
 
     @commands.register("/new", hint="新建会话 · 当前会话已保存", source="builtin")

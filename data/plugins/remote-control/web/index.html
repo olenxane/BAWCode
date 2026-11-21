@@ -145,6 +145,27 @@
   /* 链接 */
   .bubble a.lk { color: var(--accent-deep); text-decoration: none; border-bottom: 1px solid var(--accent); }
   .msg.user .bubble a.lk { color: #fff; border-bottom-color: #fff; }
+  /* 文件预览模态：markdown 渲染复用气泡排版 */
+  .md-preview .md-h { font-weight: 700; color: var(--ink); margin: 12px 0 4px; line-height: 1.35; }
+  .md-preview .md-h1 { font-size: 19px; }
+  .md-preview .md-h2 { font-size: 17px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+  .md-preview .md-h3 { font-size: 15px; }
+  .md-preview .md-h4, .md-preview .md-h5, .md-preview .md-h6 { font-size: 13.5px; }
+  .md-preview .md-h:first-child { margin-top: 2px; }
+  .md-preview .md-ul, .md-preview .md-ol { margin: 6px 0; padding-left: 22px; }
+  .md-preview .md-ul li, .md-preview .md-ol li { margin: 2px 0; }
+  .md-preview .md-task { list-style: none; margin-left: -18px; }
+  .md-preview .md-q {
+    margin: 6px 0; padding: 4px 10px; border-left: 3px solid var(--accent);
+    background: var(--accent-soft); border-radius: 0 8px 8px 0; color: var(--dim);
+  }
+  .md-preview .md-hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+  .md-preview .md-tbl { border-collapse: collapse; margin: 8px 0; font-size: 12.5px; max-width: 100%; }
+  .md-preview .md-tbl th, .md-preview .md-tbl td { border: 1px solid var(--line); padding: 4px 10px; }
+  .md-preview .md-tbl th { background: var(--bg); font-weight: 600; }
+  .md-preview .md-tbl tr:nth-child(even) td { background: var(--bg); }
+  .md-preview a.lk { color: var(--accent-deep); text-decoration: none; border-bottom: 1px solid var(--accent); }
+  .md-preview code { font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 1px 5px; border-radius: 5px; }
 
   /* 思考链 */
   details.think { margin-top: 6px; }
@@ -225,6 +246,7 @@
   #confirm-card .c-head { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--amber); font-weight: 600; }
   #confirm-card .c-count { margin-left: auto; font-size: 11px; color: var(--faint); font-weight: 400; }
   #confirm-card .cname { font-family: var(--mono); }
+  #confirm-card .cdesc { font-size: 12px; color: var(--faint); margin: 4px 0 2px; }
   #confirm-card pre {
     max-height: 150px; overflow: auto; background: var(--bg); border-radius: 10px;
     padding: 8px 10px; margin: 8px 0; color: var(--dim);
@@ -259,6 +281,12 @@
     font: inherit; font-size: 13px; outline: none; background: var(--bg);
   }
   #ask-card .ask-input-row input:focus { border-color: var(--blue); }
+  #ask-card .ask-input-row textarea {
+    flex: 1; min-width: 0; min-height: 96px; border: 1px solid var(--line); border-radius: 9px;
+    padding: 7px 10px; font: inherit; font-size: 13px; outline: none; background: var(--bg);
+    resize: vertical;
+  }
+  #ask-card .ask-input-row textarea:focus { border-color: var(--blue); }
 
   /* ============ 按钮 ============ */
   .btn {
@@ -442,9 +470,27 @@
   .st-row .st-toggle.on::after { transform: translateX(18px); }
   .st-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   .st-note { font-size: 11px; color: var(--faint); margin-top: 4px; }
+  /* 搜索选择器（模型类长列表）与模型标签折叠块 */
+  .ss-wrap { position: relative; flex: 1; min-width: 0; }
+  .ss-wrap input {
+    width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 8px;
+    padding: 5px 8px; font: inherit; font-size: 12.5px; outline: none; background: var(--card);
+  }
+  .ss-wrap input:focus { border-color: var(--accent); }
+  .ss-list {
+    position: absolute; left: 0; right: 0; top: 100%; z-index: 30; max-height: 220px; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
+  }
+  .ss-item { padding: 6px 10px; font-size: 12.5px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ss-item:hover, .ss-item.ss-hi { background: var(--accent-soft); }
+  .ss-item.active { color: var(--accent-deep); font-weight: 600; }
+  .ss-empty { padding: 6px 10px; font-size: 12px; color: var(--faint); }
+  .st-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   /* 插件配置子项（缩进） */
   .st-plugin-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-top: 1px solid var(--line); }
   .st-plugin-row:first-child { border-top: none; }
+  .st-plugin-row.expandable { cursor: pointer; }
+  .st-plugin-row.expandable:hover .p-label { color: var(--accent-deep); }
   .st-plugin-row .p-arrow { flex: none; width: 16px; text-align: center; color: var(--faint); cursor: pointer; user-select: none; }
   .st-plugin-row .p-label { flex: 1; min-width: 0; font-size: 13px; }
   .st-plugin-row .p-status { flex: none; font-size: 11px; color: var(--faint); }
@@ -498,15 +544,9 @@
   }
   #banner .bad { color: var(--red); font-size: 17px; font-weight: 650; }
 
-  /* ============ 桌面布局 ============ */
+  /* ============ 桌面布局（控制台同为弹出抽屉+遮罩，与移动端一致） ============ */
   @media (min-width: 960px) {
-    #menu-btn { display: none; }
-    #drawer {
-      position: static; transform: none; width: 330px; flex: none; padding-top: 0;
-      border-right: 1px solid var(--line);
-    }
-    #drawer .d-head .x { display: none; }
-    #scrim { display: none; }
+    #drawer { width: min(40vw, 420px); }
   }
 </style>
 </head>
@@ -613,12 +653,14 @@
     <div class="opts" id="ask-options"></div>
     <div class="ask-input-row">
       <input id="ask-input" placeholder="或自行输入回答…">
+      <textarea id="ask-input-multi" hidden placeholder="回答内容（Enter 换行 · Ctrl+Enter 提交）"></textarea>
       <button class="btn primary small" id="ask-input-ok">提交</button>
     </div>
     <div class="btns"><button class="btn small" id="ask-skip">跳过本次询问</button></div>
   </div>
   <div id="confirm-card" hidden>
     <div class="c-head">⚠ 工具确认请求 · <span class="cname" id="confirm-name"></span><span class="c-count" id="confirm-count"></span></div>
+    <div class="cdesc" id="confirm-desc" hidden></div>
     <pre id="confirm-args"></pre>
     <div class="btns">
       <button class="btn primary" id="c-allow">允许一次</button>
@@ -687,7 +729,8 @@ async function api(path, body) {
   const opt = body === undefined ? {} : {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
   };
-  const res = await fetch(path + qs(), opt);
+  const sep = path.includes("?") ? "&" : "?";  // path 自带 query 时用 & 接 token，防吞参
+  const res = await fetch(path + (CRED ? `${sep}token=${encodeURIComponent(CRED)}` : ""), opt);
   let j = {};
   try { j = await res.json(); } catch (e) { /* 非 JSON 响应 */ }
   j.__status = res.status;
@@ -866,6 +909,111 @@ function mdRender(src) {
   }
   flushAll();
   return out.join("");
+}
+
+/* ================= 文件链接预览 ================= */
+/* assistant 消息里的工作区文件链接：点击拉取 /api/file 弹窗预览（图片/md/文本/pdf）；
+   http(s) 外链保持新标签打开；超限/不支持/不存在仅弹窗显示文件名 */
+document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest("a.lk");
+  if (!a || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+  const href = a.getAttribute("href") || "";
+  if (/^https?:\/\//i.test(href)) return;
+  e.preventDefault();
+  openFilePreview(href);
+});
+
+async function openFilePreview(href) {
+  let p = String(href || "").trim();
+  if (!p) return;
+  if (p.startsWith("file://")) {
+    try {
+      p = decodeURIComponent(new URL(p).pathname).replace(/^\/([A-Za-z]:)/, "$1");
+    } catch (e2) { p = p.slice(7); }
+  } else {
+    try { p = decodeURIComponent(p); } catch (e2) { /* 保留原样 */ }
+  }
+  p = p.replace(/^\.\//, "");
+  let r;
+  try {
+    r = await api("/api/file?path=" + encodeURIComponent(p));
+  } catch (e2) {
+    showNameModal(fileName(p), "网络错误: " + e2);
+    return;
+  }
+  if (!r.ok) {
+    showNameModal(fileName(p), r.message || "该文件不支持预览");
+    return;
+  }
+  showPreviewModal(r);
+}
+function fileName(p) {
+  const s = String(p || "").replace(/\\/g, "/");
+  return s.split("/").filter(Boolean).pop() || s;
+}
+function showNameModal(name, message) {
+  const scrim = el("div", "modal-scrim");
+  const modal = el("div", "modal");
+  const head = el("div", "m-head");
+  head.append(el("span", "t", name || "文件"));
+  const x = el("button", "x", "✕");
+  x.onclick = () => scrim.remove();
+  head.append(x);
+  const body = el("div", "m-body");
+  body.append(el("div", "st-note", message || "该文件类型不支持预览"));
+  modal.append(head, body);
+  scrim.append(modal);
+  document.body.append(scrim);
+  scrim.onclick = e => { if (e.target === scrim) scrim.remove(); };
+}
+function showPreviewModal(r) {
+  const scrim = el("div", "modal-scrim");
+  const modal = el("div", "modal");
+  modal.style.maxWidth = "min(720px, 92vw)";
+  const head = el("div", "m-head");
+  head.append(el("span", "t", r.name || "预览"));
+  let objUrl = null;
+  const x = el("button", "x", "✕");
+  x.onclick = () => { if (objUrl) URL.revokeObjectURL(objUrl); scrim.remove(); };
+  head.append(x);
+  const body = el("div", "m-body");
+  if (r.category === "image") {
+    const img = document.createElement("img");
+    img.src = "data:" + (r.mime || "image/png") + ";base64," + r.data;
+    img.style.maxWidth = "100%";
+    img.style.borderRadius = "8px";
+    body.append(img);
+  } else if (r.category === "pdf") {
+    try {
+      const bin = atob(r.data);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      objUrl = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+      const frame = document.createElement("iframe");
+      frame.src = objUrl;
+      frame.style.width = "100%";
+      frame.style.height = "70vh";
+      frame.style.border = "none";
+      body.append(frame);
+    } catch (e2) {
+      body.append(el("div", "st-note", "PDF 无法嵌入预览"));
+    }
+  } else {
+    const text = String(r.data ?? "");
+    if (/\.(md|markdown)$/i.test(r.name || "")) {
+      const div = el("div", "md-preview");
+      div.innerHTML = mdRender(text);
+      body.append(div);
+    } else {
+      body.append(el("pre", "", text));
+    }
+  }
+  modal.append(head, body);
+  scrim.append(modal);
+  document.body.append(scrim);
+  scrim.onclick = e => {
+    if (e.target === scrim) { if (objUrl) URL.revokeObjectURL(objUrl); scrim.remove(); }
+  };
 }
 
 /* ================= 消息渲染 ================= */
@@ -1076,7 +1224,9 @@ function renderMessage(m) {
       span.innerHTML = mdRender(m.content);
       b.append(span);
     }
-    if (calls.length) b.append(el("div", "calls", "🔧 调用 " + calls.join("、")));
+    if (calls.length) b.append(el("div", "calls", "🔧 调用 " + calls.map(c =>
+      typeof c === "string" ? c : (c.description ? `${c.name} · ${c.description}` : c.name)
+    ).join("、")));
     if (m.thinking) b.append(thinkDetails(m.thinking));
     d.append(b);
     logEl.append(d);
@@ -1167,6 +1317,9 @@ function refreshConfirmCard() {
   confirmRenderSig = sig;
   if (!confirmActive) { $("confirm-card").hidden = true; return; }
   $("confirm-name").textContent = confirmActive.name || "";
+  const cdesc = $("confirm-desc");
+  cdesc.textContent = confirmActive.description ? "目的: " + confirmActive.description : "";
+  cdesc.hidden = !confirmActive.description;
   $("confirm-args").textContent = JSON.stringify(confirmActive.arguments || {}, null, 2);
   $("confirm-count").textContent = confirmQueue.length > 1 ? `共 ${confirmQueue.length} 个待确认` : "";
   $("deny-row").hidden = true;
@@ -1217,7 +1370,10 @@ function refreshAskCard() {
   if (!askActive) { $("ask-card").hidden = true; return; }
   $("ask-count").textContent = askQueue.length > 1 ? `共 ${askQueue.length} 个待回答` : "";
   $("ask-question").textContent = askActive.question || "";
+  $("ask-input").hidden = !!askActive.multiline;
+  $("ask-input-multi").hidden = !askActive.multiline;
   $("ask-input").value = "";
+  $("ask-input-multi").value = "";
   const box = $("ask-options");
   box.replaceChildren();
   (askActive.options || []).forEach((o, i) => {
@@ -1256,11 +1412,17 @@ async function answerAsk(payload) {
     if (!r.ok) toast(r.message || "回答发送失败", true);
   } catch (e) { toast("网络错误: " + e, true); }
 }
+function askAnswerText() {
+  return askActive && askActive.multiline ? $("ask-input-multi").value.trim() : $("ask-input").value.trim();
+}
 $("ask-input-ok").onclick = () => {
-  const text = $("ask-input").value.trim();
+  const text = askAnswerText();
   if (!text) { toast("请输入回答内容", true); return; }
   answerAsk({ status: "answer", answer: text });
 };
+$("ask-input-multi").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); $("ask-input-ok").click(); }
+});
 $("ask-input").addEventListener("keydown", e => {
   if (e.isComposing) return;
   if (e.key === "Enter") { e.preventDefault(); $("ask-input-ok").click(); }
@@ -1469,7 +1631,7 @@ function activeFilePrefix() {
   const prefix = input.value.slice(0, input.selectionStart);
   if (prefix.includes("\n")) return null;
   const at = prefix.lastIndexOf("@");
-  if (at < 0 || (at > 0 && !/\s/.test(prefix[at - 1]))) return null;
+  if (at < 0) return null;
   const query = prefix.slice(at + 1);
   return query.startsWith('"') ? query.slice(1) : query;
 }
@@ -1494,7 +1656,7 @@ async function refreshInputCompletions() {
   if (!isCommand && filePrefix === null) return;
   const epoch = completionEpoch;
   try {
-    if (isCommand) {
+    if (isCommand && filePrefix === null) {
       const r = await api("/api/complete", { prefix });
       if (epoch !== completionEpoch || prefix !== input.value.slice(0, input.selectionStart)) return;
       inputCompletions = r.ok ? (r.items || []) : [];
@@ -1647,7 +1809,7 @@ function connect() {
         break;
       case "tool_after":
         liveSeal();
-        appendToolResult({ name: p.name, args: p.arguments, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render, truncated: p.truncated, persist_path: p.persist_path });
+        appendToolResult({ name: p.name, args: p.arguments, desc: p.description, output: p.output, elapsed: p.elapsed, failed: p.failed, render: p.render, truncated: p.truncated, persist_path: p.persist_path });
         stick();
         pollStatus();
         break;
@@ -1694,7 +1856,7 @@ function openDrawer(tab) {
   activateTab(tab || (cur ? cur.dataset.tab : "sessions"));
 }
 function closeDrawer() {
-  if (!desktopMQ.matches) document.body.classList.remove("drawer-open");
+  document.body.classList.remove("drawer-open");
 }
 $("menu-btn").onclick = () => openDrawer();
 $("drawer-close").onclick = () => closeDrawer();
@@ -1809,13 +1971,18 @@ function renderTokenCard() {
   if (t.balance !== undefined) lines.push(`余额 ${t.balance} ${t.balance_currency || ""}`);
   card.append(el("div", "empty-note", lines.length ? lines.join("\n") : "暂无计量数据"));
 }
+const MODEL_LIST_COLLAPSE = 10;  // 超过此数折叠模型列表，仅展示当前模型+前 N 个
+let modelListExpanded = false;
 async function loadModels() {
   const box = $("model-list");
   try {
     const r = await api("/api/models");
     box.innerHTML = "";
     if (!r.ok || !(r.models || []).length) { box.append(el("div", "empty-note", r.message || "无可用模型")); return; }
-    for (const m of r.models) {
+    // 当前使用模型置顶（稳定排序，其余保持原顺序），超出一定长度折叠
+    const models = [...r.models].sort((a, b) => (b.is_active ? 1 : 0) - (a.is_active ? 1 : 0));
+    const hidden = modelListExpanded ? 0 : Math.max(0, models.length - MODEL_LIST_COLLAPSE);
+    for (const m of models.slice(0, models.length - hidden)) {
       const row = rowHtml(m.model_name, m.context_window ? `上下文窗口 ${m.context_window}` : "", m.is_active);
       if (!m.is_active) {
         row.style.cursor = "pointer";
@@ -1826,6 +1993,12 @@ async function loadModels() {
         };
       }
       box.append(row);
+    }
+    if (hidden > 0 || modelListExpanded) {
+      const btn = el("button", "btn small", modelListExpanded ? "收起" : `展开全部 ${models.length} 个模型`);
+      btn.style.marginTop = "6px";
+      btn.onclick = () => { modelListExpanded = !modelListExpanded; loadModels(); };
+      box.append(btn);
     }
   } catch (e) { box.innerHTML = ""; box.append(el("div", "empty-note", "网络错误: " + e)); }
 }
@@ -1972,6 +2145,71 @@ function stSelect(options, current) {
   }
   return sel;
 }
+/* 搜索+选择两合一（模型类长列表）：输入实时过滤候选、点击选中；.value 可读写，
+   setOptions 供切提供商等场景重置候选；onchange 在点选后触发 */
+function stSearchSelect(options, current) {
+  const wrap = el("div", "ss-wrap");
+  const inp = el("input");
+  inp.type = "text";
+  inp.autocomplete = "off";
+  const list = el("div", "ss-list");
+  list.style.display = "none";
+  let opts = [...options];
+  let val = current ?? "";
+  let hi = -1;  // 键盘高亮候选索引（Enter 选中）
+  inp.value = val;
+  function renderList(filter) {
+    list.innerHTML = "";
+    const kw = (filter || "").trim().toLowerCase();
+    const hits = kw ? opts.filter(o => o.toLowerCase().includes(kw)) : opts;
+    hi = hits.length ? 0 : -1;
+    hits.slice(0, 50).forEach((o, i) => {
+      const item = el("div", "ss-item" + (o === val ? " active" : "") + (i === hi ? " ss-hi" : ""), o);
+      item.onmousedown = e => {
+        e.preventDefault();  // 先于 input blur 收起，保证点选命中
+        val = o;
+        inp.value = o;
+        list.style.display = "none";
+        if (wrap.onchange) wrap.onchange();
+      };
+      list.append(item);
+    });
+    if (!hits.length) list.append(el("div", "ss-empty", "无匹配项"));
+    list.style.display = "block";
+  }
+  inp.onfocus = () => renderList("");
+  inp.oninput = () => renderList(inp.value);
+  inp.onblur = () => { setTimeout(() => { list.style.display = "none"; inp.value = val; }, 150); };
+  // 键盘导航：↑↓ 移动候选高亮、Enter 选中、Esc 收起（stopPropagation 防 modal 焦点跳转）
+  inp.onkeydown = e => {
+    if (list.style.display === "none") return;
+    const items = [...list.querySelectorAll(".ss-item")];
+    if (!items.length) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      e.stopPropagation();
+      hi = Math.max(0, Math.min(hi + (e.key === "ArrowDown" ? 1 : -1), items.length - 1));
+      items.forEach((x, i) => x.classList.toggle("ss-hi", i === hi));
+      items[hi].scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (hi >= 0 && items[hi]) items[hi].dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    } else if (e.key === "Escape") {
+      list.style.display = "none";
+    }
+  };
+  wrap.append(inp, list);
+  Object.defineProperty(wrap, "value", {
+    get: () => val,
+    set: v => { val = v ?? ""; inp.value = val; },
+  });
+  wrap.setOptions = (next, cur) => {
+    opts = [...next];
+    if (cur !== undefined) { val = cur ?? ""; inp.value = val; }
+  };
+  return wrap;
+}
 function stToggle(on) {
   const t = el("div", "st-toggle" + (on ? " on" : ""));
   t.onclick = () => t.classList.toggle("on");
@@ -2009,8 +2247,23 @@ function buildProviderTab(body, data) {
   const tempInput = stInput(p.temperature, "number");
   tempInput.step = "0.1";
   let modelIds = [...(p.models || [])];
-  const defModelSel = stSelect(modelIds, p.default_model_id);
-  const modelList = el("div", "st-note", modelIds.join(", ") || "（暂无模型）");
+  const defModelSel = stSearchSelect(modelIds, p.default_model_id);
+  // 模型列表折叠块：默认收起只显示总数，点开看标签流（替代逗号平铺长行）
+  const modelSummary = el("button", "btn small", modelIds.length ? `共 ${modelIds.length} 个模型` : "（暂无模型）");
+  const modelTags = el("div", "st-tags");
+  modelTags.style.display = "none";
+  const modelList = el("div");
+  modelList.append(modelSummary, modelTags);
+  function renderModelTags() {
+    modelTags.innerHTML = "";
+    for (const id of modelIds) modelTags.append(el("span", "tag gray", id));
+  }
+  modelSummary.onclick = () => {
+    const open = modelTags.style.display === "none";
+    modelTags.style.display = open ? "flex" : "none";
+    if (open) renderModelTags();
+    modelSummary.textContent = open ? "收起模型列表" : `共 ${modelIds.length} 个模型`;
+  };
   const activeSel = stSelect(providers.map(x => x.provider_id), p.active_provider_id);
   const fetchBtn = el("button", "btn small", "获取模型列表");
   const pruneBtn = el("button", "btn small", "清理过时模型");
@@ -2020,8 +2273,10 @@ function buildProviderTab(body, data) {
   const deleteBtn = el("button", "btn small danger", "删除提供商");
   function syncModels(current) {
     const selected = current || defModelSel.value;
-    defModelSel.replaceChildren(...stSelect(modelIds, selected).children);
-    modelList.textContent = modelIds.join(", ") || "（暂无模型）";
+    defModelSel.setOptions(modelIds, selected);
+    modelSummary.textContent = modelTags.style.display === "none"
+      ? `共 ${modelIds.length} 个模型` : "收起模型列表";
+    if (modelTags.style.display !== "none") renderModelTags();
   }
   function selectProvider() {
     const row = entries.find(x => x.provider_id === editSel.value) || {};
@@ -2154,7 +2409,7 @@ function buildModelTab(body, data) {
   const m = data.model || {};
   const card = el("div", "st-card");
   const entries = m.entries || [];
-  const modelSel = stSelect(m.model_names || [], m.active_model_name);
+  const modelSel = stSearchSelect(m.model_names || [], m.active_model_name);
   const midInput = stInput(m.model_id);
   const modInput = stInput(m.modalities);
   const ctxInput = stInput(m.context_window, "number");
@@ -2162,9 +2417,9 @@ function buildModelTab(body, data) {
   const tempInput = stInput(m.temperature, "number");
   tempInput.step = "0.1";
   const thinkSel = stSelect(["none", "low", "medium", "high"], m.thinking_effort);
-  const planSel = stSelect(m.model_names || [], m.task_plan);
-  const codeSel = stSelect(m.model_names || [], m.task_code);
-  const revSel = stSelect(m.model_names || [], m.task_review);
+  const planSel = stSearchSelect(m.model_names || [], m.task_plan);
+  const codeSel = stSearchSelect(m.model_names || [], m.task_code);
+  const revSel = stSearchSelect(m.model_names || [], m.task_review);
   function loadModel(name) {
     const row = entries.find(x => x.model_name === name);
     if (!row) return;
@@ -2220,7 +2475,9 @@ function buildSystemTab(body, data) {
     if (f.type === "bool") {
       input = stToggle(!!f.current);
     } else if (f.type === "choice") {
-      input = stSelect((f.options || []).map(String), f.current);
+      // 长候选（如 @models 全量模型）用搜索选择器，短候选保持原生下拉
+      const opts = (f.options || []).map(String);
+      input = opts.length > 8 ? stSearchSelect(opts, f.current) : stSelect(opts, f.current);
     } else if (f.type === "int" || f.type === "float") {
       input = stInput(f.current, "number");
       input.step = f.type === "float" ? "0.1" : "1";
@@ -2287,14 +2544,15 @@ function buildPluginsTab(body, data) {
   const card = el("div", "st-card");
   const toggles = {};
   for (const p of plugins) {
-    // 插件行：箭头 + 名称 + 状态 + 启停开关
+    // 插件行：箭头 + 名称 + 状态 + 启停开关；声明了配置的插件整行可点展开
     const row = el("div", "st-plugin-row");
     const hasConfigs = (p.configs || []).length > 0;
     const expanded = pluginExpanded.has(p.id);
     const arrow = el("span", "p-arrow", hasConfigs ? (expanded ? "▾" : "▸") : "·");
     if (hasConfigs) {
-      arrow.style.cursor = "pointer";
-      arrow.onclick = () => {
+      // 整行点击展开/收起（此前只有三角形可点，行内文字无效）
+      row.classList.add("expandable");
+      row.onclick = () => {
         if (pluginExpanded.has(p.id)) pluginExpanded.delete(p.id);
         else pluginExpanded.add(p.id);
         // 重新渲染插件标签页
@@ -2313,6 +2571,7 @@ function buildPluginsTab(body, data) {
     row.append(el("span", "p-status", statusText));
     const tog = stToggle(p.status === "loaded");
     toggles[p.id] = tog;
+    tog.onclick = e => { e.stopPropagation(); tog.classList.toggle("on"); };  // 启停开关不触发展开
     row.append(tog);
     card.append(row);
     if (p.error) {

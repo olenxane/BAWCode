@@ -1,12 +1,15 @@
-"""web-search —— 必应网络搜索插件 v0.1.0（无状态单次请求）。
+"""web-search —— 必应网络搜索插件 v0.2.0（无状态单次请求）。
 
-注册模型可见工具 web_search：关键词 → 拼接必应搜索 URL → 以真实浏览器头
-请求结果页 → BeautifulSoup 解析为结构化结果（标题/链接/摘要）返回给模型。
+注册模型可见工具：
+- web_search：关键词 → 必应网页搜索 → 结构化结果（标题/链接/摘要）
+- image_search：关键词 → 必应图片搜索 → 结构化结果（标题/原图/来源页），
+  可选把前 N 张原图下载落盘（插件 storage_dir/image_search/）供 read 多模态查看
 
 - 请求头取值与 core webfetch 保持一致，另按配置的必应地址动态补 Referer，
   模拟从必应首页发起搜索的真实用户
 - 必应结果链接经 bing.com/ck/a?...&u=a1<base64url> 重定向包裹，解析时解码
   还原真实 URL，解码失败保留原链接
+- 图片结果解析 .iusc 元素 m 属性里的 JSON（murl/turl/purl/t）
 - 解析到 0 条时返回页面标题与诊断提示而非空结果，避免模型空转重试
 - 配置（max_results / base_url）经 ctx.settings 每次调用实时读取，改设置即生效
 """
@@ -16,6 +19,8 @@ from bawcode_sdk import PluginContext
 
 import base64
 import binascii
+import hashlib
+import json
 import re
 import time
 from typing import List, Tuple
@@ -37,9 +42,14 @@ BROWSER_HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
-MAX_BYTES = 5 * 1024 * 1024  # 响应体上限，防超大页面
-MAX_CHARS = 20000            # 返回文本硬顶，防撑爆上下文
+MAX_BYTES = 5 * 1024 * 1024   # 响应体上限，防超大页面
+MAX_CHARS = 20000             # 返回文本硬顶，防撑爆上下文
 DEFAULT_TIMEOUT = 20
+
+IMG_MAX_BYTES = 10 * 1024 * 1024  # 单图下载上限
+IMG_TIMEOUT = 10                  # 单图下载超时
+IMG_WORKERS = 8                   # 图片并发下载数
+IMG_KEEP_DAYS = 7                 # 落盘图片保留天数
 
 # ck/a 重定向里 base64url 编码的真实 URL（u=a1 前缀）；兼容以 ~ . 补位的变体
 CK_URL_RE = re.compile(r"[?&]u=a1([A-Za-z0-9_~.-]+)")
@@ -106,6 +116,89 @@ def parse_results(soup, limit: int) -> List[Tuple[str, str, str]]:
         if len(results) >= limit:
             break
     return results
+
+
+def parse_image_results(soup, limit: int) -> List[Tuple[str, str, str, str]]:
+    """
+    解析必应图片结果页：.iusc 元素 m 属性内嵌 JSON → (标题, 原图murl, 来源页purl, 缩略图turl)
+    """
+    results: List[Tuple[str, str, str, str]] = []
+    for item in soup.select(".iusc[m]"):
+        try:
+            m = json.loads(item.get("m", ""))
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(m, dict) or not m.get("murl"):
+            continue
+        results.append((
+            str(m.get("t") or "").strip(),
+            str(m["murl"]),
+            str(m.get("purl") or ""),
+            str(m.get("turl") or ""),
+        ))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _image_save_path(img_dir, url: str, mime: str):
+    """原图落盘：文件名=sha1(url) 前 12 位+扩展名，同 URL 命中同路径幂等"""
+    ext = {
+        "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+        "image/webp": ".webp", "image/svg+xml": ".svg", "image/bmp": ".bmp",
+        "image/x-icon": ".ico", "image/avif": ".avif",
+    }.get(mime.split(";")[0].strip().lower())
+    if not ext:
+        m = re.search(r"\.(\w{2,5})(?:[?#]|$)", url)
+        ext = f".{m.group(1).lower()}" if m else ".img"
+    return img_dir / f"img_{hashlib.sha1(url.encode('utf-8')).hexdigest()[:12]}{ext}"
+
+
+def download_images(requests, img_dir, items: List[Tuple[int, str]], referer: str) -> dict:
+    """并发下载图片 → {序号: 本地Path|None}；img_dir 需已存在；失败记 None 不阻塞"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_one(item: Tuple[int, str]):
+        idx, url = item
+        try:
+            headers = dict(BROWSER_HEADERS)
+            headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+            headers["Referer"] = referer
+            headers["Sec-Fetch-Dest"] = "image"
+            headers["Sec-Fetch-Mode"] = "no-cors"
+            headers.pop("Sec-Fetch-User", None)
+            with requests.get(url, headers=headers, timeout=IMG_TIMEOUT, stream=True) as r:
+                r.raise_for_status()
+                mime = (r.headers.get("Content-Type") or "").lower()
+                buf, total = [], 0
+                for chunk in r.iter_content(65536):
+                    buf.append(chunk)
+                    total += len(chunk)
+                    if total > IMG_MAX_BYTES:
+                        return idx, None
+                path = _image_save_path(img_dir, url, mime)
+                if not path.exists():
+                    path.write_bytes(b"".join(buf))
+                return idx, path
+        except Exception:
+            return idx, None
+
+    with ThreadPoolExecutor(max_workers=IMG_WORKERS) as pool:
+        return dict(pool.map(fetch_one, items))
+
+
+def gc_image_dir(img_dir) -> None:
+    """按 mtime 清掉超过保留期的落盘图片"""
+    cutoff = time.time() - IMG_KEEP_DAYS * 86400
+    try:
+        for p in img_dir.iterdir():
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def setup(ctx: PluginContext):
@@ -227,4 +320,146 @@ def setup(ctx: PluginContext):
         if len(text) > MAX_CHARS:
             text = text[:MAX_CHARS] + f"\n\n[内容已截断：原始 {len(text)} 字符，上限 {MAX_CHARS}]"
         ctx.log.debug("web_search 完成: %s（%d 条）", query, len(results))
+        return text
+
+    @ctx.register_tool(
+        name="image_search",
+        description=(
+            "Search images via Microsoft Bing and return structured results "
+            "(numbered list of title/source-page/original-image-URL). Set "
+            "download>0 to save the first N original images to disk so you "
+            "can view them with read (multimodal)"
+        ),
+        usage="image_search <query> [count] [download] [timeout]",
+        schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search keywords",
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Max results, optional, default 10 (plugin settings), clamped to 1-30",
+                },
+                "download": {
+                    "type": "integer",
+                    "description": "Save the first N images to disk for read to view, optional, default 0, clamped to 0-8",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Request timeout in seconds, optional, default 20, clamped to 1-60",
+                },
+            },
+            "required": ["query"],
+        },
+    )
+    def image_search(query: str, count: int = 0, download: int = 0, timeout: int = DEFAULT_TIMEOUT) -> str:
+        """图片搜索：关键词 → 必应图片结果页 → 结构化结果（标题/原图/来源页），可选原图落盘"""
+        deps = load_deps()
+        if deps is None:
+            return "image_search 依赖缺失（requests/beautifulsoup4），请安装插件目录 requirements.txt"
+        requests, BeautifulSoup = deps
+
+        query = str(query or "").strip()
+        if not query:
+            return "query 不能为空：请提供搜索关键词"
+
+        settings = ctx.settings
+        base_url = str(settings.get("base_url") or "https://www.bing.com").rstrip("/")
+        try:
+            limit = int(count) if count else int(settings.get("max_results") or 10)
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(limit, 30))
+        try:
+            n_download = max(0, min(int(download or 0), 8))
+        except (TypeError, ValueError):
+            n_download = 0
+        try:
+            seconds = int(timeout)
+        except (TypeError, ValueError):
+            seconds = DEFAULT_TIMEOUT
+        seconds = max(1, min(seconds, 60))
+
+        url = f"{base_url}/images/search?q={quote(query)}&count={limit}&mkt=zh-CN&form=HDRSC2"
+        headers = dict(BROWSER_HEADERS)
+        headers["Referer"] = f"{base_url}/"
+
+        ctx.log.info("image_search: %s（count=%d download=%d timeout=%ds）", query, limit, n_download, seconds)
+        deadline = time.monotonic() + seconds
+        try:
+            with requests.get(
+                url,
+                headers=headers,
+                timeout=seconds,
+                allow_redirects=True,
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    ctx.log.warn("image_search HTTP %d: %s", resp.status_code, query)
+                    return f"图片搜索失败：必应返回 HTTP {resp.status_code}（{resp.reason or '无说明'}）"
+                chunks = []
+                total = 0
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if time.monotonic() > deadline:
+                        return f"图片搜索超时：读取结果页总耗时超过 {seconds}s: {query}"
+                    if not chunk:
+                        continue
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > MAX_BYTES:
+                        ctx.log.warn("image_search 响应超限截断: %s（>%d bytes）", query, MAX_BYTES)
+                        break
+                content = b"".join(chunks)
+        except requests.exceptions.Timeout:
+            return f"图片搜索超时（>{seconds}s）: {query}"
+        except requests.exceptions.SSLError as e:
+            return f"SSL 错误: {e}"
+        except requests.exceptions.RequestException as e:
+            ctx.log.warn("image_search 失败: %s（%s）", query, e)
+            return f"图片搜索失败: {e}"
+        except Exception as e:
+            ctx.log.warn("image_search 异常: %s（%r）", query, e)
+            return f"图片搜索失败：{type(e).__name__}: {e}"
+
+        try:
+            soup = make_soup(BeautifulSoup, content)
+            results = parse_image_results(soup, limit)
+        except Exception as e:
+            ctx.log.warn("image_search 解析失败: %s（%r）", query, e)
+            return f"图片结果页解析失败：{type(e).__name__}: {e}"
+        if not results:
+            title = soup.title.get_text(strip=True) if soup.title else ""
+            return (
+                "未解析到图片结果（疑似必应风控或页面结构变化）。\n"
+                f"页面标题: {title or '无'}\n"
+                "建议：稍后重试，或经设置面板把 base_url 换成 https://cn.bing.com"
+            )
+
+        saved = {}
+        if n_download:
+            img_dir = ctx.storage_dir() / "image_search"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            gc_image_dir(img_dir)
+            items = [(i, r[1]) for i, r in enumerate(results[:n_download], 1)]
+            saved = download_images(requests, img_dir, items, referer=str(resp.url))
+
+        lines = [f"图片搜索「{query}」共 {len(results)} 条结果（{base_url}）", ""]
+        for i, (title, murl, purl, turl) in enumerate(results, 1):
+            lines.append(f"{i}. {title or '(无标题)'}")
+            lines.append(f"   原图: {murl}")
+            if purl:
+                lines.append(f"   来源: {purl}")
+            if turl:
+                lines.append(f"   缩略图: {turl}")
+            if i in saved:
+                lines.append(f"   已保存: {saved[i] if saved[i] else '下载失败'}"
+                             + ("（read 可查看）" if saved[i] else ""))
+            lines.append("")
+        text = "\n".join(lines).strip()
+        if len(text) > MAX_CHARS:
+            text = text[:MAX_CHARS] + f"\n\n[内容已截断：原始 {len(text)} 字符，上限 {MAX_CHARS}]"
+        ctx.log.debug("image_search 完成: %s（%d 条，下载 %d/%d）", query, len(results),
+                      sum(1 for v in saved.values() if v), n_download)
         return text

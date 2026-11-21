@@ -1912,7 +1912,8 @@ class Memory:
             if value in REASONING_REPLAY_OPTIONS:
                 return value
             provider = self.config.find_provider(row.get("provider_id") or "") or {}
-            advanced = provider.get("advanced") if isinstance(provider.get("advanced"), dict) else {}
+            adv_raw = provider.get("advanced")
+            advanced = adv_raw if isinstance(adv_raw, dict) else {}
             value = str(advanced.get("reasoning_replay") or "").strip().lower()
             if value in REASONING_REPLAY_OPTIONS:
                 return value
@@ -2132,8 +2133,10 @@ class Memory:
         return "".join(out)
 
     def rename_session(self, title: str) -> str:
-        """手动命名当前会话（折叠空白、按显示宽度截断）；随下次 save_session 落盘"""
-        self.session_title = self._clip_title(" ".join(str(title or "").split()))
+        """手动命名当前会话（折叠空白，保留全量标题不截断，超长上限防滥用）；
+        显示层（会话列表/状态栏）自行按宽度截断。随下次 save_session 落盘"""
+        full = " ".join(str(title or "").split())[:200]
+        self.session_title = full
         self._dirty = True
         log.info("会话已重命名: %s (id=%s)", self.session_title, self.session_id)
         return self.session_title

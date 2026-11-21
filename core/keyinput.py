@@ -56,14 +56,16 @@ def _hotkey(name: str, ctrl: bool, alt: bool, shift: bool) -> KeyEvent:
 
 
 def _mouse_event(data: str) -> Optional[KeyEvent]:
-    """WindowsMouseEvent data = "button;event_type;X;Y"（0-based 单元格）。
+    """WindowsMouseEvent data = "button;event_type;X;Y[;ctrl]"（0-based 单元格）。
 
     pt 枚举值为大写（如 'NONE;SCROLL_UP;76;19'），统一 lower 后匹配；
+    第 5 段 "ctrl" 为 Win32 ControlKeyState 捕获的 Ctrl 按下标记；
     MOUSE_UP 的 button 为 NONE，不参与按下态判定。"""
-    try:
-        button, et, xs, ys = (data or "").split(";")
-    except ValueError:
+    parts = (data or "").split(";")
+    if len(parts) < 4:
         return None
+    button, et, xs, ys = parts[:4]
+    ctrl = "ctrl" in (p.strip().lower() for p in parts[4:])
     button = button.strip().lower()
     et = et.strip().lower()
     if et == "scroll_up":
@@ -72,8 +74,8 @@ def _mouse_event(data: str) -> Optional[KeyEvent]:
         return KeyEvent("mouse_wheel", "down")
     pos = f"{xs},{ys}"
     if et == "mouse_down":
-        # value 携带按键前缀（left/right/middle）：会话树自绘选区需要右键复制
-        return KeyEvent("mouse_down", f"{button}:{pos}")
+        # value 携带按键前缀（[ctrl+]left/right/middle）：右键复制选区，Ctrl+左键打开链接
+        return KeyEvent("mouse_down", f"{'ctrl+' if ctrl else ''}{button}:{pos}")
     if et == "mouse_up":
         return KeyEvent("mouse_up", pos)
     if et == "mouse_move":
@@ -301,17 +303,31 @@ def _baw_win32_input_cls():
     ——该路径的 _get_keys 只解码KEY_EVENT，MOUSE_EVENT 记录被丢弃（滚轮/滑块拖拽全断）；
     VT 路径的鼠标需应用主动发 \\x1b[?1000h 上报序列，裸 reader 没有。此处强制回到ConsoleInputReader 事件记录路径：MOUSE_EVENT → WindowsMouseEvent →
     翻译层；raw_mode 也不再设置输入 VT。
+    reader 子类补充捕获 ControlKeyState：Ctrl 按下时鼠标数据串追加第 5 段 "ctrl"。
     """
     try:
         from prompt_toolkit.input.win32 import ConsoleInputReader, Win32Input
+        from prompt_toolkit.key_binding import KeyPress
     except ImportError:  # pragma: no cover
         return None
+
+    class BawConsoleInputReader(ConsoleInputReader):
+        def _handle_mouse(self, ev):
+            presses = super()._handle_mouse(ev)
+            # LEFT_CTRL_PRESSED(0x8) | RIGHT_CTRL_PRESSED(0x2)；
+            # pt 的 MOUSE_EVENT_RECORD 字段名是 ControlKeyState（非 Win32 原生 dwControlKeyState）
+            ctrl_state = getattr(ev, "ControlKeyState", None)
+            if ctrl_state is None:
+                ctrl_state = getattr(ev, "dwControlKeyState", 0)
+            if presses and (ctrl_state & 0xA):
+                presses[0] = KeyPress(presses[0].key, presses[0].data + ";ctrl")
+            return presses
 
     class BawWin32Input(Win32Input):
         def __init__(self, stdin=None):
             super().__init__(stdin)
             self._use_virtual_terminal_input = False
-            self.console_input_reader = ConsoleInputReader()
+            self.console_input_reader = BawConsoleInputReader()
 
     return BawWin32Input
 

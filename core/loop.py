@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from core import memory as memory_mod
@@ -115,8 +116,11 @@ def drain_injections(turn: TurnContext) -> int:
 
 def ensure_system_prompt(turn: TurnContext, files=None) -> None:
     """注入系统提示词：写入 turn.system_prompt_text，会话无 system_prompt 记录时补一条两段式（core + environment 目录动态拼装 + 记忆占位符），会话首次生成后按 files
-    缓存于 session——记忆在会话初始化时读入并固定，本会话后续回合不再重读/刷新；新会话随新 session 对象自然重建。"""
-    cache_key = tuple(files or [])
+    缓存于 session——记忆在会话初始化时读入并固定，本会话后续回合不再重读/刷新；新会话随新 session 对象自然重建。
+    主对话（files=None）跟随激活人格：缓存键取解析后的文件清单，切换人格后下一回合自动重建注入。"""
+    if files is None:
+        files = prompt_loader.persona_files(turn.config) or []
+    cache_key = tuple(files)
     cache = getattr(turn.session, "system_prompt_cache", None)
     parts_cache = getattr(turn.session, "system_prompt_parts_cache", None)
     if isinstance(cache, dict) and cache_key in cache:
@@ -162,7 +166,9 @@ def ensure_system_prompt(turn: TurnContext, files=None) -> None:
             ", ".join(files or prompt_loader.system_prompt_files(turn.config)),
         )
     if not any(m.get("type") == "system_prompt" for m in turn.session.messages):
-        names = files or list(prompt_loader.system_prompt_files(turn.config))
+        names = [Path(f).name if Path(f).is_absolute() else f for f in files] or list(
+            prompt_loader.system_prompt_files(turn.config)
+        )
         turn.session.add_message(
             "system",
             "注入系统提示词",

@@ -730,6 +730,39 @@ def _md_inline(text: str, pal: dict, strict: bool = True, plain: Optional[str] =
         out.append(_md_keyinfo(text[pos:], pal, base, strict))
     return "".join(out)
 
+def _md_link_spans(line: str, url_c: str, dim_c: str) -> List[Tuple[int, int, str]]:
+    """渲染行反解链接命中区（显示列）：dim 色 " (url)" 回溯最近 url 色起点，
+    可点区间 = label + " (url)" 全段 → (列0, 列1, url)。折行把 url 拆断的尾部段不识别（保守不命中）"""
+    spans: List[Tuple[int, int, str]] = []
+    col = 0
+    label_start: Optional[int] = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\x1b":
+            m = _ANSI_RE.match(line, i)
+            if m:
+                code = m.group(0)
+                if code == url_c:
+                    label_start = col
+                elif code == dim_c and label_start is not None:
+                    mm = re.match(r" \(([^)]+)\)", line[m.end():])
+                    if mm:
+                        end = col + _display_width(mm.group(0))
+                        spans.append((label_start, end, mm.group(1)))
+                        label_start = None
+                        col = end
+                        i = m.end() + mm.end()
+                        continue
+                    label_start = None
+                i = m.end()
+                continue
+        w = _char_width(ch)
+        col += max(1, w)
+        i += 1
+    return spans
+
+
 def _md_prefixed(prefix: str, prefix_c: str, content: str, width: int) -> List[str]:
     """列表/任务项：前缀着 list 色，正文按剩余宽度折行，续行悬挂对齐"""
     pw = _display_width(prefix)
@@ -771,20 +804,23 @@ def _md_table_align(cell: str) -> str:
     return "left"
 
 
-def _md_pad_cell(cell_ansi: str, col_w: int, align: str) -> str:
-    """ANSI 单元格按对齐补空格到 col_w（超宽先裁剪）"""
-    clipped = _clip_keep_ansi(cell_ansi, col_w)
-    pad = max(0, col_w - _display_width(clipped))
-    if align == "right":
-        return " " * pad + clipped
-    if align == "center":
-        left = pad // 2
-        return " " * left + clipped + " " * (pad - left)
-    return clipped + " " * pad
+def _md_pad_cell(cell_ansi: str, col_w: int, align: str) -> List[str]:
+    """ANSI 单元格按列宽折行成多物理行（超宽换行不截断），各行按对齐补空格到列宽"""
+    out = []
+    for ln in _wrap_keep_ansi(cell_ansi, col_w):
+        pad = max(0, col_w - _display_width(ln))
+        if align == "right":
+            out.append(" " * pad + ln)
+        elif align == "center":
+            left = pad // 2
+            out.append(" " * left + ln + " " * (pad - left))
+        else:
+            out.append(ln + " " * pad)
+    return out
 
 
 def _md_table(header: List[str], aligns: List[str], rows: List[List[str]], pal: dict, width: int) -> List[str]:
-    """GFM 表格 → 带框线逐行；列宽按内容自适应，超出宽度按最宽列收缩"""
+    """GFM 表格 → 带框线逐行；列宽按内容自适应，超出宽度按最宽列收缩，单元格超宽折行到下一行"""
     ncol = len(header)
     if ncol <= 0:
         return []
@@ -814,21 +850,33 @@ def _md_table(header: List[str], aligns: List[str], rows: List[List[str]], pal: 
     def _border(left: str, mid: str, right: str) -> str:
         return dim + left + mid.join("─" * (w + 2) for w in cols) + right + base
 
-    def _line(cells: List[str], is_header: bool) -> str:
-        seg = []
+    def _line(cells: List[str], is_header: bool) -> List[str]:
+        """单逻辑行 → 多物理行：单元格折行后按最大行数扩展，短单元格补空行"""
+        wrapped: List[List[str]] = []
         for c in range(ncol):
             cell = _md_inline(cells[c], pal, plain=pal["bold"]) if is_header else _md_inline(cells[c], pal)
-            seg.append(" " + _md_pad_cell(cell, cols[c], aligns[c]) + " ")
-        return dim + "│" + base + (dim + "│" + base).join(seg) + dim + "│" + base
+            wrapped.append(_md_pad_cell(cell, cols[c], aligns[c]))
+        height = max(len(x) for x in wrapped)
+        for c in range(ncol):
+            wrapped[c] += [" " * cols[c]] * (height - len(wrapped[c]))
+        out = []
+        for li in range(height):
+            seg = [" " + wrapped[c][li] + " " for c in range(ncol)]
+            out.append(dim + "│" + base + (dim + "│" + base).join(seg) + dim + "│" + base)
+        return out
 
-    out = [_border("┌", "┬", "┐"), _line(header, True), _border("├", "┼", "┤")]
-    out.extend(_line(r, False) for r in rows)
+    out = [_border("┌", "┬", "┐")]
+    out.extend(_line(header, True))
+    out.append(_border("├", "┼", "┤"))
+    for r in rows:
+        out.extend(_line(r, False))
     out.append(_border("└", "┴", "┘"))
     return out
 
 
-def _md_render(text: str, pal: dict, width: int) -> List[str]:
-    """对话正文 → 逐行 Markdown 渲染（块级 + 内联）并折行；返回可直拼的 ANSI 行"""
+def _md_render(text: str, pal: dict, width: int, links: Optional[List[Tuple[int, int, int, str]]] = None) -> List[str]:
+    """对话正文 → 逐行 Markdown 渲染（块级 + 内联）并折行；返回可直拼的 ANSI 行。
+    links 为收集器时逐行登记链接命中区 (行号, 列0, 列1, url)，供 Ctrl+单击命中"""
     width = max(1, width)
     base = pal["base"]
     src = safe_text(text or "").split("\n")
@@ -896,6 +944,14 @@ def _md_render(text: str, pal: dict, width: int) -> List[str]:
             continue
         rows.extend(_wrap_keep_ansi(_md_inline(line, pal), width))
         i += 1
+    if links is not None:
+        url_c, dim_c = pal.get("url") or "", pal.get("dim") or ""
+        if url_c and dim_c:
+            for li, ln in enumerate(rows):
+                if url_c not in ln:
+                    continue  # 无链接色的行快速跳过，省去逐字符扫描
+                for a, b, u in _md_link_spans(ln, url_c, dim_c):
+                    links.append((li, a, b, u))
     return rows or [""]
 
 class Layout:
@@ -1847,7 +1903,7 @@ class RenderMixin(UiState):
 
     def _mcp_line(self) -> str:
         """MCP 状态摘要（进程级常驻，core/mcp.py 后台线程维护；无配置时为空串）：
-        渲染在底部状态栏行尾右对齐，格式 mcp:<连接数>-<工具数>"""
+        追加在底部状态栏状态文本之后，格式 mcp(在线/配置-可用工具/工具总数)"""
         return mcp_mod.status_line()
 
     def _tree_signature(self) -> tuple:
@@ -1982,6 +2038,7 @@ class RenderMixin(UiState):
         flat = self._flatten_tree()
         if not flat:
             self._node_spans = []
+            self._frame_links = {}
             return [self.c("dim") + _clip("  —", width) + self.RESET]
         hl = self.tree_cursor if self.focus == "tree" else -1
         rows, spans = self._rows_for_flat(flat, width, hl)
@@ -2034,6 +2091,8 @@ class RenderMixin(UiState):
         rows = []
         # 消息类节点：正文在 label 内直接折行展示（同色连续），不另开详情区
         inline_kinds = {"assistant", "user", "system", "tool", "system_prompt"}
+        # markdown 链接命中表随树行重建整帧刷新（Ctrl+单击用）
+        self._frame_links = {}
         def _marker(has: bool, is_expanded: bool) -> str:
             return "▾" if has and is_expanded else ("▸" if has else "·")
 
@@ -2168,8 +2227,9 @@ class RenderMixin(UiState):
             badge_plain = f"{badge} · " if badge else ""
             budget = max(8, width - gw - 2 - _display_width(badge_plain))
             is_md = node.kind in _MD_KINDS
+            md_links: List[Tuple[int, int, int, str]] = []
             if is_md:
-                vis = _md_render(body_text, self._md_palette(content_c), budget)
+                vis = _md_render(body_text, self._md_palette(content_c), budget, links=md_links)
             else:
                 vis = _wrap(body_text, budget)
             total_rows = len(vis)
@@ -2182,6 +2242,7 @@ class RenderMixin(UiState):
                 vis = vis[:_TREE_INLINE_CAP]
             piece_no = 0
             for wline in vis:
+                row_idx = len(rows)
                 if abs_i == hl and piece_no == 0:
                     raw = first_prefix + badge_plain + wline
                     rows.append(self.C_HL + _pad(_ANSI_RE.sub("", raw), width) + self.RESET)
@@ -2202,6 +2263,20 @@ class RenderMixin(UiState):
                     else:
                         rows.append(gseg + content_c + _clip("  " + wline, max(1, width - gw)) + self.RESET)
                 piece_no += 1
+                # 链接命中区登记（Ctrl+单击打开）：按首行/续行各自前缀宽折算，越出裁剪宽度的丢弃
+                if is_md and md_links:
+                    cont_limit = max(1, width - gw) - 2
+                    for li, a, b, u in md_links:
+                        if li != piece_no - 1:
+                            continue
+                        if piece_no == 1:
+                            pw = gw + 2 + _display_width(badge_plain)
+                            if a < budget:
+                                self._frame_links.setdefault(row_idx, []).append(
+                                    (pw + a, pw + min(b, budget), u))
+                        elif a < cont_limit:
+                            self._frame_links.setdefault(row_idx, []).append(
+                                (gw + 2 + a, gw + 2 + min(b, cont_limit), u))
             if truncated:
                 hint = f"… (+{total_rows - _TREE_INLINE_CAP} 行)"
                 rows.append(gseg + self.c("dim") + _clip("  " + hint, max(1, width - gw)) + self.RESET)
@@ -2359,6 +2434,7 @@ class RenderMixin(UiState):
         if self._show_splash_logo():
             body = self._compose_logo_body(w, tree_h)
             self._row_meta["scrollbar_on"] = 0
+            self._frame_links = {}  # 无树行：清残留命中表，防 Ctrl+单击按旧行列误开
         else:
             # 右侧固定预留 1 列滚动条（内容不足一屏时该列留空，宽度稳定不跳变）
             rows = self._tree_rows(w - 1)
@@ -2570,7 +2646,7 @@ class RenderMixin(UiState):
         lines.append(self.c("dim") + _clip(self._rotating_tip(), w) + self.RESET)
         lines.append(self._rule(w))
 
-        # 状态栏：token / 余额；右侧 mcp:<连接数>-<工具数>（无 MCP 不占位）
+        # 状态栏：token / 余额；mcp 段直接追加在状态文本之后（不固定贴行尾）
         focus_tag = "会话" if tree_focus else "输入"
         token_txt = self.token_meter.status_text()
         # 插件依赖后台安装时优先展示进度（含转轮/耗时，逐帧刷新）
@@ -2579,11 +2655,9 @@ class RenderMixin(UiState):
         status = f" {lead} · {focus_tag} · {len(self.messages)}msg · {token_txt} "
         mcp_seg = self._mcp_line()
         if mcp_seg:
-            if _display_width(mcp_seg) > w - 20:
-                mcp_seg = _clip(mcp_seg, w - 20)
-            left = _clip(status, max(0, w - _display_width(mcp_seg) - 1))
+            left = _clip(status, max(0, w - _display_width(mcp_seg)))
             lines.append(
-                self.c("dim") + _pad(left, w - _display_width(mcp_seg)) + self.RESET
+                self.c("dim") + left + self.RESET
                 + self.c("mcp") + mcp_seg + self.RESET
             )
         else:
