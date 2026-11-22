@@ -468,6 +468,20 @@
     border-radius: 50%; background: #fff; transition: transform .2s; box-shadow: 0 1px 2px rgba(0,0,0,.15);
   }
   .st-row .st-toggle.on::after { transform: translateX(18px); }
+  .st-row textarea {
+    flex: 1; min-width: 0; box-sizing: border-box; padding: 6px 9px;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--card);
+    color: var(--text); font: inherit; font-size: 12.5px; resize: vertical; min-height: 64px;
+  }
+  .st-row textarea:focus { border-color: var(--accent); outline: none; }
+  .st-row .n-mini { flex: none; width: 64px; }
+  /* 工作流编排节点卡片 */
+  .wf-node { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin: 8px 0; }
+  .wf-node .n-head { display: flex; align-items: center; gap: 6px; }
+  .wf-node .n-head select { flex: 1; }
+  .wf-node .n-head .n-tools { display: flex; gap: 2px; flex: none; }
+  .wf-node .st-row { border-top: none; padding: 4px 0; }
+  .wf-node .st-row label { width: auto; }
   .st-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
   .st-note { font-size: 11px; color: var(--faint); margin-top: 4px; }
   /* 搜索选择器（模型类长列表）与模型标签折叠块 */
@@ -595,6 +609,16 @@
       <div class="d-sec">
         <div class="s-head">工作流<button class="d-refresh" data-act="refresh-workflows">刷新</button></div>
         <div class="d-card" id="workflow-list"><div class="empty-note">加载中…</div></div>
+        <div class="btn-row">
+          <button class="btn small primary" data-act="workflow-new">新建工作流</button>
+        </div>
+      </div>
+      <div class="d-sec">
+        <div class="s-head">Agent 角色<button class="d-refresh" data-act="refresh-agents">刷新</button></div>
+        <div class="d-card" id="agent-list"><div class="empty-note">加载中…</div></div>
+        <div class="btn-row">
+          <button class="btn small primary" data-act="agent-new">新建角色</button>
+        </div>
       </div>
       <div class="d-sec">
         <div class="s-head">回合快照 / 回收站<button class="d-refresh" data-act="refresh-undo">刷新</button></div>
@@ -1939,6 +1963,7 @@ async function loadControl() {
   renderTokenCard();
   loadModels();
   loadWorkflows();
+  loadAgents();
   loadUndo();
 }
 const MODE_NOTES = {
@@ -2002,25 +2027,301 @@ async function loadModels() {
     }
   } catch (e) { box.innerHTML = ""; box.append(el("div", "empty-note", "网络错误: " + e)); }
 }
+/* ================= 工作流编排与 Agent 角色 ================= */
+let wfItemsCache = [];   // 工作流定义（含 nodes）
+let wfRolesCache = [];   // 自定义角色清单
+let wfBuiltinCache = []; // 内置 Agent 清单
+let modelsCache = [];    // 模型名清单（角色编辑用）
+
+function agentOptions() {
+  const opts = wfBuiltinCache.map(b => ({ v: b.id, label: `${b.id}（内置 · ${b.description}）` }));
+  for (const r of wfRolesCache) opts.push({ v: r.id, label: `${r.id}${r.model ? " · " + r.model : ""}` });
+  opts.push({ v: "type:system_prompt", label: "系统提示词注入（非 Agent）" });
+  opts.push({ v: "type:skill", label: "技能清单注入（非 Agent）" });
+  return opts;
+}
+
 async function loadWorkflows() {
   const box = $("workflow-list");
   try {
     const r = await api("/api/workflows");
     box.innerHTML = "";
-    if (!r.ok || !(r.workflows || []).length) { box.append(el("div", "empty-note", r.message || "无工作流")); return; }
-    for (const name of r.workflows) {
-      const row = rowHtml(name, "", name === r.active);
-      if (name !== r.active) {
+    if (!r.ok) { box.append(el("div", "empty-note", r.message || "读取失败")); return; }
+    wfItemsCache = r.items || [];
+    wfRolesCache = r.roles || [];
+    wfBuiltinCache = r.builtin_agents || [];
+    if (!wfItemsCache.length) box.append(el("div", "empty-note", "无工作流"));
+    for (const item of wfItemsCache) {
+      // 待命语义：选中标记跟随 pending（一次性，跑一轮自动回直接对话）
+      const row = rowHtml(item.name, `${(item.nodes || []).length} 节点 · ${item.description || "无描述"}`, item.name === r.pending);
+      if (item.name !== r.pending) {
         row.style.cursor = "pointer";
+        row.title = "点击进入待命（下一条消息按节点链执行一轮）";
         row.onclick = async () => {
-          const rr = await api("/api/workflow/switch", { name });
+          const rr = await api("/api/workflow/switch", { name: item.name });
           if (rr.ok) { toast(rr.result); loadWorkflows(); }
           else toast(rr.message || "切换失败", true);
         };
       }
+      const editBtn = el("button", "btn small", "编辑");
+      editBtn.onclick = e => { e.stopPropagation(); openWorkflowModal(item); };
+      row.append(editBtn);
+      const delBtn = el("button", "link-danger", "删除");
+      delBtn.onclick = e => { e.stopPropagation(); twoTap(delBtn, async () => {
+        const rr = await api("/api/workflow/delete", { name: item.name });
+        if (rr.ok) { toast(rr.result); loadWorkflows(); } else toast(rr.message || "删除失败", true);
+      }); };
+      row.append(delBtn);
       box.append(row);
     }
   } catch (e) { box.innerHTML = ""; box.append(el("div", "empty-note", "网络错误: " + e)); }
+}
+
+async function loadAgents() {
+  const box = $("agent-list");
+  try {
+    const r = await api("/api/agents");
+    box.innerHTML = "";
+    if (!r.ok) { box.append(el("div", "empty-note", r.message || "读取失败")); return; }
+    const roles = r.roles_list || [];
+    if (!roles.length) box.append(el("div", "empty-note", "无角色"));
+    for (const role of roles) {
+      const sub = `${role.builtin ? "内置 · " : ""}${role.description || "无描述"}${role.model ? " · " + role.model : ""}`;
+      const row = rowHtml(role.id, sub, false);
+      if (!role.builtin) {
+        row.style.cursor = "pointer";
+        row.title = "点击编辑（id/系统提示词/模型/任务提示词）";
+        row.onclick = () => openRoleModal(role);
+        const delBtn = el("button", "link-danger", "删除");
+        delBtn.onclick = e => { e.stopPropagation(); twoTap(delBtn, async () => {
+          let rr = await api("/api/agent/delete", { id: role.id });
+          if (rr.confirm_required) {
+            if (!confirm(rr.message)) return;
+            rr = await api("/api/agent/delete", { id: role.id, confirm: true });
+          }
+          if (rr.ok) { toast(rr.result); loadAgents(); loadWorkflows(); } else toast(rr.message || "删除失败", true);
+        }); };
+        row.append(delBtn);
+      }
+      box.append(row);
+    }
+  } catch (e) { box.innerHTML = ""; box.append(el("div", "empty-note", "网络错误: " + e)); }
+}
+
+function stTextarea(value, placeholder) {
+  const ta = el("textarea");
+  ta.value = value ?? "";
+  if (placeholder) ta.placeholder = placeholder;
+  return ta;
+}
+
+/* Agent 角色编辑弹窗：id/系统提示词/使用模型/任务提示词（内置 Agent 只读展示） */
+async function openRoleModal(role) {
+  role = role || { id: "", description: "", model: "", prompt: "", task_prompt: "" };
+  const isNew = !role.id;
+  if (role.builtin) { toast(`${role.id}（内置，只读）：${role.description || ""}`); return; }
+  if (!modelsCache.length) {
+    try { const r = await api("/api/models"); if (r.ok) modelsCache = (r.models || []).map(m => m.model_name).filter(Boolean); } catch (e) { /* 下拉降级为手输 */ }
+  }
+  const scrim = el("div", "modal-scrim");
+  const modal = el("div", "modal");
+  modal.style.maxWidth = "560px";
+  const head = el("div", "m-head");
+  head.append(el("span", "t", isNew ? "新建角色" : `编辑角色 · ${role.id}`));
+  const x = el("button", "x", "✕"); x.onclick = () => scrim.remove(); head.append(x);
+  const body = el("div", "m-body");
+  const idInp = stInput(role.id, "text");
+  const descInp = stInput(role.description, "text");
+  const modelSel = stSearchSelect(modelsCache, role.model || "");
+  const sysTa = stTextarea(role.prompt, "系统提示词：该角色作为工作流节点/子代理运行时的人设与职责（空=仅基础系统提示词）");
+  const taskTa = stTextarea(role.task_prompt, "任务提示词：工作流节点引用该角色时的默认任务指令（节点可覆盖）");
+  body.append(
+    stRow("id", idInp),
+    stRow("描述", descInp),
+    stRow("使用模型", modelSel),
+    stRow("系统提示词", sysTa),
+    stRow("任务提示词", taskTa),
+  );
+  body.append(el("div", "st-note", "子代理 task 工具只使用系统提示词与模型；任务提示词仅作为工作流节点的默认任务。"));
+  const actions = el("div", "st-actions");
+  const saveBtn = el("button", "btn small primary", "保存");
+  saveBtn.onclick = async () => {
+    const id = idInp.value.trim();
+    if (!id) { toast("id 不能为空", true); return; }
+    saveBtn.disabled = true;
+    try {
+      const r = await api("/api/agent/save", {
+        id, description: descInp.value.trim(), model: modelSel.value,
+        prompt: sysTa.value, task_prompt: taskTa.value,
+      });
+      toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
+      if (r.ok) { scrim.remove(); loadAgents(); loadWorkflows(); }
+    } catch (e) { toast("网络错误: " + e, true); }
+    saveBtn.disabled = false;
+  };
+  const cancelBtn = el("button", "btn small", "取消");
+  cancelBtn.onclick = () => scrim.remove();
+  actions.append(saveBtn, cancelBtn);
+  body.append(actions);
+  modal.append(head, body);
+  scrim.append(modal);
+  document.body.append(scrim);
+  scrim.onclick = e => { if (e.target === scrim) scrim.remove(); };
+}
+
+/* 工作流编排弹窗：节点增删/排序，每节点选内置或自定义 Agent，可覆盖提示词 */
+function openWorkflowModal(item) {
+  const isNew = !item;
+  item = item || { name: "", description: "", nodes: [] };
+  const scrim = el("div", "modal-scrim");
+  const modal = el("div", "modal");
+  modal.style.maxWidth = "640px";
+  const head = el("div", "m-head");
+  head.append(el("span", "t", isNew ? "新建工作流" : `编辑工作流 · ${item.name}`));
+  const x = el("button", "x", "✕"); x.onclick = () => scrim.remove(); head.append(x);
+  const body = el("div", "m-body");
+  const nameInp = stInput(item.name, "text");
+  const descInp = stInput(item.description, "text");
+  body.append(stRow("名称", nameInp), stRow("描述", descInp));
+  body.append(el("div", "st-note", "节点自上而下执行；每个 Agent 节点在独立上下文运行，只看到任务提示词与前序节点产出。"));
+  body.append(el("div", "s-head", "节点链"));
+
+  const nodesBox = el("div");
+  const editors = [];  // {src, card, collect}
+
+  function nodeCard(src) {
+    src = src || { agent: "execute" };
+    const isInjection = !String(src.agent || "").trim() && ["system_prompt", "skill"].includes(String(src.type || ""));
+    const card = el("div", "wf-node");
+    const headRow = el("div", "n-head");
+    const sel = el("select");
+    const current = isInjection ? "type:" + src.type : String(src.agent || "execute");
+    for (const o of agentOptions()) {
+      const op = el("option", "", o.label); op.value = o.v;
+      if (o.v === current) op.selected = true;
+      sel.append(op);
+    }
+    const tools = el("div", "n-tools");
+    const upBtn = el("button", "btn small", "↑");
+    const downBtn = el("button", "btn small", "↓");
+    const delBtn = el("button", "link-danger", "移除");
+    tools.append(upBtn, downBtn, delBtn);
+    headRow.append(sel, tools);
+    card.append(headRow);
+    const rows = el("div");
+
+    const promptTa = stTextarea(src.prompt || "",
+      ["understand", "analyze", "plan", "execute", "review", "llm"].includes(current)
+        ? "阶段提示词覆盖（留空用内置默认，走系统层）" : "任务提示词覆盖（留空用角色 task_prompt）");
+    const roundsInp = stInput(src.max_rounds ?? "", "number");
+    const extraInp = stInput(
+      (src.files || src.list || []).join(", "), "text");
+    const enabledCb = el("input"); enabledCb.type = "checkbox"; enabledCb.checked = src.enabled !== false;
+
+    function syncRows() {
+      rows.innerHTML = "";
+      const v = sel.value;
+      if (v === "type:system_prompt") {
+        rows.append(stRow("提示词文件", extraInp));
+        extraInp.placeholder = "逗号分隔，留空=默认人格文件";
+      } else if (v === "type:skill") {
+        rows.append(stRow("技能清单", extraInp));
+        extraInp.placeholder = "逗号分隔，留空=不注入任何技能";
+      } else {
+        rows.append(stRow("提示词", promptTa));
+        rows.append(stRow("轮数上限", roundsInp));
+      }
+      const en = el("div", "st-row");
+      en.append(el("label", "", "启用"));
+      en.append(enabledCb);
+      rows.append(en);
+    }
+    sel.onchange = syncRows;
+    syncRows();
+    card.append(rows);
+
+    upBtn.onclick = () => {
+      const i = editors.findIndex(e2 => e2.card === card);
+      if (i > 0) { nodesBox.insertBefore(card, editors[i - 1].card); editors.splice(i - 1, 0, editors.splice(i, 1)[0]); }
+    };
+    downBtn.onclick = () => {
+      const i = editors.findIndex(e2 => e2.card === card);
+      if (i >= 0 && i < editors.length - 1) {
+        const ref = editors[i + 1].card.nextSibling;
+        nodesBox.insertBefore(card, ref);
+        editors.splice(i + 1, 0, editors.splice(i, 1)[0]);
+      }
+    };
+    delBtn.onclick = () => {
+      const i = editors.findIndex(e2 => e2.card === card);
+      if (i >= 0) editors.splice(i, 1);
+      card.remove();
+    };
+    return {
+      card,
+      collect(i) {
+        const base = { enabled: enabledCb.checked };
+        const v = sel.value;
+        if (v.startsWith("type:")) {
+          base.type = v.slice(5);
+          const list = extraInp.value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+          if (v === "type:system_prompt" && list.length) base.files = list;
+          if (v === "type:skill" && list.length) base.list = list;
+          return base;
+        }
+        base.agent = v;
+        const p = promptTa.value.trim();
+        if (p) base.prompt = p;
+        const mr = parseInt(roundsInp.value, 10);
+        if (Number.isFinite(mr) && mr > 0) base.max_rounds = mr;
+        // 保留编辑器未覆盖的字段（capture/model_role/prompt_files 等），编排不丢配置
+        for (const k of ["capture", "override_system", "model", "model_role", "prompt_files", "retry_times", "confirm", "steps", "default_level"]) {
+          if (src[k] !== undefined) base[k] = src[k];
+        }
+        return base;
+      },
+    };
+  }
+
+  function addNode(src) {
+    const ed = nodeCard(src);
+    editors.push(ed);
+    nodesBox.append(ed.card);
+  }
+  for (const n of item.nodes || []) addNode(n);
+
+  const addBtn = el("button", "btn small", "+ 添加节点");
+  addBtn.onclick = () => addNode(null);
+  body.append(nodesBox, addBtn);
+
+  const actions = el("div", "st-actions");
+  const saveBtn = el("button", "btn small primary", "保存");
+  saveBtn.onclick = async () => {
+    const name = nameInp.value.trim();
+    if (!name) { toast("名称不能为空", true); return; }
+    const nodes = editors.map((ed, i) => ed.collect(i));
+    // id 规范化：任一空缺或重复时整体重排为 n1..nN，保证校验唯一性
+    const ids = nodes.map(n => String(n.id || "").trim());
+    const named = ids.filter(Boolean);
+    if (named.length !== ids.length || new Set(named).size !== named.length) {
+      nodes.forEach((n, i) => { n.id = `n${i + 1}`; });
+    }
+    saveBtn.disabled = true;
+    try {
+      const r = await api("/api/workflow/save", { name, description: descInp.value.trim(), nodes });
+      toast(r.ok ? (r.result || "已保存") : (r.message || "保存失败"), !r.ok);
+      if (r.ok) { scrim.remove(); loadWorkflows(); }
+    } catch (e) { toast("网络错误: " + e, true); }
+    saveBtn.disabled = false;
+  };
+  const cancelBtn = el("button", "btn small", "取消");
+  cancelBtn.onclick = () => scrim.remove();
+  actions.append(saveBtn, cancelBtn);
+  body.append(actions);
+  modal.append(head, body);
+  scrim.append(modal);
+  document.body.append(scrim);
+  scrim.onclick = e => { if (e.target === scrim) scrim.remove(); };
 }
 async function loadUndo() {
   const box = $("undo-list");
@@ -2745,6 +3046,9 @@ document.querySelector(".d-body").addEventListener("click", async e => {
     if (act === "refresh-sessions") loadSessions();
     else if (act === "refresh-models") loadModels();
     else if (act === "refresh-workflows") loadWorkflows();
+    else if (act === "workflow-new") openWorkflowModal(null);
+    else if (act === "refresh-agents") loadAgents();
+    else if (act === "agent-new") openRoleModal(null);
     else if (act === "refresh-undo") loadUndo();
     else if (act === "session-new") twoTap(btn, async () => {
       const r = await api("/api/session/new", {});

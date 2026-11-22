@@ -144,6 +144,48 @@ _app: Optional["TuiApp"] = None
 DIALOG_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# UI 请求桥工厂：回合线程与后台线程（工作流实例/子代理/远控）弹交互面板的统一
+# 通道。一律走请求槽（app.request_ui/wait_ui）：TUI 由 read_line 命令 handler 直接
+# 弹面板的场景不经本工厂（走槽会无人服务而死锁）；等待循环退出条件：槽位被
+# 后到请求顶掉 / 取消探针命中（ask 面板自带的超时在面板内处理）
+
+
+def _request_ui_wait(app, kind: str, payload: dict, cancelled=None):
+    """统一请求槽交互：持 DIALOG_LOCK 覆盖 request→wait 整个周期（并发申请串行弹窗），
+    写槽后自旋等待应答；槽位被顶掉或取消命中即返回取消哨兵"""
+    with DIALOG_LOCK:
+        req = app.request_ui(kind, payload)
+        while not req["event"].wait(0.05):
+            if app._ui_req is not req:
+                return CANCEL_RESULT
+            if cancelled is not None and cancelled():
+                req["result"] = CANCEL_RESULT
+                req["event"].set()
+        return req["result"]
+
+
+def make_ask_bridge(app, cancelled=None):
+    """ask_user 弹窗桥工厂：payload 进，结果 dict 出（捕获 cancelled 作为取消探针）"""
+    def bridge(payload: dict):
+        return _request_ui_wait(app, "ask", payload or {}, cancelled)
+    return bridge
+
+
+def make_choose_bridge(app, cancelled=None):
+    """choose 选择菜单桥工厂：options[(key, label)] 进，所选 key 出"""
+    def bridge(options, prompt: str = ""):
+        return _request_ui_wait(app, "choose", {"options": list(options), "prompt": str(prompt or "")}, cancelled)
+    return bridge
+
+
+def make_line_bridge(app, config=None, cancelled=None):
+    """单行输入桥工厂：prompt 进，输入行出（config 供 read_line 渲染）"""
+    def bridge(prompt: str):
+        return _request_ui_wait(app, "line", {"prompt": str(prompt or ""), "config": config}, cancelled)
+    return bridge
+
+
 class _LlmRetryGate:
     """LLM 错误手动重试闸：agent 线程在 wait 上阻塞，主线程按键/插件置位放行"""
 

@@ -731,11 +731,15 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
         return True
 
     @commands.register(
-        "/workflow", hint="工作流 · 列表/切换/停用/编辑", usage="/workflow [名称|off|edit [名称]]", source="builtin"
+        "/workflow",
+        hint="工作流 · 待命执行/临时定义/列表/取消/编辑",
+        usage="/workflow [名称 [提示词]|run <JSON>|off|edit [名称]]",
+        source="builtin",
     )
     def _workflow(ctx, args):
         from core import workflow as workflow_mod
-        #直接对话路径不加载工作流模块
+        #直接对话路径不加载工作流模块；工作流非常驻模式：命令进入待命（一次性），
+        #下一条消息按节点链跑一轮后自动回直接对话
 
         arg = (args or "").strip()
         parts = arg.split(maxsplit=1)
@@ -744,32 +748,84 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
             name = parts[1].strip() if len(parts) > 1 else workflow_mod.active_name(ctx["config"])
             _launch_workflow_editor(ctx, name)
             return True
+        if head in ("run", "inline", "临时"):
+            # 临时自定义：内联传入节点顺序与提示词，走与预定义相同的校验与执行路径，不落盘
+            payload = parts[1].strip() if len(parts) > 1 else ""
+            if not payload:
+                _echo(ctx, "用法: /workflow run <JSON> —— {\"nodes\":[{\"id\":\"n1\",\"agent\":\"execute\"},...]}"
+                           "（agent 可为内置 understand/analyze/plan/execute/review/llm 或 data/agents 角色 id，也可传完整工作流对象）")
+                return True
+            try:
+                loaded = json.loads(payload)
+            except json.JSONDecodeError as e:
+                _echo(ctx, f"JSON 解析失败: {e}")
+                return True
+            wf_data: dict = {}
+            if isinstance(loaded, list):
+                wf_data = {"nodes": loaded}
+            elif isinstance(loaded, dict):
+                wf_data = dict(loaded)
+            else:
+                _echo(ctx, "JSON 根节点须为对象（或节点数组）")
+                return True
+            errors = workflow_mod.validate_workflow_full(wf_data)
+            if errors:
+                _echo(ctx, "工作流校验失败:\n" + "\n".join(f"- {e}" for e in errors))
+                return True
+            wf_data["name"] = str(wf_data.get("name") or "adhoc")
+            workflow_mod._normalize_workflow(wf_data)
+            ctx["session"].pending_workflow_data = wf_data
+            ctx["session"].pending_workflow = str(wf_data["name"])
+            ctx["app"].status = f"临时工作流待命: {wf_data['name']}"
+            _echo(ctx, f"临时工作流已就绪（{len(wf_data['nodes'])}节点，不落盘）：下一条消息按节点链执行一轮（/workflow off 取消）")
+            return True
         if arg in ("", "list", "列表"):
-            active = workflow_mod.active_name(ctx["config"])
+            pending = str(getattr(ctx["session"], "pending_workflow", "") or "")
             names = workflow_mod.list_workflows(ctx["config"])
-            state = "启用" if workflow_mod.workflow_enabled(ctx["config"]) else "未启用（直接对话）"
-            lines = [f"工作流（{state} · active={active}）:"]
+            lines = [f"工作流（待命: {pending or '无'}）:"]
             for name in names:
-                lines.append(("  * " if name == active else "    ") + name)
-            lines.append("提示: /workflow <名称> 切换并启用 · /workflow off 直接对话 · /workflow edit [名称] 打开编辑器")
+                lines.append(("  * " if name == pending else "    ") + name)
+            lines.append("提示: /workflow <名称> 进入待命（下一条消息按节点链执行一轮，可追加提示词直跑） · /workflow run <JSON> 临时定义 · /workflow off 取消待命 · /workflow edit [名称] 打开编辑器")
             _echo(ctx, "\n".join(lines))
             return True
-        if arg in ("off", "off".upper(), "关闭", "直接对话"):
-            wf_cfg = ctx["config"].data.setdefault("workflow", {})
-            wf_cfg["enabled"] = False
-            ctx["config"].save()
-            ctx["app"].status = "直接对话"
-            _echo(ctx, "工作流已停用：直接与 LLM 对话（下一回合生效）")
+        if arg in ("off", "off".upper(), "关闭", "取消"):
+            pending = str(getattr(ctx["session"], "pending_workflow", "") or "")
+            if pending:
+                ctx["session"].pending_workflow = ""
+                ctx["session"].pending_workflow_data = None
+                ctx["app"].status = "已退出待命"
+                _echo(ctx, f"已取消待命工作流: {pending}（回到直接对话）")
+            else:
+                _echo(ctx, "当前没有待命工作流（/workflow 查看列表）")
             return True
-        if arg not in workflow_mod.list_workflows(ctx["config"]):
+        name = parts[0].strip()
+        prompt = parts[1].strip() if len(parts) > 1 else ""
+        if name not in workflow_mod.list_workflows(ctx["config"]):
             available = ", ".join(workflow_mod.list_workflows(ctx["config"])) or "（无）"
-            _echo(ctx, f"未找到工作流: {arg}\n可用: {available}（/workflow off 可停用工作流）")
+            _echo(ctx, f"未找到工作流: {name}\n可用: {available}")
             return True
-        workflow_mod.set_active(ctx["config"], arg)
-        ctx["config"].data.setdefault("workflow", {})["enabled"] = True  # 显式选择即启用
-        ctx["config"].save()
-        ctx["app"].status = f"工作流: {arg}"
-        _echo(ctx, f"已启用工作流: {arg}（下一回合生效；/workflow off 可停用）")
+        ctx["session"].pending_workflow = name
+        if prompt:
+            # 带参直跑：待命 + 立即执行。有 runner 时一律走后台线程（帧循环继续服务交互
+            # 弹窗；主线程内联跑回合会令 plan 确认菜单无人服务，且与在途回合并发写会话）；
+            # 无 runner（无头/桩）就地执行
+            runner = getattr(ctx["app"], "agent_runner", None)
+            if runner is not None:
+                if runner.busy or not runner.start(prompt):
+                    ctx["session"].pending_workflow = ""
+                    _echo(ctx, "回合进行中：工作流未启动（请等当前回合结束或停止后再试）")
+                    return True
+                ctx["app"].status = f"工作流 {name} · 执行中"
+                return True
+            ctx["app"].status = f"工作流 {name} · 执行中"
+            task = _before_turn(prompt)
+            try:
+                _agent_turn(ctx["llm"], ctx["session"], task, ctx["app"])
+            finally:
+                _after_turn(ctx["session"], task)
+        else:
+            ctx["app"].status = f"工作流待命: {name}"
+            _echo(ctx, f"已进入工作流 {name} 待命：下一条消息将按节点链执行一轮（跑完自动回到直接对话；/workflow off 取消）")
         return True
 
     @commands.register("/steps", hint="查看步骤", source="builtin")
@@ -1009,18 +1065,6 @@ def _handle_tool_confirm(llm: LLM, app, session, call: dict, cancelled=None) -> 
         "content": policy.default_reject_message(result.get("reason") or ""),
         "type": "tool",
     }
-
-
-def _bridge_choose(app, options, prompt: str, cancelled=None):
-    with ui.DIALOG_LOCK:
-        req = app.request_ui("choose", {"options": options, "prompt": prompt})
-        return app.wait_ui(req, cancelled)
-
-
-def _bridge_line(app, prompt: str, config, cancelled=None):
-    with ui.DIALOG_LOCK:
-        req = app.request_ui("line", {"prompt": prompt, "config": config})
-        return app.wait_ui(req, cancelled)
 
 
 def _launch_workflow_editor(ctx, name: str = "") -> None:
@@ -1391,8 +1435,8 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app, runner=None) -> Non
     retry_wait = getattr(app, "wait_llm_retry", None)  # 无头桩无此方法：不提供手动重试
     io = loop_mod.TurnIO(
         status=_set_status,
-        choose=lambda options, prompt: _bridge_choose(app, options, prompt, _cancelled),
-        line=lambda prompt: _bridge_line(app, prompt, llm.config, _cancelled),
+        choose=ui.make_choose_bridge(app, _cancelled),
+        line=ui.make_line_bridge(app, llm.config, _cancelled),
         cancelled=_cancelled,
         on_delta=_on_delta,
         clear_stream=lambda: setattr(app, "streaming_msg", None),
@@ -1422,24 +1466,35 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app, runner=None) -> Non
     )
 
 
-    def _bridge_ask(payload: dict) -> dict:
-        req = app.request_ui("ask", payload)
-        result = app.wait_ui(req, _cancelled)
-        return result if isinstance(result, dict) else {}
-
-    tools_mod.set_ask_user_bridge(_bridge_ask)  # ask_user 工具经此弹面板（回合内有效）
+    # ask_user 全局桥（回合内有效，回合末解绑）：经工厂持 DIALOG_LOCK，与后台实例的
+    # 线程级桥并发弹窗时串行排队；后台实例跨回合存活，走 bind_thread_ask_bridge 不受此清空影响
+    tools_mod.set_ask_user_bridge(ui.make_ask_bridge(app, _cancelled))
     tools_mod.set_mode_bridge(
         lambda payload: _handle_mode_switch(app, llm.config, payload, _cancelled)
     )
     try:
-        if ((getattr(llm.config, "data", None) or {}).get("workflow") or {}).get("enabled", False):
-            from core import workflow as workflow_mod  # lazy：仅启用工作流时加载编排层
+        wf_name = str(getattr(session, "pending_workflow", "") or "").strip()
+        wf_def = getattr(session, "pending_workflow_data", None)
+        # 后台完成通知自动开的回合不消费待命（通知文本不该当作工作流任务跑）
+        is_notification = user_text.startswith("[子代理完成通知") or user_text.startswith("[工作流完成通知")
+        if (wf_name or isinstance(wf_def, dict)) and not is_notification:
+            session.pending_workflow = ""  # 一次性消费：待命工作流只跑一轮
+            session.pending_workflow_data = None
+            from core import workflow as workflow_mod  # lazy：仅待命时加载编排层
 
-            wf = workflow_mod.load_workflow(llm.config)
-            log.info("工作流: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
-            workflow_mod.run_workflow(wf, turn)
+            if isinstance(wf_def, dict):
+                # 临时自定义（/workflow run 内联 JSON，命令期已校验）：不落盘直接按节点链执行
+                log.info("临时工作流执行: %s（%d节点）", wf_def.get("name"), len(wf_def.get("nodes") or []))
+                workflow_mod.run_workflow(wf_def, turn)
+            elif wf_name not in workflow_mod.list_workflows(llm.config):
+                session.add_message("system", f"工作流 {wf_name} 不存在，本次按直接对话执行。", type="help")
+                log.warn("待命工作流不存在: %s，回退直接对话", wf_name)
+                loop_mod.run_direct(turn)
+            else:
+                wf = workflow_mod.load_workflow(llm.config, wf_name)
+                log.info("工作流待命执行: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
+                workflow_mod.run_workflow(wf, turn)
         else:
-            log.info("工作流未启用：直接对话（设置页\"系统\"标签可启用）")
             loop_mod.run_direct(turn)
     except loop_mod.TurnInterrupt:
         _aborted()
@@ -1449,8 +1504,8 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app, runner=None) -> Non
         tools_mod.set_ask_user_bridge(None)
         tools_mod.set_mode_bridge(None)
         tools_mod.set_background_origin(None)
-        app.last_turn_error = turn.captured.pop("turn_error", None)  # 无头 --json 消费
-        if runner is not None and turn.captured.pop("turn_failed", None):
+        app.last_turn_error = turn.last_error or None  # 无头 --json 消费（回合级标志按 turn 隔离，节点错误不泄漏）
+        if runner is not None and turn.turn_failed:
             runner._failed_rollback = True  # 请求级失败：回合收尾整体回滚（_agent_turn 执行）
 
 
@@ -2040,6 +2095,9 @@ def main_headless(args) -> int:
     session.set_context_reset(llm.meter.reset_context)
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     subagent_mod.register_tools(config)
+    from core import workflow as workflow_mod  # lazy：编排层仅工具注册与待命执行时加载
+
+    workflow_mod.register_tools(config)  # 工作流实例派发工具（依赖子代理任务基建）
     mcp_mod.register_tools(config)  # MCP 后台连接发现；退出时统一 shutdown
     if args.full:
         config.mode = policy.MODE_FULL  # --full：完全访问（策略判定读 config.mode）
@@ -2144,6 +2202,9 @@ def main(args=None) -> None:
     session.set_context_reset(llm.meter.reset_context)
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     subagent_mod.register_tools(config)
+    from core import workflow as workflow_mod  # lazy：编排层仅工具注册与待命执行时加载
+
+    workflow_mod.register_tools(config)  # 工作流实例派发工具（依赖子代理任务基建）
     mcp_mod.register_tools(config)  # MCP 服务器后台连接发现，工具随注册进度逐个可见
     app = ui.get_app()
     app.bind_config(config)

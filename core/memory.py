@@ -288,8 +288,11 @@ def conv_block_bounds(messages: List[dict], idx: int) -> tuple:
 class Memory:
     """Agent 记忆：消息、计划、步骤、长期记忆（md）"""
 
-    def __init__(self, config, project_identity: Optional[dict] = None):
+    def __init__(self, config, project_identity: Optional[dict] = None, isolated: bool = False):
         self.config = config
+        # 隔离会话（后台工作流实例）：不动全局文件台账、不迁移/写记忆文件，
+        # 长期记忆只读（save_longterm 拒写）——避免后台实例污染主会话状态
+        self.memory_readonly = isolated
         memory_cfg = config.data.get("memory", {})
         self.longterm_path = _ROOT / memory_cfg.get("longterm_path", "data/memory.json")
         longterm_dir = memory_cfg.get("longterm_dir") or "data/memory"
@@ -335,7 +338,8 @@ class Memory:
         self.aggressive_keep_reads_per_file = int(ctx_cfg.get("aggressive_keep_reads_per_file", 3))
         self._sync_image_cfg(ctx_cfg)
         self._sync_strip_cfg(ctx_cfg)
-        toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
+        if not isolated:
+            toolstore.ledger_reset()  # 文件台账是会话级 RAM 状态，新会话从零开始
         self.sessions_dir = session_store.sessions_dir(config, self.project_id)
         self.session_id = session_store.new_session_id()
         self.session_created_at = datetime.now().isoformat(timespec="seconds")
@@ -355,8 +359,9 @@ class Memory:
         self.steps: List[dict] = []
         self.longterm = self._load_longterm()
         self._ensure_md_files()
-        self._migrate_legacy_json()
-        self.migrate_legacy_memory_files()
+        if not isolated:
+            self._migrate_legacy_json()
+            self.migrate_legacy_memory_files()
         self.ensure_memory_notice()
         log.info(
             "记忆会话已初始化: Agent.md=%s 项目记忆=%s 自动压缩=%s 阈值=%.0f%%",
@@ -451,7 +456,10 @@ class Memory:
         self.longterm["project_notes"] = notes_left
 
     def save_longterm(self, external_handler=None) -> None:
-        """写入长期记忆（md 为事实来源；json 仅作兼容快照）"""
+        """写入长期记忆（md 为事实来源；json 仅作兼容快照）；隔离会话拒写（防后台实例污染全局记忆）"""
+        if self.memory_readonly:
+            log.debug("隔离会话拒绝写入长期记忆")
+            return
         self.longterm["updated_at"] = datetime.now().isoformat(timespec="seconds")
         payload = {
             "memory": self.longterm,
@@ -564,6 +572,8 @@ class Memory:
 
     def write_memory_file(self, mtype: str, keyword: str, content) -> tuple:
         """创建或追加记忆；全局按功能文件追加，项目仍按关键词新建"""
+        if self.memory_readonly:
+            return "readonly", ""
         d = self.memory_dir_for(mtype)
         key = self.sanitize_keyword(keyword)
         if d is None or not key:
@@ -589,6 +599,8 @@ class Memory:
     def update_memory_file(self, mtype: str, keyword: str, content, new_keyword: str = "") -> tuple:
         """更新内容/改名；全局记忆按节合并（未提及的章节保留）；
         返回 (status, key)，status: ok/missing/conflict/invalid/error"""
+        if self.memory_readonly:
+            return "readonly", ""
         d = self.memory_dir_for(mtype)
         key = self.sanitize_keyword(keyword)
         if d is None or not key:
@@ -642,6 +654,8 @@ class Memory:
 
     def delete_memory_file(self, mtype: str, keyword: str) -> tuple:
         """删除关键词记忆；返回 (status, key)，status: deleted/missing/invalid/error"""
+        if self.memory_readonly:
+            return "readonly", ""
         d = self.memory_dir_for(mtype)
         key = self.sanitize_keyword(keyword)
         if d is None or not key:

@@ -192,20 +192,25 @@ def default_config() -> dict:
             "auto_install_deps": True,
         },
         "plugins_config": {},
-        # 外置工作流（core/workflow.py）：enabled=false（默认）时用户直接与 LLM 对话
-        # （系统提示词+工具循环，不经节点链）；true 时按 dir 下 <active>.json 声明的线性节点链运行
-        # （system_prompt/skill/analyze/plan/execute/llm），加载失败回退内置默认工作流；
-        # 设置页"系统"标签可切换 enabled/active，/workflow 命令切换即自动启用；
-        # 编辑器 gui/workflow_editor.py（/workflow edit）。max_rounds >0 时覆盖工作流 execute 节点的 max_rounds（0=用节点值）；
+        # 外置工作流（core/workflow.py）：节点=Agent 的可自定义执行流程。enabled=false（默认）
+        # 时用户直接与 LLM 对话；/workflow <名称> 待命后下一条消息按节点链跑一轮；
+        # Agent 经 workflow 工具派发（mode=background 后台并行实例 / foreground 阻塞执行整链）。
+        # 节点引用内置 Agent（understand/analyze/plan/execute/review/llm，旧 type 字段兼容）
+        # 或 data/agents/ 自定义角色（id/系统提示词/模型/任务提示词）；system_prompt/skill
+        # 为注入节点。加载失败回退内置默认工作流。
+        # 编辑器 gui/workflow_editor.py（/workflow edit）；WebUI 可编排预定义工作流与角色。
+        # max_rounds >0 时覆盖工作流 execute/agent 节点的 max_rounds（0=用节点值）；
         # spin_kill_count：空转熔断器计数上限（core/tools.SpinGuard）——重复输出出现才开始计数、
         # 整轮全新结果清零，计满即终止回合；未计满期间续期不设次数上限；
-        # max_total_rounds：可选兜底保险丝——>0 时封顶续期总量（0/未配置 = 不启用）。
+        # max_total_rounds：可选兜底保险丝——>0 时封顶续期总量（0/未配置 = 不启用）；
+        # handoff_char_cap：节点间交接摘要总字符上限（独立上下文交接的唯一纽带）。
         "workflow": {
             "enabled": False,
             "dir": "data/workflows",
             "active": "default",
             "max_rounds": 0,
             "spin_kill_count": 12,
+            "handoff_char_cap": 4000,
         },
         # 子代理系统（core/subagent.py）：task 工具派发独立上下文子代理，
         # query_subagent 查询其工作过程。enabled=false 不注册工具（模型侧不可见）。
@@ -706,18 +711,6 @@ class Config:
 
     def get_task_model(self, role: str) -> str:
         return self.task_models().get(role) or self.active_model_name()
-
-    def workflow_active(self) -> str:
-        """激活工作流名（config.workflow.active，缺省 default）"""
-        return str(((self.data or {}).get("workflow") or {}).get("active") or "default").strip()
-
-    def workflow_path(self, name: Optional[str] = None) -> Path:
-        """工作流 JSON 路径（name 缺省取 active）；规则与 core/workflow.py.workflow_path 一致"""
-        safe = re.sub(r'[\\/:*?"<>|]+', "_", str(name or self.workflow_active()).strip())
-        rel = ((self.data or {}).get("workflow") or {}).get("dir") or "data/workflows"
-        d = Path(rel)
-        base = d if d.is_absolute() else Path(__file__).resolve().parent.parent / rel
-        return base / f"{safe or 'default'}.json"
 
     def set_task_model(self, role: str, model_name: str) -> bool:
         if role not in TASK_ROLES:

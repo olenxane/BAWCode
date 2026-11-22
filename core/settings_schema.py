@@ -4,7 +4,7 @@
 TUI（core/settings.py）与远控插件网页设置面板共用同一份声明，字段清单/
 类型/选项/缺省值不再分散硬编码于各面板；新增或调整配置项只需编辑声明
 文件。带副作用的少数键（mode 走属性 setter、log_level 重初始化日志、
-workflow_active / active_model_name / font_size / default_shell）在
+active_model_name / font_size / default_shell）在
 special_read / special_write 分发，其余走通用点路径读写。声明文件缺失
 或损坏时返回空列表（记录日志），面板显示空页，不影响其它标签页。
 """
@@ -78,14 +78,6 @@ def dynamic_options(source: str, config) -> List[Any]:
         return list(policy.MODES)
     if source == "@shells":
         return list(shells.SHELL_NAMES)
-    if source == "@workflows":
-        from core import workflow
-
-        names = workflow.list_workflows(config)
-        active = workflow.active_name(config)
-        if active not in names:
-            names.append(active)
-        return names or ["default"]
     if source == "@models":
         return config.list_model_names() or [config.model_name]
     if source == "@personas":
@@ -178,12 +170,6 @@ def _read_mode(config):
     return config.mode
 
 
-def _read_workflow_active(config):
-    from core import workflow
-
-    return workflow.active_name(config)
-
-
 def _read_active_model(config):
     return config.model_name
 
@@ -202,7 +188,6 @@ def _read_persona(config):
 
 special_read: Dict[str, Callable] = {
     "mode": _read_mode,
-    "workflow_active": _read_workflow_active,
     "active_model_name": _read_active_model,
     "log_level": _read_log_level,
     "persona": _read_persona,
@@ -233,15 +218,6 @@ def _write_log_level(config, raw) -> bool:
     if log_cfg.get("level") != level:
         log_cfg["level"] = level
         init_logging(log_cfg)
-    return True
-
-
-def _write_workflow_active(config, raw) -> bool:
-    if not raw:
-        return False
-    from core import workflow
-
-    workflow.set_active(config, str(raw))
     return True
 
 
@@ -277,7 +253,6 @@ special_write: Dict[str, Callable] = {
     "mode": _write_mode,
     "font_size": _write_font_size,
     "log_level": _write_log_level,
-    "workflow_active": _write_workflow_active,
     "active_model_name": _write_active_model,
     "default_shell": _write_default_shell,
     "persona": _write_persona,

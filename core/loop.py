@@ -79,6 +79,16 @@ class TurnContext:
         self.system_prompt_text = ""
         self.system_prompt_parts: Optional[Dict[str, int]] = None
         self.captured: Dict[str, Any] = {}
+        # 回合级失败标志：挂 TurnContext 自身而非 captured——工作流 Agent 节点与主回合
+        # 共享 captured（capture 变量贯通），回合级错误/失败必须按 turn 隔离，防节点
+        # 非致命错误把整个成功回合挂起为「请求失败」
+        self.last_error = ""
+        self.turn_failed = False
+        # 显示会话（工作流 Agent 节点隔离执行时挂载）：计划/步骤等会话级工件与回合中
+        # 插话的落点——节点 LLM 上下文用 turn.session，会话级写入经 get_session 路由到这里
+        self.display_session = None
+        # 回合级工具面过滤器（工具名 -> bool）：后台工作流实例经此剔除递归派发类工具
+        self.tool_filter: Optional[Callable[[str], bool]] = None
         self._last_autosave = time.monotonic()
 
 
@@ -102,10 +112,14 @@ def drain_injections(turn: TurnContext) -> int:
     for item in pending:
         text = str(item.get("text") or "") if isinstance(item, dict) else str(item or "")
         snapshot_mod.add_task_message(text, source="background" if isinstance(item, dict) and item.get("background_call") else "inject")
-        turn.session.add_message(
+        is_notice = text.startswith("[子代理完成通知") or text.startswith("[工作流完成通知")
+        # 工作流 Agent 节点的独立上下文里插话会随节点会话丢弃：并入显示会话（主会话/
+        # 实例骨架），链路结束后主回合自然看到
+        target = getattr(turn, "display_session", None) or turn.session
+        target.add_message(
             "user",
             text,
-            type="subagent_notice" if text.startswith("[子代理完成通知") else "task",
+            type="subagent_notice" if is_notice else "task",
             injected=True,
         )
     if pending:
@@ -195,14 +209,19 @@ def _remeasure(turn: TurnContext) -> None:
         log.debug("管线后计量刷新失败: %s", e)
 
 
-def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, model: Optional[str]) -> dict:
+def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, model: Optional[str],
+              tool_filter: Optional[Callable[[str], bool]] = None) -> dict:
     """工具调用循环：返回 {"status", "content"}
 
     status: complete（模型本轮不再调用工具）/ error / max_rounds。
+    tool_filter: 可选工具名过滤器（返回 False 剔除定义）——后台工作流实例经此剔除
+    递归派发类工具（task/workflow/wait/cancel/query），LLM 侧不可见。
     取消/中断抛 TurnInterrupt。轮次用尽且空转计数未满时续期——正常推进的回合不设次数上限，
     config.workflow.max_total_rounds 是可选的兜底保险丝（0/负数 = 不启用）：
     空转计数器（SpinGuard——重复/近似重复输出才开始计数，整轮全新结果清零）计满config.workflow.spin_kill_count 才终止回合"""
     io, session, llm = turn.io, turn.session, turn.llm
+    if tool_filter is None:
+        tool_filter = getattr(turn, "tool_filter", None)  # 回合级过滤器（后台工作流实例挂载）
     wf_cfg = (getattr(turn.config, "data", None) or {}).get("workflow") or {}
 
     def _autosave_tick() -> None:
@@ -262,6 +281,9 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             drain_injections(turn)  # 回合中插话：并入本回合，下一轮模型即看到
             _autosave_tick()
             builtin_defs, mcp_defs = register.get_tool_defs_grouped()
+            if tool_filter is not None:
+                builtin_defs = [d for d in builtin_defs if tool_filter(str(d["function"].get("name") or ""))]
+                mcp_defs = [d for d in mcp_defs if tool_filter(str(d["function"].get("name") or ""))]
             tool_defs = builtin_defs + mcp_defs
             payload = session.build_messages(extra_system=extra_system, tools=tool_defs, model=model)
             llm.meter.measure_context(
@@ -306,8 +328,8 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
                     continue
                 reason = "[回合异常：模型未返回有效内容]"
                 session.add_message("assistant", reason, type="error")
-                turn.captured["turn_error"] = "empty_response"
-                turn.captured["turn_failed"] = True
+                turn.last_error = "empty_response"
+                turn.turn_failed = True
                 io.status("出错")
                 log.error("第%d轮模型空回复，放弃回合", round_no)
                 return {"status": "error", "content": ""}
@@ -315,7 +337,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         if response.get("error"):
             log.error("第%d轮推理返回错误: %s", round_no, response["error"])
             session.add_message("assistant", response["error"])
-            turn.captured["turn_error"] = response["error"]  # 无头 --json 的 error 字段来源
+            turn.last_error = str(response["error"])  # 无头 --json 的 error 字段来源
             io.status("出错")
             return {"status": "error", "content": ""}
         if (content or reasoning) and not tool_calls:
@@ -374,9 +396,11 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             **thinking_extra,
         )
         # 同步到 UI 快照：工具确认弹窗期间主线程读 self.messages 渲染树，
-        # 否则本轮 assistant(tool_call) 节点要等下轮 io.status 才出现
+        # 否则本轮 assistant(tool_call) 节点要等下轮 io.status 才出现。
+        # 工作流 Agent 节点隔离执行时刷新显示会话（主会话树持续显示链路标记），
+        # 不把 UI 树切到随链路即弃的节点会话
         if turn.app is not None:
-            turn.app.refresh_from_session(session, render=False)
+            turn.app.refresh_from_session(getattr(turn, "display_session", None) or session, render=False)
         registered = 0
         round_results = []
         log.debug("第%d轮返回 %d 个工具调用", round_no, len(tool_calls))
@@ -384,6 +408,16 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
         try:
             for call in tool_calls:
                 check_cancel(turn)
+                # 执行期硬拦截：工具面过滤不只作用于 defs（防模型幻觉调用绕过
+                # 递归防线——task/workflow 等被剔除的名字即使被凭空调用也不执行）
+                if tool_filter is not None and not tool_filter(str(call.get("name") or "")):
+                    log.warn("工具 %s 不在本回合工具面，拒绝执行", call.get("name"))
+                    msg = session.add_tool_result(
+                        call, f"该工具不在此运行环境的工具面内: {call.get('name')}", None)
+                    if msg:
+                        round_results.append(msg)
+                    registered += 1
+                    continue
                 action, reason = llm.evaluate_tool(call.get("name"), call.get("arguments") or {})
                 check_cancel(turn)
                 if action == policy.ALLOW:
@@ -456,7 +490,7 @@ def run_direct(turn: TurnContext) -> str:
     result = tool_loop(turn, turn.system_prompt_text or None, max_rounds, model=None)
     if result["status"] == "error":
         # 请求级失败：标记回合收尾整体回滚（main._agent_turn 消费），失败信息不留在上下文
-        turn.captured["turn_failed"] = True
+        turn.turn_failed = True
     if result["status"] != "complete":
         raise TurnStop()
     return "complete"

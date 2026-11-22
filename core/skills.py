@@ -8,6 +8,7 @@ import hashlib
 import re
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -200,23 +201,47 @@ class SkillLoader:
 
 
 # 注入过滤（工作流 skill 节点经 set_injection 设置；None=默认不过滤）
-# enabled=False → 清单整段不注入；allow 非空 → 仅注入白名单内技能
+# enabled=False → 清单整段不注入；allow 非空 → 仅注入白名单内技能。
+# 线程绑定作用域内的实例（后台工作流）读写各自线程状态，不污染主回合的全局过滤
 _injection: Dict[str, Any] = {"enabled": None, "allow": None}
+_injection_local = threading.local()
+
+
+def _injection_state() -> Dict[str, Any]:
+    """当前线程生效的注入过滤：线程绑定优先，未绑定的线程（主回合）读全局"""
+    return getattr(_injection_local, "state", None) or _injection
 
 
 def set_injection(enabled: Optional[bool] = None, allow: Optional[List[str]] = None) -> None:
-    """设置回合级注入过滤；None 恢复默认（不过滤）。工作流每回合开始时重置"""
-    _injection["enabled"] = enabled
-    _injection["allow"] = list(allow) if allow else None
+    """设置回合级注入过滤；None 恢复默认（不过滤）。工作流每回合开始时重置。
+    在 bind_thread_injection 作用域内只改本线程状态"""
+    state = _injection_state()
+    state["enabled"] = enabled
+    state["allow"] = list(allow) if allow else None
+
+
+@contextmanager
+def bind_thread_injection():
+    """线程级注入过滤作用域：进入时以当前线程态（嵌套时）或全局值初始化，
+    作用域内 set_injection 只改本线程，退出恢复。后台工作流实例的 skill 节点经此与主回合隔离；
+    _wf_scope 与 run_workflow 会双重嵌套，初始化取线程态防外层过滤被内层吞掉"""
+    previous = getattr(_injection_local, "state", None)
+    base = previous if previous is not None else _injection
+    _injection_local.state = {"enabled": base["enabled"], "allow": base["allow"]}
+    try:
+        yield
+    finally:
+        _injection_local.state = previous
 
 
 def filtered_listing(loader: Optional[SkillLoader]) -> str:
     """经注入过滤的清单（memory.build_context_supplements 使用）"""
     if loader is None:
         return ""
-    if _injection["enabled"] is False:
+    state = _injection_state()
+    if state["enabled"] is False:
         return ""
-    allow = _injection["allow"]
+    allow = state["allow"]
     if not allow:
         return loader.listing()
     listing = loader.listing()
@@ -417,16 +442,9 @@ def summon(session, llm, config, scope: str = "global", system_prompt: Optional[
         _summon_inflight = True
     try:
         if system_prompt is None:
-            system_files = None
-            from core import workflow as workflow_mod
-
-            if workflow_mod.workflow_enabled(config):
-                workflow_data = workflow_mod.load_workflow(config)
-                for node in workflow_data.get("nodes") or []:
-                    if node.get("enabled", True) and node.get("type") == "system_prompt":
-                        system_files = node.get("files") or ["system_prompt.md"]
+            # 工作流非常驻模式：技能生成系统提示词跟随默认人格（不再引用工作流 system_prompt 节点）
             system_prompt = prompt_loader.get_system_prompt(
-                config=config, files=system_files,
+                config=config, files=None,
                 extra_variables=_memory_prompt_vars(session),
             )
         messages = session.build_messages(extra_system=system_prompt)

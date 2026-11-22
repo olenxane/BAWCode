@@ -774,7 +774,8 @@ def setup(ctx: PluginContext):
             info["mode_label"] = ctx.host.policy.MODE_LABELS.get(mode, mode)
         if ctx.host.workflows is not None:
             try:
-                info["workflow"] = ctx.host.workflows.active_name(ctx.config)
+                # 工作流非常驻模式：状态显示待命名（一次性，跑一轮自动回直接对话）
+                info["workflow"] = str(getattr(session, "pending_workflow", "") or "") if session is not None else ""
             except Exception:
                 pass
         info["tokens"] = _tokens_info()
@@ -1099,15 +1100,99 @@ def setup(ctx: PluginContext):
         if ctx.host.workflows is None:
             return {"ok": False, "message": "宿主缺少 workflow 模块"}
         try:
-            enabled = bool(getattr(ctx.host.workflows, "workflow_enabled", lambda c: True)(ctx.config))
+            pending = ""
+            session, _err = _require_session()
+            if session is not None:
+                pending = str(getattr(session, "pending_workflow", "") or "")
+            # 携带各工作流定义（nodes 原样透传）：WebUI 编排面板直接读写
+            items = []
+            for name in ctx.host.workflows.list_workflows(ctx.config):
+                wf = ctx.host.workflows.load_workflow(ctx.config, name)
+                if not isinstance(wf, dict):
+                    continue
+                items.append({
+                    "name": str(wf.get("name") or name),
+                    "description": str(wf.get("description") or ""),
+                    "nodes": wf.get("nodes") or [],
+                })
             return {
                 "ok": True,
-                "enabled": enabled,
-                "active": ctx.host.workflows.active_name(ctx.config),
+                "pending": pending,
                 "workflows": ctx.host.workflows.list_workflows(ctx.config),
+                "items": items,
+                "builtin_agents": ctx.host.workflows.builtin_agents(),
+                "roles": [
+                    {"id": rid, "description": (spec or {}).get("description") or "",
+                     "model": (spec or {}).get("model") or "", "task_prompt": (spec or {}).get("task_prompt") or "",
+                     "prompt": (spec or {}).get("prompt") or "", "builtin": False}
+                    for rid, spec in (ctx.host.agents.get_specs() or {}).items()
+                ] if ctx.host.agents is not None else [],
             }
         except Exception as e:
             return {"ok": False, "message": f"工作流列表读取失败: {e}"}
+
+    def _op_workflow_save(data: dict) -> dict:
+        if ctx.host.workflows is None:
+            return {"ok": False, "message": "宿主缺少 workflow 模块"}
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return {"ok": False, "message": "缺少 name"}
+        wf = {
+            "name": name,
+            "description": str(data.get("description") or ""),
+            "nodes": data.get("nodes") or [],
+        }
+        _path, err = ctx.host.workflows.save_workflow(ctx.config, wf)
+        if err:
+            return {"ok": False, "message": err}
+        _broadcast({"t": "reset"})
+        return {"ok": True, "result": f"工作流 {name} 已保存（{len(wf['nodes'])}节点）"}
+
+    def _op_workflow_delete(name: str) -> dict:
+        if ctx.host.workflows is None:
+            return {"ok": False, "message": "宿主缺少 workflow 模块"}
+        name = (name or "").strip()
+        ok, err = ctx.host.workflows.delete_workflow(ctx.config, name)
+        if not ok:
+            return {"ok": False, "message": err}
+        _broadcast({"t": "reset"})
+        return {"ok": True, "result": f"工作流 {name} 已删除"}
+
+    def _op_agent_save(data: dict) -> dict:
+        if ctx.host.agents is None:
+            return {"ok": False, "message": "宿主缺少 subagent 模块"}
+        role = {
+            "name": str(data.get("id") or data.get("name") or "").strip(),
+            "description": str(data.get("description") or ""),
+            "model": str(data.get("model") or ""),
+            "prompt": str(data.get("prompt") or ""),
+            "task_prompt": str(data.get("task_prompt") or ""),
+        }
+        _path, err = ctx.host.agents.save_role(ctx.config, role)
+        if err:
+            return {"ok": False, "message": err}
+        _broadcast({"t": "reset"})
+        return {"ok": True, "result": f"角色 {role['name']} 已保存"}
+
+    def _op_agent_delete(role_id: str, confirm: bool) -> dict:
+        if ctx.host.agents is None:
+            return {"ok": False, "message": "宿主缺少 subagent 模块"}
+        role_id = (role_id or "").strip()
+        if not role_id:
+            return {"ok": False, "message": "缺少 id"}
+        if not confirm and ctx.host.workflows is not None:
+            # 引用检查：任一预定义工作流的节点引用该角色时须带确认重提
+            for name in ctx.host.workflows.list_workflows(ctx.config):
+                wf = ctx.host.workflows.load_workflow(ctx.config, name)
+                for node in (wf.get("nodes") or []) if isinstance(wf, dict) else []:
+                    if str(node.get("agent") or "").strip() == role_id:
+                        return {"ok": False, "confirm_required": True,
+                                "message": f"角色 {role_id} 被工作流 {name} 引用，确认删除请再次提交（confirm=true）"}
+        ok, err = ctx.host.agents.delete_role(ctx.config, role_id)
+        if not ok:
+            return {"ok": False, "message": err}
+        _broadcast({"t": "reset"})
+        return {"ok": True, "result": f"角色 {role_id} 已删除"}
 
     def _op_workflow_switch(name: str) -> dict:
         if ctx.host.workflows is None:
@@ -1115,11 +1200,13 @@ def setup(ctx: PluginContext):
         name = (name or "").strip()
         if name not in ctx.host.workflows.list_workflows(ctx.config):
             return {"ok": False, "message": f"未找到工作流: {name}"}
-        ctx.host.workflows.set_active(ctx.config, name)
-        # 显式选择工作流即启用（工作流默认关闭=直接对话，与 /workflow 命令同语义）
-        ctx.config.data.setdefault("workflow", {})["enabled"] = True
-        ctx.config.save()
-        return {"ok": True, "result": f"已启用工作流: {name}（下一回合生效）", "workflow": name}
+        session, err = _require_session()
+        if err:
+            return err
+        # 待命（一次性）：下一条消息按节点链跑一轮后自动回直接对话，与 /workflow 命令同语义
+        session.pending_workflow = name
+        _broadcast({"t": "reset"})
+        return {"ok": True, "result": f"已进入工作流 {name} 待命：下一条消息执行一轮后回到直接对话", "workflow": name}
 
     def _undo_listing() -> dict:
         session, err = _require_session()
@@ -1215,7 +1302,20 @@ def setup(ctx: PluginContext):
                     })
             except Exception:
                 pass
-        return {"ok": True, "records": records, "roles": ctx.host.agents.roles_listing()}
+        # 结构化角色清单（内置 Agent + 自定义角色）：角色管理面板用；roles 字符串保留兼容
+        roles_list = []
+        if ctx.host.workflows is not None:
+            for item in ctx.host.workflows.builtin_agents():
+                roles_list.append({"id": item["id"], "description": item["description"],
+                                   "model": "", "prompt": "", "task_prompt": "", "builtin": True})
+        for rid, spec in (ctx.host.agents.get_specs() or {}).items():
+            spec = spec or {}
+            roles_list.append({
+                "id": rid, "description": spec.get("description") or "",
+                "model": spec.get("model") or "", "prompt": spec.get("prompt") or "",
+                "task_prompt": spec.get("task_prompt") or "", "builtin": False,
+            })
+        return {"ok": True, "records": records, "roles": ctx.host.agents.roles_listing(), "roles_list": roles_list}
 
     def _skills_listing() -> dict:
         if ctx.host.skills is None:
@@ -1361,12 +1461,12 @@ def setup(ctx: PluginContext):
         if ext in _FILE_IMAGE_EXT or ext == ".pdf":
             # stat 与读取间文件可能被删/占用/增长（Windows 文件锁常见），读取统一兜底
             try:
-                raw = candidate.read_bytes()
+                blob = candidate.read_bytes()
             except OSError:
                 return {"ok": False, "status": 404, "message": "文件不可读"}
-            if len(raw) > _FILE_PREVIEW_MAX_BYTES:
+            if len(blob) > _FILE_PREVIEW_MAX_BYTES:
                 return {"ok": False, "status": 413, "message": "文件超过预览大小上限（5MB）"}
-            data = base64.b64encode(raw).decode("ascii")
+            data = base64.b64encode(blob).decode("ascii")
             if ext == ".pdf":
                 return {"ok": True, "category": "pdf", "mime": "application/pdf", "name": name, "data": data}
             return {"ok": True, "category": "image", "mime": _FILE_IMAGE_EXT[ext], "name": name, "data": data}
@@ -2172,6 +2272,14 @@ def setup(ctx: PluginContext):
                     self._json(200, _op_mode(str(data.get("mode") or "")))
                 elif path == "/api/workflow/switch":
                     self._json(200, _op_workflow_switch(str(data.get("name") or "")))
+                elif path == "/api/workflow/save":
+                    self._json(200, _op_workflow_save(data))
+                elif path == "/api/workflow/delete":
+                    self._json(200, _op_workflow_delete(str(data.get("name") or "")))
+                elif path == "/api/agent/save":
+                    self._json(200, _op_agent_save(data))
+                elif path == "/api/agent/delete":
+                    self._json(200, _op_agent_delete(str(data.get("id") or ""), bool(data.get("confirm"))))
                 elif path == "/api/undo":
                     which = data.get("which", "last")
                     checkpoint = data.get("checkpoint")

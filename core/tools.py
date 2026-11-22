@@ -491,18 +491,36 @@ def _bg_watch(proc: subprocess.Popen, fh, command: str, out_file: str, task_id: 
 
 
 # ask_user：询问用户意见
-# 交互经UI请求桥main._agent_turn_impl回合内绑定，回合末解绑
+# 交互经UI请求桥main._agent_turn_impl回合内绑定，回合末解绑；
+# 后台线程（工作流实例/子代理）经 bind_thread_ask_bridge 绑线程级桥，互不覆盖
 
 _ask_bridge = None  # Callable[[dict], dict]
+_ask_bridge_local = threading.local()  # 线程级桥：仅后台实例线程可见
 
 # 自动超时秒数：开关型配置，开启即固定 5 分钟
 ASK_USER_TIMEOUT = 300
 
 
 def set_ask_user_bridge(fn) -> None:
-    """注册 ask_user 的 UI 交互桥：payload 进，result dict 出"""
+    """注册 ask_user 的 UI 交互桥：payload 进，result dict 出（主回合全局绑定）"""
     global _ask_bridge
     _ask_bridge = fn
+
+
+@contextmanager
+def bind_thread_ask_bridge(fn):
+    """线程级 ask_user 桥：后台实例线程绑定自己的桥（捕获自身取消信号），退出恢复原值，不动全局绑定"""
+    previous = getattr(_ask_bridge_local, "fn", None)
+    _ask_bridge_local.fn = fn
+    try:
+        yield
+    finally:
+        _ask_bridge_local.fn = previous
+
+
+def _current_ask_bridge():
+    """ask_user 桥查找：线程绑定优先，未绑定的线程（主回合）读全局"""
+    return getattr(_ask_bridge_local, "fn", None) or _ask_bridge
 
 
 def _ask_user_timeout() -> int:
@@ -560,7 +578,7 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
             opts.append({"title": str(o["title"]).strip(), "description": str(o.get("description") or "").strip()})
     if not opts:
         return "参数错误: options 至少需要一项（含 title）"
-    bridge = _ask_bridge
+    bridge = _current_ask_bridge()
     if bridge is None:
         return "当前环境无交互通道，无法询问用户；请基于现有信息自行决策。"
     payload = {"question": question.strip(), "options": opts, "timeout": _ask_user_timeout()}
@@ -2574,6 +2592,8 @@ def write_memory(keyword: str, content: str, type: str = "project") -> str:
     if type not in ("global", "project"):
         return "参数错误: type 必须为 global 或 project"
     status, key = session.write_memory_file(type, keyword, content)
+    if status == "readonly":
+        return "写入失败: 当前为隔离会话（后台工作流实例），不能修改长期记忆；请把结论写进最终输出"
     if status == "exists":
         return f"写入失败: 项目关键词「{key}」的记忆已存在，请改用 update_memory 更新内容"
     if status == "invalid":
@@ -2615,6 +2635,8 @@ def update_memory(keyword: str, content: str, type: str = "project", new_keyword
     if type not in ("global", "project"):
         return "参数错误: type 必须为 global 或 project"
     status, key = session.update_memory_file(type, keyword, content, new_keyword)
+    if status == "readonly":
+        return "更新失败: 当前为隔离会话（后台工作流实例），不能修改长期记忆"
     if status == "missing":
         return f"更新失败: 关键词「{key}」的记忆不存在，可先用 write_memory 新建"
     if status == "conflict":
@@ -2690,6 +2712,8 @@ def delete_memory(keyword: str, type: str = "project") -> str:
     if type not in ("global", "project"):
         return "参数错误: type 必须为 global 或 project"
     status, key = session.delete_memory_file(type, keyword)
+    if status == "readonly":
+        return "删除失败: 当前为隔离会话（后台工作流实例），不能修改长期记忆"
     if status == "missing":
         return f"删除失败: 关键词「{key}」的记忆不存在"
     if status == "invalid":

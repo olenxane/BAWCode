@@ -28,12 +28,13 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import threading
 from contextlib import contextmanager
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core import policy
 from core import memory as memory_mod
@@ -57,6 +58,8 @@ _SUBAGENT_EXCLUDED_TOOLS = {
     # 等待/取消是主代理对后台任务的编排动作，子代理不该阻塞在别的任务上
     "wait_subagent",
     "cancel_subagent",
+    # 工作流派发与子代理互斥：防 workflow→subagent→workflow 递归爆炸
+    "workflow",
     "write_plan",
     "update_plan",
     "generate_steps",
@@ -111,6 +114,7 @@ _STATUS_LABELS = {
     "cancelling": "取消中",
     "done": "完成",
     "interrupted": "已中断",
+    "stopped": "已终止",
     "max_rounds": "达轮次上限",
     "error": "出错",
 }
@@ -191,7 +195,10 @@ def _agents_dir(config) -> Path:
 
 
 def load_specs(config) -> int:
-    """扫描 data/agents/*.json 重建角色表；universal 内置兜底（同名文件可覆盖其提示词）"""
+    """扫描 data/agents/*.json 重建角色表；universal 内置兜底（同名文件可覆盖其提示词）。
+
+    字段：name/description/model/prompt（系统提示词）/prompt_file/task_prompt（任务提示词，
+    工作流节点引用该角色时的默认任务指令，task 工具派发不用它）"""
     global _SPECS
     specs: Dict[str, dict] = {
         "universal": {
@@ -200,6 +207,7 @@ def load_specs(config) -> int:
             "model": "",
             "prompt": _UNIVERSAL_PROMPT,
             "prompt_file": "",
+            "task_prompt": "",
         }
     }
     directory = _agents_dir(config)
@@ -223,10 +231,81 @@ def load_specs(config) -> int:
                 "model": str(data.get("model") or ""),
                 "prompt": str(data.get("prompt") or ""),
                 "prompt_file": str(data.get("prompt_file") or ""),
+                "task_prompt": str(data.get("task_prompt") or ""),
             }
     _SPECS = specs
     log.info("子代理角色已加载: %s", ", ".join(specs) or "（无）")
     return len(specs)
+
+
+def get_specs() -> Dict[str, dict]:
+    """角色表快照（拷贝）：工作流 Agent 解析与 WebUI 列表用"""
+    return dict(_SPECS)
+
+
+def get_role_spec(role_id: str) -> Optional[dict]:
+    """按 id 取角色定义；不存在返回 None"""
+    return _SPECS.get(str(role_id or "").strip())
+
+
+def agents_dir(config) -> Path:
+    """角色库目录（data/agents，可经 subagent.agents_dir 配置）"""
+    return _agents_dir(config)
+
+
+_ROLE_FIELDS = ("name", "description", "model", "prompt", "prompt_file", "task_prompt")
+
+
+def save_role(config, data: dict) -> Tuple[Optional[Path], str]:
+    """保存自定义智能体角色（WebUI/管理入口共用）：安全文件名 + 原子写 + 热重载。
+    返回 (路径, 错误信息)；与内置 Agent 同名拒绝（避免节点引用被遮蔽）"""
+    if not isinstance(data, dict):
+        return None, "角色定义须为对象"
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return None, "缺少 name（角色 id）"
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", name)
+    if safe != name:
+        return None, f"name 含非法字符（不能包含 \\ / : * ? \" < > | 或空白）: {name}"
+    try:
+        from core import workflow as workflow_mod
+
+        if name in workflow_mod.BUILTIN_AGENTS:
+            return None, f"名称与内置 Agent 冲突: {name}"
+    except Exception:
+        pass
+    role = {key: str(data.get(key) or "") for key in _ROLE_FIELDS}
+    role["name"] = name
+    if "prompt_file" not in data:
+        # 编辑入口（WebUI 四配置项）不携带 prompt_file：保留已有值，防静默清空
+        role["prompt_file"] = str((_SPECS.get(name) or {}).get("prompt_file") or "")
+    path = _agents_dir(config) / f"{safe}.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(role, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        return None, f"写入失败: {e}"
+    load_specs(config)  # 热重载，派发与工作流解析立即生效
+    log.info("智能体角色已保存: %s", name)
+    return path, ""
+
+
+def delete_role(config, name: str) -> Tuple[bool, str]:
+    """删除自定义角色文件并热重载；返回 (是否删除, 错误信息)"""
+    name = str(name or "").strip()
+    safe = re.sub(r'[\\/:*?"<>|\s]+', "_", name)
+    path = _agents_dir(config) / f"{safe or '0'}.json"
+    if not path.exists():
+        return False, f"角色不存在: {name}"
+    try:
+        path.unlink()
+    except OSError as e:
+        return False, f"删除失败: {e}"
+    load_specs(config)
+    log.info("智能体角色已删除: %s", name)
+    return True, ""
 
 
 def roles_listing() -> str:
@@ -321,6 +400,67 @@ def create_record(directory: Path, build, record_id: Optional[str] = None) -> tu
 
 def _task_key(project_id: str, session_id: str, task_id: str) -> str:
     return f"{project_id or '_default'}:{session_id or '_default'}:{task_id}"
+
+
+# ---------------------------------------------------------------------------
+# 后台任务注册表公共助手：工作流实例与子代理共用 _TASKS/并发闸/记录目录，
+# wait/cancel/query 工具对两者统一生效
+
+
+def session_gate(config, session) -> threading.Semaphore:
+    """会话级并发闸（信号量）：后台任务与子代理共享同一上限（subagent.max_concurrent）"""
+    gate_key = f"{getattr(session, 'project_id', '') or '_default'}:{getattr(session, 'session_id', '') or '_default'}"
+    with _TASKS_LOCK:
+        return _TASK_GATES.setdefault(
+            gate_key,
+            threading.Semaphore(max(1, int(subagent_cfg(config).get("max_concurrent") or _DEFAULT_MAX_CONCURRENT))),
+        )
+
+
+def register_background_task(task: dict) -> None:
+    """把后台任务（子代理或工作流实例）登记进进程内任务注册表"""
+    key = _task_key(str(task.get("project_id") or ""), str(task.get("session_id") or ""), str(task["id"]))
+    with _TASKS_LOCK:
+        _TASKS[key] = task
+
+
+def update_task(task: dict, **updates) -> None:
+    """线程安全地更新后台任务状态字段并刷新 updated_at"""
+    _update_task(task, **updates)
+
+
+def records_dir(config, session) -> Path:
+    """后台任务记录目录（data/subagents/{project}/{session}/），编号两族共用"""
+    return _records_dir(config, session)
+
+
+def save_record(directory: Path, record: dict) -> Optional[Path]:
+    """后台任务记录落盘（原子写），返回记录路径"""
+    return _save_record(directory, record)
+
+
+def runtime_snapshot() -> Optional[dict]:
+    """为派发的异步任务捕获运行时依赖引用（回合内派发窗口有效）"""
+    return _runtime_snapshot()
+
+
+def subagent_excluded_tools() -> set:
+    """子代理执行循环的递归与会话状态工具排除集（拷贝）。
+
+    注意：工作流 Agent 节点不使用本集合——改用 core/workflow._NODE_EXCLUDED_TOOLS
+    （仅剔除递归派发类，保留 write_plan/generate_steps 等会话级工具并经线程绑定
+    会话路由到显示会话），防递归与防状态污染的职责分属两套语义"""
+    return set(_SUBAGENT_EXCLUDED_TOOLS)
+
+
+def live_slot(rt: dict, record_id: str) -> Optional[dict]:
+    """取（或建）本后台任务的直播槽"""
+    return _live(rt, record_id)
+
+
+def live_clear_slot(rt: dict, record_id: str) -> None:
+    """清除本后台任务的直播槽"""
+    _live_clear(rt, record_id)
 
 
 def running_tasks_for_session(session) -> List[dict]:
@@ -418,9 +558,18 @@ def _task_mode_bridge(task: dict):
     return lambda payload: bridge(payload, cancel)
 
 
+def _make_task_ask_bridge(app, cancel: threading.Event):
+    """任务线程的 ask_user 桥：捕获任务自身取消信号（面板等待随之可中断）；无 app 的环境为 None"""
+    if app is None:
+        return None
+    from core import ui as ui_mod
+
+    return ui_mod.make_ask_bridge(app, cancel.is_set)
+
+
 @contextmanager
 def _task_scope(task: dict):
-    """绑定后台子代理的会话、文件快照与模式切换申请桥上下文。"""
+    """绑定后台子代理的会话、文件快照与交互申请桥（模式切换/ask_user）上下文。"""
     from contextlib import ExitStack
     from core import tools as tools_mod
     with ExitStack() as stack:
@@ -428,6 +577,10 @@ def _task_scope(task: dict):
         stack.enter_context(_bind_task_runtime(task))
         # 模式切换申请桥：任务线程级，主回合结束解绑后子代理仍能经用户面板申请切模式
         stack.enter_context(tools_mod.bind_thread_mode_bridge(_task_mode_bridge(task)))
+        # ask_user 线程级桥：子代理跨回合存活，主回合的全局桥已拆；桥捕获自身取消信号
+        ask_bridge = task.get("ask_bridge")
+        if callable(ask_bridge):
+            stack.enter_context(tools_mod.bind_thread_ask_bridge(ask_bridge))
         import core.snapshot as snapshot_mod
         stack.enter_context(snapshot_mod.bind_context(task["config"], task["project_id"], task["session_id"], task["id"]))
         yield
@@ -575,18 +728,22 @@ def submit_task(rt: dict, record: dict, cfg: dict, directory: Path, record_path:
             f"{project_id}:{session_id}",
             threading.Semaphore(max(1, int(cfg.get("max_concurrent") or _DEFAULT_MAX_CONCURRENT))),
         )
+    app = rt.get("app")
     task = {
         "id": task_id,
+        "kind": "subagent",
         "project_id": project_id,
         "session_id": session_id,
         "config": rt["config"],
         "session": rt.get("session"),
         "runner": runner,
         "origin_turn_id": rt.get("origin_turn_id"),
-        "app": rt.get("app"),
+        "app": app,
         "confirm_bridge": rt.get("confirm_bridge"),
         # 模式切换申请桥（payload, cancelled）-> {"approved", "detail"}；无交互环境为 None
         "mode_bridge": rt.get("mode_bridge"),
+        # ask_user 线程级桥：跨回合存活，桥捕获任务自身取消信号（无 app 的环境为 None）
+        "ask_bridge": _make_task_ask_bridge(app, cancel),
         "cancel": cancel,
         "gate": gate,
         "done": threading.Event(),
