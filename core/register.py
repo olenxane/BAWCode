@@ -19,6 +19,7 @@ def register(
     schema: Optional[dict] = None,
     owner: str = "",
     safe: bool = False,
+    safe_actions: Optional[list] = None,
 ) -> Callable[[Callable], Callable]:
     """工具注册装饰器
 
@@ -29,6 +30,8 @@ def register(
     :param owner: 归属标识即插件 id，便于整体注销
     :param safe: 免确认声明（纯交互/无副作用类，与 policy.SAFE_TOOLS 同待遇；
         标志随注册表条目存亡，插件卸载自动消失）
+    :param safe_actions: action 参数级免确认白名单（分发式工具用，如 computer_use
+        的 screenshot/window_list 观测动作；命中 args["action"] 即放行，其余 action 照常过门禁）
     """
 
     def decorator(func: Callable) -> Callable:
@@ -45,6 +48,15 @@ def register(
             "schema": schema or {"type": "object", "properties": {}, "required": []},
             "owner": owner or "",
             "safe": safe is True,  # 严格布尔：仅显式 True 生效，防 "false" 等真值误声明
+            # 防 "screenshot" 被拆成单字符名单：字符串包成列表，非迭代类型归空
+            "safe_actions": [
+                str(a).strip().lower()
+                for a in (
+                    [safe_actions] if isinstance(safe_actions, str)
+                    else safe_actions if isinstance(safe_actions, (list, tuple, set)) else []
+                )
+                if str(a).strip()
+            ],
         }
         if safe is True:
             log.info("注册免确认工具(safe): %s (owner=%s)", tool_name, owner or "-")

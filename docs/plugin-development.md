@@ -193,7 +193,7 @@ Pillow>=10
 | `ctx.register_external_api(event, fn=None, url="", priority=50)` | 实现 external_apis 同名扩展点 | §5.4 |
 | `ctx.register_command(name, hint="", usage="", aliases=None, handler=None, completer=None)` | 注册斜杠命令 | §6 |
 | `ctx.register_arg_completer(name, fn)` | 为任意命令（含内建）扩展参数补全 | §6.2 |
-| `ctx.register_tool(name=None, description="", usage="", schema=None)` | 注册模型可见工具（装饰器） | §7 |
+| `ctx.register_tool(name=None, description="", usage="", schema=None, safe=False, safe_actions=None)` | 注册模型可见工具（装饰器） | §7 |
 | `ctx.call(event, payload, default=None)` | 主动触发变换链事件 | §5.5 |
 | `ctx.collect(event, payload)` | 主动触发观察链事件 | §5.5 |
 | `ctx.register_ui_tree(fn, priority=100)` | 每帧提供主窗口会话树根节点（返回 `TreeNode` 或列表） | §4.6 |
@@ -519,6 +519,18 @@ def translate_text(text: str, target_lang: str = "en") -> str:
 - 函数按 `schema` 属性名以关键字参数调用，**形参名要与属性名一致**并给缺省值
 - 权限：未列入 `policy.SAFE_TOOLS` 的新工具在 auto/manual 模式下会弹确认面板；
   用户"始终允许"后记入指纹白名单
+- `safe=True` 免确认声明：纯交互/无副作用类工具（问用户、委派任务）在所有访问模式
+  直接放行，与 `SAFE_TOOLS` 成员同待遇——先确认"能调用"纯属打扰。注意通用工具的
+  "始终允许"指纹混入参数值、对变参调用永不复配，声明型 safe 是变参交互工具的唯一
+  免确认通道；仅接受显式布尔 `True`，标志随插件卸载自动消失
+- **safe 是信任声明而非沙箱**，仅限确无副作用的工具。不得声明 safe 的类型：写文件/
+  删文件、执行命令、发起网络写请求、发消息（如 qbridge）、桌面控制（computer-use）、
+  MCP 代理工具。声明后仍受 `before_tool` 钩子约束；插件可覆盖同名内建工具——
+  绝不要把 `write`/`execute_command` 这类名字声明成 safe
+- `safe_actions=[...]` 是 safe 的 action 级变体：按 `action` 参数分发内部操作的单工具
+  （如 computer_use 的 screenshot/window_list 观测动作），名单内 action 免确认、其余照常
+  过门禁。只许声明纯观测动作——computer_use 可声明 `screenshot`，但 `click`/`type`
+  这类输入动作绝不可入列
 - 返回值超长部分按 `context.inline_limit_tokens` 外置落盘——不用担心大结果撑爆上下文
 
 ---

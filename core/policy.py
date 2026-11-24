@@ -524,11 +524,18 @@ def load_allowlist(root: Optional[Path] = None) -> Dict[str, list]:
             return {"rules": []}
         data = json.loads(raw)
         if isinstance(data, dict) and isinstance(data.get("rules"), list):
-            # 存量清洗：路径类工具的工具级通配（如 write|*）放行范围无界，加载即剔除
-            data["rules"] = [
-                r for r in data["rules"]
-                if not (r.get("tool") in PATH_TOOLS and (r.get("fingerprint") or "") == f"{r.get('tool')}|*")
-            ]
+            # 存量清洗一：路径类工具的工具级通配（如 write|*）放行范围无界，加载即剔除
+            # 存量清洗二：computer_use 指纹已改 action 分段（旧格式 computer_use|<16hex>
+            # 永不复配且永不清理），通配 computer_use|* 仍命中故保留
+            def _keep(r) -> bool:
+                tool, fp = r.get("tool"), r.get("fingerprint") or ""
+                if tool in PATH_TOOLS and fp == f"{tool}|*":
+                    return False
+                if tool == "computer_use" and fp.startswith("computer_use|") and fp.count("|") == 1 and fp != "computer_use|*":
+                    return False
+                return True
+
+            data["rules"] = [r for r in data["rules"] if _keep(r)]
             return data
         log.warn("allowlist 格式异常，忽略: %s", path)
     except (json.JSONDecodeError, OSError) as e:
@@ -564,6 +571,15 @@ def fingerprint(tool_name: str, args: Optional[dict]) -> str:
     if tool_name == "run_program":
         prog = str(args.get("program") or "").lower()
         return f"run_program|{prog}"
+    if tool_name == "computer_use":
+        # 按 action 分段：「始终允许」click 不连带放行 type/key 等输入动作
+        action = str(args.get("action") or "").strip().lower() or "-"
+        raw_params = args.get("params")
+        params: dict = raw_params if isinstance(raw_params, dict) else {}
+        digest = hashlib.sha1(
+            ",".join(f"{k}={params[k]}" for k in sorted(params)[:5]).encode("utf-8")
+        ).hexdigest()[:8]
+        return f"computer_use|{action}|{digest}"
     if tool_name in ("write", "edit_file", "delete_file"):
         path = str(args.get("file_path") or "").replace("\\", "/")
         if sys.platform == "win32":
@@ -589,6 +605,9 @@ def similar_fingerprint(tool_name: str, args: Optional[dict]) -> str:
 
         shell_name = shells.resolve_name(args.get("shell"))
         return f"execute_command|{shell_name}|{(parts[0].lower() if parts else '')}"
+    if tool_name == "computer_use":
+        action = str(args.get("action") or "").strip().lower() or "-"
+        return f"computer_use|{action}|*"
     return fingerprint(tool_name, args).split("|")[0] + "|*"
 
 
@@ -628,6 +647,9 @@ def is_safe_call(tool_name: str, args: Optional[dict]) -> bool:
     # 工具，与 SAFE_TOOLS 同待遇；标志随注册表条目存亡，插件卸载自动消失
     entry = register.get_tool(tool_name)
     if entry is not None and entry.get("safe"):
+        return True
+    # action 级免确认（register_tool safe_actions）：分发式工具的观测动作放行，其余照常
+    if entry is not None and str(args.get("action") or "").strip().lower() in set(entry.get("safe_actions") or []):
         return True
     if tool_name in ("execute_command", "run_program"):
         cmd = command_text(tool_name, args)
@@ -685,6 +707,10 @@ def _evaluate(tool_name: str, args: Optional[dict], mode: str, root: Optional[Pa
     entry = register.get_tool(tool_name)
     if entry is not None and entry.get("safe"):
         return ALLOW, "safe:declared"
+    if entry is not None and str((args or {}).get("action") or "").strip().lower() in set(
+        entry.get("safe_actions") or []
+    ):
+        return ALLOW, "safe:declared_action"
 
     if is_safe_call(tool_name, args):
         return ALLOW, "safe"

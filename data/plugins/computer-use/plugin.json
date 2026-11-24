@@ -36,7 +36,25 @@
       "type": "bool",
       "label": "粘贴后恢复剪贴板",
       "default": true,
-      "hint": "非 ASCII 文本（中文等）自动走剪贴板粘贴，完成后恢复原剪贴板内容"
+      "hint": "非 ASCII 文本（中文等）自动走剪贴板粘贴，完成后按全格式快照恢复原剪贴板内容"
+    },
+    {
+      "key": "locate_confidence",
+      "type": "int",
+      "label": "模板定位默认置信度(%)",
+      "default": 0,
+      "min": 0,
+      "max": 100,
+      "hint": "locate/wait_for 的默认模糊匹配阈值；0=精确匹配。模糊匹配需安装 opencv-python"
+    },
+    {
+      "key": "wait_for_max_seconds",
+      "type": "int",
+      "label": "wait_for 超时上限(s)",
+      "default": 60,
+      "min": 1,
+      "max": 600,
+      "hint": "wait_for 动作 timeout 参数允许的最大值，防止模型挂起等待过长"
     }
   ]
 }
