@@ -340,7 +340,11 @@ def _clip(text: str, width: int) -> str:
     for ch in safe_text(_ANSI_RE.sub("", text or "")):
         w = _char_width(ch)
         if used + w > width:
-            out.append("…")
+            # 尾部吐出字符给 … 腾 1 列，保证 dw<=width（超宽折行会破 inline 的 live_h 记账）
+            while out and used + 1 > width:
+                used -= _char_width(out.pop())
+            if used + 1 <= width:
+                out.append("…")
             break
         out.append(ch)
         used += w
@@ -2580,21 +2584,26 @@ class RenderMixin(UiState):
         input_rows = []
         accent = self.c("accent") if self.focus == "input" else self.c("dim")
         # 输入框：显示缓冲与光标（确认面板模式下跳过，行位由面板取代）
+        # 光标用反显渲染：聚焦时反转光标所在字符前景/背景（行尾反显空格），不再插入 ▌
+        rv_on, rv_off = "\x1b[7m", "\x1b[27m"
+        focused = self.focus == "input"
         if confirm_panel is None and not raw.strip():
+            caret = f"{rv_on} {rv_off}" if focused else " "
             input_rows.append(
-                f"{accent}>{self.RESET} {self.c('dim')}{_clip('输入消息或 / 命令 · Enter 提交 · Tab 补全', inner_w)}{self.RESET}{accent}▌{self.RESET}"
+                f"{accent}>{self.RESET} {caret}{self.c('dim')}{_clip('输入消息或 / 命令 · Enter 提交 · Tab 补全', inner_w)}{self.RESET}"
             )
         elif confirm_panel is None:
             ink = self.c("ink")
-            mark = f"{self.c('accent')}▌{self.RESET}"
             for i, part in enumerate(vis):
                 abs_row = self.input_scroll + i
                 prefix = self._input_prompt if abs_row == 0 else " " * _display_width(self._input_prompt)
                 head = f"{accent}{prefix}{self.RESET}{ink}"
-                if self.focus == "input" and abs_row == cursor_row:
-                    # 显示光标必须插在逻辑光标列，不能固定贴在行尾
+                if focused and abs_row == cursor_row:
+                    # 反显光标下的字符（行尾反显空格）；split_at_cells 不拆宽字符
                     left, right = split_at_cells(part, before_last_w)
-                    input_rows.append(f"{head}{left}{mark}{ink}{_clip(right, inner_w)}{self.RESET}")
+                    cur_ch, right = (right or " ")[0], (right or " ")[1:]
+                    tail_w = max(0, inner_w - _display_width(left) - _char_width(cur_ch))
+                    input_rows.append(f"{head}{left}{rv_on}{cur_ch}{rv_off}{ink}{_clip(right, tail_w)}{self.RESET}")
                 else:
                     input_rows.append(f"{head}{_clip(part, inner_w)}{self.RESET}")
         if cand_show and confirm_panel is None:

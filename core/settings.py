@@ -169,7 +169,7 @@ class SettingsPanelMixin(UiState):
                     display = _clip(f"    {label:18} < {show} > ←→", w - 4)
                 elif ftype == "ptext":
                     show = self._edit_caret_text(edit) if editing else ("" if field.get("current") is None else str(field.get("current")))
-                    display = _clip(f"    {label:18} {show}", w - 4)
+                    display = _clip_keep_ansi(f"    {label:18} {show}", w - 4)
                 elif ftype in ("section", "body_item_section"):
                     arrow = "▾" if field.get("expanded") else "▸"
                     display = _clip(f"{arrow} {label} · Enter{'收起' if field.get('expanded') else '展开'}", w - 4)
@@ -180,7 +180,7 @@ class SettingsPanelMixin(UiState):
                 elif ftype == "body_text":
                     item = self.settings_scratch["adv_custom_body"][field["body_index"]]
                     show = self._edit_caret_text(edit) if editing else str(item.get("key") or "")
-                    display = _clip(f"      键名：{show}", w - 4)
+                    display = _clip_keep_ansi(f"      键名：{show}", w - 4)
                 elif ftype == "body_json":
                     item = self.settings_scratch["adv_custom_body"][field["body_index"]]
                     if editing:
@@ -191,7 +191,7 @@ class SettingsPanelMixin(UiState):
                         show = f"继承（当前 {inherited}）"
                     else:
                         show = json.dumps(item.get("value"), ensure_ascii=False)
-                    display = _clip(f"      值：{show}", w - 4)
+                    display = _clip_keep_ansi(f"      值：{show}", w - 4)
                 elif ftype in ("advbool", "check"):
                     mark = "[x]" if value in (True, "true", "1", 1) else "[ ]"
                     display = _clip(f"    {mark} {label}", w - 4)
@@ -200,7 +200,7 @@ class SettingsPanelMixin(UiState):
                     display = _clip(f"    {label:18} < {show} > ←→", w - 4)
                 elif ftype == "advtext":
                     show = self._edit_caret_text(edit) if editing else ("" if value is None else str(value))
-                    display = _clip(f"    {label:18} {show}", w - 4)
+                    display = _clip_keep_ansi(f"    {label:18} {show}", w - 4)
                 elif ftype == "choice":
                     show = _binding_text(value)
                     hint_lr = " ←→"
@@ -214,7 +214,7 @@ class SettingsPanelMixin(UiState):
                     display = _clip(f"  {label}", w - 4)
                 elif editing:
                     # 正在编辑：字段行内直接显示缓冲与光标（像输入框一样就地输入）
-                    display = _clip(f"{label:20}  {self._edit_caret_text(edit)}", w - 4)
+                    display = _clip_keep_ansi(f"{label:20}  {self._edit_caret_text(edit)}", w - 4)
                 else:
                     show = "" if value is None else str(value)
                     marker = "▌" if i == self.settings_index else ""
@@ -1887,13 +1887,14 @@ class SettingsPanelMixin(UiState):
 
     @staticmethod
     def _edit_caret_text(edit) -> str:
-        """编辑缓冲的可视文本：在光标处插入 ▌（edit 为空则返回空串）。"""
+        """编辑缓冲的可视文本：光标处字符反显（行尾反显空格），不再插入 ▌；调用点须用 _clip_keep_ansi 保留反显序列。"""
         buf = (edit or {}).get("buf")
         if buf is None:
             return ""
         text = buf.to_text()
         cur = buf.cursor
-        return f"{text[:cur]}▌{text[cur:]}"
+        cur_ch = text[cur] if cur < len(text) else " "
+        return f"{text[:cur]}\x1b[7m{cur_ch}\x1b[27m{text[cur + 1:]}"
 
     def _compose_edit_line(self, w: int) -> str:
         edit = self.settings_edit or {}

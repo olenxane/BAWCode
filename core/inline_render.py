@@ -79,7 +79,11 @@ def redraw_sequence(prev_h: int, commit: Sequence[str], live: Sequence[str]) -> 
         parts.append("\033[J")
     for row in commit:
         parts.append(row + "\033[0m\r\n")
+    # live 区写期间关 DECAWM 自动换行：任一 live 行显示宽超 w 时按列裁剪而非折行，
+    # 保证物理行数==len(live)；否则 _live_h 欠账→erase 漏行→live 顶行残留进 scrollback
+    parts.append("\x1b[?7l")
     parts.append("\r\n".join(row + "\033[0m" for row in live))
+    parts.append("\x1b[?7h")
     parts.append(SYNC_END)
     return "".join(parts)
 
