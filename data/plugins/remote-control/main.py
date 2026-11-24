@@ -372,6 +372,8 @@ def setup(ctx: PluginContext):
     confirm_timeout = float(ctx.settings.get("confirm_timeout") or 90)
     max_history = int(ctx.settings.get("max_history") or 80)
     upload_max_bytes = int(ctx.settings.get("upload_max_bytes") or 10 * 1024 * 1024)
+    _JSON_BODY_MAX = 16 * 1024 * 1024  # JSON 请求体上限：防异常/恶意超大 Content-Length 全量读入内存
+    _BODY_TOO_LARGE = object()         # _body 超限哨兵（与 JSON 解析失败区分，回 413）
     page_path = Path(ctx.dir) / "web" / "index.html"
     root_workspace = Path(getattr(ctx, "workspace", Path.cwd())).resolve()
     attachment_dir = root_workspace / ".bawcode" / "attachments" / "remote"
@@ -547,6 +549,21 @@ def setup(ctx: PluginContext):
         with st.lock:
             return bool(st.clients) or (time.monotonic() - st.last_client_seen) < CLIENT_TTL
 
+    def _is_cancelled() -> bool:
+        """宿主回合取消信号（tool_confirm/ui_request payload 里的 cancelled 被宿主剥走，只能轮询 runner）"""
+        llm = _llm()
+        cancelled = getattr(llm, "cancelled", None) if llm is not None else None
+        return callable(cancelled) and cancelled()
+
+    def _wait_remote_answer(event: threading.Event) -> bool:
+        """分片等待远程应答：期间轮询取消信号，终端 Esc/中断即时生效（纯 wait 会卡满 confirm_timeout）"""
+        deadline = time.monotonic() + confirm_timeout
+        while True:
+            if event.wait(timeout=0.5):
+                return True
+            if _is_cancelled() or time.monotonic() >= deadline:
+                return False
+
     def _on_tool_confirm(payload):
         if payload.get("phase") == "closed":
             with st.lock:
@@ -577,7 +594,7 @@ def setup(ctx: PluginContext):
                     "description": description})
         ctx.notify(f"[远程控制] 工具 {name} 等待远程确认（{confirm_timeout:.0f}s 内未响应将转回终端面板）")
         try:
-            answered = item["event"].wait(timeout=confirm_timeout)
+            answered = _wait_remote_answer(item["event"])
         finally:
             with st.lock:
                 st.confirms.remove(item)
@@ -590,6 +607,9 @@ def setup(ctx: PluginContext):
             if action in ("deny", "reject"):
                 ctx.notify(f"[远程控制] 远程已拒绝 {name}")
                 return {"action": "deny", "reason": str(resp.get("reason") or "")}
+        if not answered and _is_cancelled():
+            _broadcast({"t": "confirm_done", "id": item["id"], "action": "cancelled"})
+            return None
         _broadcast({"t": "confirm_done", "id": item["id"], "action": "timeout"})
         return None
 
@@ -624,7 +644,7 @@ def setup(ctx: PluginContext):
         _broadcast({"t": "ask", "id": item["id"], "question": question, "options": options, "multiline": multiline})
         ctx.notify(f"[远程控制] 询问已推送浏览器等待回答（{confirm_timeout:.0f}s 内未响应将转回终端面板）")
         try:
-            answered = item["event"].wait(timeout=confirm_timeout)
+            answered = _wait_remote_answer(item["event"])
         finally:
             with st.lock:
                 st.asks.remove(item)
@@ -641,6 +661,9 @@ def setup(ctx: PluginContext):
                 if isinstance(index, int):
                     out["index"] = index
                 return out
+        if not answered and _is_cancelled():
+            _broadcast({"t": "ask_done", "id": item["id"], "action": "cancelled"})
+            return None
         _broadcast({"t": "ask_done", "id": item["id"], "action": "timeout"})
         return None
 
@@ -895,6 +918,13 @@ def setup(ctx: PluginContext):
             return ctx.run_when_idle(lambda: fn(*args, **kwargs))
         return wrapped
 
+    def _discard_pending_turn() -> None:
+        """切换会话前收束挂起的失败回合（与宿主 /new /resume 同口径），防回滚消息写进新会话"""
+        runner = _runner()
+        discard = getattr(runner, "discard_pending_turn", None) if runner is not None else None
+        if callable(discard):
+            discard()
+
     @_idle_operation
     def _op_session_new() -> dict:
         err = _session_op_guard()
@@ -903,6 +933,7 @@ def setup(ctx: PluginContext):
         session, err = _require_session()
         if err:
             return err
+        _discard_pending_turn()
         session.save_session()
         session.start_new_session()
         app = _app()
@@ -983,6 +1014,7 @@ def setup(ctx: PluginContext):
         data = ctx.host.sessions.load_session_data(directory, sid)
         if not data:
             return {"ok": False, "message": f"会话加载失败: {sid}"}
+        _discard_pending_turn()
         session.save_session()
         session.switch_to(data)
         app = _app()
@@ -1438,6 +1470,10 @@ def setup(ctx: PluginContext):
         ".sql", ".sh", ".bat", ".ps1", ".c", ".h", ".cpp", ".hpp", ".java", ".kt", ".go", ".rs",
         ".rb", ".php", ".swift", ".vue", ".tex",
     }
+    # 敏感目录黑名单：插件密钥(key.json)/附件/会话快照都在 .bawcode 下
+    _FILE_PREVIEW_BLOCKED_DIRS = {".bawcode", ".git"}
+    # 宿主主配置含 provider api_key，同样不进网页预览
+    _FILE_PREVIEW_BLOCKED_PREFIXES = {("data", "config.json"), ("data", "config.example.json")}
 
     def _file_preview(ws_root: Path, raw: str) -> dict:
         """工作区文件预览读取：越界 403、不存在 404、超限 413、类型/编码不支持 415；
@@ -1445,9 +1481,13 @@ def setup(ctx: PluginContext):
         p = Path(str(raw or "").strip().strip('"'))
         try:
             candidate = (p if p.is_absolute() else ws_root / p).resolve()
-            candidate.relative_to(ws_root)
+            rel = candidate.relative_to(ws_root)
         except (ValueError, OSError):
             return {"ok": False, "status": 403, "message": "路径超出工作区"}
+        if set(rel.parts) & _FILE_PREVIEW_BLOCKED_DIRS:
+            return {"ok": False, "status": 403, "message": "敏感目录禁止预览"}
+        if rel.parts[:2] in _FILE_PREVIEW_BLOCKED_PREFIXES:
+            return {"ok": False, "status": 403, "message": "宿主配置文件禁止预览"}
         if not candidate.is_file():
             return {"ok": False, "status": 404, "message": "文件不存在"}
         try:
@@ -1896,6 +1936,9 @@ def setup(ctx: PluginContext):
 
             def _login(self):
                 data = self._body()
+                if data is _BODY_TOO_LARGE:
+                    self._json(413, {"ok": False, "message": "请求体超过大小上限（16MB）"})
+                    return
                 if data is None:
                     self._json(400, {"ok": False, "message": "请求体不是合法 JSON"})
                     return
@@ -1931,6 +1974,8 @@ def setup(ctx: PluginContext):
             def _body(self):
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
+                    if length > _JSON_BODY_MAX:
+                        return _BODY_TOO_LARGE
                     raw = self.rfile.read(length) if length > 0 else b""
                     return json.loads(raw.decode("utf-8")) if raw else {}
                 except (ValueError, json.JSONDecodeError, OSError):
@@ -1973,6 +2018,18 @@ def setup(ctx: PluginContext):
                     return None, f"上传失败: {exc}"
 
             def do_GET(self):
+                try:
+                    self._route_get()
+                except Exception as exc:
+                    if urlparse(getattr(self, "path", "")).path == "/api/events":
+                        raise  # SSE 自管响应流，补发 500 会破坏流式语义
+                    ctx.log.warn("GET %s 处理异常: %r", getattr(self, "path", "?"), exc)
+                    try:
+                        self._json(500, {"ok": False, "message": f"服务器内部错误: {type(exc).__name__}"})
+                    except Exception:
+                        pass
+
+            def _route_get(self):
                 path = urlparse(self.path).path
                 if path == "/favicon.ico":
                     self._json(404, {"ok": False})
@@ -2135,6 +2192,16 @@ def setup(ctx: PluginContext):
                     with st.lock:
                         st.clients.discard(client)
             def do_POST(self):
+                try:
+                    self._route_post()
+                except Exception as exc:
+                    ctx.log.warn("POST %s 处理异常: %r", getattr(self, "path", "?"), exc)
+                    try:
+                        self._json(500, {"ok": False, "message": f"服务器内部错误: {type(exc).__name__}"})
+                    except Exception:
+                        pass
+
+            def _route_post(self):
                 path = urlparse(self.path).path
                 if path == "/api/login":
                     self._login()
@@ -2151,6 +2218,9 @@ def setup(ctx: PluginContext):
                     self._json(200 if result else 400, {"ok": bool(result), **(result or {"message": error})})
                     return
                 data = self._body()
+                if data is _BODY_TOO_LARGE:
+                    self._json(413, {"ok": False, "message": "请求体超过大小上限（16MB）"})
+                    return
                 if data is None:
                     self._json(400, {"ok": False, "message": "请求体不是合法 JSON"})
                     return
