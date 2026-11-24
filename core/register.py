@@ -37,8 +37,9 @@ def register(
     def decorator(func: Callable) -> Callable:
         tool_name = name or func.__name__
         existing = _registry.get(tool_name)
-        if owner and existing is not None and existing.get("owner") != owner and tool_name not in _overridden:
-            # 插件覆盖非本归属的已有工具：留底原条目，卸载时恢复
+        if existing is not None and existing.get("owner") != owner and tool_name not in _overridden:
+            # 跨归属覆盖一律留底：插件先注册再被内建反覆盖（注册顺序见 main）同样
+            # 需要原条目在卸载/再注册时可用
             _overridden[tool_name] = existing
         _registry[tool_name] = {
             "name": tool_name,
@@ -97,6 +98,9 @@ def unregister_owner(owner: str) -> List[str]:
             _registry[n] = original
         else:
             _registry.pop(n, None)
+    # 被内建反覆盖时本插件条目留在 _overridden：卸载即清，避免复活已卸载的工具
+    for n in [n for n, t in _overridden.items() if t.get("owner") == owner]:
+        _overridden.pop(n, None)
     if removed:
         log.debug("注销 owner=%s 的工具: %s", owner, ",".join(removed))
     return removed

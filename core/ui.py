@@ -154,7 +154,12 @@ DIALOG_LOCK = threading.Lock()
 def _request_ui_wait(app, kind: str, payload: dict, cancelled=None):
     """统一请求槽交互：持 DIALOG_LOCK 覆盖 request→wait 整个周期（并发申请串行弹窗），
     写槽后自旋等待应答；槽位被顶掉或取消命中即返回取消哨兵"""
-    with DIALOG_LOCK:
+    # 锁等待本身可被外部取消：否则队列里的后台任务在持锁者面板结束/取消前
+    # 永远停在排队态（cancel 只置事件，这里吃不到）
+    while not DIALOG_LOCK.acquire(timeout=0.05):
+        if cancelled is not None and cancelled():
+            return CANCEL_RESULT
+    try:
         req = app.request_ui(kind, payload)
         while not req["event"].wait(0.05):
             if app._ui_req is not req:
@@ -163,6 +168,8 @@ def _request_ui_wait(app, kind: str, payload: dict, cancelled=None):
                 req["result"] = CANCEL_RESULT
                 req["event"].set()
         return req["result"]
+    finally:
+        DIALOG_LOCK.release()
 
 
 def make_ask_bridge(app, cancelled=None):

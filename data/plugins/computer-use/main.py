@@ -101,7 +101,7 @@ _basis_local = threading.local()
 # 全局兜底基带时效与全屏标记：仅全屏基可被无基线程继承且限时有效——
 # 防 B 代理凭上一回合截图继承 A 代理（尤其窗口/裁剪）的基，坐标被错算进 A 的窗口矩形误点击
 _basis_global = {"entry": None}
-_BASIS_TTL = 10.0  # 全局兜底基最长继承年龄（秒）；超龄按原生坐标处理并提示先截图
+_BASIS_TTL = 120.0  # 全局兜底基最长继承年龄（秒）；10s 连同一会话的相邻回合都保不住
 
 
 def _get_basis():
@@ -111,12 +111,22 @@ def _get_basis():
     e = _basis_global["entry"]
     if e is None or not e["full"] or time.monotonic() - e["t"] > _BASIS_TTL:
         return None
+    # 继承前确认虚拟屏矩形未变：显示器拔插/投影切换后旧基坐标直接错位
+    try:
+        if backend.cu_virtual_rect() != e.get("vrect"):
+            return None
+    except Exception:
+        return None
     return e["b"]
 
 
 def _set_basis(b, full: bool) -> None:
     _basis_local.b = b
-    _basis_global["entry"] = {"b": b, "t": time.monotonic(), "full": bool(full)}
+    try:
+        vrect = backend.cu_virtual_rect()
+    except Exception:
+        vrect = None
+    _basis_global["entry"] = {"b": b, "t": time.monotonic(), "full": bool(full), "vrect": vrect}
 
 
 def _settings() -> dict:
@@ -312,10 +322,16 @@ def _locate_confidence(p: dict):
     conf = p.get("confidence")
     if conf is None:
         conf = _settings().get("locate_confidence")
-    conf = None if conf in (None, "", 0) else float(conf)
-    if conf is not None and conf > 1:
+    if conf is None or str(conf).strip() == "":
+        return None
+    conf = float(conf)
+    if conf > 1:
         conf = conf / 100.0
-    return None if conf is None else min(max(conf, 0.0), 1.0)
+    if conf == 0:
+        return None  # 0 = 精确匹配
+    if not 0.0 < conf <= 1.0:
+        raise ValueError(f"confidence 须在 (0,1] 或 0（=精确匹配）/百分数，得到 {conf!r}")
+    return conf
 
 
 def _act_locate(p: dict) -> tuple:
@@ -361,13 +377,14 @@ def _act_wait_for(p: dict) -> tuple:
     deadline = time.monotonic() + timeout
     region = _region_param(p)
     vrect = _rect_to_screen(*region) if region is not None else None
+    conf = _locate_confidence(p)  # 参数校验前置：非法 confidence 立即报错，不吞成超时
     err_count, last_err = 0, ""
     while True:
         _check_cancel()
         backend.cu_check_abort()
         if image:
             try:
-                matches = backend.cu_locate_all(image, region=vrect, confidence=_locate_confidence(p))
+                matches = backend.cu_locate_all(image, region=vrect, confidence=conf)
                 err_count = 0
             except Exception as exc:
                 matches = []
@@ -489,7 +506,8 @@ def _act_type(p: dict) -> tuple:
     skipped = f"，{snapshot[1]} 个不可克隆格式未恢复" if (snapshot and snapshot[1]) else ""
     if restore and not restore_ok:
         skipped = f"{skipped}；注意：恢复失败（剪贴板被占用），原内容可能已丢失"
-    return f"已通过剪贴板粘贴 {len(text)} 字符（规避输入法干扰，原剪贴板内容已恢复{skipped}）。", None
+    restored_text = f"原剪贴板内容已恢复{skipped}" if restore else "剪贴板恢复已关闭，原内容未恢复"
+    return f"已通过剪贴板粘贴 {len(text)} 字符（规避输入法干扰，{restored_text}）。", None
 
 
 def _act_key(p: dict) -> tuple:

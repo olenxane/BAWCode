@@ -2586,7 +2586,7 @@ def computer_use(action: str, params: Optional[dict] = None, external_handler=No
 )
 def write_memory(keyword: str, content: str, type: str = "project") -> str:
     """写入全局功能记忆或新建项目关键词记忆"""
-    session = _session()
+    session = memory_mod.get_memory_session()
     if session is None:
         return "记忆会话未初始化"
     if type not in ("global", "project"):
@@ -2629,7 +2629,7 @@ def write_memory(keyword: str, content: str, type: str = "project") -> str:
     },
 )
 def update_memory(keyword: str, content: str, type: str = "project", new_keyword: str = "") -> str:
-    session = _session()
+    session = memory_mod.get_memory_session()
     if session is None:
         return "记忆会话未初始化"
     if type not in ("global", "project"):
@@ -2666,7 +2666,7 @@ def update_memory(keyword: str, content: str, type: str = "project", new_keyword
 )
 def read_memory(keywords: Optional[List[str]] = None) -> str:
     """按关键词读取项目记忆正文；结果入工具白名单，跨回合保留不被剥离"""
-    session = _session()
+    session = memory_mod.get_memory_session()
     if session is None:
         return "记忆会话未初始化"
     keys = [str(k).strip() for k in (keywords or []) if str(k).strip()]
@@ -2706,7 +2706,7 @@ def read_memory(keywords: Optional[List[str]] = None) -> str:
     },
 )
 def delete_memory(keyword: str, type: str = "project") -> str:
-    session = _session()
+    session = memory_mod.get_memory_session()
     if session is None:
         return "记忆会话未初始化"
     if type not in ("global", "project"):

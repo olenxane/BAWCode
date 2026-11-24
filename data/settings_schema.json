@@ -30,8 +30,6 @@
     {"key": "ask_user_timeout", "path": "tools.ask_user_timeout", "type": "bool", "label": "询问自动超时", "hint": "←→ 开/关 · 开启后询问框 5 分钟未选择自动跳过", "default": true},
     {"key": "delete_guard", "path": "security.delete_guard", "type": "bool", "label": "删除安全护栏", "hint": "关闭后 shell 删除命令直接执行；delete_file 始终移入项目回收站", "default": true},
     {"key": "strict_delete_guard", "path": "security.strict_delete_guard", "type": "bool", "label": "严格删除护栏", "hint": "开启时拦截 git clean、find -delete、cmd /c、python -c 删除等无法移入回收站的写法；仅在删除护栏开启时生效", "default": true},
-    {"key": "workflow_enabled", "path": "workflow.enabled", "type": "bool", "label": "启用工作流", "hint": "←→ 关=直接对话 · 开=按工作流节点链运行（下一回合生效）", "default": false},
-    {"key": "workflow_active", "path": "workflow.active", "type": "choice", "options": "@workflows", "label": "工作流", "hint": "←→ 选择处理管线（仅在启用工作流时生效）"},
     {"key": "log_level", "path": "log.level", "type": "choice", "options": ["debug", "info", "warn", "error", "关闭"], "label": "日志等级", "hint": "←→ 关闭=不记录任何日志（含写盘）", "default": "info"},
     {"key": "active_model_name", "path": "active_model_id", "type": "choice", "options": "@models", "label": "全局默认模型", "hint": "←→ 非工作流主对话与压缩摘要使用"}
   ],

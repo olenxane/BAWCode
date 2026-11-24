@@ -108,6 +108,8 @@ _ELEVATION_DEF = {
     },
 }
 
+_TERMINAL_STATUSES = frozenset(("done", "error", "interrupted", "max_rounds", "stopped"))
+
 _STATUS_LABELS = {
     "queued": "排队中",
     "running": "运行中",
@@ -295,8 +297,11 @@ def save_role(config, data: dict) -> Tuple[Optional[Path], str]:
 def delete_role(config, name: str) -> Tuple[bool, str]:
     """删除自定义角色文件并热重载；返回 (是否删除, 错误信息)"""
     name = str(name or "").strip()
+    # 与保存同口径：非法名直接拒绝，净化成别的合法名再删会误伤他人角色
     safe = re.sub(r'[\\/:*?"<>|\s]+', "_", name)
-    path = _agents_dir(config) / f"{safe or '0'}.json"
+    if not name or safe != name:
+        return False, f"name 含非法字符或为空: {name!r}"
+    path = _agents_dir(config) / f"{safe}.json"
     if not path.exists():
         return False, f"角色不存在: {name}"
     try:
@@ -768,7 +773,17 @@ def submit_task(rt: dict, record: dict, cfg: dict, directory: Path, record_path:
         name=f"bawcode-subagent-task-{task_id}",
     )
     task["thread"] = thread
-    thread.start()
+    try:
+        thread.start()
+    except Exception as exc:
+        # 启动失败也要落终态并置位 done：否则注册表里留下永久 queued 僵尸，
+        # wait_subagent 无超时等待会悬挂
+        log.error("后台任务 #%s 线程启动失败: %r", task_id, exc)
+        task["status"] = "error"
+        task["summary"] = f"后台线程启动失败: {exc}"
+        record["status"] = "error"
+        _save_record(directory, record)
+        task["done"].set()
     return task
 
 
@@ -1437,7 +1452,7 @@ def _tool_wait_subagent(id: str, timeout: Optional[float] = None) -> str:
     key = _task_key(str(getattr(rt.get("session"), "project_id", "") or ""), str(getattr(rt.get("session"), "session_id", "") or ""), task_id)
     with _TASKS_LOCK:
         task = _TASKS.get(key)
-    if task and status.get("status") not in ("done", "error", "interrupted", "max_rounds"):
+    if task and status.get("status") not in _TERMINAL_STATUSES:
         try:
             wait_seconds = None if timeout is None or float(timeout) < 0 else max(0.0, float(timeout))
         except (TypeError, ValueError):
@@ -1457,7 +1472,7 @@ def _tool_wait_subagent(id: str, timeout: Optional[float] = None) -> str:
             if deadline is not None and time.monotonic() >= deadline:
                 status = task_status(rt["config"], rt.get("session"), task_id) or status
                 return _format_task_progress(status, timed_out=True)
-    if status.get("status") in ("done", "error", "interrupted", "max_rounds"):
+    if status.get("status") in _TERMINAL_STATUSES:
         return str(status.get("summary") or f"子代理 #{task_id} 已结束，状态={status.get('status')}。")
     return _format_task_progress(status, timed_out=True)
 

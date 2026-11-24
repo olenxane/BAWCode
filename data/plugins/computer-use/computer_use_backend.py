@@ -168,13 +168,13 @@ def cu_set_clipboard(text: str) -> None:
     pyperclip.copy(text)
 
 
-# 剪贴板快照跳过的句柄型格式：内容是 GDI 句柄/元文件而非内存块，无法按字节克隆
+# 剪贴板快照跳过的句柄型格式：内容是 GDI 句柄/元文件而非内存块，无法按字节克隆。
+# CF_DIB(8)/CF_DIBV5(17) 是 HGLOBAL 内存块可正常克隆，不在此列
 _CLIP_SKIP_FORMATS = {
     2,   # CF_BITMAP
     3,   # CF_METAFILEPICT
     9,   # CF_PALETTE
     14,  # CF_ENHMETAFILE
-    8,   # CF_DIB（设备相关位图，DIBV5=17 保留）
     128, # CF_OWNERDISPLAY：返回 HWND 非 HGLOBAL，不能按内存块克隆
     129, 130, 131, 142,  # CF_DSP* 私有显示格式
 }
@@ -239,9 +239,12 @@ def cu_clipboard_restore(items) -> bool:
                 ok = False
                 continue
             p = k32.GlobalLock(h)
-            if p:
-                ctypes.memmove(p, data, len(data))
-                k32.GlobalUnlock(h)
+            if not p:
+                k32.GlobalFree(h)
+                ok = False
+                continue
+            ctypes.memmove(p, data, len(data))
+            k32.GlobalUnlock(h)
             if not u32.SetClipboardData(int(fmt), h):
                 k32.GlobalFree(h)
                 ok = False

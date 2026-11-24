@@ -219,6 +219,7 @@ def parse_required_snapshot(text: str) -> Optional[dict]:
 # 会话级记忆单例，由 main 初始化
 _session: Optional["Memory"] = None
 _SESSION_OVERRIDE = threading.local()
+_MEMORY_SESSION_OVERRIDE = threading.local()
 
 
 @contextmanager
@@ -230,6 +231,24 @@ def bind_session(session):
         yield
     finally:
         _SESSION_OVERRIDE.value = previous
+
+
+@contextmanager
+def bind_memory_session(session):
+    """仅给长期记忆工具（write/update/delete_memory）绑定会话：Agent 节点的独立
+    上下文里记忆写目标必须是只读节点会话，不能落到可写的主会话；其他工具（计划/
+    步骤工件等）仍走 get_session 路由到显示会话。"""
+    previous = getattr(_MEMORY_SESSION_OVERRIDE, "value", None)
+    _MEMORY_SESSION_OVERRIDE.value = session
+    try:
+        yield
+    finally:
+        _MEMORY_SESSION_OVERRIDE.value = previous
+
+
+def get_memory_session() -> Optional["Memory"]:
+    """记忆工具的会话解析：线程记忆绑定 > 线程会话绑定 > 全局会话"""
+    return getattr(_MEMORY_SESSION_OVERRIDE, "value", None) or get_session()
 
 
 def init_session(config, project_identity_data: Optional[dict] = None) -> "Memory":
@@ -510,8 +529,10 @@ class Memory:
         self.messages.append(message)
         self._dirty = True
         # message_added 观察链：外部同步/转发方消费（content 可能为多模态数组）；
-        # 处理函数异常已在 hooks 内隔离，处理函数内不得再写会话消息（会递归）
-        hooks.collect_hook("message_added", {"role": role, "content": content, **extra})
+        # 处理函数异常已在 hooks 内隔离，处理函数内不得再写会话消息（会递归）；
+        # 隔离会话（工作流实例/节点上下文）不广播——内部交接内容不是用户消息
+        if not self.memory_readonly:
+            hooks.collect_hook("message_added", {"role": role, "content": content, **extra})
         # 插话与子代理通知不算新用户回合，否则熔断会在回合中途被清零
         if role == "user" and not extra.get("injected"):
             self._compress_noop_fingerprint = ""

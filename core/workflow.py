@@ -135,6 +135,16 @@ def workflow_path(config, name: str) -> Path:
     return workflow_dir(config) / f"{safe or 'default'}.json"
 
 
+def _safe_workflow_name(name) -> Optional[str]:
+    """名称净化校验：净化后与原值不一致或为空 → None（拒绝），否则返回净化名。
+    防止 a/b → a_b 静默覆盖他者，及空名经缺省映射落到 default.json"""
+    raw = str(name or "").strip()
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", raw)
+    if not raw or safe != raw:
+        return None
+    return safe
+
+
 def active_name(config) -> str:
     return str(((getattr(config, "data", None) or {}).get("workflow") or {}).get("active") or "default").strip()
 
@@ -240,9 +250,9 @@ def save_workflow(config, data: dict) -> Tuple[Optional[Path], str]:
     errors = validate_workflow_full(data)
     if errors:
         return None, "；".join(errors)
-    name = str(data.get("name") or "").strip()
-    if not name:
-        return None, "缺少 name"
+    name = _safe_workflow_name(data.get("name"))
+    if name is None:
+        return None, "name 含非法字符或为空（仅允许字母/数字/_-/中文，不能含 \\ / : * ? \" < > |）"
     data = copy.deepcopy(data)
     data["name"] = name
     _normalize_workflow(data)
@@ -260,7 +270,9 @@ def save_workflow(config, data: dict) -> Tuple[Optional[Path], str]:
 
 def delete_workflow(config, name: str) -> Tuple[bool, str]:
     """删除预定义工作流文件；返回 (是否删除, 错误信息)"""
-    name = str(name or "").strip()
+    name = _safe_workflow_name(name)
+    if name is None:
+        return False, "name 非法或为空"
     path = workflow_path(config, name)
     if not path.exists():
         return False, f"工作流不存在: {name}"
@@ -277,41 +289,36 @@ def builtin_agents() -> List[dict]:
     return [{"id": aid, "description": desc, "builtin": True} for aid, desc in BUILTIN_AGENTS.items()]
 
 
-def load_workflow(config, name: Optional[str] = None) -> dict:
-    """读取工作流 JSON；缺失/损坏 → 告警并回退内置默认（保证回合可跑）"""
+def load_workflow_strict(config, name: Optional[str] = None) -> Tuple[Optional[dict], str]:
+    """按名读取并校验工作流：任何失败返回 (None, 错误信息)，绝不静默回落。
+    供调用方显式指定工作流的入口（workflow 工具等）——坏文件必须报错而非
+    偷换成默认链还以原名执行。"""
     name = str(name or active_name(config)).strip() or "default"
     path = workflow_path(config, name)
     if not path.exists():
-        log.warn("工作流文件不存在: %s，使用内置默认工作流", path)
-        data = copy.deepcopy(DEFAULT_WORKFLOW)
-        data["name"] = name
-        return data
+        return None, f"工作流文件不存在: {path.name}"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
-        log.warn("工作流读取/解析失败 %s: %s，使用内置默认工作流", path, e)
-        data = copy.deepcopy(DEFAULT_WORKFLOW)
-        data["name"] = name
-        return data
-    errors = validate_workflow(data)
+        return None, f"工作流 {name} 读取/解析失败: {e}"
+    errors = validate_workflow(data) + _agent_ref_errors(data)
     if errors:
-        for err in errors:
-            log.warn("工作流校验失败 %s: %s", path, err)
-        log.warn("工作流 %s 不合法，使用内置默认工作流", name)
-        fallback = copy.deepcopy(DEFAULT_WORKFLOW)
-        fallback["name"] = name
-        return fallback
-    agent_errors = _agent_ref_errors(data)
-    if agent_errors:
-        for err in agent_errors:
-            log.warn("工作流校验失败 %s: %s", path, err)
-        log.warn("工作流 %s 引用了不存在的 Agent，使用内置默认工作流", name)
-        fallback = copy.deepcopy(DEFAULT_WORKFLOW)
-        fallback["name"] = name
-        return fallback
+        return None, f"工作流 {name} 校验失败: " + "；".join(errors)
     data["name"] = str(data.get("name") or name)
-    _normalize_workflow(data)  # 规范化节点：补 id、enabled 缺省（宽松读取）
-    return data
+    _normalize_workflow(data)
+    return data, ""
+
+
+def load_workflow(config, name: Optional[str] = None) -> dict:
+    """读取工作流 JSON；缺失/损坏 → 告警并回退内置默认（保证回合可跑）"""
+    name = str(name or active_name(config)).strip() or "default"
+    data, err = load_workflow_strict(config, name)
+    if data is not None:
+        return data
+    log.warn("工作流 %s 不可用（%s），使用内置默认工作流", name, err or "未知原因")
+    fallback = copy.deepcopy(DEFAULT_WORKFLOW)
+    fallback["name"] = name
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +555,11 @@ def _exec_plan(node: dict, turn: TurnContext) -> None:
     if node.get("steps", True):
         # 步骤拆解归口主 LLM：execute 节点据该标记注入启动指令，经 generate_steps 工具落库
         turn.captured["steps_kickoff"] = "1"
+    # 确认后的计划正文写回节点会话：节点产出经 _final_text 纳入交接，后续 Agent
+    # 节点（execute 等）在独立上下文才能拿到计划全文而非只见"计划确认"
+    plan_text = str(ds.plan.get("content") or "").strip()
+    if plan_text:
+        session.add_message("assistant", plan_text)
     # 收尾消息附带 plan 快照（extras 不进 API）：会话树在该消息时间线位置渲染冻结的
     # 计划节点（core/ui.py._snapshot_nodes）；步骤不在此快照——由后续 generate_steps
     # 工具调用在时间线上以独立节点呈现
@@ -777,7 +789,13 @@ def _node_task_text(turn: TurnContext, node: dict, agent_id: str, spec: Optional
     if is_builtin:
         task = ""
     else:
-        task = str(node.get("prompt") or "").strip()
+        task = prompt_loader.render_text(str(node.get("prompt") or ""), variables).strip()
+        if not task and node.get("prompt_files"):
+            files = node.get("prompt_files")
+            if isinstance(files, str):
+                files = [files]
+            segs = prompt_loader.load_prompt_bundle([str(f) for f in files], variables, config=turn.config)
+            task = prompt_loader.join_segments(segs).strip()
         if not task:
             task = prompt_loader.render_text(str((spec or {}).get("task_prompt") or ""), variables).strip()
     sections = []
@@ -894,7 +912,10 @@ def _run_node(node: dict, turn: TurnContext) -> None:
         if runner is None:  # 角色表加载晚于校验的兜底（理论不发生）
             log.warn("Agent 角色缺失，跳过节点: id=%s agent=%s", node.get("id"), agent_id)
             return
-        runner(node, node_turn)
+        # 记忆工具绑到节点只读会话：Agent 上下文里 write/update/delete_memory 一律
+        # 落到 readonly 目标被拒，不会污染主会话长期记忆（其他会话级工具仍走 ds）
+        with memory_mod.bind_memory_session(session):
+            runner(node, node_turn)
     finally:
         messages = list(session.messages)
         final = _final_text(messages)
@@ -929,12 +950,21 @@ def run_workflow(workflow: dict, turn: TurnContext) -> str:
         ensure_system_prompt(turn)  # 默认注入 config.prompt.system_files
     # 技能注入线程作用域：skill 节点的 set_injection 只改本回合/本实例，链结束自动还原
     with skills_mod.bind_thread_injection():
-        for node in nodes:
-            check_cancel(turn)
-            if not node.get("enabled", True):
-                log.debug("节点已停用，跳过: %s", node.get("id"))
-                continue
-            _run_node(node, turn)
+        try:
+            for node in nodes:
+                check_cancel(turn)
+                if not node.get("enabled", True):
+                    log.debug("节点已停用，跳过: %s", node.get("id"))
+                    continue
+                _run_node(node, turn)
+        except TurnStop:
+            # 节点致命错误上浮到本回合的失败标志：无头 --json/error_fatal 等
+            # 回合级消费方只看 turn.last_error/turn_failed，不能漏掉节点错误
+            err = str(turn.captured.get("node_error") or "").strip()
+            if err:
+                turn.last_error = err
+                turn.turn_failed = True
+            raise
     return "complete"
 
 
@@ -1073,7 +1103,8 @@ def _run_workflow_turn(task: dict, record: dict, wf_llm) -> Tuple[str, str]:
         wf = load_workflow(config, name)
     project_identity = getattr(task.get("session"), "project_identity", None)
     session = memory_mod.Memory(config, project_identity=project_identity, isolated=True)
-    session.session_id = f"wf-{task['id']}-{name}"
+    # 实例 id 按源会话分配会重号：存档路径带源会话 id，不同源会话的同名工作流不互相覆盖
+    session.session_id = f"wf-{task.get('session_id') or 'x'}-{task['id']}-{name}"
     session.sessions_dir = _wf_runs_dir(config) / str(task.get("project_id") or "_default")
     task["runtime"]["wf_session"] = session
     prompt = str(record.get("task") or "")
@@ -1287,7 +1318,15 @@ def submit_workflow_instance(rt: dict, name: str, prompt: str, workflow_def: Opt
         name=f"bawcode-workflow-{task_id}",
     )
     task["thread"] = thread
-    thread.start()
+    try:
+        thread.start()
+    except Exception as exc:
+        log.error("工作流实例 #%s 线程启动失败: %r", task_id, exc)
+        subagent_mod.update_task(task, status="error", phase="启动失败")
+        record["status"] = "error"
+        record["summary"] = f"后台线程启动失败: {exc}"
+        subagent_mod.save_record(directory, record)
+        task["done"].set()
     return task
 
 
@@ -1321,7 +1360,7 @@ def _resolve_tool_workflow(rt: dict, name: str, nodes: Any) -> Tuple[Optional[di
         )
     if name_text not in available:
         return None, f"工作流不存在: {name_text}。可用: {', '.join(available) or '（无）'}"
-    return load_workflow(config, name_text), ""
+    return load_workflow_strict(config, name_text)
 
 
 def _chain_final_output(turn: TurnContext, session) -> str:
@@ -1343,6 +1382,9 @@ def _run_foreground(rt: dict, wf: dict, prompt_text: str) -> str:
     turn = TurnContext(session=session, llm=llm, app=rt.get("app"), config=rt["config"], user_text=prompt_text, io=io)
     if not turn.system_prompt_text:
         ensure_system_prompt(turn)
+    # 前台跑在外层 workflow 工具调用内部：节点输出若落成普通 assistant 消息会插到
+    # tool_calls 与其 tool 结果之间破坏配对，最终输出随工具结果返回即可
+    turn.skip_standalone_final = True
     _FG_ACTIVE.on = True
     try:
         run_workflow(wf, turn)

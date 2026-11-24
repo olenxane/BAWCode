@@ -526,12 +526,13 @@ def load_allowlist(root: Optional[Path] = None) -> Dict[str, list]:
         if isinstance(data, dict) and isinstance(data.get("rules"), list):
             # 存量清洗一：路径类工具的工具级通配（如 write|*）放行范围无界，加载即剔除
             # 存量清洗二：computer_use 指纹已改 action 分段（旧格式 computer_use|<16hex>
-            # 永不复配且永不清理），通配 computer_use|* 仍命中故保留
+            # 永不复配且永不清理）；computer_use|* 通配会架空 action 级门禁——连 click/
+            # type 都直接放行，与路径通配同级别的无界风险，一并剔除
             def _keep(r) -> bool:
                 tool, fp = r.get("tool"), r.get("fingerprint") or ""
                 if tool in PATH_TOOLS and fp == f"{tool}|*":
                     return False
-                if tool == "computer_use" and fp.startswith("computer_use|") and fp.count("|") == 1 and fp != "computer_use|*":
+                if tool == "computer_use" and fp.startswith("computer_use|") and fp.count("|") <= 1:
                     return False
                 return True
 

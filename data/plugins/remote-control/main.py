@@ -2023,7 +2023,7 @@ def setup(ctx: PluginContext):
                 except Exception as exc:
                     if urlparse(getattr(self, "path", "")).path == "/api/events":
                         raise  # SSE 自管响应流，补发 500 会破坏流式语义
-                    ctx.log.warn("GET %s 处理异常: %r", getattr(self, "path", "?"), exc)
+                    ctx.log.warn("GET %s 处理异常: %r", urlparse(getattr(self, "path", "")).path, exc)
                     try:
                         self._json(500, {"ok": False, "message": f"服务器内部错误: {type(exc).__name__}"})
                     except Exception:
@@ -2195,7 +2195,7 @@ def setup(ctx: PluginContext):
                 try:
                     self._route_post()
                 except Exception as exc:
-                    ctx.log.warn("POST %s 处理异常: %r", getattr(self, "path", "?"), exc)
+                    ctx.log.warn("POST %s 处理异常: %r", urlparse(getattr(self, "path", "")).path, exc)
                     try:
                         self._json(500, {"ok": False, "message": f"服务器内部错误: {type(exc).__name__}"})
                     except Exception:

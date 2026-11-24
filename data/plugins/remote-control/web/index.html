@@ -2274,8 +2274,9 @@ function openWorkflowModal(item) {
         if (p) base.prompt = p;
         const mr = parseInt(roundsInp.value, 10);
         if (Number.isFinite(mr) && mr > 0) base.max_rounds = mr;
-        // 保留编辑器未覆盖的字段（capture/model_role/prompt_files 等），编排不丢配置
-        for (const k of ["capture", "override_system", "model", "model_role", "prompt_files", "retry_times", "confirm", "steps", "default_level"]) {
+        // 保留编辑器未覆盖的字段，编排不丢配置；id 必须保留——缺失会导致保存时
+        // 全部节点重排为 n1..nN，破坏节点轨迹与外部引用
+        for (const k of ["id", "capture", "override_system", "model", "model_role", "prompt_files", "retry_times", "confirm", "steps", "default_level"]) {
           if (src[k] !== undefined) base[k] = src[k];
         }
         return base;

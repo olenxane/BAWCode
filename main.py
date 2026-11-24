@@ -316,6 +316,9 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
             runner.discard_pending_turn()
         sess.save_session()
         sess.switch_to(data)
+        # 待命工作流绑定的是旧会话的任务语境：换会话必须清，否则新会话首条消息被劫持
+        sess.pending_workflow = ""
+        sess.pending_workflow_data = None
         ctx["app"]._tree_follow_tail = True  # 切换后贴底显示恢复的消息
         ctx["app"].status = f"已切换: {memory_mod.Memory._clip_title(sess.session_title or sess.session_id)}"
         return True
@@ -328,6 +331,8 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
             runner.discard_pending_turn()
         sess.save_session()
         sess.start_new_session()
+        sess.pending_workflow = ""
+        sess.pending_workflow_data = None
         ctx["app"].task = ""
         ctx["app"].status = "新会话已开启"
         return True
@@ -342,6 +347,8 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
                 return True
         else:
             cleanup = ctx["session"].clear()
+        ctx["session"].pending_workflow = ""
+        ctx["session"].pending_workflow_data = None
         ctx["app"].task = ""
         ctx["app"].status = "会话已清空"
         if cleanup and not cleanup.get("ok"):
@@ -804,7 +811,9 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
             available = ", ".join(workflow_mod.list_workflows(ctx["config"])) or "（无）"
             _echo(ctx, f"未找到工作流: {name}\n可用: {available}")
             return True
+        # 重新指定待命前先清掉旧的临时定义：否则 wf_def 优先判定会跑错工作流
         ctx["session"].pending_workflow = name
+        ctx["session"].pending_workflow_data = None
         if prompt:
             # 带参直跑：待命 + 立即执行。有 runner 时一律走后台线程（帧循环继续服务交互
             # 弹窗；主线程内联跑回合会令 plan 确认菜单无人服务，且与在途回合并发写会话）；
@@ -813,6 +822,7 @@ def _register_commands(llm: LLM, session, config: Config, app) -> None:
             if runner is not None:
                 if runner.busy or not runner.start(prompt):
                     ctx["session"].pending_workflow = ""
+                    ctx["session"].pending_workflow_data = None
                     _echo(ctx, "回合进行中：工作流未启动（请等当前回合结束或停止后再试）")
                     return True
                 ctx["app"].status = f"工作流 {name} · 执行中"
@@ -1491,9 +1501,15 @@ def _agent_turn_impl(llm: LLM, session, user_text: str, app, runner=None) -> Non
                 log.warn("待命工作流不存在: %s，回退直接对话", wf_name)
                 loop_mod.run_direct(turn)
             else:
-                wf = workflow_mod.load_workflow(llm.config, wf_name)
-                log.info("工作流待命执行: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
-                workflow_mod.run_workflow(wf, turn)
+                wf, load_err = workflow_mod.load_workflow_strict(llm.config, wf_name)
+                if wf is None:
+                    # 显式待命的工作流坏了不能静默换默认链跑——回直接对话并报原因
+                    session.add_message("system", f"{load_err}，本次按直接对话执行。", type="help")
+                    log.warn("待命工作流不可用: %s", load_err)
+                    loop_mod.run_direct(turn)
+                else:
+                    log.info("工作流待命执行: %s（%d节点）", wf.get("name"), len(wf.get("nodes") or []))
+                    workflow_mod.run_workflow(wf, turn)
         else:
             loop_mod.run_direct(turn)
     except loop_mod.TurnInterrupt:
@@ -2005,6 +2021,7 @@ class _HeadlessApp:
         self._tree_follow_tail = True
         self.tool_count = 0
         self.ui_requests: list = []
+        self._ui_req = None
         self.config = None
         self.usage_statistics: Optional["statistics_mod.UsageStatistics"] = None
         self.agent_runner = None
@@ -2031,13 +2048,17 @@ class _HeadlessApp:
 
     def request_ui(self, kind: str, payload: dict) -> dict:
         self.ui_requests.append((kind, payload or {}))
-        return {
+        req = {
             "kind": kind,
             "payload": payload or {},
             "result": self._auto_answer(kind, payload or {}),
             "event": threading.Event(),
             "served": True,
         }
+        # 无头下请求立即自动应答：占槽 + 置位 event，与 TUI 路径的等待循环同构
+        self._ui_req = req
+        req["event"].set()
+        return req
 
     @staticmethod
     def _auto_answer(kind: str, payload: dict):
