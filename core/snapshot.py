@@ -38,6 +38,7 @@ _SNAPSHOT_DEFAULTS = {
     "max_file_bytes": 20 * 1024 * 1024,
     "inventory_max_files": 50000,
     "inventory_max_seconds": 32.0,
+    "gc_days": 30,
 }
 
 # 单回合字节留底总量上限（与单文件上限并存，防大量小文件把磁盘写爆）
@@ -84,6 +85,7 @@ def snapshot_cfg(config) -> dict:
         data["inventory_max_seconds"] = max(0.0, float(data.get("inventory_max_seconds", 32.0)))
     except (TypeError, ValueError):
         data["inventory_max_seconds"] = 32.0
+    data["gc_days"] = max(0, _int(data.get("gc_days"), 30))
     return data
 
 
@@ -602,6 +604,94 @@ def _prune_old_turns(cfg: dict, project_id: str, session_id: str, keep: int) -> 
     seq_dirs = sorted((c for c in base.iterdir() if c.is_dir() and c.name.isdigit()), key=lambda c: int(c.name))
     for child in seq_dirs[:-keep] if len(seq_dirs) > keep else []:
         shutil.rmtree(child, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 启动回收：快照目录按最后活跃时间过期
+
+
+def gc(config) -> dict:
+    """启动时回收过期回合快照：每个会话目录取 max(会话json mtime, 快照目录mtime)
+    为最后活跃时间，超 gc_days 天整目录删除；gc_days=0 禁用。异常不阻塞启动。
+
+    双信号兜底孤儿目录：会话文件被删后无 json 可参照，回落到快照目录自身
+    mtime（末次落盘时间）；反向场景（会话活跃但快照目录更旧）不会误删。
+    """
+    result = {"removed": 0, "freed_bytes": 0}
+    try:
+        cfg = snapshot_cfg(config)
+        days = _int(cfg.get("gc_days"), 0)
+        if days <= 0:
+            return result
+        from core import session_store
+
+        root = _base_dir(cfg, "dir")
+        if not root.is_dir():
+            return result
+        cutoff = time.time() - days * 86400
+        for project_dir in list(root.iterdir()):
+            if not project_dir.is_dir():
+                continue
+            sessions_root = session_store.sessions_dir(config, project_dir.name)
+            for sid_dir in list(project_dir.iterdir()):
+                try:
+                    if sid_dir.is_symlink():
+                        if sid_dir.lstat().st_mtime < cutoff:
+                            sid_dir.unlink()
+                            result["removed"] += 1
+                        continue
+                    if not sid_dir.is_dir():
+                        continue
+                    session_file = sessions_root / f"{sid_dir.name}.json"
+                    last_active = sid_dir.stat().st_mtime
+                    if session_file.is_file():
+                        last_active = max(last_active, session_file.stat().st_mtime)
+                    if last_active < cutoff:
+                        shutil.rmtree(sid_dir, ignore_errors=True)
+                        result["removed"] += 1
+                        log.info("快照回收：会话 %s/%s 过期（最后活跃 %.0f 天前），目录已删除",
+                                 project_dir.name, sid_dir.name,
+                                 (time.time() - last_active) / 86400)
+                except OSError as exc:
+                    log.warn("快照回收失败 %s: %s", sid_dir, exc)
+    except Exception as exc:
+        log.warn("快照回收异常（忽略）: %r", exc)
+    if result["removed"]:
+        log.info("快照启动回收完成：%d 个过期会话目录已删除", result["removed"])
+    return result
+
+
+def ensure_resume_baseline(config, project_id: str, session_id: str) -> Optional[Path]:
+    """恢复的会话无任何回合快照时合成 0001 基线索引（files 为空），
+    使过期清理后恢复的会话仍有一个"恢复时刻"的 /undo 锚点。
+    已有快照（含非数字目录如子代理任务目录）时不动作；异常吞掉返回 None。"""
+    try:
+        cfg = snapshot_cfg(config)
+        if not cfg.get("enabled"):
+            return None
+        base = _snapshots_dir(cfg, project_id, session_id)
+        if base.is_dir() and any(c.is_dir() and c.name.isdigit() for c in base.iterdir()):
+            return None
+        seq_dir = base / "0001"
+        index = {
+            "version": 2,
+            "seq": 1,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "task": "（恢复基线：过期快照已清理，以此为还原锚点）",
+            "task_messages": [],
+            "turn_id": "",
+            "session_id": str(session_id or ""),
+            "revision": 0,
+            "msg_index": -1,
+            "files": [],
+            "external_changes": [],
+        }
+        _atomic_write_bytes(seq_dir / "index.json", json.dumps(index, ensure_ascii=False, indent=1).encode("utf-8"))
+        log.info("恢复基线快照已建立: %s", seq_dir)
+        return seq_dir
+    except OSError as exc:
+        log.warn("恢复基线快照建立失败: %r", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------

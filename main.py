@@ -2115,6 +2115,7 @@ def main_headless(args) -> int:
     session = memory_mod.init_session(config, project_identity_data=identity)
     tools_mod.webfetch_gc()
     pasteboard_mod.gc_temp_images()
+    snapshot_mod.gc(config)  # 启动回收 data/snapshots 过期会话快照（snapshot.gc_days 天封顶）
     llm = LLM(config)
     session.set_llm_fn(memory_mod.summary_llm_fn(llm))
     session.set_context_reset(llm.meter.reset_context)
@@ -2223,6 +2224,7 @@ def main(args=None) -> None:
     session = memory_mod.init_session(config, project_identity_data=identity)
     tools_mod.webfetch_gc()
     pasteboard_mod.gc_temp_images()  #启动回收data/temp过期剪贴板图片（7 天封顶）
+    snapshot_mod.gc(config)  #启动回收 data/snapshots 过期会话快照（snapshot.gc_days 天封顶）
     llm = LLM(config)
     session.set_llm_fn(memory_mod.summary_llm_fn(llm))
     session.set_context_reset(llm.meter.reset_context)

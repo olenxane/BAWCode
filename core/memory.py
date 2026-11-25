@@ -2241,6 +2241,14 @@ class Memory:
         steps = data.get("steps")
         self.steps = list(steps) if isinstance(steps, list) else []
         toolstore.ledger_reset()  # 台账不跨会话：resume 后首次 edit 需重新 read（安全优先）
+        try:
+            from core import snapshot as snapshot_mod  # 惰性导入避免循环依赖
+
+            snapshot_mod.ensure_resume_baseline(
+                self.config, self.project_id, self.session_id
+            )  # 过期快照被回收的会话补 0001 恢复锚点
+        except Exception as exc:
+            log.warn("恢复基线快照建立失败: %r", exc)
         if callable(self._context_reset):
             self._context_reset()
         self._reset_system_prompt_cache()
