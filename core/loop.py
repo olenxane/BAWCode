@@ -131,9 +131,9 @@ def drain_injections(turn: TurnContext) -> int:
 def ensure_system_prompt(turn: TurnContext, files=None) -> None:
     """注入系统提示词：写入 turn.system_prompt_text，会话无 system_prompt 记录时补一条两段式（core + environment 目录动态拼装 + 记忆占位符），会话首次生成后按 files
     缓存于 session——记忆在会话初始化时读入并固定，本会话后续回合不再重读/刷新；新会话随新 session 对象自然重建。
-    主对话（files=None）跟随激活人格：缓存键取解析后的文件清单，切换人格后下一回合自动重建注入。"""
+    主对话（files=None）跟随选中的系统提示词：缓存键取解析后的文件清单，切换提示词后下一回合自动重建注入。"""
     if files is None:
-        files = prompt_loader.persona_files(turn.config) or []
+        files = prompt_loader.active_system_prompt_files(turn.config) or []
     cache_key = tuple(files)
     cache = getattr(turn.session, "system_prompt_cache", None)
     parts_cache = getattr(turn.session, "system_prompt_parts_cache", None)

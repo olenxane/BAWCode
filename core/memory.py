@@ -381,6 +381,8 @@ class Memory:
         if not isolated:
             self._migrate_legacy_json()
             self.migrate_legacy_memory_files()
+            # 系统提示词库初始化与旧人格迁移（含 memory/global/Persona.md 移出记忆注入）
+            prompt_loader.ensure_system_prompt_library(config)
         self.ensure_memory_notice()
         log.info(
             "记忆会话已初始化: Agent.md=%s 项目记忆=%s 自动压缩=%s 阈值=%.0f%%",

@@ -80,10 +80,10 @@ def dynamic_options(source: str, config) -> List[Any]:
         return list(shells.SHELL_NAMES)
     if source == "@models":
         return config.list_model_names() or [config.model_name]
-    if source == "@personas":
+    if source in ("@system_prompts", "@personas"):
         from core import prompt_loader
 
-        return ["默认"] + [p["name"] for p in prompt_loader.list_personas(config)]
+        return ["默认"] + [p["name"] for p in prompt_loader.list_system_prompt_files(config)]
     log.warn("未知的设置选项动态源: %s", source)
     return []
 
@@ -181,8 +181,9 @@ def _read_log_level(config):
     return level if level in LOG_LEVELS else "info"
 
 
-def _read_persona(config):
-    name = str(((config.data or {}).get("prompt") or {}).get("active_persona") or "").strip()
+def _read_system_prompt(config):
+    pc = (config.data or {}).get("prompt") or {}
+    name = str(pc.get("active_system_prompt") or pc.get("active_persona") or "").strip()
     return name or "默认"
 
 
@@ -190,7 +191,7 @@ special_read: Dict[str, Callable] = {
     "mode": _read_mode,
     "active_model_name": _read_active_model,
     "log_level": _read_log_level,
-    "persona": _read_persona,
+    "system_prompt": _read_system_prompt,
 }
 
 
@@ -236,16 +237,16 @@ def _write_default_shell(config, raw) -> bool:
     return True
 
 
-def _write_persona(config, raw) -> bool:
+def _write_system_prompt(config, raw) -> bool:
     raw = str(raw or "").strip()
     if not raw or raw == "默认":
-        config.data.setdefault("prompt", {})["active_persona"] = ""
+        config.data.setdefault("prompt", {})["active_system_prompt"] = ""
         return True
     from core import prompt_loader
 
-    if raw not in {p["name"] for p in prompt_loader.list_personas(config)}:
+    if raw not in {p["name"] for p in prompt_loader.list_system_prompt_files(config)}:
         return False
-    config.data.setdefault("prompt", {})["active_persona"] = raw
+    config.data.setdefault("prompt", {})["active_system_prompt"] = raw
     return True
 
 
@@ -255,5 +256,5 @@ special_write: Dict[str, Callable] = {
     "log_level": _write_log_level,
     "active_model_name": _write_active_model,
     "default_shell": _write_default_shell,
-    "persona": _write_persona,
+    "system_prompt": _write_system_prompt,
 }

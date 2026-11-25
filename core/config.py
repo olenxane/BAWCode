@@ -69,10 +69,10 @@ def default_config() -> dict:
             "dir": "core/prompts",
             "system_files": ["system_prompt.md"],
             "plan_files": ["plan.md"],
-            # 人格库：personas_dir 下 *.md（整文件=core 段人格正文，支持 ^{var}^ 占位符）；
-            # active_persona 为文件名去后缀，空=内置 system_prompt.md，切换后下一回合重新注入
-            "personas_dir": "data/personas",
-            "active_persona": "",
+            # 提示词库：system_prompt_dir 下 *.md（整文件=core 段系统提示词，支持 ^{var}^ 占位符）；
+            # active_system_prompt 为文件名去后缀，空=内置模板，切换后下一回合重新注入
+            "system_prompt_dir": "data/system_prompt",
+            "active_system_prompt": "",
         },
         "system": {"font_size": 16},
         "security": {"delete_guard": True, "strict_delete_guard": True},
@@ -636,6 +636,18 @@ class Config:
         for name in ("read", "edit_file", "write"):
             if name not in whitelist:
                 whitelist.append(name)
+        # 旧人格库键位迁移：active_persona→active_system_prompt（新键已非空则旧值作废）；
+        # personas_dir 仅作 ensure_system_prompt_library 的迁移来源保留，自定义目录改挂 system_prompt_dir
+        prompt_cfg = self.data.get("prompt")
+        if isinstance(prompt_cfg, dict):
+            if "active_persona" in prompt_cfg:
+                if not prompt_cfg.get("active_system_prompt"):
+                    prompt_cfg["active_system_prompt"] = str(prompt_cfg.get("active_persona") or "")
+                prompt_cfg.pop("active_persona", None)
+            if "system_prompt_dir" not in prompt_cfg:
+                old_dir = str(prompt_cfg.pop("personas_dir", "") or "")
+                if old_dir and old_dir != "data/personas":
+                    prompt_cfg["system_prompt_dir"] = old_dir
 
     def providers(self) -> List[dict]:
         return list(self.data.get("providers") or [])

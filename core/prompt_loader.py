@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ log = get_logger("prompt_loader")
 
 _ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PROMPT_DIR = _ROOT / "core" / "prompts"
+DEFAULT_SYSTEM_PROMPT_DIR = _ROOT / "data" / "system_prompt"
+DEFAULT_SYSTEM_FILE = "system_prompt.md"
 PLACEHOLDER_RE = re.compile(r"\^\{([a-zA-Z_][a-zA-Z0-9_]*)\}\^")
 
 
@@ -51,22 +54,75 @@ def _prompt_files(config, key: str, default: List[str]) -> List[str]:
 
 
 def system_prompt_files(config=None) -> List[str]:
-    return _prompt_files(config, "system_files", ["system_prompt.md"])
+    return _prompt_files(config, "system_files", [DEFAULT_SYSTEM_FILE])
 
 
-def personas_dir(config=None) -> Path:
-    """人格库目录：config.prompt.personas_dir，缺省 data/personas"""
+def system_prompt_dir(config=None) -> Path:
+    """系统提示词库目录：config.prompt.system_prompt_dir（兼容旧 personas_dir），缺省 data/system_prompt"""
+    rel = "data/system_prompt"
     if config is not None:
-        rel = ((config.data or {}).get("prompt") or {}).get("personas_dir") or "data/personas"
-        p = Path(rel)
-        return p if p.is_absolute() else _ROOT / rel
-    return _ROOT / "data" / "personas"
+        pc = (config.data or {}).get("prompt") or {}
+        rel = pc.get("system_prompt_dir") or pc.get("personas_dir") or rel
+    p = Path(rel)
+    return p if p.is_absolute() else _ROOT / rel
 
 
-def list_personas(config=None) -> List[dict]:
-    """扫描人格库：[{name(文件名去后缀), description(首个一级标题，无则空)}]，按文件名排序；
-    描述只读文件头部 2KB（人格正文可能很长，标题总在开头）"""
-    base = personas_dir(config)
+def ensure_system_prompt_library(config=None) -> Path:
+    """初始化提示词库目录并做一次性迁移，返回目录。
+
+    - 目录缺失则创建；内置模板拷入为 system_prompt.md（用户可直接编辑的默认样本）
+    - 旧 data/personas/*.md 拷入（同名单文件已存在则跳过，不覆盖用户内容）
+    - 旧 data/memory/global/Persona.md 移入（移走后不再随全局记忆拼进系统提示词）；
+      目标已存在时不强迁，避免两个 Persona.md 语义混淆
+    幂等，可每会话安全调用。"""
+    base = system_prompt_dir(config)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warn("系统提示词目录创建失败 %s: %s", base, e)
+        return base
+    builtin = prompt_dir(config) / DEFAULT_SYSTEM_FILE
+    target = base / DEFAULT_SYSTEM_FILE
+    if builtin.is_file() and not target.exists() and builtin.resolve() != target.resolve():
+        try:
+            shutil.copy2(builtin, target)
+            log.info("内置默认提示词已拷入提示词库: %s", target)
+        except OSError as e:
+            log.warn("默认提示词拷入失败 %s: %s", target, e)
+    legacy_dir = ((config.data or {}).get("prompt") or {}).get("personas_dir") if config is not None else None
+    legacy = Path(legacy_dir) if legacy_dir else _ROOT / "data" / "personas"
+    if not legacy.is_absolute():
+        legacy = _ROOT / legacy
+    try:
+        same_dir = legacy.resolve() == base.resolve()
+    except OSError:
+        same_dir = False
+    if legacy.is_dir() and not same_dir:
+        for src in sorted(legacy.glob("*.md")):
+            dst = base / src.name
+            if dst.exists():
+                continue
+            try:
+                shutil.copy2(src, dst)
+                log.info("旧人格库提示词迁入: %s -> %s", src.name, dst)
+            except OSError as e:
+                log.warn("人格文件迁移失败 %s: %s", src, e)
+    persona_src = memory_paths(config)["agent_md"].parent / "global" / "Persona.md"
+    persona_dst = base / "Persona.md"
+    if persona_src.is_file() and not persona_dst.exists():
+        try:
+            # shutil.move 支持跨盘（os.replace 只限同卷）
+            shutil.move(str(persona_src), str(persona_dst))
+            log.info("记忆中的 Persona.md 已迁入提示词库: %s", persona_dst)
+        except OSError as e:
+            log.warn("Persona.md 迁移失败 %s: %s", persona_src, e)
+    return base
+
+
+def list_system_prompt_files(config=None) -> List[dict]:
+    """扫描提示词库：[{name(文件名去后缀), description(首个一级标题，无则空)}]，按文件名排序；
+    描述只读文件头部 2KB（提示词正文可能很长，标题总在开头）"""
+    base = system_prompt_dir(config)
     if not base.is_dir():
         return []
     out: List[dict] = []
@@ -86,21 +142,23 @@ def list_personas(config=None) -> List[dict]:
     return out
 
 
-def persona_files(config=None) -> Optional[List[str]]:
-    """激活人格的文件清单（绝对路径，供 load_prompt_bundle 直载）；
-    未激活/文件缺失返回 None（回退内置 system_prompt.md）。
-    active_persona 来自 config（可手改），拒绝带路径分隔符的名字防指向人格库之外"""
+def active_system_prompt_files(config=None) -> Optional[List[str]]:
+    """选中系统提示词的文件清单（绝对路径，供 load_prompt_bundle 直载）；
+    未选中/文件缺失返回 None（回退内置 system_prompt.md）。
+    active_system_prompt 来自 config（可手改，兼容旧键 active_persona），
+    拒绝带路径分隔符的名字防指向提示词库之外"""
     if config is None:
         return None
-    name = str(((config.data or {}).get("prompt") or {}).get("active_persona") or "").strip()
+    pc = (config.data or {}).get("prompt") or {}
+    name = str(pc.get("active_system_prompt") or pc.get("active_persona") or "").strip()
     if not name:
         return None
     if "/" in name or "\\" in name or name in (".", ".."):
-        log.warn("人格名含非法路径字符: %r，回退默认系统提示词", name)
+        log.warn("提示词名含非法路径字符: %r，回退默认系统提示词", name)
         return None
-    p = personas_dir(config) / f"{name}.md"
+    p = system_prompt_dir(config) / f"{name}.md"
     if not p.is_file():
-        log.warn("人格 %s 文件缺失（%s），回退默认系统提示词", name, p)
+        log.warn("系统提示词 %s 文件缺失（%s），回退默认提示词", name, p)
         return None
     return [str(p)]
 
