@@ -12,6 +12,7 @@ class UsageStatistics:
         self.path = Path(path) if path else Path(__file__).resolve().parent.parent / "data" / "stat.json"
         self._lock = threading.RLock()
         self._data = self._load()
+        self._tool_events_since_save = 0
 
     def _load(self) -> dict:
         try:
@@ -21,10 +22,21 @@ class UsageStatistics:
                 data.setdefault("dialogs", {})
                 data.setdefault("models", {})
                 data.setdefault("total_tokens", 0)
+                tools = data.setdefault("tools", {})
+                if not isinstance(tools, dict):
+                    tools = data["tools"] = {}
+                tools.setdefault("calls", 0)
+                tools.setdefault("failures", 0)
+                tools.setdefault("duration_seconds", 0.0)
+                tools.setdefault("outcomes", {})
+                tools.setdefault("by_name", {})
                 return data
         except (OSError, ValueError, TypeError):
             pass
-        return {"version": 1, "total_tokens": 0, "daily_starts": {}, "dialogs": {}, "models": {}}
+        return {
+            "version": 1, "total_tokens": 0, "daily_starts": {}, "dialogs": {}, "models": {},
+            "tools": {"calls": 0, "failures": 0, "duration_seconds": 0.0, "outcomes": {}, "by_name": {}},
+        }
 
     def _save(self) -> None:
         temp: Optional[Path] = None
@@ -47,6 +59,52 @@ class UsageStatistics:
             starts = self._data["daily_starts"]
             starts[key] = int(starts.get(key, 0)) + 1
             self._save()
+
+    def flush(self) -> None:
+        """立即写出累计数据；record_tool 每累计 32 次也会自动落盘一次"""
+        with self._lock:
+            self._save()
+            self._tool_events_since_save = 0
+
+    def record_tool(self, name: str, elapsed: float = 0.0, outcome: str = "ok") -> None:
+        """累计工具执行结果；outcome 为 ok 之外的值时计为失败"""
+        name = str(name or "unknown")
+        outcome = str(outcome or "ok")
+        try:
+            seconds = max(0.0, float(elapsed or 0.0))
+        except (TypeError, ValueError):
+            seconds = 0.0
+        with self._lock:
+            tools = self._data.setdefault("tools", {})
+            for key, default in (
+                ("calls", 0), ("failures", 0), ("duration_seconds", 0.0),
+                ("outcomes", {}), ("by_name", {}),
+            ):
+                if key not in tools or not isinstance(tools.get(key), type(default)):
+                    tools[key] = default
+            by_name = tools["by_name"]
+            entry = by_name.setdefault(name, {
+                "calls": 0, "failures": 0, "duration_seconds": 0.0, "outcomes": {},
+            })
+            for key, default in (
+                ("calls", 0), ("failures", 0), ("duration_seconds", 0.0), ("outcomes", {}),
+            ):
+                if key not in entry or not isinstance(entry.get(key), type(default)):
+                    entry[key] = default
+            for item in (tools, entry):
+                item["calls"] = int(item.get("calls", 0)) + 1
+                item["failures"] = int(item.get("failures", 0)) + int(outcome != "ok")
+                item["duration_seconds"] = round(float(item.get("duration_seconds", 0.0)) + seconds, 3)
+                outcomes = item["outcomes"]
+                outcomes[outcome] = int(outcomes.get(outcome, 0)) + 1
+            self._tool_events_since_save += 1
+            if self._tool_events_since_save >= 32:
+                self._save()
+                self._tool_events_since_save = 0
+
+    def record_tool_event(self, payload: dict) -> None:
+        """接收 after_tool 观察事件，只记录执行链明确提供的结果类型"""
+        self.record_tool(payload.get("name"), payload.get("elapsed", 0.0), payload.get("outcome", "ok"))
 
     def begin_turn(self, session_id: str, model: str, now: Optional[datetime] = None) -> tuple:
         now = now or datetime.now()

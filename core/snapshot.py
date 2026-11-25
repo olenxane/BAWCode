@@ -37,6 +37,7 @@ _SNAPSHOT_DEFAULTS = {
     "max_turns": 10,
     "max_file_bytes": 20 * 1024 * 1024,
     "inventory_max_files": 50000,
+    "inventory_max_seconds": 32.0,
 }
 
 # 单回合字节留底总量上限（与单文件上限并存，防大量小文件把磁盘写爆）
@@ -79,6 +80,10 @@ def snapshot_cfg(config) -> dict:
     data["max_turns"] = max(1, _int(data.get("max_turns"), 10))
     data["max_file_bytes"] = max(1024, _int(data.get("max_file_bytes"), 20 * 1024 * 1024))
     data["inventory_max_files"] = max(0, _int(data.get("inventory_max_files"), 50000))
+    try:
+        data["inventory_max_seconds"] = max(0.0, float(data.get("inventory_max_seconds", 32.0)))
+    except (TypeError, ValueError):
+        data["inventory_max_seconds"] = 32.0
     return data
 
 
@@ -128,10 +133,9 @@ def _trash_base(cfg: dict, project_id: str) -> Path:
 
 
 def _key(path: Path) -> str:
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path)
+    # 与 _walk_inventory 的键保持同一口径：绝对路径规范化，但不逐文件 resolve()
+    # （逐文件 resolve 是原扫描的主要开销，且符号链接场景下并不需要）。
+    return os.path.normpath(os.path.abspath(str(path)))
 
 
 def _file_md5(path: Path) -> Optional[str]:
@@ -141,24 +145,144 @@ def _file_md5(path: Path) -> Optional[str]:
         return None
 
 
-def _walk_inventory(root: Path, cap: int) -> Optional[Dict[str, Tuple[int, int]]]:
-    """轻量清单：路径 → (mtime_ns, size)，不含内容；超 cap 返回 None（放弃对账，封顶成本）"""
+def _walk_inventory(
+    root: Path, cap: int, max_seconds: float = 0.0
+) -> Optional[Dict[str, Tuple[int, int]]]:
+    """轻量清单：路径 → (mtime_ns, size)，不含内容；超文件数或时间预算返回 None。
+
+    使用 os.scandir + entry.stat() 避免逐文件 Path.resolve()；这是回合末扫描
+    与初始化后台扫描共用的实现。max_seconds=0 表示不限时。
+    """
+    if cap <= 0:
+        return None
+    root_abs = os.path.normpath(os.path.abspath(str(root)))
     inventory: Dict[str, Tuple[int, int]] = {}
+    started = time.monotonic()
+    checked = 0
+    stack = [root_abs]
     try:
-        for cur, dirs, files in os.walk(root):
-            dirs[:] = [d for d in dirs if d not in _INVENTORY_SKIP_DIRS]
-            for name in files:
-                full = os.path.join(cur, name)
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-                inventory[str(Path(full).resolve())] = (st.st_mtime_ns, st.st_size)
-                if len(inventory) > cap:
-                    return None
+        while stack:
+            if max_seconds > 0 and time.monotonic() - started >= max_seconds:
+                return None
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as entries:
+                    for entry in entries:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name not in _INVENTORY_SKIP_DIRS:
+                                    stack.append(entry.path)
+                                continue
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            st = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        inventory[os.path.normpath(entry.path)] = (st.st_mtime_ns, st.st_size)
+                        if len(inventory) > cap:
+                            return None
+                        checked += 1
+                        if checked % 256 == 0 and max_seconds > 0 and time.monotonic() - started >= max_seconds:
+                            return None
+            except OSError:
+                continue
     except OSError:
         return None
     return inventory
+
+
+# 清单缓存：会话初始化时后台扫描一次，回合末扫描后更新；begin_turn 只取缓存基线，
+# 避免每回合开始/结束各扫一次。root 变化（切换工作区）时重新建立基线。
+_INVENTORY_LOCK = threading.Lock()
+_INVENTORY_CACHE: Dict[str, Any] = {
+    "root": "",
+    "inventory": None,
+    "scanned_at": 0.0,
+    "elapsed": 0.0,
+    "running": False,
+    "last_attempt": 0.0,
+    "token": 0,
+}
+_INVENTORY_RETRY_SECONDS = 30.0
+
+
+def _inventory_root() -> str:
+    return os.path.normpath(os.path.abspath(os.getcwd()))
+
+
+def _cached_inventory(root: str) -> Optional[Dict[str, Tuple[int, int]]]:
+    with _INVENTORY_LOCK:
+        if _INVENTORY_CACHE.get("root") == root:
+            inventory = _INVENTORY_CACHE.get("inventory")
+            if isinstance(inventory, dict):
+                return inventory
+    return None
+
+
+def _update_inventory_cache(
+    root: str,
+    inventory: Optional[Dict[str, Tuple[int, int]]],
+    elapsed: float,
+    token: Optional[int] = None,
+) -> None:
+    with _INVENTORY_LOCK:
+        current = int(_INVENTORY_CACHE.get("token") or 0)
+        if token is not None and token != current:
+            # 回合末同步扫描已经更新过缓存，迟到的后台扫描结果直接丢弃
+            return
+        _INVENTORY_CACHE.update({
+            "root": root,
+            "inventory": inventory,
+            "scanned_at": time.time(),
+            "elapsed": max(0.0, float(elapsed or 0.0)),
+            "running": False,
+            "last_attempt": time.monotonic(),
+            # 同步扫描（token=None）递增 token，使仍在飞的后台结果失效
+            "token": current + 1 if token is None else current,
+        })
+
+
+def _inventory_worker(root: str, cap: int, max_seconds: float, token: int) -> None:
+    started = time.monotonic()
+    inventory = _walk_inventory(Path(root), cap, max_seconds)
+    elapsed = time.monotonic() - started
+    _update_inventory_cache(root, inventory, elapsed, token=token)
+    if inventory is None:
+        log.info("快照清单异步扫描超时/超限，本会话外部改动对账将按回合重试（用时 %.2fs）", elapsed)
+    else:
+        log.info("快照清单异步扫描完成: %d 文件，用时 %.2fs", len(inventory), elapsed)
+
+
+def prime_inventory(config) -> bool:
+    """会话初始化时异步建立清单基线；已在扫描或已有基线时返回 False。"""
+    cfg = snapshot_cfg(config)
+    if not cfg.get("enabled") or not cfg.get("inventory_max_files"):
+        return False
+    root = _inventory_root()
+    now = time.monotonic()
+    with _INVENTORY_LOCK:
+        if _INVENTORY_CACHE.get("root") == root:
+            if isinstance(_INVENTORY_CACHE.get("inventory"), dict):
+                return False
+            if _INVENTORY_CACHE.get("running"):
+                return False
+            if now - float(_INVENTORY_CACHE.get("last_attempt") or 0.0) < _INVENTORY_RETRY_SECONDS:
+                return False
+        token = int(_INVENTORY_CACHE.get("token") or 0) + 1
+        _INVENTORY_CACHE.update({
+            "root": root,
+            "inventory": None,
+            "running": True,
+            "last_attempt": now,
+            "token": token,
+        })
+    threading.Thread(
+        target=_inventory_worker,
+        args=(root, int(cfg["inventory_max_files"]), float(cfg["inventory_max_seconds"]), token),
+        name="baw-snapshot-inventory",
+        daemon=True,
+    ).start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -187,14 +311,23 @@ def begin_turn(
         "msg_index": _int(msg_index, -1),
         "task_id": str(task_id or ""),
         "files": {},
-        "inventory": (
-            _walk_inventory(Path.cwd(), cfg["inventory_max_files"])
-            if cfg["enabled"] and not task_id else None
-        ),
+        "inventory": None,
         "bytes_total": 0,
     }
-    if _CONTEXT.turn["inventory"] is None and cfg["enabled"] and cfg["inventory_max_files"]:
-        log.debug("清单超限，本回合跳过外部改动对账")
+    if cfg["enabled"] and not task_id:
+        root = _inventory_root()
+        baseline = _cached_inventory(root)
+        if baseline is None:
+            started = prime_inventory(config)
+            log.info(
+                "快照清单基线未就绪，本回合跳过外部改动对账%s",
+                "（后台扫描中）" if started else "",
+            )
+        else:
+            _CONTEXT.turn["inventory"] = baseline
+            log.debug("快照清单基线就绪: %d 文件", len(baseline))
+    elif cfg["enabled"] and task_id:
+        log.debug("子代理回合跳过外部改动对账")
 
 
 def add_task_message(text: str, source: str = "inject") -> None:
@@ -371,32 +504,43 @@ def end_turn() -> Optional[dict]:
             entry["checkpoints"].append(checkpoint_entry)
 
     external: List[str] = []
-    if turn["inventory"] is not None:
-        current = _walk_inventory(Path.cwd(), cfg["inventory_max_files"])
-        if current is not None:
-            captured = set(turn["files"])
-            # 自身产物不算外部改动：本回合刚写的 blob、移入回收站的文件
-            # （前缀比对带分隔符边界，防 project_id 互为前缀时误判）
-            snap_prefix = _key(_snapshots_dir(cfg, turn["project_id"], session_dir)) + os.sep
-            trash_prefix = _key(_trash_base(cfg, turn["project_id"])) + os.sep
-            for key, (mtime, size) in current.items():
-                before = turn["inventory"].get(key)
-                if key in captured or before == (mtime, size):
-                    continue
-                if key.startswith(snap_prefix) or key.startswith(trash_prefix):
-                    continue
-                external.append(key)
-                if len(external) >= _EXTERNAL_LIST_CAP:
+    baseline = turn["inventory"]
+    current = None
+    if cfg["enabled"] and not turn.get("task_id"):
+        root = _inventory_root()
+        scan_started = time.monotonic()
+        current = _walk_inventory(Path(root), cfg["inventory_max_files"], cfg["inventory_max_seconds"])
+        elapsed = time.monotonic() - scan_started
+        _update_inventory_cache(root, current, elapsed)
+        if elapsed >= 2.0:
+            log.info(
+                "回合末清单扫描: %d 文件，用时 %.2fs%s",
+                len(current or {}), elapsed, "（超时/超限）" if current is None else "",
+            )
+    if baseline is not None and current is not None:
+        captured = set(turn["files"])
+        # 自身产物不算外部改动：本回合刚写的 blob、移入回收站的文件
+        # （前缀比对带分隔符边界，防 project_id 互为前缀时误判）
+        snap_prefix = _key(_snapshots_dir(cfg, turn["project_id"], session_dir)) + os.sep
+        trash_prefix = _key(_trash_base(cfg, turn["project_id"])) + os.sep
+        for key, (mtime, size) in current.items():
+            before = baseline.get(key)
+            if key in captured or before == (mtime, size):
+                continue
+            if key.startswith(snap_prefix) or key.startswith(trash_prefix):
+                continue
+            external.append(key)
+            if len(external) >= _EXTERNAL_LIST_CAP:
+                external.append("…（其余略）")
+                break
+        # 已消失的文件也属于外部改动
+        for key in baseline.keys() - current.keys():
+            if len(external) >= _EXTERNAL_LIST_CAP:
+                if external[-1] != "…（其余略）":
                     external.append("…（其余略）")
-                    break
-            # 已消失的文件也属于外部改动
-            for key in turn["inventory"].keys() - current.keys():
-                if len(external) >= _EXTERNAL_LIST_CAP:
-                    if external[-1] != "…（其余略）":
-                        external.append("…（其余略）")
-                    break
-                if key not in captured and not key.startswith((snap_prefix, trash_prefix)):
-                    external.append(key)
+                break
+            if key not in captured and not key.startswith((snap_prefix, trash_prefix)):
+                external.append(key)
 
     if not entries and not external:
         return None  # 空回合不产生任何文件

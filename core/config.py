@@ -99,10 +99,10 @@ def default_config() -> dict:
         },
         # stream: 流式输出开关；首个 chunk 前失败自动回落非流式，
         # 已收 chunk 后失败不回落不重试（内容已上屏）；false 完全走整段路径
-        "llm": {"retry_times": 3, "retry_delay": 1.0, "stream": True, "request_timeout": 180},#防止通通超市
-        # 分级日志（core/log.py）：level 全局阈值 debug/info/warn/error/off；
-        # modules 按模块覆盖粒度（如 {"llm": "debug", "ui": "off"}）；
-        # console 同步输出 stderr；days_to_keep 保留天数（0 永久）
+        "llm": {
+            "retry_times": 3, "retry_delay": 1.0, "stream": True, "request_timeout": 180,
+            "reasoning_replay_default": "strip",
+        },#防止通通超市
         "log": {
             "level": "info",
             "modules": {},
@@ -265,6 +265,8 @@ def default_config() -> dict:
         # （不含内容）回合末对账，execute_command 等绕过写入工具的改动仅列出无法还原。
         # trash_dir 项目回收站：delete_file 移入、/clear-trash 真正清空。
         # inventory_max_files 清单文件数上限（0=禁用对账；超限本回合放弃对账）。
+        # inventory_max_seconds 单次扫描时间预算（0=不限时），超时只放弃外部改动对账，
+        # 不影响编辑快照；默认 32 秒，兼顾大仓库完整对账与回合末等待上限。
         "snapshot": {
             "enabled": True,
             "dir": "data/snapshots",
@@ -272,6 +274,7 @@ def default_config() -> dict:
             "max_turns": 10,
             "max_file_bytes": 20971520,
             "inventory_max_files": 50000,
+            "inventory_max_seconds": 32.0,
         },
         # 核心功能外部 API（UI/改配置不挂接口）
         "external_apis": {

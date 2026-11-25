@@ -1952,10 +1952,12 @@ class Memory:
             value = str(advanced.get("reasoning_replay") or "").strip().lower()
             if value in REASONING_REPLAY_OPTIONS:
                 return value
-        return "verbatim"
+        default = str(
+            ((getattr(self.config, "data", None) or {}).get("llm") or {}).get("reasoning_replay_default") or "").strip().lower()
+        return default if default in REASONING_REPLAY_OPTIONS else "strip"
 
     def _reasoning_on(self) -> bool:
-        """当前模型是否按 reasoning 模型出站（verbatim 档空字段补齐开关）
+        """当前模型是否按reasoning模型出站
 
         与 chat() 实际发送的思考开关同口径：复用 _thinking_effort_of 解析最终 effort。"""
         from core.config import THINKING_OPTIONS, model_preset_defaults
@@ -1978,7 +1980,8 @@ class Memory:
     def _api_session_item(item: dict, replay: str = "verbatim", reasoning_on: bool = True) -> dict:
         """会话消息 → API 消息（DeepSeek Tool Calls 协议）
 
-        思考出站三档（默认 verbatim，与 pi-ai/qwen-code 对齐）：
+        思考出站三档（生产默认 strip，由 _resolve_replay 决定；本 helper 默认 verbatim
+        仅供显式调用/单测）：
         verbatim=按留档的 thinking_field 原字段名回传，忽略 thinking_stripped（协议要求
         思考在场，如 DeepSeek tools 场景缺字段直接 400）；reasoning_on 时无思考的
         assistant 消息补空字段（DeepSeek 校验字段存在性，空串即可，pi-ai 同款）。
@@ -2022,8 +2025,24 @@ class Memory:
                 args = c.get("arguments")
                 if args is None:
                     args = (c.get("function") or {}).get("arguments") or "{}"
-                if not isinstance(args, str):
-                    args = _json.dumps(args, ensure_ascii=False)
+                try:
+                    parsed = _json.loads(args) if isinstance(args, str) else args
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    # 历史里可能残留模型幻觉出的全量参数；出站前按当前 schema 清洗，
+                    # 避免模型把自己的畸形调用当成合法先例继续模仿。
+                    try:
+                        from core import register as _register
+                        parsed = _register.sanitize_args(fn_name, parsed)["args"]
+                    except Exception:
+                        pass
+                    args = _json.dumps(parsed, ensure_ascii=False)
+                elif parsed is None:
+                    log.warn("历史工具调用参数无法解析，出站置空: tool=%s", fn_name or "-")
+                    args = "{}"
+                else:
+                    args = _json.dumps(parsed, ensure_ascii=False)
                 calls.append(
                     {
                         "id": c.get("id") or f"call_{uuid4().hex[:12]}",

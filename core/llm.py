@@ -344,6 +344,8 @@ class _StreamAggregate:
         self.usage = None
         self.error: Optional[Exception] = None
         self.finished = False
+        self.finish_reason: Optional[str] = None
+        self.dropped_chunks = 0
         self.produced = 0      # 已回调增量数
 
     def _emit(self, kind: str, piece: str) -> None:
@@ -414,7 +416,7 @@ class _StreamAggregate:
                         self.reasoning_field or "reasoning_content": "".join(self.reasoning_parts),
                         "tool_calls": tool_calls,
                     },
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "finish_reason": self.finish_reason or ("tool_calls" if tool_calls else "stop"),
                 }
             ],
             "usage": self.usage or {},
@@ -595,6 +597,7 @@ class LLM:
         head = choices[0] or {}
         if head.get("finish_reason") is not None:
             agg.finished = True
+            agg.finish_reason = str(head.get("finish_reason") or "")
         delta = head.get("delta") or head.get("message") or {}
         field, reasoning_value = _reasoning_entry(delta)
         agg.add_reasoning(reasoning_value, field=field)
@@ -699,10 +702,10 @@ class LLM:
         try:
             content_type = (resp.headers.get("Content-Type") or "").lower()
             if "text/event-stream" not in content_type:
-                # 服务端不支持流式（回了整段 JSON）：同一聚合器优雅降级
                 self._feed_chunk(agg, json.loads(resp.read().decode("utf-8")))
                 agg.finished = True
                 return self._finish_stream(agg, None)
+            dropped = 0
             for raw_line in resp:
                 if self._cancel.is_set():
                     return None
@@ -716,8 +719,16 @@ class LLM:
                 try:
                     data = json.loads(data_text)
                 except json.JSONDecodeError:
+                    dropped += 1
                     continue
                 self._feed_chunk(agg, data)
+            if dropped:
+                agg.dropped_chunks = dropped
+                log.warn("流式响应解析失败 %d 片", dropped)
+                if agg.tool_buckets:
+                    agg.error = ConnectionError(
+                        f"流式响应解析失败 {dropped} 片，工具调用参数可能不完整"
+                    )
             return self._finish_stream(agg, None)
         except Exception as e:
             return self._finish_stream(agg, e)
@@ -830,8 +841,13 @@ class LLM:
                     args = c.get("arguments")
                     if args is None:
                         args = (c.get("function") or {}).get("arguments") or "{}"
-                    if not isinstance(args, str):
-                        args = json.dumps(args, ensure_ascii=False)
+                    try:
+                        parsed = json.loads(args) if isinstance(args, str) else args
+                        if isinstance(parsed, dict):
+                            parsed = register.sanitize_args(fn_name, parsed)["args"]
+                        args = json.dumps(parsed, ensure_ascii=False) if isinstance(parsed, (dict, list)) else "{}"
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        args = "{}"
                     calls.append(
                         {
                             "id": LLM._ensure_call_id(c.get("id")),
@@ -855,12 +871,10 @@ class LLM:
         on_delta=None,
         on_payload_overflow=None,
     ) -> dict:
-        """调用 LLM（核心扩展点：llm_request）；model 可指定任务专用模型。
+        """调用 LLM
 
-        on_delta 接收 reasoning/content 增量和 reset 清空事件。
-        config.llm.stream 开启时走 SSE 流式，网络中断按配置重试。
-        HTTP 413（请求体过大）走渐进缩图重发：本轮图片每步相对原图再缩 10%、
-        最多 5 次；仍超则调 on_payload_overflow() 做回合间维护换一组新消息再发一次。
+        相关处理：
+        HTTP 413（请求体过大）走渐进缩图重发：本轮图片每步相对原图再缩 10%、最多 5 次；仍超则调 on_payload_overflow() 做回合间维护换一组新消息再发一次。
         失败尝试不计成功用量，不返回未完成工具调用。
         """
         if self._cancel.is_set():
@@ -944,6 +958,7 @@ class LLM:
         retry_times = int(self.config.data.get("llm", {}).get("retry_times", 3))
         retry_delay = float(self.config.data.get("llm", {}).get("retry_delay", 1.0))
         attempt = 0
+        args_retry = 0
         last_error = None
         error_fatal = False
         shrink_step = 0          # 413 渐进缩图已用步数（不占用网络重试预算）
@@ -1007,6 +1022,40 @@ class LLM:
                     time.monotonic() - start,
                     attempt + 1,
                 )
+                bad_args = [
+                    c for c in (result.get("tool_calls") or [])
+                    if isinstance(c, dict) and c.get("args_error")
+                ]
+                truncated = str(result.get("finish_reason") or "") == "length"
+                if (bad_args or truncated) and args_retry < 1 and result.get("tool_calls"):
+                    args_retry += 1
+                    log.warn(
+                        "工具调用参数不完整（finish_reason=%s，解析失败=%d），重试一次",
+                        result.get("finish_reason") or "-", len(bad_args),
+                    )
+                    if on_delta is not None:
+                        try:
+                            on_delta("reset", "")
+                        except Exception as callback_err:
+                            log.warn("流式重置回调异常: %s", callback_err)
+                    retry_messages = list(payload.get("messages") or [])
+                    notice = {
+                        "role": "system",
+                        "content": (
+                            "上一次工具调用参数不是完整 JSON 或输出被截断。"
+                            "请只输出当前工具 schema 中声明的参数，保持 JSON 完整；"
+                            "不要枚举其他工具的参数。"
+                        ),
+                    }
+                    insert_at = 0
+                    for idx, msg in enumerate(retry_messages):
+                        if isinstance(msg, dict) and msg.get("role") == "system":
+                            insert_at = idx + 1
+                        else:
+                            break
+                    retry_messages.insert(insert_at, notice)
+                    payload["messages"] = retry_messages
+                    continue
                 return result
             except Exception as e:
                 if self._cancel.is_set():
@@ -1016,7 +1065,7 @@ class LLM:
                 log.warn("LLM 调用失败(第%d/%d次): %s", attempt, max(retry_times, 0) + 1, e)
                 log.debug("异常详情:\n%s", traceback.format_exc())
                 if _is_payload_too_large(e):
-                    # 渐进缩图重发：每步相对原图再缩 10%、最多 5 次到 50%，不消耗网络重试
+                    # 渐进缩图重发：每步相对原图再缩10%、最多5次到 50%
                     if shrink_step < _PAYLOAD_SHRINK_MAX:
                         scale = max(
                             _PAYLOAD_SHRINK_FLOOR,
@@ -1031,9 +1080,8 @@ class LLM:
                                 "请求体超限(413)，图片缩至原尺寸%d%%重发（第%d/%d次，缩 %d 张）",
                                 int(scale * 100), shrink_step, _PAYLOAD_SHRINK_MAX, n_img,
                             )
-                            attempt -= 1  # 本次重发不计网络重试
+                            attempt -= 1
                             continue
-                    # 缩到 50% 仍超（或无图可缩）：回合间维护一次性兜底
                     if callable(on_payload_overflow) and not maintenance_used:
                         maintenance_used = True
                         try:
@@ -1052,7 +1100,6 @@ class LLM:
                     and _has_reasoning_key(payload.get("messages"))
                     and _is_reasoning_schema_rejection(e)
                 ):
-                    # verbatim 回放字段被 schema 严格端点拒收：剥键重发一次（不占网络重试预算）
                     reasoning_degrade_used = True
                     _strip_reasoning_keys(payload.get("messages"))
                     attempt -= 1
@@ -1060,7 +1107,6 @@ class LLM:
                     continue
                 if not _is_retryable_error(e):
                     # 401/404/400 等确定性失败：不做自动重试；error_fatal 供回合层跳过
-                    # 手动重试等待（重发同一请求必然复现，直接走失败回滚）
                     error_fatal = True
                     log.error("不可自动重试的错误（%s.%s），终止自动重试", type(e).__module__, type(e).__name__)
                     break
@@ -1078,7 +1124,7 @@ class LLM:
         log.error("LLM 调用最终失败: %s", last_error)
         error_text = f"LLM 调用失败: {last_error}"
         if last_error is not None and _is_payload_too_large(last_error):
-            error_text += "（请求体超网关体积上限：已缩图/维护后仍被拒，建议 /clear 或减小本轮请求内容）"
+            error_text += "请求体超网关体积上限"
         return {
             "content": "",
             "tool_calls": [],
@@ -1102,6 +1148,7 @@ class LLM:
                 "raw": data.get("raw", data),
                 "error": data.get("error"),
                 "error_fatal": bool(data.get("error_fatal")),
+                "finish_reason": data.get("finish_reason") or "tool_calls",
             }
         if isinstance(data, dict) and data.get("error") and "choices" not in data:
             return {
@@ -1122,22 +1169,35 @@ class LLM:
         tool_calls = []
         for call in message.get("tool_calls") or []:
             function = call.get("function", {})
-            raw_args = function.get("arguments") or "{}"
+            raw_args = function.get("arguments")
+            if raw_args is None or (isinstance(raw_args, str) and not raw_args.strip()):
+                raw_args = "{}"
+            args_error = False
+            raw_text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False)
             try:
                 args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except json.JSONDecodeError:
+                if not isinstance(args, dict):
+                    args_error = True
+                    args = {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                args_error = True
                 args = {}
-            tool_calls.append(
-                {
-                    "id": self._ensure_call_id(call.get("id")),
-                    "name": function.get("name"),
-                    "arguments": args,
-                    "type": call.get("type") or "function",
-                }
-            )
+                log.warn(
+                    "工具参数 JSON 解析失败: tool=%s len=%d head=%r tail=%r",
+                    function.get("name") or "-", len(raw_text),
+                    raw_text[:160], raw_text[-160:],
+                )
+            call_item = {
+                "id": self._ensure_call_id(call.get("id")),
+                "name": function.get("name"),
+                "arguments": args,
+                "type": call.get("type") or "function",
+            }
+            if args_error:
+                call_item["args_error"] = True
+            tool_calls.append(call_item)
         content = message.get("content") or ""
         reasoning = _reasoning_of(message)
-        # 中转站泄漏兜底：content 内的思考段/标记改道思考侧（reasoning_content 通常为空或为思考前段）
         leaked, content = _split_leaked_thinking(content)
         if leaked:
             reasoning = f"{reasoning}\n{leaked}" if reasoning else leaked
@@ -1147,7 +1207,13 @@ class LLM:
             content = reasoning
             reasoning = ""
         # 思考与正文并存时 reasoning 单独返回，由调用方以 thinking 字段随消息留档
-        return {"content": content, "reasoning": reasoning, "tool_calls": tool_calls, "raw": data}
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+            "raw": data,
+            "finish_reason": choices[0].get("finish_reason") or "stop",
+        }
 
     def _account_completion(self, result: dict) -> None:
         """本地分词累计本轮输出 token（正文+思考），供提示行实时显示"""
@@ -1196,50 +1262,96 @@ class LLM:
         return str(result.get("content") or "").strip().upper() == "APPROVE"
 
     def execute_approved_tool(self, call: dict) -> dict:
-        """确认通过后执行单个工具；before_tool 钩子可改写 args 或拒绝执行"""
+        """确认通过后执行单个工具；before_tool 钩子可改写 args 或拒绝执行。
+
+        参数在执行前按工具 schema 清洗：未声明键丢弃并提示，常见别名自动映射；
+        必填缺失或参数 JSON 解析失败时返回带允许参数/示例的结构化错误，不进入工具本体。
+        """
         name = call.get("name")
         args = call.get("arguments") or {}
         if not isinstance(args, dict):
             args = {}
         description = str(call.get("description") or args.get("description") or "")
         args = {k: v for k, v in args.items() if k != "description"}
+        args_error = bool(call.get("args_error"))
+        dropped_args: list = []
+        applied_aliases: dict = {}
         # before_tool（变换链）：返回 {"args": {...}} 改写参数；
         # 返回 {"decision": "deny", "message": "..."} 拒绝执行（不进工具本体）
-        hooked = hooks.call_hook(
-            "before_tool", {"name": name, "args": args, "description": description}, default=None
-        )
-        if isinstance(hooked, dict):
-            if str(hooked.get("decision") or "").lower() in ("deny", "denied", "block", "blocked"):
-                message = str(hooked.get("message") or f"工具 {name} 被 before_tool 钩子拒绝")
-                log.info("工具 %s 被 before_tool 钩子拒绝: %s", name, message)
-                return {
-                    "role": "tool",
-                    "tool_call_id": call.get("id"),
-                    "tool_name": name,
-                    "content": message,
-                    "type": "tool",
-                }
-            if isinstance(hooked.get("args"), dict):
-                args = hooked["args"]
+        if not args_error:
+            hooked = hooks.call_hook(
+                "before_tool", {"name": name, "args": args, "description": description}, default=None
+            )
+            if isinstance(hooked, dict):
+                if str(hooked.get("decision") or "").lower() in ("deny", "denied", "block", "blocked"):
+                    message = str(hooked.get("message") or f"工具 {name} 被 before_tool 钩子拒绝")
+                    log.info("工具 %s 被 before_tool 钩子拒绝: %s", name, message)
+                    return {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "tool_name": name,
+                        "content": message,
+                        "type": "tool",
+                        "outcome": "denied",
+                    }
+                if isinstance(hooked.get("args"), dict):
+                    args = hooked["args"]
         log.info("执行工具 %s（已确认）", name)
         started = time.monotonic()
-        if not register.has_tool(name or ""):
+        outcome = "ok"
+        if args_error:
+            sanitized = register.sanitize_args(str(name or ""), {})
+            output = register.arg_error_message(
+                str(name or ""), sanitized,
+                detail="参数不是合法 JSON（可能输出被截断）",
+            )
+            outcome = "invalid_arguments"
+            log.error("工具 %s 参数 JSON 不完整，拒绝执行", name)
+        elif not register.has_tool(name or ""):
             output = f"工具不存在: {name}"
+            outcome = "tool_not_found"
             log.warn("调用未注册工具: %s", name)
         else:
-            # 工具执行期下发本 LLM 的取消事件：命令等待据此提前终止（子代理各持独立事件）
-            proc.set_cancel(getattr(self, "_cancel", None))
-            try:
-                output = register.call(str(name or ""), **args)
-                log.debug("工具 %s 完成，用时 %.2fs", name, time.monotonic() - started)
-            except TypeError as e:
-                output = f"工具参数错误: {e}"
-                log.error("工具 %s 参数错误: %s", name, e)
-            except Exception as e:
-                output = f"工具执行错误: {e}"
-                log.error("工具 %s 执行错误: %s", name, e)
-            finally:
-                proc.clear_cancel()
+            sanitized = register.sanitize_args(str(name or ""), args)
+            dropped_args = sanitized["dropped"]
+            applied_aliases = sanitized["aliases"]
+            if sanitized["missing"]:
+                output = register.arg_error_message(str(name or ""), sanitized)
+                outcome = "invalid_arguments"
+                log.error("工具 %s 参数缺失: %s", name, sanitized["missing"])
+            else:
+                args = sanitized["args"]
+                if dropped_args or applied_aliases:
+                    log.warn(
+                        "工具 %s 参数清洗: 忽略=%s 别名=%s", name,
+                        dropped_args or "-", applied_aliases or "-",
+                    )
+                # 工具执行期下发本 LLM 的取消事件：命令等待据此提前终止（子代理各持独立事件）
+                proc.set_cancel(getattr(self, "_cancel", None))
+                try:
+                    output = register.call(str(name or ""), **args)
+                    log.debug("工具 %s 完成，用时 %.2fs", name, time.monotonic() - started)
+                except TypeError as e:
+                    output = register.arg_error_message(str(name or ""), sanitized, detail=str(e))
+                    outcome = "invalid_arguments"
+                    log.error("工具 %s 参数错误: %s", name, e)
+                except Exception as e:
+                    output = f"工具执行错误: {e}"
+                    outcome = "execution_error"
+                    log.error("工具 %s 执行错误: %s", name, e)
+                finally:
+                    proc.clear_cancel()
+        if isinstance(output, dict):
+            exit_code = output.get("exit_code")
+            exit_status = str(output.get("exit_status") or "")
+        else:
+            exit_code = getattr(output, "exit_code", None)
+            exit_status = str(getattr(output, "exit_status", "") or "")
+        if outcome == "ok":
+            if isinstance(exit_code, int) and exit_code != 0:
+                outcome = "nonzero_exit"
+            elif exit_status in ("超时", "已中断"):
+                outcome = "timeout" if exit_status == "超时" else "cancelled"
         # 多模态约定：工具返回 dict 可带 "images"（本地图片路径列表），摘出随消息携带，
         # 由 add_tool_result 落为 API 数组形态 content；正文取 content 键，无则序列化其余键
         images = None
@@ -1249,10 +1361,36 @@ class LLM:
             text = output["content"] if isinstance(output.get("content"), str) else json.dumps(output, ensure_ascii=False)
         else:
             text = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
-        # after_tool（观察链）：通知执行结果（处理函数异常已在 hooks 内隔离）
+        note_parts = []
+        if dropped_args:
+            note_parts.append("已忽略未声明参数: " + ", ".join(str(k) for k in dropped_args))
+        if applied_aliases:
+            note_parts.append(
+                "已映射别名: " + ", ".join(f"{k}->{v}" for k, v in applied_aliases.items())
+            )
+        if note_parts:
+            note = "\n[参数提示] " + "；".join(note_parts)
+            if hasattr(text, "exit_code"):
+                text = cast(Any, type(text))(
+                    str(text) + note,
+                    exit_code=getattr(text, "exit_code", None),
+                    output_text=(getattr(text, "output_text", None) or str(text)) + note,
+                    exit_status=getattr(text, "exit_status", "未知"),
+                )
+            else:
+                text = str(text) + note
+        if outcome == "ok":
+            try:
+                from core.tools import tool_failure_hint
+                if tool_failure_hint(str(text)):
+                    outcome = "tool_reported_failure"
+            except Exception:
+                pass
         hooks.collect_hook(
             "after_tool",
-            {"name": name, "args": args, "output": text,
+            {"name": name, "args": args, "output": text, "outcome": outcome,
+             "exit_code": exit_code, "exit_status": exit_status,
+             "dropped_args": dropped_args, "applied_aliases": applied_aliases,
              "elapsed": round(time.monotonic() - started, 3), "description": description},
         )
         result = {
@@ -1261,7 +1399,12 @@ class LLM:
             "tool_name": name,
             "content": text,
             "type": "tool",
+            "outcome": outcome,
         }
+        if dropped_args:
+            result["dropped_args"] = dropped_args
+        if applied_aliases:
+            result["applied_aliases"] = applied_aliases
         if images:
             result["images"] = images
         return result

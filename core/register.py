@@ -1,4 +1,6 @@
 #该文件实现工具装饰器的注册，是插件系统的基础
+import inspect
+import json
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -139,6 +141,137 @@ def _with_description_param(schema: Optional[dict]) -> dict:
         required.append("description")
     base["required"] = required
     return base
+
+
+# 常见模型先验参数名 → 本工具真实参数名。只在该工具确实声明目标参数时启用，
+# 避免把其他工具的合法参数误映射。未知键仍然丢弃并提示。
+_ARG_ALIASES: Dict[str, Dict[str, str]] = {
+    "read": {"path": "file_path", "start_line": "offset"},
+    "write": {"path": "file_path"},
+    "edit_file": {"path": "file_path"},
+    "delete_file": {"path": "file_path"},
+    "search": {"context_lines": "context", "text": "pattern"},
+    "glob": {"text": "pattern"},
+}
+
+
+_ACCEPTED_CACHE: Dict[str, tuple] = {}
+
+
+def _accepted_params(tool: dict) -> tuple:
+    """工具可接受的参数集合；函数含 **kwargs 时不裁剪未知键。
+
+    结果按工具条目对象缓存：历史回放会对每个 tool_call 调用 sanitize，
+    避免每轮请求重复 inspect.signature。
+    """
+    name = str(tool.get("name") or "")
+    cached = _ACCEPTED_CACHE.get(name)
+    if cached is not None and cached[0] is tool:
+        return cached[1]
+    schema = tool.get("schema") if isinstance(tool.get("schema"), dict) else {}
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    accepted = set(props)
+    accept_all = False
+    func = tool.get("func")
+    if callable(func):
+        try:
+            params = inspect.signature(func).parameters
+            accepted.update(params)
+            accept_all = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        except (TypeError, ValueError):
+            pass
+    result = (accepted, accept_all)
+    _ACCEPTED_CACHE[name] = (tool, result)
+    return result
+
+
+def sanitize_args(tool_name: str, args: Any) -> dict:
+    """按工具 schema + 函数签名清洗参数，不修改入参。
+
+    返回:
+        args      清洗后的参数（含别名映射）
+        dropped   被丢弃的未声明键
+        missing   缺失的必填参数
+        aliases   实际应用的 {别名: 目标名}
+        required  声明的必填参数
+        allowed   允许的参数名
+    """
+    result = {
+        "args": dict(args) if isinstance(args, dict) else {},
+        "dropped": [],
+        "missing": [],
+        "aliases": {},
+        "required": [],
+        "allowed": [],
+    }
+    tool = _registry.get(tool_name)
+    if tool is None:
+        return result
+    clean = result["args"]
+    schema = tool.get("schema") if isinstance(tool.get("schema"), dict) else {}
+    required = [str(k) for k in (schema.get("required") or []) if str(k)]
+    accepted, accept_all = _accepted_params(tool)
+    result["required"] = required
+    result["allowed"] = sorted(accepted, key=str)
+    for alias, target in _ARG_ALIASES.get(tool_name, {}).items():
+        if alias in clean and target not in clean and (accept_all or target in accepted):
+            clean[target] = clean.pop(alias)
+            result["aliases"][alias] = target
+    if not accept_all:
+        dropped = [k for k in clean if k not in accepted]
+        for key in dropped:
+            clean.pop(key, None)
+        result["dropped"] = dropped
+    result["missing"] = [k for k in required if k not in clean]
+    return result
+
+
+def _example_value(prop: Any) -> Any:
+    if not isinstance(prop, dict):
+        return "..."
+    kind = str(prop.get("type") or "").lower()
+    if kind == "integer":
+        return 0
+    if kind == "number":
+        return 0.0
+    if kind == "boolean":
+        return False
+    if kind == "array":
+        return []
+    if kind == "object":
+        return {}
+    enum = prop.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    return "..."
+
+
+def arg_error_message(tool_name: str, sanitized: dict, detail: str = "") -> str:
+    """把参数校验结果转成模型可自纠的结构化错误（允许参数 + 必填 + 最小示例）"""
+    missing = sanitized.get("missing") or []
+    allowed = sanitized.get("allowed") or []
+    required = sanitized.get("required") or []
+    lines = []
+    if missing:
+        suffix = f"（{detail}）" if detail else ""
+        lines.append(f"工具参数错误: {tool_name} 缺少必填参数: {', '.join(missing)}{suffix}")
+    elif detail:
+        lines.append(f"工具参数错误: {tool_name} 调用参数不合法: {detail}")
+    else:
+        lines.append(f"工具参数错误: {tool_name} 调用参数不合法")
+    if allowed:
+        lines.append("允许参数: " + ", ".join(str(k) for k in allowed))
+    if required:
+        lines.append("必填参数: " + ", ".join(str(k) for k in required))
+    tool = _registry.get(tool_name) or {}
+    schema = tool.get("schema") if isinstance(tool.get("schema"), dict) else {}
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    keys = required or [k for k in props if k in allowed][:2]
+    if keys:
+        example = {str(k): _example_value(props.get(k)) for k in keys}
+        lines.append("示例: " + json.dumps(example, ensure_ascii=False))
+    lines.append("请只输出上述 schema 中声明的参数，不要枚举其他工具的参数。")
+    return "\n".join(lines)
 
 
 def get_tool_defs() -> List[dict]:

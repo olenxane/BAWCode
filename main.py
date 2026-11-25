@@ -41,7 +41,12 @@ log = get_logger("main")
 
 def _init_usage_statistics():
     try:
-        return statistics_mod.initialize()
+        stats = statistics_mod.initialize()
+        hooks.unregister_hook("after_tool", owner="core.statistics")
+        hooks.register_hook(
+            "after_tool", stats.record_tool_event, owner="core.statistics", name="record_tool_event"
+        )
+        return stats
     except Exception as exc:
         log.debug("使用统计初始化失败: %r", exc)
         return None
@@ -2106,7 +2111,6 @@ def main_headless(args) -> int:
         config.model_name,
         identity.get("project_id"),
     )
-    # 无头模式不依赖底部进度条：同步补齐依赖，保证本次任务能看到插件工具
     plugins_mod.load(config, workspace=Path.cwd(), async_deps=False)
     session = memory_mod.init_session(config, project_identity_data=identity)
     tools_mod.webfetch_gc()
@@ -2116,7 +2120,7 @@ def main_headless(args) -> int:
     session.set_context_reset(llm.meter.reset_context)
     hooks.set_external_apis((config.data or {}).get("external_apis") or {})
     subagent_mod.register_tools(config)
-    from core import workflow as workflow_mod  # lazy：编排层仅工具注册与待命执行时加载
+    from core import workflow as workflow_mod
 
     workflow_mod.register_tools(config)  # 工作流实例派发工具（依赖子代理任务基建）
     mcp_mod.register_tools(config)  # MCP 后台连接发现；退出时统一 shutdown
@@ -2126,6 +2130,7 @@ def main_headless(args) -> int:
     app.bind_config(config)
     app.usage_statistics = _init_usage_statistics()
     app.token_meter = llm.meter
+    snapshot_mod.prime_inventory(config)  # 会话初始化：后台建立回合快照清单基线
     _register_commands(llm, session, config, app)
 
     user_text = args.prompt
@@ -2231,6 +2236,7 @@ def main(args=None) -> None:
     app.bind_config(config)
     app.usage_statistics = _init_usage_statistics()
     app.token_meter = llm.meter
+    snapshot_mod.prime_inventory(config)  # 会话初始化：后台建立回合快照清单基线
     _register_commands(llm, session, config, app)
 
     app.enter()
