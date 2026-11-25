@@ -3,8 +3,9 @@
 
 TUI（core/settings.py）与远控插件网页设置面板共用同一份声明，字段清单/
 类型/选项/缺省值不再分散硬编码于各面板；新增或调整配置项只需编辑声明
-文件。带副作用的少数键（mode 走属性 setter、log_level 重初始化日志、
-active_model_name / font_size / default_shell）在
+文件。声明 type 统一为标准类型：bool/int/float/str/list（list=枚举单选，
+"multi": true 为逗号分隔多值）。带副作用的少数键（mode 走属性 setter、
+log_level 重初始化日志、active_model_name / font_size / default_shell）在
 special_read / special_write 分发，其余走通用点路径读写。声明文件缺失
 或损坏时返回空列表（记录日志），面板显示空页，不影响其它标签页。
 """
@@ -99,7 +100,7 @@ def fields(tab: str, config) -> List[dict]:
             if spec == "@shells":
                 item["hint"] = (field.get("hint") or "") + " · " + shell_availability_hint()
         item["current"] = read_field(config, item)
-        if item["type"] == "csv" and isinstance(item["current"], list):
+        if item["type"] == "list" and item.get("multi") and isinstance(item["current"], list):
             item["current"] = ", ".join(str(x) for x in item["current"])
         out.append(item)
     return out
@@ -148,12 +149,12 @@ def coerce(field: dict, raw) -> Any:
             if not math.isfinite(number):
                 return None
             value = int(number) if ftype == "int" else number
-        elif ftype == "csv":
+        elif ftype == "list" and field.get("multi"):
             return [p.strip() for p in str(raw).split(",") if p.strip()]
-        elif ftype == "choice" and isinstance(field.get("options"), list):
+        elif ftype == "list" and isinstance(field.get("options"), list):
             text = str(raw)
             return text if text in [str(o) for o in field["options"]] else None
-        else:  # str / choice / binding
+        else:  # str / list(无候选约束)
             return str(raw)
     except (TypeError, ValueError, OverflowError):
         return None

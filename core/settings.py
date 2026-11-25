@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from core import keyinput
@@ -110,6 +111,8 @@ class SettingsPanelMixin(UiState):
         self._settings_model_scratch_name = ""
         self._settings_baseline: Dict[str, Any] = {}
         self._settings_esc_stage = 0
+        # x 重置确认：最近一按时刻（0=无待确认）
+        self._settings_reset_at = 0.0
         self.settings_edit: Optional[dict] = None
         # 提供商页「高级设置」折叠区状态（默认折叠）
         self._provider_adv_expanded = False
@@ -130,7 +133,7 @@ class SettingsPanelMixin(UiState):
                 tab_parts.append(self.C_HL + f" {name} " + self.RESET)
             else:
                 tab_parts.append(self.c("dim") + f" {name} " + self.RESET)
-        tab_line = " ".join(tab_parts) + self.c("dim") + "  Tab切换标签 · ↑↓选项 · ←→切换 · Enter保存 · Esc放弃" + self.RESET
+        tab_line = " ".join(tab_parts) + self.c("dim") + "  PgUp/PgDn切页 · ↑↓选项 · ←→切换 · x重置本页 · Enter保存 · Esc放弃" + self.RESET
         lines.append(_clip_keep_ansi(tab_line, w))
         lines.append(self._rule(w))
 
@@ -823,7 +826,7 @@ class SettingsPanelMixin(UiState):
                     "label": field.get("label", field["key"]),
                     "hint": field.get("hint") or "",
                 }
-                if ftype == "choice":
+                if ftype == "list" and not field.get("multi"):
                     options = [str(o) for o in (field.get("options") or [])]
                     current = field.get("current")
                     if current is not None and current not in options:
@@ -831,7 +834,7 @@ class SettingsPanelMixin(UiState):
                     item.update({"type": "choice", "options": options, "current": current})
                 elif ftype == "bool":
                     item.update({"type": "bool", "current": bool(field.get("current"))})
-                else:  # int / float / str / csv：文本行编辑
+                else:  # int / float / str / list(multi)：文本行编辑
                     item.update({"type": "text", "current": field.get("current")})
                 fields.append(item)
         self.settings_fields = fields
@@ -888,11 +891,12 @@ class SettingsPanelMixin(UiState):
         self._settings_body_provider_id = ""
         self.settings_provider_id = config.data.get("active_provider_id", "")
         self.settings_model_name = config.model_name
-        self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
+        self.settings_notice = "↑↓ 选择 · ←→ 修改 · PgUp/PgDn切页 · x重置本页 · Enter保存退出 · Esc放弃"
         self.settings_model_work = getattr(self, "settings_model_work", {}) or {}
         self.settings_model_removed = getattr(self, "settings_model_removed", {}) or {}
         self._settings_model_scratch_name = ""
         self.settings_edit = None
+        self._settings_reset_at = 0.0
         self._build_settings_fields(config)
         self._settings_baseline = self._settings_snapshot(config)
         self._settings_esc_stage = 0
@@ -914,7 +918,7 @@ class SettingsPanelMixin(UiState):
             if self.settings_edit is not None:
                 navigation = _key_direction(kind, value) in ("up", "down")
                 field_edit = self.settings_edit["kind"] in ("text", "plugin", "body_text", "body_json")
-                if field_edit and (navigation or kind in ("tab", "escape", "interrupt", "submit", "submit_ctrl")):
+                if field_edit and (navigation or kind in ("tab", "escape", "interrupt", "submit", "submit_ctrl", "scroll_up", "scroll_down")):
                     edit_kind = self.settings_edit["kind"]
                     self._settings_edit_commit(config)
                     if kind in ("submit", "submit_ctrl"):
@@ -933,7 +937,7 @@ class SettingsPanelMixin(UiState):
             if kind == "interrupt":
                 if self._settings_is_dirty(config) and self._settings_esc_stage == 0:
                     self._settings_esc_stage = 1
-                    self.settings_notice = "有未保存更改 · Enter保存退出 · Esc放弃"
+                    self.settings_notice = "有未保存更改 · Enter保存退出 · Esc放弃 · x重置本页"
                     self.render()
                     continue
                 self.settings_mode = False
@@ -944,7 +948,7 @@ class SettingsPanelMixin(UiState):
                     return {}
                 if self._settings_is_dirty(config):
                     self._settings_esc_stage = 1
-                    self.settings_notice = "有未保存更改 · Enter保存退出 · Esc放弃 · 其它键继续编辑"
+                    self.settings_notice = "有未保存更改 · Enter保存退出 · Esc放弃 · x重置本页 · 其它键继续编辑"
                     self.render()
                     continue
                 self.settings_mode = False
@@ -956,17 +960,22 @@ class SettingsPanelMixin(UiState):
                     self.bind_config(config)
                     return updates
                 self._settings_esc_stage = 0
-                self.settings_notice = "↑↓ 选择 · ←→ 修改 · Enter保存退出 · Esc放弃"
+                self.settings_notice = "↑↓ 选择 · ←→ 修改 · PgUp/PgDn切页 · x重置本页 · Enter保存退出 · Esc放弃"
                 # 继续处理当前键
             if kind == "mode_switch":
                 continue
             if self._is_mode_switch(kind, value) and kind != "tab":
                 continue
-            if kind == "tab":
+            if kind in ("tab", "scroll_up", "scroll_down"):
+                # PgUp/PgDn 切页（Tab 已让位）：先落存模型页暂存再翻页
+                if kind == "tab":
+                    continue
                 self._settings_capture_model_scratch(config)
-                self.settings_tab = (self.settings_tab + 1) % len(self.settings_tabs)
+                direction = 1 if kind == "scroll_down" else -1
+                self.settings_tab = (self.settings_tab + direction) % len(self.settings_tabs)
                 self.settings_index = 0
                 self._settings_scroll = 0
+                self._settings_reset_at = 0.0
                 self._immediate_settings_refresh(config)
                 self._clamp_settings_index()
                 self.render()
@@ -1094,6 +1103,10 @@ class SettingsPanelMixin(UiState):
                 else:
                     self._settings_cycle_choice(1, config)
                 self.render()
+            elif kind == "char" and str(value).lower() == "x" and not self._settings_field_editable():
+                # x 两按确认重置当前标签页；文本字段选中时 x 照常进入行内编辑
+                self._settings_reset_request(config)
+                self.render()
             else:
                 # 文本项可直接键入进入行内编辑（与字段尾部 ▌ 提示一致），
                 # 也可先 Enter 再输入；其余按键仅重绘
@@ -1109,6 +1122,97 @@ class SettingsPanelMixin(UiState):
             self.settings_index = 0
         if self.settings_index >= n:
             self.settings_index = n - 1
+
+    # ----- x 一键重置当前标签页 -----
+
+    # 重置确认窗口秒数：第一次 x 提示，窗口内第二次执行
+    _RESET_CONFIRM_SECONDS = 4.0
+
+    # 可直接键入行内编辑的字段类型：这些行聚焦时 x 照常输入字符
+    _RESET_EDITABLE_TYPES = frozenset(
+        {"text", "advtext", "ptext", "body_text", "body_json", "readonly"}
+    )
+
+    def _settings_field_editable(self) -> bool:
+        field = self._plugin_current_field()
+        return field.get("type") in self._RESET_EDITABLE_TYPES
+
+    def _settings_reset_request(self, config) -> None:
+        if time.monotonic() - self._settings_reset_at < self._RESET_CONFIRM_SECONDS:
+            self._settings_reset_tab(config)
+            self._settings_reset_at = 0.0
+            return
+        self._settings_reset_at = time.monotonic()
+        self.settings_notice = "再按 x 确认：重置当前标签页设置"
+
+    def _settings_reset_tab(self, config) -> None:
+        """重置当前标签页：系统/快捷键/插件恢复声明 default（插件按页内
+        写透语义即时落盘）；提供商/模型页无出厂默认，丢弃未保存修改、
+        恢复已保存配置。统一按面板流程走：Enter 保存生效、Esc 放弃。"""
+        tab = self.settings_tabs[self.settings_tab]
+        s = self.settings_scratch
+        if tab == "系统":
+            for field in settings_schema.fields("system", config):
+                if "default" in field:
+                    s[field["key"]] = field["default"]
+                else:
+                    s.pop(field["key"], None)
+            self.settings_notice = "系统页已恢复默认值 · Enter 保存生效"
+        elif tab == "快捷键":
+            for field in settings_schema.fields("shortcuts", config):
+                if "default" in field:
+                    s[f"key_{field['key']}"] = field["default"]
+                else:
+                    s.pop(f"key_{field['key']}", None)
+            self.settings_notice = "快捷键页已恢复默认绑定 · Enter 保存生效"
+        elif tab == "插件":
+            from core import plugins as plugins_mod
+
+            count = 0
+            for row in plugins_mod.statuses():
+                for d in plugins_mod.declared_configs(row["id"]):
+                    if "default" not in d:
+                        continue
+                    try:
+                        plugins_mod.set_setting(row["id"], d["key"], d["default"], config)
+                        count += 1
+                    except (ValueError, Exception) as e:
+                        log.warn("插件配置重置失败 %s.%s: %s", row["id"], d["key"], e)
+            self.settings_notice = f"已重置并保存 {count} 项插件配置" if count else "没有可重置的插件配置"
+        elif tab == "模型":
+            # 丢弃全部未保存的模型页暂存（工作副本 + 待删除标记 + 本页字段）
+            self.settings_model_work = {}
+            self.settings_model_removed = {}
+            self._settings_model_scratch_name = ""
+            for key in (
+                "select_model", "select_provider",
+                *self._MODEL_MODALITIES, *self._MODEL_PARAMETER_KEYS,
+                "task_plan", "task_code", "task_review",
+            ):
+                s.pop(key, None)
+            self.settings_model_name = config.model_name
+            self.settings_notice = "模型页已恢复已保存配置 · 未保存修改已丢弃"
+        else:
+            # 提供商页：恢复已保存配置；"切换提供商/激活提供商"选中的目标本身不动
+            keep_switch = s.get("switch_provider")
+            for key in (
+                "active_provider_id", "provider_id", "provider_name", "api_key",
+                "base_url", "balance_url", "provider_temperature",
+                "adv_send_temperature", "adv_thinking_enabled", "adv_thinking_effort",
+                "adv_custom_body", "default_model_id",
+            ):
+                s.pop(key, None)
+            self._provider_adv_expanded = False
+            self._provider_body_expanded = False
+            self._provider_body_items_expanded = set()
+            self._provider_body_by_provider = {}
+            self._settings_body_provider_id = ""
+            if keep_switch == "(新建)":
+                # 新建表单无已保存配置可恢复，重置为新建默认模板
+                s["base_url"] = "https://api.openai.com/v1"
+            self.settings_notice = "提供商页已恢复已保存配置 · 未保存修改已丢弃"
+        self._immediate_settings_refresh(config)
+        self._clamp_settings_index()
 
     def _settings_move_selection(self, direction: int) -> None:
         """↑↓ 移动选中项，跳过 sep 分隔行"""
@@ -1899,6 +2003,6 @@ class SettingsPanelMixin(UiState):
     def _compose_edit_line(self, w: int) -> str:
         edit = self.settings_edit or {}
         label = edit.get("label", "")
-        hint = "↑↓ 切换字段 · Tab 切换标签 · Enter 保存退出 · Esc 放弃" if edit.get("kind") in ("text", "plugin") else "Enter 提交 · Esc 取消"
+        hint = "↑↓ 切换字段 · PgUp/PgDn 切页 · Enter 保存退出 · Esc 放弃" if edit.get("kind") in ("text", "plugin") else "Enter 提交 · Esc 取消"
         body = f" {label} [{self._edit_caret_text(edit)}]  {hint}"
         return self.c("warn") + _clip(body, w) + self.RESET

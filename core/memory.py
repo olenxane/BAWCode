@@ -329,7 +329,7 @@ class Memory:
         self.compress_threshold = min(max(float(memory_cfg.get("compress_threshold", 0.8)), 0.1), 1.0)
         # 压缩管线：尾段保留预算（最近轮次原文）与摘要硬上限；连续失败熔断计数
         self.compress_keep_recent_tokens = int(memory_cfg.get("compress_keep_recent_tokens", 16384))
-        self.compress_summary_max_tokens = int(memory_cfg.get("compress_summary_max_tokens", 64000))
+        self.compress_summary_max_tokens = int(memory_cfg.get("compress_summary_max_tokens", 10240))
         # 摘要软目标比例与压缩目标水位：目标水位用于动态收紧尾段预算
         self.compress_summary_ratio = max(0.01, float(memory_cfg.get("compress_summary_ratio", 0.06)))
         self.compress_target_ratio = min(max(float(memory_cfg.get("compress_target_ratio", 0.45)), 0.1), 0.95)
