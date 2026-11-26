@@ -36,7 +36,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from core import policy
+from core import policy, proc
 from core import memory as memory_mod
 from core import prompt_loader
 from core import register
@@ -653,6 +653,7 @@ def _background_task_worker(task: dict, record: dict, cfg: dict, directory: Path
     messages = record["messages"]
     status, final_text = "error", "后台任务未启动"
     try:
+        proc.set_scope("subagent")
         if task["cancel"].is_set():
             status, final_text = "interrupted", "任务在启动前被取消"
         else:

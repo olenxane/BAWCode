@@ -24,22 +24,24 @@ SERVICE_METHODS = {
     "mcp": ("status_listing",),
     "models": ("make_model_name", "normalize_base_url"),
     "settings": ("fields", "read_field", "write_field"),
-    "runtime": ("snapshot", "notify", "interrupt", "tree_node"),
+    "runtime": ("snapshot", "notify", "interrupt", "tree_node", "cancelled", "scope"),
     "logging": ("get_logger",),
+    "ui": ("request_wait",),
 }
 SERVICE_VALUES = {
     "policy": ("MODE_LABELS", "MODE_CONFIRM", "MODES"),
     "files": ("MAX_SCAN_DEPTH",),
-    "runtime": ("CANCELLED",),
+    "runtime": ("CANCELLED", "HOST_ROOT"),
 }
 
 
 class Service:
     """Only declared operations are reachable; private host attributes are not forwarded."""
 
-    def __init__(self, host: HostAPI, name: str):
+    def __init__(self, host: HostAPI, name: str, owner: str = ""):
         self._host = host
         self._name = name
+        self._owner = owner
 
     def __getattr__(self, name: str) -> Any:
         if name in SERVICE_METHODS.get(self._name, ()):
@@ -49,6 +51,35 @@ class Service:
         if name in SERVICE_VALUES.get(self._name, ()):
             return self._host.value(self._name, name)
         raise AttributeError(f"Unknown SDK operation: {self._name}.{name}")
+
+    def invoke_raw(self, operation: str, *args: Any, **kwargs: Any) -> Any:
+        """绑定本服务一次的直通调用（供 HostServices 包装层使用）"""
+        return self._host.invoke(self._name, operation, *args, **kwargs)
+
+
+class _HooksService:
+    """hooks 服务的 owner 感知包装：注册/注销缺省归属调用方插件。
+
+    防两类事故：register_hook 忘传 owner → 卸载时残留；unregister_hook 只按
+    handler/name 的宿主默认 OR 匹配 → 误注销别家插件的订阅。"""
+
+    def __init__(self, service: Service, owner: str):
+        self._service = service
+        self._owner = owner
+
+    def register_hook(self, event, handler=None, priority: int = 100, owner: str = "", name: str = ""):
+        return self._service.invoke_raw(
+            "register_hook", event, handler, priority=priority, owner=owner or self._owner, name=name
+        )
+
+    def unregister_hook(self, event, handler=None, owner: str = "", name: str = "", match_all: bool = False):
+        # 缺省只注销本插件的订阅；显式传 owner 才允许跨插件（管理插件权责自负）
+        return self._service.invoke_raw(
+            "unregister_hook", event, handler, owner=owner or self._owner, name=name, match_all=True
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._service, name)
 
 
 class HostServices:
@@ -73,7 +104,11 @@ class HostServices:
     runtime: Service
     logging: Service
     policy: Service
+    ui: Service
 
-    def __init__(self, host: HostAPI):
+    def __init__(self, host: HostAPI, owner: str = ""):
         for name in SERVICE_METHODS.keys() | SERVICE_VALUES.keys():
-            setattr(self, name, Service(host, name))
+            service = Service(host, name, owner)
+            if name == "hooks" and owner:
+                service = _HooksService(service, owner)  # type: ignore[assignment]
+            setattr(self, name, service)

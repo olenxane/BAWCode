@@ -61,41 +61,14 @@
           "thinking_effort": "high"
         }
       ]
-    },
-    {
-      "provider_id": "qwen",
-      "name": "Qwen Local",
-      "api_key": "666666",
-      "base_url": "http://192.168.101.53:8001/v1",
-      "default_model_id": "qwen1.5-0.1b",
-      "temperature": 1.0,
-      "balance_url": "",
-      "advanced": {
-        "send_temperature": false,
-        "thinking_enabled": false,
-        "thinking_effort": "none",
-        "send_stream_options": false
-      },
-      "models": [
-        {
-          "model_id": "qwen1.5-0.1b",
-          "context_window": 32768,
-          "max_tokens": 2048,
-          "temperature": 1.0,
-          "modalities": [
-            "text"
-          ],
-          "thinking_effort": "none"
-        }
-      ]
     }
   ],
-  "active_provider_id": "qwen",
-  "active_model_id": "qwen1.5-0.1b",
+  "active_provider_id": "deepseek",
+  "active_model_id": "deepseek-flash",
   "task_models": {
-    "plan": "qwen-qwen1.5-0.1b",
-    "code": "qwen-qwen1.5-0.1b",
-    "review": "qwen-qwen1.5-0.1b"
+    "plan": "deepseek-deepseek-flash",
+    "code": "deepseek-deepseek-flash",
+    "review": "deepseek-deepseek-flash"
   },
   "prompt": {
     "dir": "core/prompts",
@@ -104,18 +77,22 @@
     ],
     "plan_files": [
       "plan.md"
-    ]
+    ],
+    "system_prompt_dir": "data/system_prompt",
+    "active_system_prompt": ""
   },
   "system": {
     "font_size": 16
   },
   "security": {
-    "delete_guard": true
+    "delete_guard": true,
+    "strict_delete_guard": true
   },
   "ui": {
     "theme": "dark",
     "mode": "auto",
     "logo": true,
+    "render_mode": "fullscreen",
     "send": "ctrl+enter",
     "newline": "shift+enter",
     "switch_focus": "tab",
@@ -150,7 +127,8 @@
   "llm": {
     "retry_times": 3,
     "retry_delay": 1.0,
-    "stream": true
+    "stream": true,
+    "request_timeout": 180.0
   },
   "log": {
     "level": "info",
@@ -164,9 +142,12 @@
     "auto_compress": true,
     "compress_threshold": 0.8,
     "compress_keep_recent_tokens": 16384,
-    "compress_summary_max_tokens": 1024,
+    "compress_summary_max_tokens": 10240,
     "strip_tool_history": true,
-    "strip_tool_keep": 6
+    "strip_tool_keep": 6,
+    "autosave_minutes": 10,
+    "compress_summary_ratio": 0.06,
+    "compress_target_ratio": 0.45
   },
   "context": {
     "tool_whitelist": [
@@ -193,7 +174,21 @@
     ],
     "inline_limit_tokens_large": 32768,
     "persist_dir": "data/toolcalls",
-    "strip_keep_recent": 6
+    "strip_keep_recent": 6,
+    "aggressive_optimization": false,
+    "aggressive_keep_tool_rounds": 12,
+    "mid_turn_maintenance": true,
+    "mid_turn_keep_tool_rounds": 12,
+    "mid_turn_keep_reads_per_file": 3,
+    "mid_turn_keep_thinking_rounds": 3,
+    "request_safety_tokens": 2048,
+    "strip_digest_chars": 200,
+    "aggressive_keep_reads_per_file": 3,
+    "keep_recent_images": 3,
+    "strip_call_args_min_chars": 512,
+    "image_max_edge": 1568,
+    "image_token_estimate": 1600,
+    "evict_protected_overflow": true
   },
   "skills": {
     "enabled": true,
@@ -206,24 +201,15 @@
   "plugins": {
     "enabled": true,
     "dir": "data/plugins",
-    "disable": [
-      "music-player",
-      "computer-use",
-      "qbridge",
-      "remote-control",
-      "emotion-detector",
-      "hello-plugin",
-      "bottom-banter"
-    ],
+    "disable": [],
     "auto_install_deps": true
   },
   "plugins_config": {},
   "workflow": {
-    "enabled": false,
     "dir": "data/workflows",
-    "active": "default",
     "max_rounds": 0,
-    "spin_kill_count": 12
+    "spin_kill_count": 12,
+    "handoff_char_cap": 4000
   },
   "subagent": {
     "enabled": true,
@@ -232,7 +218,10 @@
     "max_rounds": 20,
     "result_char_cap": 3000,
     "query_default_rounds": 3,
-    "max_concurrent": 3
+    "max_concurrent": 3,
+    "context_fold_ratio": 0.85,
+    "context_fold_keep_rounds": 4,
+    "context_fold_digest_chars": 240
   },
   "tools": {
     "max_timeout": 600,
@@ -241,7 +230,15 @@
   },
   "mcp": {
     "enabled": false,
-    "servers": {},
+    "servers": {
+      "blender": {
+        "command": "uvx",
+        "args": [
+          "blender-mcp"
+        ],
+        "enabled": true
+      }
+    },
     "discovery_timeout_stdio": 30,
     "discovery_timeout_http": 5,
     "call_timeout": 600,
@@ -253,7 +250,8 @@
     "trash_dir": "data/trash",
     "max_turns": 10,
     "max_file_bytes": 20971520,
-    "inventory_max_files": 50000
+    "inventory_max_files": 50000,
+    "gc_days": 30
   },
   "external_apis": {
     "prompt_refine": null,
@@ -267,6 +265,7 @@
     "rag_query": null,
     "computer_use": null,
     "llm_request": null,
+    "complexity_judge": null,
     "tool_confirm": null
   }
 }

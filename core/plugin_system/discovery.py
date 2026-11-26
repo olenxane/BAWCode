@@ -9,6 +9,8 @@ from .defaults import DEFAULT_DISABLED_PLUGINS
 
 log = get_logger("plugins.discovery")
 _ROOT = Path(__file__).resolve().parents[2]
+# 宿主根（仓库/安装根）：插件全局存储等场景的基准目录
+HOST_ROOT = _ROOT
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 def _plugins_dirs(config, workspace: Optional[Path]) -> List[Path]:

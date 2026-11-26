@@ -349,3 +349,77 @@ def progress_text() -> str:
     extra = f" 等{len(jobs)}项" if len(jobs) > 2 else ""
     frame = "|/-\\"[int(now * 4) % 4]
     return f"{frame} 插件依赖安装中: " + " · ".join(parts) + extra
+
+
+def scan_conflicts(items: List[dict]) -> Dict[str, List[str]]:
+    """跨插件依赖冲突扫描（纯检测不干预）：返回 {pid: [冲突描述]}。
+
+    仅当 ≥2 个不同插件约束同一发行名时检查：
+      - 已安装版本同时不满足两方 → 冲突（确定有一方已坏）
+      - 满足其一不满足另一方 → 警示（后装一方会破坏另一方）
+      - 未安装且纯下界/纯上界互斥（>=X 与 <Y 且 Y<=X）→ 潜在冲突
+    复杂多段约束/环境标记/extras 跳过，宁缺勿滥。
+    """
+    if _Requirement is None:
+        return {}
+    by_name: Dict[str, List[tuple]] = {}
+    for item in items:
+        pid = item.get("id") or ""
+        for line in _read_requirements(item["dir"]):
+            name, spec = _split_requirement(line)
+            if name is not None and spec is not None:
+                by_name.setdefault(name.lower(), []).append((pid, line, spec))
+    out: Dict[str, List[str]] = {}
+    for name, entries in by_name.items():
+        owners = {pid for pid, _, _ in entries}
+        if len(owners) < 2:
+            continue
+        try:
+            dist = importlib.metadata.distribution(name)
+            installed = str(dist.version)
+        except Exception:
+            installed = ""
+        if installed:
+            unsat = [(pid, line) for pid, line, spec in entries if not spec.contains(installed, prereleases=True)]
+            sat = [(pid, line) for pid, line, spec in entries if spec.contains(installed, prereleases=True)]
+            if unsat and sat:
+                for pid, line, _spec in entries:
+                    others = "；".join(f"{p2} 要求 {l2}" for p2, l2, _ in entries if p2 != pid)
+                    level = "冲突" if (pid, line) in unsat else "警示"
+                    msg = f"{level}: {name} 已装 {installed}，本插件要求 {line}（{others}）"
+                    out.setdefault(pid, []).append(msg)
+            elif len(unsat) >= 2:
+                for pid, line, _spec in entries:
+                    others = "；".join(f"{p2} 要求 {l2}" for p2, l2, _ in entries if p2 != pid)
+                    out.setdefault(pid, []).append(f"警示: {name} 已装 {installed} 不满足任何一方，本插件要求 {line}（{others}）")
+            continue
+        # 未安装：纯下界与纯上界互斥粗判
+        lowers, uppers = [], []
+        for pid, line, spec in entries:
+            specs = list(spec)
+            if len(specs) != 1:
+                continue
+            op, ver = specs[0].operator, specs[0].version
+            if op in (">=", ">", "=="):
+                lowers.append((pid, line, ver))
+            elif op in ("<", "<="):
+                uppers.append((pid, line, ver))
+        try:
+            from packaging.version import Version as _V
+        except ImportError:
+            _V = None
+
+        def _ver_leq(a: str, b: str) -> bool:
+            if _V is not None:
+                try:
+                    return _V(a) <= _V(b)
+                except Exception:
+                    return False
+            return a == b
+
+        for lpid, lline, lver in lowers:
+            for upid, uline, uver in uppers:
+                if lpid != upid and _ver_leq(uver, lver):
+                    out.setdefault(lpid, []).append(f"潜在冲突: {name} 本插件要求 {lline}，{upid} 要求 {uline}（无共存版本）")
+                    out.setdefault(upid, []).append(f"潜在冲突: {name} 本插件要求 {uline}，{lpid} 要求 {lline}（无共存版本）")
+    return out

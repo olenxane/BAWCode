@@ -38,7 +38,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from core import memory as memory_mod
+from core import memory as memory_mod, proc
 from core import policy
 from core import prompt_loader
 from core import register
@@ -1161,6 +1161,7 @@ def _workflow_worker(task: dict, record: dict, directory: Path, record_path: Opt
     task_id = str(task["id"])
     status, final_text = "error", "后台工作流未启动"
     try:
+        proc.set_scope("workflow")
         if task["cancel"].is_set():
             status, final_text = "interrupted", "实例在启动前被取消"
         else:

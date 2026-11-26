@@ -1,9 +1,37 @@
 """Public plugin context. All host calls go through an injected HostAPI."""
+import threading
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 from .configuration import _parse_config_decls
+from .events import is_known, suggest
 from .host import HostAPI, HostServices
 from .ui import PluginUI
+
+
+class Worker:
+    """spawn_worker 返回的线程句柄：停止信号、线程对象与停止方法。
+
+    长循环 worker 应周期检查 stop_event；插件卸载时 SDK 自动置位并 join，
+    即使插件忘记注册 teardown 也不会永久残留。"""
+
+    def __init__(self, thread: threading.Thread, stop_event: threading.Event, name: str):
+        self.thread = thread
+        self.stop_event = stop_event
+        self.name = name
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        """置位停止信号并等待线程退出；返回是否在超时内停止"""
+        self.stop_event.set()
+        self.thread.join(timeout)
+        return not self.thread.is_alive()
+
+
+# worker 线程本地自省：ctx.current_worker 在 worker 线程内返回自身句柄
+_worker_local = threading.local()
+
+
+def current_worker() -> Optional[Worker]:
+    return getattr(_worker_local, "worker", None)
 
 
 class PluginContext:
@@ -14,7 +42,7 @@ class PluginContext:
     """
 
     def __init__(self, pid: str, dir_path: Path, manifest: dict, source: str, config, workspace: Path, *, host: HostAPI):
-        self.host = HostServices(host)
+        self.host = HostServices(host, owner=pid)
         self._closed = False
         self.plugin_id = pid
         self.dir = dir_path
@@ -27,6 +55,7 @@ class PluginContext:
         self.log = self.host.logging.get_logger(f"plugins.{pid}")
         self.ui = PluginUI(self)
         self._teardowns: List[Callable] = []  # register_teardown 登记，卸载时按序执行
+        self._workers: List[Worker] = []      # spawn_worker 登记，close 时自动兜底停止
 
     @property
     def runtime(self) -> dict:
@@ -36,6 +65,77 @@ class PluginContext:
     @property
     def session(self):
         return self.host.sessions.get_session()
+
+    @property
+    def cancelled(self):
+        """当前线程的回合取消事件（threading.Event 或 None）。
+
+        工具执行期宿主已在线程上挂好；长循环/可切片工作应按 cancelled.is_set()
+        及时退出。None 表示脱离回合（后台独立线程），按不可取消处理。
+        传给 ctx.ui 各原语的 cancelled 参数缺省时即自动使用本事件。"""
+        return self.host.runtime.cancelled()
+
+    def execution_scope(self) -> str:
+        """当前线程的执行域：main（主代理回合）/subagent（后台子代理任务）/
+        workflow（工作流实例）/unknown（未标记线程，如插件自起 worker、主线程）。
+
+        替代按线程名前缀判身份的旧约定；插件可据此拒绝子代理递归调用等。"""
+        return str(self.host.runtime.scope() or "unknown")
+
+    @property
+    def turn_active(self) -> bool:
+        """当前是否有回合进行中（只读；替代裸读 runner.busy）"""
+        runner = self.runtime.get("runner")
+        return bool(getattr(runner, "busy", False)) if runner is not None else False
+
+    @property
+    def current_worker(self) -> Optional[Worker]:
+        """worker 线程内返回自身句柄（含 stop_event）；非 worker 线程返回 None"""
+        return current_worker()
+
+    def spawn_worker(self, fn: Callable[[], Any], name: str = "worker", daemon: bool = True,
+                     stop_event: Optional[threading.Event] = None) -> Worker:
+        """启动插件后台工作线程（标准库惯例：fn 为普通无参函数，签名零绑架）。
+
+        停止信号两种用法（可混用）：
+          - 闭包自管：传入自己的 stop_event，fn 内周期检查 stop_event.is_set()
+          - 线程内自省：fn 内任意深度经 ctx.current_worker.stop_event 检查
+
+        插件卸载时 close() 自动置位 stop_event 并 join（最多 2 秒/线程），
+        未退出的记 warn——忘记 register_teardown 也不会永久残留。
+        """
+        self._ensure_active()
+        ev = stop_event if stop_event is not None else threading.Event()
+        full_name = f"bawcode-plugin-{self.plugin_id}-{name}"
+        holder: dict = {}
+
+        def _run():
+            _worker_local.worker = holder["worker"]
+            try:
+                fn()
+            except (Exception, SystemExit) as exc:
+                self.log.warn("worker %s 异常退出: %r", full_name, exc)
+            finally:
+                _worker_local.worker = None
+
+        thread = threading.Thread(target=_run, name=full_name, daemon=daemon)
+        worker = Worker(thread, ev, full_name)
+        holder["worker"] = worker
+        self._workers.append(worker)
+        thread.start()
+        return worker
+
+    def _stop_workers(self) -> None:
+        """close 兜底：全部 worker 置位停止信号并限时 join"""
+        workers, self._workers = self._workers, []
+        for w in workers:
+            w.stop_event.set()
+        for w in workers:
+            if w.thread is threading.current_thread():
+                continue  # worker 在自己的线程里触发卸载：join 自己会死锁
+            w.thread.join(2.0)
+            if w.thread.is_alive():
+                self.log.warn("worker %s 未在 2s 内退出（线程仍在运行）", w.name)
 
     @property
     def closed(self) -> bool:
@@ -59,12 +159,13 @@ class PluginContext:
         return self.host.runtime.interrupt()
 
     def close(self) -> None:
-        """Run cleanup exactly once, including after a failed setup."""
+        """Run cleanup exactly once, including after a failed setup (workers first, teardowns LIFO)."""
         if self._closed:
             return
         self._closed = True
+        self._stop_workers()  # 先停后台线程的消费者，再释放 teardown 里的资源
         callbacks, self._teardowns = self._teardowns, []
-        for fn in callbacks:
+        for fn in reversed(callbacks):
             try:
                 fn()
             except (Exception, SystemExit) as exc:
@@ -84,20 +185,35 @@ class PluginContext:
 
     # ---- hooks ----
 
+    def _warn_unknown_event(self, event: str) -> None:
+        """目录外事件 warn 一次：多为拼写错误；自定义互通事件属预期用法可忽略"""
+        if not is_known(event):
+            hint = suggest(event)
+            self.log.warn(
+                "注册的事件 %r 不在内置目录（%s），不会响应宿主生命周期；若为插件间自定义事件可忽略",
+                event, f"是否想用 {hint!r}？" if hint else "无相近事件名",
+            )
+
     def register_hook(
         self, event: str, handler: Optional[Callable] = None, priority: int = 100, name: str = ""
     ):
-        """注册 hook 处理函数（装饰器或直接传 fn）；语义见插件开发指南的事件目录"""
+        """注册 hook 处理函数（装饰器或直接传 fn）；语义见插件开发指南的事件目录。
+        目录内事件名可从 bawcode_sdk.events 以常量引用，避免拼写错误"""
+        self._warn_unknown_event(event)
         def bind(fn):
             self._ensure_active()
             return self.host.hooks.register_hook(event, fn, priority=priority, owner=self.plugin_id, name=name)
         return bind(handler) if handler is not None else bind
 
-    def register_context_supplement(self, fn: Callable[[dict], Any], priority: int = 100):
-        """注册回合上下文补充：fn(payload) -> str|None；非 None 文本以 [插件补充] 注入"""
+    def register_user_message_supplement(self, fn: Callable[[dict], Any], priority: int = 100):
+        """注册用户消息补充：fn(payload) -> str|None；非 None 文本写入时焊进该条
+        user 消息（user_supplement 字段），出站时以 <system> 块拼在消息正文开头。
+        payload 带 user_message/project_id/session_id。写入后字节冻结，
+        前缀缓存友好；注意内容随消息长期存在，只适合与该消息语义绑定的补充
+        （如 RAG 按消息召回、按消息内容的判定提示），不适合全局动态状态。"""
         self._ensure_active()
         return self.host.hooks.register_hook(
-            "context_supplement", fn, priority=priority, owner=self.plugin_id, name="supplement"
+            "user_message_supplement", fn, priority=priority, owner=self.plugin_id, name="supplement"
         )
 
     def register_ui_tree(self, fn: Callable[[dict], Any], priority: int = 100):
@@ -114,6 +230,7 @@ class PluginContext:
         """插件侧实现 external_apis 同名扩展点（如 computer_use/memory_write）。
         传 fn 直接挂进程内处理函数；传 url 挂 HTTP POST 处理函数。"""
         self._ensure_active()
+        self._warn_unknown_event(event)
         if fn is not None:
             return self.host.hooks.register_hook(event, fn, priority=priority, owner=self.plugin_id, name="api")
         if url:
@@ -227,7 +344,7 @@ class PluginContext:
     def request_llm_retry(self) -> bool:
         """请求重试当前失败的 LLM 请求：仅当回合正处于 API 错误等待态（瞬态错误
         自动重试耗尽后，终端提示 Ctrl+Y 重试）时有效；返回是否成功触发。"""
-        app = self.runtime.get("app") if self is not None else None
+        app = self.runtime.get("app")
         if app is None:
             return False
         fn = getattr(app, "request_llm_retry", None)
@@ -242,9 +359,19 @@ class PluginContext:
         self._teardowns.append(fn)
         return fn
 
-    def storage_dir(self) -> Path:
-        """插件专属持久化目录 {workspace}/.bawcode/plugin-data/<id>/（自动创建）"""
-        d = self.workspace / ".bawcode" / "plugin-data" / self.plugin_id
+    def storage_dir(self, scope: str = "project") -> Path:
+        """插件专属持久化目录（自动创建）。
+
+        scope="project"（缺省）：{workspace}/.bawcode/plugin-data/<id>/，按项目隔离；
+        scope="global"：{宿主根}/data/plugin-data/<id>/，跨项目共享——注意全局目录
+        无跨实例写锁，多实例并发写入需插件自行保证原子性（临时文件+replace）。"""
+        if scope == "project":
+            base = self.workspace / ".bawcode" / "plugin-data"
+        elif scope == "global":
+            base = Path(self.host.runtime.HOST_ROOT) / "data" / "plugin-data"
+        else:
+            raise ValueError(f"storage_dir scope 须为 project 或 global，得到 {scope!r}")
+        d = base / self.plugin_id
         d.mkdir(parents=True, exist_ok=True)
         return d
 

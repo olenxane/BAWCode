@@ -17,10 +17,7 @@ except ImportError as _e:  # 缺 pyautogui 等依赖时不注册，宿主占位�
     backend = None
     _IMPORT_ERROR = str(_e)
 
-try:
-    from core import proc as _proc  # 宿主取消令牌（线程本地，工具执行期已挂上）
-except Exception:
-    _proc = None
+_ctx = None  # setup() 注入；取消令牌经 ctx.cancelled 实时取（线程本地）
 
 _TOOL_NAME = "computer_use"
 _KEEP_SHOTS = 50          # 截图目录保留张数
@@ -48,8 +45,9 @@ _DESC = (
     "any screenshot). locate returns coordinates in the same latest-screenshot space, usable "
     "directly in click. "
     "type: default pastes text via the clipboard (reliable under any input method/IME; the "
-    "full clipboard contents are restored afterwards). method=keys types ASCII keystrokes "
-    "directly as a fallback for targets that block Ctrl+V (non-ASCII text is rejected). "
+    "full clipboard contents, in all formats, are snapshotted and restored afterwards1). "
+    "method=keys types ASCII keystrokes directly as a fallback for targets that block "
+    "Ctrl+V (non-ASCII text is rejected). "
     "key: single key (enter/esc/f5), combo (ctrl+s), optional hold_ms. Focus the target "
     "window with window_focus before typing. Verify results on the newest screenshot — an "
     "accepted action does not guarantee the app acted. Do not touch mouse/keyboard while "
@@ -149,7 +147,7 @@ def _num(value, name: str) -> float:
 
 
 def _check_cancel() -> None:
-    ev = _proc.cancel_event() if _proc is not None else None
+    ev = _ctx.cancelled if _ctx is not None else None
     if ev is not None and ev.is_set():
         raise _Cancelled()
 

@@ -19,6 +19,10 @@ _OVERRIDES = {
     ("files", "read_persisted_content"): ("toolstore", "read_persisted_content"),
     ("runtime", "CANCELLED"): ("llm", "CANCELLED"),
     ("runtime", "tree_node"): ("render", "TreeNode"),
+    ("runtime", "cancelled"): ("proc", "cancel_event"),
+    ("runtime", "scope"): ("proc", "current_scope"),
+    ("runtime", "HOST_ROOT"): ("plugin_system.discovery", "HOST_ROOT"),
+    ("ui", "request_wait"): ("ui", "_request_ui_wait"),
 }
 
 
@@ -32,7 +36,7 @@ class BAWCodeHost:
     def invoke(self, service, operation, *args, **kwargs):
         if operation not in SERVICE_METHODS.get(service, ()):
             raise AttributeError(f"Unknown SDK operation: {service}.{operation}")
-        if service == "runtime" and operation != "tree_node":
+        if service == "runtime" and operation not in ("tree_node", "cancelled", "scope"):
             from .runtime import runtime, notify, interrupt
             return {"snapshot": runtime, "notify": notify, "interrupt": interrupt}[operation](*args, **kwargs)
         return self._resolve(service, operation)(*args, **kwargs)

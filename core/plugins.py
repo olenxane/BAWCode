@@ -43,7 +43,8 @@ class PluginContext(SDKPluginContext):
                          host=host if host is not None else _LegacyHost())
 
     def request_llm_retry(self):
-        app = self.runtime.get("app") if self is not None else _runtime.get("app")
+        # 旧调用方存在以 None 作 self 的用法（经模块属性直访运行时载体）
+        app = (self.runtime.get("app") if self is not None else None) or _runtime.get("app")
         fn = getattr(app, "request_llm_retry", None) if app is not None else None
         return bool(fn()) if callable(fn) else False
 

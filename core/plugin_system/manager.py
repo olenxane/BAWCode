@@ -14,6 +14,7 @@ from .dependencies import (
     cancel_install,
     inspect_requirements,
     progress_text as _deps_progress_text,
+    scan_conflicts,
     start_install,
     take_completed,
 )
@@ -177,6 +178,13 @@ def load(config, workspace: Optional[Path] = None, async_deps: Optional[bool] = 
     items = discover(config, ws)
     for item in items:
         _load_one(item, config, ws)
+    for pid, msgs in scan_conflicts(items).items():
+        rec = _loaded.get(pid)
+        if rec is None:
+            continue
+        rec.setdefault("deps", dict(_NO_DEPS))["conflicts"] = msgs
+        for msg in msgs:
+            log.warn("插件依赖%s: %s", "", msg)
     _sync_plugin_skills(ws)
     counts = summary()
     log.info(
@@ -272,6 +280,11 @@ def _deps_note(deps: Optional[dict]) -> str:
     return ""
 
 
+def _conflict_note(deps: Optional[dict]) -> str:
+    msgs = (deps or {}).get("conflicts") or []
+    return f" · 依赖冲突×{len(msgs)}" if msgs else ""
+
+
 def statuses() -> List[dict]:
     """诊断视图：id/名称/版本/来源/状态/错误/注册量/依赖"""
     rows = []
@@ -309,6 +322,7 @@ def status_listing() -> str:
         if r["status"] == "loaded":
             line += f" · hooks={r['hooks']} tools={r['tools']} commands={r['commands']}"
             line += _deps_note(r.get("deps"))
+            line += _conflict_note(r.get("deps"))
         if r["description"]:
             line += f" · {r['description'][:40]}"
         lines.append(line)
@@ -318,6 +332,8 @@ def status_listing() -> str:
         if deps.get("status") == "failed" and deps.get("error"):
             last = (deps["error"] or "").splitlines()[-1]
             lines.append(f"    └ 依赖安装失败: {last}")
+        for msg in deps.get("conflicts") or []:
+            lines.append(f"    └ {msg}")
     hooks_view = hooks.list_hooks()
     hook_lines = [f"{ev}: {len(entries)}" for ev, entries in sorted(hooks_view.items()) if entries]
     if hook_lines:

@@ -154,6 +154,10 @@ DIALOG_LOCK = threading.Lock()
 def _request_ui_wait(app, kind: str, payload: dict, cancelled=None):
     """统一请求槽交互：持 DIALOG_LOCK 覆盖 request→wait 整个周期（并发申请串行弹窗），
     写槽后自旋等待应答；槽位被顶掉或取消命中即返回取消哨兵"""
+    if threading.current_thread() is threading.main_thread() and hasattr(app, "_serve_ui_request"):
+        # 死锁仅当请求需主线程 read_line 帧循环服务（交互式 TuiApp）：帧循环正被本调用
+        # 占住，请求永远等不到应答。无头/桩 app（同步作答或无帧循环）无此问题，放行。
+        raise RuntimeError(f"UI 桥({kind})不可在主线程调用：请直调 show_*_form/choose/read_line 阻塞表单")
     # 锁等待本身可被外部取消：否则队列里的后台任务在持锁者面板结束/取消前
     # 永远停在排队态（cancel 只置事件，这里吃不到）
     while not DIALOG_LOCK.acquire(timeout=0.05):

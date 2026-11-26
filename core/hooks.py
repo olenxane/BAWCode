@@ -7,7 +7,7 @@
 #                   函数时返回 default。适配 llm_request/prompt_refine/before_tool
 #                   这类"可改写输入"的扩展点。
 #   collect_hook —— 观察链：收集所有非 None 返回值组成列表返回。适配
-#                   context_supplement/after_turn/session_start 这类"多方贡献"的扩展点。
+#                   user_message_supplement/after_turn/session_start 这类"多方贡献"的扩展点。
 #
 # 每个处理函数带 owner 归属（插件 id），支持按 owner 注销（插件卸载）；单个处理函数异常被隔离记录，不中断链条。
 #
@@ -33,37 +33,8 @@ _lock = threading.Lock()
 # 默认超时（秒）
 DEFAULT_TIMEOUT = 60
 
-# 事件目录：call=变换链 collect=观察链。
-# 用户参与型外部能力（external_apis 对应项）+ 生命周期事件。
-EVENTS: Dict[str, dict] = {
-    # ---- 用户参与型能力（external_apis 同名映射；call 变换链）----
-    "prompt_refine": {"kind": "call", "desc": "改写用户的编码任务提示"},
-    "plan_generate": {"kind": "call", "desc": "外部生成/接收计划内容"},
-    "plan_confirm": {"kind": "call", "desc": "计划确认回调"},
-    "step_generate": {"kind": "call", "desc": "外部生成执行步骤（返回 {steps: []} 生效）"},
-    "step_update": {"kind": "call", "desc": "步骤状态变更通知"},
-    "memory_write": {"kind": "call", "desc": "长期记忆写入旁路"},
-    "memory_read": {"kind": "call", "desc": "长期记忆读取旁路"},
-    "rag_add": {"kind": "call", "desc": "RAG 文档加入旁路"},
-    "rag_query": {"kind": "call", "desc": "RAG 查询旁路"},
-    "computer_use": {"kind": "call", "desc": "computer-use 外部执行接口"},
-    "llm_request": {"kind": "call", "desc": "整段接管/转发 LLM 请求（返回 chat 响应结构生效）"},
-    "tool_confirm": {"kind": "call", "desc": "工具确认代答，首个有效应答生效；None 交回 UI 面板"},
-    "tool_confirm_closed": {"kind": "collect", "desc": "工具确认已应答，按 request_id 关闭其他通道请求"},
-    "ui_request": {"kind": "call", "desc": "交互弹窗代答 confirm/choose/line/ask（返回与键盘输入同语义的应答值生效；None 交回 UI 面板）"},
-    # ---- 生命周期事件 ----
-    "session_start": {"kind": "collect", "desc": "会话初始化完成（collect）"},
-    "before_turn": {"kind": "call", "desc": "回合开始，可改写 user_text（返回 {user_text: ...} 生效）"},
-    "after_turn": {"kind": "collect", "desc": "回合结束通知（collect）"},
-    "stream_delta": {"kind": "collect", "desc": "流式输出增量通知 {kind, piece}（collect，高频率）"},
-    "turn_status": {"kind": "collect", "desc": "回合状态/阶段变化通知 {status} 或 {phase}（collect）"},
-    "before_tool": {"kind": "call", "desc": "工具执行前，可改写 args 或拒绝执行"},
-    "after_tool": {"kind": "collect", "desc": "工具执行后通知（collect）"},
-    "context_supplement": {"kind": "collect", "desc": "回合上下文补充文本（collect，返回 str 生效）"},
-    "message_added": {"kind": "collect", "desc": "会话消息新增通知 {role, content, type, ...extra}（collect，content 可能为多模态数组；处理函数内禁止再写会话消息，否则递归）"},
-    "ui_tree_nodes": {"kind": "collect", "desc": "每帧提供插件主窗口会话树根节点（collect）"},
-    "ui_bottom_rows": {"kind": "collect", "desc": "每帧提供主窗口统计状态栏下方的 ANSI 文本行（collect）"},
-}
+# 事件目录单一事实源在 bawcode_sdk/events.py（SDK 侧校验/常量共用同一份）
+from bawcode_sdk.events import EVENTS  # noqa: F401  (re-export: 事件目录见该模块)
 
 
 def _register(

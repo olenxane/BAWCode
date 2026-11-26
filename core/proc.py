@@ -20,6 +20,7 @@ POLL_INTERVAL = 0.05
 KILL_WAIT = 3.0
 
 _cancel_state = threading.local()
+_scope_state = threading.local()
 
 
 def set_cancel(event) -> None:
@@ -34,6 +35,20 @@ def clear_cancel() -> None:
 def cancel_event():
     """当前线程的取消事件；工具被独立调用时无事件，按不可取消处理"""
     return getattr(_cancel_state, "event", None)
+
+
+# 线程执行域标记：main（主代理回合）/subagent（后台子代理任务）/workflow（工作流实例），
+# 未标记返回 "unknown"。插件经 ctx.execution_scope() 判定身份，替代线程名前缀魔法字符串
+def set_scope(scope: str) -> None:
+    _scope_state.scope = scope
+
+
+def clear_scope() -> None:
+    _scope_state.scope = None
+
+
+def current_scope() -> str:
+    return getattr(_scope_state, "scope", None) or "unknown"
 
 
 if sys.platform == "win32":

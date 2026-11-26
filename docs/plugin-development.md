@@ -128,6 +128,8 @@ Pillow>=10
 - 关闭自动安装：`config.plugins.auto_install_deps = false`（此时仅检查，缺依赖状态显示在
   `/plugin` 的"未自动装"标注里，需用户自行安装）
 - 插件依赖请在 `requirements.txt` 声明，**不要**写进主程序根目录的 `requirements.txt`
+- **跨插件冲突检测**：装载时若两个插件约束同一库且不可共存（或已装版本不满足其中一方），
+  `/plugin` 行内会标注 `依赖冲突×N` 并附明细；纯检测不阻断装载，安装行为不变
 - 安装可能耗时（下载大型包），且发生在启动/装载阶段——首次装载会短暂阻塞，属预期
 
 ---
@@ -182,14 +184,16 @@ Pillow>=10
 | `ctx.workspace` | Path | 当前工作区根目录 |
 | `ctx.settings` | dict | 插件配置**实时视图**（声明缺省 + `config.plugins_config[<id>]` 持久化值）。每次访问重读宿主配置——设置面板改动即时生效；动态行为请在处理函数内读取，勿在 setup 时缓存 |
 | `ctx.log` | Logger | 命名空间化日志器（`plugins.<id>`），落盘到 `data/log/` |
-| `ctx.ui` | PluginUI | 交互面板桥（confirm/choose/line），**仅 agent 线程可用**，见 §4.4 |
+| `ctx.ui` | PluginUI | 交互面板桥（confirm/choose/line/ask），**仅 agent/后台线程可用**，见 §4.4 |
+| `ctx.cancelled` | Event 或 None | 当前线程的回合取消令牌：工具执行期宿主已挂好，长循环/可切片工作按 `cancelled.is_set()` 及时退出；None 表示脱离回合（后台独立线程），按不可取消处理 |
+| `ctx.turn_active` | bool | 是否有回合进行中（只读；替代裸读 `runner.busy`） |
 
 ### 4.2 注册方法
 
 | 方法 | 用途 | 详细 |
 |------|------|------|
 | `ctx.register_hook(event, fn=None, priority=100, name="")` | 注册 hook 处理函数（可作装饰器） | §5 |
-| `ctx.register_context_supplement(fn, priority=100)` | 每回合注入上下文文本 | §5.3 |
+| `ctx.register_user_message_supplement(fn, priority=100)` | 用户消息写入时焊入补充文本 | §5.3 |
 | `ctx.register_external_api(event, fn=None, url="", priority=50)` | 实现 external_apis 同名扩展点 | §5.4 |
 | `ctx.register_command(name, hint="", usage="", aliases=None, handler=None, completer=None)` | 注册斜杠命令 | §6 |
 | `ctx.register_arg_completer(name, fn)` | 为任意命令（含内建）扩展参数补全 | §6.2 |
@@ -206,6 +210,9 @@ Pillow>=10
 | `ctx.get_setting(key, default=None)` / `ctx.set_setting(key, value)` | 本插件配置读取、校验和持久化 | §15 |
 | `ctx.unregister_hook(event, handler=None, name="")` | 仅注销本插件匹配的订阅 | §15 |
 | `ctx.interrupt_turn()` | 请求调度器中断回合，返回 bool | §15 |
+| `ctx.execution_scope()` | 当前线程执行域：main/subagent/workflow/unknown（替代线程名前缀判身份） | §12 |
+| `ctx.spawn_worker(fn, name, daemon=True, stop_event=None)` | 启动插件后台工作线程，卸载自动兜底停止 | §12 |
+| `ctx.current_worker` | worker 线程内返回自身句柄（含 stop_event），非 worker 线程 None | §12 |
 | `ctx.submit_turn(text, images=None)` | 以用户语义提交一条消息开启回合 | §4.4 |
 | `ctx.notify(text)` | 用户可见通知（写入会话系统消息） | §4.4 |
 | `ctx.request_llm_retry()` | 请求重试当前失败的 LLM 请求（仅 API 错误等待态有效） | §4.5 |
@@ -239,10 +246,17 @@ def setup(ctx: PluginContext):
 
 `register_ui_bottom(fn, priority=100)` 的回调每帧返回字符串或字符串列表，内容可含 ANSI 转义序列，绘制在输入框、项目/模型信息及会话状态统计栏之后；每个返回项占一行，宿主按终端宽度裁剪并将多行高度从会话区扣除。避免执行网络/磁盘操作或长时间计算。
 
-### 4.3 持久化：`ctx.storage_dir()`
+### 4.3 持久化：`ctx.storage_dir(scope="project")`
 
-返回 `{工作区}/.bawcode/plugin-data/<id>/`（不存在会自动创建）。插件的状态文件、缓存、
-落痕都应写在这里——目录随工作区隔离，且不会被插件升级（覆盖目录）清除。
+scope 二选一，按数据的归属选：
+
+- `scope="project"`（缺省）：`{工作区}/.bawcode/plugin-data/<id>/`——按项目隔离，
+  适合项目相关的索引/缓存/会话映射；目录不会被插件升级（覆盖目录）清除
+- `scope="global"`：`{宿主根}/data/plugin-data/<id>/`——跨项目共享，适合与项目无关的
+  数据（如音乐播放器的歌单）。**注意全局目录无跨实例写锁**：多个 BAWCode 实例并发跑时，
+  插件须自行保证写入原子性（写临时文件再 replace）
+
+不存在会自动创建。插件的状态文件、缓存、落痕都应写在这里。
 
 ```python
 def setup(ctx):
@@ -289,7 +303,7 @@ def setup(ctx):
 由帧循环统一上屏）。适合"后台发生了你需要知道的事"这类轻量提醒；需要用户**回应**时用
 `ctx.ui` 面板或 `submit_turn`。
 
-#### `ctx.ui.confirm / choose / line` —— 交互面板桥
+#### `ctx.ui.confirm / choose / line / ask` —— 交互面板桥
 
 `app.request_ui/wait_ui`（工具确认面板同款通道）的插件包装：
 
@@ -298,6 +312,10 @@ def setup(ctx):
 | `ctx.ui.confirm(prompt, cancelled=None)` | 是/否选择 | `True` / `False`；取消 `None` |
 | `ctx.ui.choose(options, prompt, cancelled=None)` | 序号选择菜单 | 所选项文本（支持序号或文本命中）；自由文本原样返回；取消 `None` |
 | `ctx.ui.line(prompt, default="", cancelled=None)` | 单行输入 | 输入文本（空输入回落 `default`）；取消 `None` |
+| `ctx.ui.ask(question, options=(), timeout=0, multiline=False, cancelled=None)` | 任务卡片（自由作答/选项作答，可多行、可超时） | `{status, answer?}`（status ∈ answer/timeout/rejected）；取消/通道未就绪 `None` |
+
+四个原语的 `cancelled` 参数省略时**自动接当前线程回合取消令牌**（`ctx.cancelled`）——
+工具执行内调用无需手工传探针；后台独立线程（无令牌）按不可取消处理。
 
 ```python
 def _on_before_turn(payload):
@@ -315,10 +333,9 @@ ctx.register_hook("before_turn", _on_before_turn)
 
 **线程约束（重要）**：
 
-- `ctx.ui` **只能在 agent 线程调用**（hook / 模型工具执行内）。面板的应答由主线程帧循环
-  完成——在主线程命令 handler 里调用会把帧循环堵死造成死锁；主线程请直接用 app 的
-  阻塞表单（`cctx["app"].read_line(...)` 等，`/run` `/resume` 的做法）
-- `cancelled` 回调可选传入（如 `llm.cancelled`）；回合被用户中断时面板应尽快放弃
+- `ctx.ui` **只能在 agent/后台线程调用**（hook / 模型工具执行内、插件自起线程）。面板的应答
+  由主线程帧循环完成——主线程调用会被宿主防护**直接抛 RuntimeError**（不再是静默死锁）；
+  主线程请直接用 app 的阻塞表单（`cctx["app"].read_line(...)` 等，`/run` `/resume` 的做法）
 - 注意 `before_turn` 返回空白的语义是"不参与改写"（原输入照常进行），**没有中止回合的
   通道**——需要放弃任务时请改写成无操作说明（如上例）
 
@@ -372,6 +389,10 @@ BAWCode 的每个 hook 事件属于两种语义之一（下表标明），写处
 
 ### 5.2 事件总表
 
+事件名同时以常量导出在 `bawcode_sdk.events`（如 `AFTER_TURN = "after_turn"`），建议引用常量
+获得 IDE 补全与重构可查性；`register_hook`/`register_external_api` 对目录外事件名会 warn 一次
+（带相近拼写建议）——插件间自定义互通事件属预期用法，可忽略该 warn。
+
 #### 用户参与型能力（对应 `config.external_apis` 同名映射；变换链）
 
 | 事件 | 触发时机 | payload | 生效返回值 |
@@ -400,17 +421,18 @@ BAWCode 的每个 hook 事件属于两种语义之一（下表标明），写处
 | `turn_status` | collect | 回合状态/阶段变化 | `{status}` 或 `{phase}` | 无消费方 |
 | `before_tool` | call | 工具确认通过、执行前 | `{name, args}` | `{args: {...}}` 改写参数；`{decision: "deny", message: str}` 拒绝执行（拒绝文案回传给模型）；None 原样执行 |
 | `after_tool` | collect | 工具执行完成（含出错） | `{name, args, output, elapsed}` | 无消费方 |
-| `context_supplement` | collect | 每回合构建上下文补充时 | `{project_id, session_id}` | `str`（非空文本）—— 以 `[插件补充]` 消息注入本回合上下文（不进会话历史，每回合重建） |
+| `user_message_supplement` | collect | 用户消息写入会话时（每条一次） | `{project_id, session_id, user_message}` | `str`（非空文本）—— 焊入该条 user 消息（user_supplement 字段），出站以 `<system>` 块拼在正文开头；字节写入后冻结，随历史出站 |
 | `ui_tree_nodes` | collect | 每帧主窗口渲染 | `{app}` | `TreeNode` 或节点列表，加入会话树根部 |
 | `ui_bottom_rows` | collect | 每帧主窗口渲染 | `{app, width}` | ANSI 字符串或字符串列表，显示在状态栏下方 |
 
-### 5.3 上下文补充的预算与礼仪
+### 5.3 用户消息补充的预算与礼仪
 
-`context_supplement` 的文本每回合都会进入模型上下文，请克制：
+`user_message_supplement` 的文本写入后随消息**长期存在于历史**（字节冻结，前缀缓存友好），请克制：
 
-- 单条建议 ≤ 200 字符；只注入"模型不知道且本回合需要"的信息
-- 可在处理函数里读取 `ctx.settings`，让用户按需开关
-- 文本会统一加 `[插件补充]` 前缀，不要自带大标题
+- 单条建议 ≤ 200 字符；只注入"与该条用户消息语义绑定"的信息（如按消息内容的检索召回、内容判定提示）
+- 不适合全局动态状态（时间/计数器/任务进度）——焊死后不再更新，会成为陈旧信息
+- 可在处理函数里读取 `ctx.settings`，让用户按需开关（只影响后续写入的消息）
+- 文本以 `<system>` 块拼在 user 正文开头，不要自带大标题
 
 ### 5.4 实现 external_apis 扩展点
 
@@ -722,9 +744,19 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
   sys.path、清空插件技能目录）→ 重新发现装载。模块级全局变量不保留——需要跨重载的
   状态请存 `ctx.storage_dir()`
 - **后台资源清理（必须）**：setup 里启动线程/HTTP 服务器等长期资源的插件，务必
-  `ctx.register_teardown(fn)` 注册卸载回调——卸载/重载/禁用回滚时按注册顺序执行
+  `ctx.register_teardown(fn)` 注册卸载回调——卸载/重载/禁用回滚时**按后进先出（LIFO）**执行
   （异常隔离记日志）。没有它，`/plugin reload` 后旧线程会残留且插件自身无法停止
   （模块对象已换新）。官方示例：remote-control 插件的 HTTP 服务即经 teardown 停止
+- **后台工作线程用 `ctx.spawn_worker(fn, name, stop_event=None)`**：返回 Worker 句柄
+  （`worker.thread`/`worker.stop_event`/`worker.stop(timeout)`）。fn 是普通无参函数，
+  停止信号两种用法可混用——闭包自管（传自己的 stop_event，循环里查 `is_set()`）或
+  线程内自省（任意深度用 `ctx.current_worker.stop_event`）。close 时自动置位全部
+  worker 的停止信号并限时 join（2 秒/线程）：**即使忘记注册 teardown 也不会永久残留**，
+  未退出仅记 warn。worker 里 `ctx.cancelled` 为 None 是正确语义——后台 worker 的取消
+  信号是自己的 stop_event 与插件卸载，不响应单次回合中断
+- **执行域判定 `ctx.execution_scope()`**：返回 `main`（主代理回合）/`subagent`（后台
+  子代理任务）/`workflow`（工作流实例）/`unknown`（未标记线程，含插件 worker 与主线程）。
+  需要"禁止子代理递归调用本插件"这类判定时用它，不要按线程名前缀硬编码
 - **运行时载体只读访问**：`ctx.runtime` 返回 `{app, runner}`（`bind_runtime`
   注入的同一对象引用；未注入时值为 None）。可读取 `app.busy / app.streaming_msg /
   app.status` 等实时状态、`runner.busy` 判定忙闲，或 `runner.llm.cancel()` 中断在途
@@ -784,7 +816,7 @@ description: 一句话说明该技能解决什么问题、何时触发（供模�
 
 *本指南对应实现：`core/plugin_system/`（宿主管理与适配）、`bawcode_sdk/`（公开接口）、`core/plugins.py`（兼容入口）、`core/hooks.py`（hook 链）；
 示例插件：`data/plugins/hello-plugin/`（入门）、`data/plugins/rag/`（项目 RAG 知识库，
-自核心剥离的真实案例：同名工具迁移 + context_supplement 上下文补充 + external_apis
+自核心剥离的真实案例：同名工具迁移 + user_message_supplement 用户消息补充 + external_apis
 接管语义保留）、`data/plugins/remote-control/`（远程控制：后台 HTTP 服务 + register_teardown
 + 类用户操作 API + tool_confirm 代答的综合案例）；
 端到端测试：`develop/test_plugins_e2e.py`、`develop/test_rag_plugin.py`、`develop/test_remote_control_e2e.py`。*
@@ -838,7 +870,7 @@ def setup(ctx: PluginContext):
 
 `set_setting` 按声明转换、钳制并保存；无效 bool、NaN/Infinity 会被拒绝。
 持久化失败会恢复原内存值并抛出异常，不会假报保存成功。
-卸载清理按注册顺序执行且每个 context 只执行一次；单个清理函数的 Exception/SystemExit
+卸载清理按后进先出（LIFO）执行且每个 context 只执行一次；单个清理函数的 Exception/SystemExit
 不阻断后续清理。关闭后的 context 不允许重新注册命令、工具或 hook。
 `ctx.ui.tree_node(...)` 创建与终端兼容的树节点，无需导入 `core.ui.TreeNode`。
 
@@ -859,7 +891,7 @@ def setup(ctx: PluginContext):
 | `workflows` / `snapshots` | 工作流列表/选择、快照查询与回滚 |
 | `agents` / `skills` / `mcp` | 子代理记录、技能加载器、MCP 状态 |
 | `policy` | 模式常量与显示标签 |
-| `hooks` | 订阅、触发、诊断 |
+| `hooks` | 订阅、触发、诊断（`register_hook`/`unregister_hook` 自动归属调用方插件：注册缺省带 owner，注销缺省只动本插件订阅；显式传 owner 才可跨插件操作） |
 
 这些高级操作保留对应宿主函数的参数、返回结构与副作用；例如：
 

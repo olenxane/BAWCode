@@ -23,6 +23,7 @@ from core import memory as memory_mod
 from core import pasteboard as pasteboard_mod
 from core import plugins as plugins_mod
 from core import policy
+from core import proc
 from core import project_identity
 from core import register
 from core import scheduler as scheduler_mod
@@ -1147,6 +1148,7 @@ def _agent_turn(llm: LLM, session, user_text: str, app, runner=None) -> None:
         stats_handle = None
     api_tokens_before = getattr(meter, "api_total_tokens", 0)
     try:
+        proc.set_scope("main")
         _agent_turn_impl(llm, session, user_text, app, runner=runner)
     except Exception as exc:
         app.last_turn_error = str(exc)
