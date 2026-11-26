@@ -5,14 +5,17 @@
 额外提取**注释与 docstring** 作为自然语言匹配基（doc 字段）——召回时用自然
 语言描述匹配，而非直接匹配代码体。
 
-主动召回（context_supplement）：用户每发送消息即触发，按该消息检索切片注入。
-匹配方式由配置项 match_mode 选择：
+主动召回（user_message_supplement）：用户消息写入会话时触发一次，按该消息检索
+切片，结果焊死进消息（user_supplement 字段），出站以 <system> 块拼在正文开头。
+字节写入后冻结，前缀缓存友好；同一长回合内召回不更新，语义为"提问时的上下文"。
+匹配方式由配置项 match_mode 选择（2026-11-26 审查裁决：**embedding 模式暂时
+停用，一律走关键词**，向量构建/检索/熔断链路代码保留，恢复见 _mode() 注释）：
   - keyword   关键词加权：doc 命中(5) > 路由(2) > 文件名(1) > 代码体(0.5，
               用户要求代码块与消息的匹配程度应较低)
   - embedding 嵌入模型：对切片 doc 文本与用户消息各算向量（OpenAI 兼容
               /v1/embeddings，插件独立配置 embedding_base_url/model/api_key），
-              余弦相似度召回（阈值 embedding_min_score）。API 未配置/失败回落
-              keyword。向量落盘 embeddings.json，仅对有 doc 的切片计算。
+              余弦相似度召回（阈值 embedding_min_score）。API 未配置/失败/零命中
+              回落 keyword。向量落盘 embeddings.json，仅对有 doc 的切片计算。
 索引文件持久化在 ctx.storage_dir()（{workspace}/.bawcode/plugin-data/rag/），
 生命周期由插件自行处置：built_at 超过 index_ttl_days（缺省 30 天）即废弃删除；
 set_rag 的项目级开关存 state.json（不随索引过期）。
@@ -145,7 +148,7 @@ def setup(ctx: PluginContext):
     embs: Dict[str, List[float]] = {}  # uid -> 向量（匹配 embeddings.json 的 model）
     emb_model_used = ""                # 现存向量所属模型（不匹配即视为不可用）
     proj_enabled: Optional[bool] = None  # set_rag 写入的项目级开关（None=随配置）
-    recall_cache: Tuple[str, str, List[str]] = ("", "", [])  # (mode, msg, sections)
+    recall_cache: Tuple[str, str, str, List[str]] = ("", "", "", [])  # (mode, msg, cfgkey, sections)
     parsers: Dict[str, Any] = {}
     meta = {"built_at": "", "workspace": ""}
     lock = threading.Lock()
@@ -164,7 +167,10 @@ def setup(ctx: PluginContext):
         return bool(_cfg().get("enabled", True))
 
     def _mode() -> str:
-        return "embedding" if str(_cfg().get("match_mode") or "keyword") == "embedding" else "keyword"
+        # embedding 模式暂时停用（2026-11-26 审查裁决：一律走关键词召回；
+        # 向量构建/检索/熔断链路整体保留，恢复时删掉下面这行强制返回即可）
+        return "keyword"
+        # return "embedding" if str(_cfg().get("match_mode") or "keyword") == "embedding" else "keyword"
 
     def _ttl_days() -> int:
         try:
@@ -193,8 +199,11 @@ def setup(ctx: PluginContext):
         if data and data.get("version") == _INDEX_VERSION:
             built = str(data.get("built_at") or "")
             age = _age_days(built)
-            if age is not None and age > _ttl_days():
-                ctx.log.info("RAG 索引已超 %d 天（%.1f 天），废弃删除", _ttl_days(), age)
+            # built_at 缺失/非法时 TTL 无从判定 → 一律废弃，防陈旧索引永久驻留
+            if age is None or age > _ttl_days():
+                ctx.log.info("RAG 索引%s，废弃删除",
+                             f"已超 {_ttl_days()} 天（{age:.1f} 天）" if age is not None
+                             else "构建时间戳缺失（视为过期）")
                 _clear_files()
                 embs.clear()
                 emb_model_used = ""
@@ -229,6 +238,26 @@ def setup(ctx: PluginContext):
             except OSError:
                 pass
 
+    def _evict_if_expired() -> bool:
+        """TTL 运行时门禁：装载后长会话中索引超龄同样废弃（原先只在装载时判定，
+        常驻进程会无限期用陈旧索引）。返回 True 表示本次已废弃。"""
+        nonlocal emb_model_used, recall_cache
+        age = _age_days(meta["built_at"])
+        if not docs_index or (age is not None and age <= _ttl_days()):
+            return False
+        with lock:
+            if not docs_index:
+                return False
+            docs_index.clear()
+            embs.clear()
+            emb_model_used = ""
+            meta["built_at"] = ""
+            recall_cache = ("", "", "", [])
+            _clear_files()
+        ctx.log.info("RAG 索引超龄（%s 天），已废弃：请 /rag build 重建",
+                     f"{age:.1f}" if age is not None else "时间戳缺失")
+        return True
+
     def _persist_snapshot(stats: dict) -> dict:
         """须在 lock 内调用：更新元信息并取一份可在锁外落盘的浅拷贝"""
         meta["built_at"] = datetime.now().isoformat(timespec="seconds")
@@ -256,14 +285,16 @@ def setup(ctx: PluginContext):
 
     # ---------- doc 匹配基提取（注释 + docstring） ----------
 
-    _PY_DOCSTRING_RE = re.compile(r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\')')
+    # 行首起匹配：docstring 必为语句位置的三引号串；行内三引号（赋值/模板常量如
+    # TEMPLATE = """..."""）不再被误吸为匹配基
+    _PY_DOCSTRING_RE = re.compile(r'^[ \t]*("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\')', re.M)
     _LINE_RE = {c: re.compile(re.escape(c) + r"[^\n]*") for c in set(LINE_COMMENT.values())}
     _SLASH_LINE_RE = re.compile(r"//[^\n]*")
     _BLOCK_RE = re.compile(r"/\*[\s\S]*?\*/")
 
     def _extract_doc(text: str, lang: str, kind: str) -> str:
         """切片的自然语言匹配基：注释 + docstring（markdown/text 即正文本身）"""
-        if kind in ("file", "heading") and lang in ("markdown", "text"):
+        if kind in ("file", "heading", "preamble") and lang in ("markdown", "text"):
             return text[:_DOC_MAX_CHARS]
         parts: List[str] = []
         if lang == "python":
@@ -305,10 +336,31 @@ def setup(ctx: PluginContext):
                 names.add(n)
         return names
 
+    def _declarator_name(node, src: bytes) -> Optional[str]:
+        """C/C++ 声明符下钻：function_declarator 的 declarator 字段才是标识符，
+        pointer/array 等包裹层逐层剥掉，避免把返回类型（type_identifier）当函数名"""
+        inner = node
+        for _ in range(8):
+            if inner.type == "function_declarator":
+                d = inner.child_by_field_name("declarator")
+                if d is None:
+                    return None
+                text = src[d.start_byte:d.end_byte].decode("utf-8", "ignore").strip()
+                return text or None
+            inner = inner.child_by_field_name("declarator")
+        return None
+
     def _node_name(node, src: bytes) -> Optional[str]:
         fld = NAME_FIELD_OVERRIDE.get(node.type, "name")
         n = node.child_by_field_name(fld)
+        if n is None:
+            # C/C++ 系 function_definition 无 name 字段：名字在 declarator
+            n = node.child_by_field_name("declarator")
         if n is not None:
+            if n.type == "function_declarator" or n.type.endswith("declarator"):
+                name = _declarator_name(n, src)
+                if name is not None:
+                    return name
             return src[n.start_byte:n.end_byte].decode("utf-8", "ignore")
         for ch in node.children:
             if ch.type in ("identifier", "constant", "property_identifier",
@@ -366,8 +418,14 @@ def setup(ctx: PluginContext):
         heads = [i for i, ln in enumerate(lines) if re.match(r"^#{1,6}\s", ln)]
         if not heads:
             return [_mk_chunk(rel, "markdown", "file", [], text)]
-        heads.append(len(lines))
         chunks = []
+        # 首个标题之前的内容（frontmatter/引言）单独成片，否则整段永不进索引
+        if heads[0] > 0:
+            pre = "\n".join(lines[:heads[0]]).rstrip()
+            if pre:
+                chunks.append(_mk_chunk(rel, "markdown", "preamble", [],
+                                        pre, line0=1, line1=heads[0]))
+        heads.append(len(lines))
         for a, b in zip(heads, heads[1:]):
             if a >= len(lines):
                 break
@@ -456,33 +514,49 @@ def setup(ctx: PluginContext):
             ctx.log.warn("RAG 嵌入失败，回落关键词匹配: %s: %s", type(e).__name__, msg[:300])
             return None
 
-    def _cosine(a: List[float], b: List[float]) -> float:
+    def _cosine(a: List[float], b: List[float], na: float = 0.0) -> float:
+        # 单趟 zip 算点积与 b 范数；na 由调用方对查询向量预算一次，避免每切片重算
         if len(a) != len(b) or not a:
             return 0.0
-        dot = sum(x * y for x, y in zip(a, b))
-        na = math.sqrt(sum(x * x for x in a))
-        nb = math.sqrt(sum(x * x for x in b))
+        dot = nb2 = 0.0
+        for x, y in zip(a, b):
+            dot += x * y
+            nb2 += y * y
+        if not na:
+            na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(nb2)
         return dot / (na * nb) if na and nb else 0.0
 
     # ---------- 索引构建（手动触发） ----------
 
+    def _decode_text(data: bytes) -> str:
+        # utf-8-sig 顺手去 BOM；失败按中文 Windows 常见的 GBK 系兜底，
+        # 否则 GBK 源码的注释会静默乱码、匹配基与注入内容双输
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("gb18030", "ignore")
+        return text.replace("\r\n", "\n").replace("\r", "\n")  # CRLF 归一：\r 不进注入文本，行号口径统一
+
     def _parse_file(rel: str, data: bytes) -> List[dict]:
         ext = os.path.splitext(rel)[1].lower()
+        text = _decode_text(data)
         if ext in LANG_BY_EXT:
             lang, def_types = LANG_BY_EXT[ext]
+            buf = text.encode("utf-8")  # 归一后喂 parser：字节偏移与切片取文自洽
             try:
                 valid = grammar_cache.get(lang)
                 if valid is None:
                     valid = grammar_cache[lang] = _grammar_types(lang)
-                chunks = _parse_code(rel, lang, def_types & valid, data)
+                chunks = _parse_code(rel, lang, def_types & valid, buf)
             except Exception:
                 chunks = []
             if not chunks:  # 语法异常/无定义节点 → 整文件一片兜底
-                chunks = [_mk_chunk(rel, lang, "file", [], data.decode("utf-8", "ignore"))]
+                chunks = [_mk_chunk(rel, lang, "file", [], text)]
             return chunks
         if ext in MARKDOWN_EXTS:
-            return _parse_markdown(rel, data.decode("utf-8", "ignore"))
-        return [_mk_chunk(rel, "text", "file", [], data.decode("utf-8", "ignore"))]
+            return _parse_markdown(rel, text)
+        return [_mk_chunk(rel, "text", "file", [], text)]
 
     def refresh() -> Optional[dict]:
         """增量重建：只重解析 (mtime, size) 变化的文件；embedding 模式下为
@@ -551,7 +625,7 @@ def setup(ctx: PluginContext):
                 if new_vecs:
                     embs.update(new_vecs)
                     emb_model_used = model_now
-                recall_cache = ("", "", [])
+                recall_cache = ("", "", "", [])
                 snapshot = _persist_snapshot(stats)
             _write_snapshot(snapshot)
             return stats
@@ -566,6 +640,7 @@ def setup(ctx: PluginContext):
     # ---------- 召回 ----------
 
     _SPLIT_RE = re.compile(r"[\s,;:()\[\]{}<>\"'`~!@#\$%\^&\*\+\=\\\|/\?？，。：；（）【】！？、]")
+    _CJK_RUN_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]+")
 
     # 英文虚词/问句引导词：命中无区分度（"python" 含 "on" 之类的假阳性）
     _STOPWORDS = {
@@ -578,15 +653,44 @@ def setup(ctx: PluginContext):
     }
 
     def _tokens(query: str) -> List[str]:
-        return [t for t in _SPLIT_RE.split((query or "").lower())
-                if len(t) >= 2 and t not in _STOPWORDS][:16]
+        """切词：西文按标点/空白切并滤虚词；CJK 连续段切 bigram——中文无分词工具，
+        整句长短语与注释子串精确匹配的概率趋近于零（原实现中文主动召回基本失效），
+        bigram 与子串打分天然兼容。单字 CJK 段丢弃：子串匹配无区分度，等于全库噪声"""
+        out: List[str] = []
+        for seg in _SPLIT_RE.split((query or "").lower()):
+            if not seg:
+                continue
+            pos = 0
+            for m in _CJK_RUN_RE.finditer(seg):
+                if m.start() > pos:
+                    latin = seg[pos:m.start()]
+                    if len(latin) >= 2 and latin not in _STOPWORDS:
+                        out.append(latin)
+                run = m.group(0)
+                if len(run) > 1:
+                    out.extend(run[i:i + 2] for i in range(len(run) - 1))
+                pos = m.end()
+            tail = seg[pos:]
+            if len(tail) >= 2 and tail not in _STOPWORDS:
+                out.append(tail)
+        return list(dict.fromkeys(out))[:24]
 
     def _format_chunk(ch: dict) -> str:
         route = " > ".join([ch["file"]] + ch["route"])
         fence = "```"
         lang_tag = "" if ch["lang"] in ("markdown", "text") else ch["lang"]
+        # 单切片注入上限：大切片（如整段类体）曾独占全部预算、top_k 多样性归零——
+        # 超长截到行边界并显式标注，让前三名真能共存
+        cap = int(_cfg().get("chunk_chars") or 1800)
+        content = ch["content"]
+        if cap > 0 and len(content) > cap:
+            cut = content[:cap]
+            nl = cut.rfind("\n")
+            if nl > cap // 2:  # 行截点太靠前就保留硬截，避免过度损失
+                cut = cut[:nl]
+            content = cut + f"\n…（注入截断，完整切片至 L{ch.get('line1', '?')}，可用 read 工具按行读取）"
         return (f"[{route} | {ch['lang']} | L{ch.get('line0', '?')}-L{ch.get('line1', '?')}]\n"
-                f"{fence}{lang_tag}\n{ch['content']}\n{fence}")
+                f"{fence}{lang_tag}\n{content}\n{fence}")
 
     def _all_chunks() -> List[dict]:
         with lock:
@@ -636,12 +740,14 @@ def setup(ctx: PluginContext):
             return None
         emb_breaker["fails"] = 0
         uid2chunk = {_uid(ch): ch for ch in _all_chunks()}
+        qvec = qv[0]
+        qn = math.sqrt(sum(x * x for x in qvec))
         scored = []
         for uid, vec in vec_items:
             ch = uid2chunk.get(uid)
             if ch is None:
                 continue
-            sim = _cosine(qv[0], vec)
+            sim = _cosine(qvec, vec, qn)
             if sim >= float(_cfg().get("embedding_min_score") or 0.15):
                 scored.append((sim, ch))
         scored.sort(key=lambda x: (-x[0], -len(x[1]["route"]), len(x[1]["content"])))
@@ -669,7 +775,7 @@ def setup(ctx: PluginContext):
         hits: Optional[List[Tuple[float, dict]]] = None
         if mode == "embedding":
             hits = _search_embedding(message, top_k)
-        if hits is None:
+        if not hits:  # None(失败/未配置) 与 [](零命中) 一律回落关键词——否则嵌入服务健康但低于阈值时召回凭空消失
             hits = _search_keyword(message, top_k, doc_w=5, route_w=2,
                                    file_w=1, content_w=0.5)
         return _within_budget([_format_chunk(ch) for _, ch in hits], budget)
@@ -678,7 +784,8 @@ def setup(ctx: PluginContext):
 
     @ctx.register_tool(
         name="rag_search",
-        description="Search the project RAG index by keywords; returns matching code chunks with structure info (file > class > method, language, line range)",
+        description="Search the project RAG index by keywords; returns matching code chunks with structure info (file > class > method, language, line range; requires an index built by rag_index first)",
+        safe=True,  # 纯只读检索，与内置 SAFE_TOOLS 同待遇免确认
         usage="rag_search <keywords> [top_k]",
         schema={
             "type": "object",
@@ -695,6 +802,7 @@ def setup(ctx: PluginContext):
         if not _TS_OK:
             return ("tree-sitter 依赖未安装（pip install tree_sitter "
                     "tree-sitter-language-pack），结构索引不可用")
+        _evict_if_expired()
         if not docs_index:
             return "索引为空：先用 rag_index 工具（或 /rag build）手动建立索引"
         top_k = int(top_k or _cfg().get("top_k") or 3)
@@ -707,7 +815,7 @@ def setup(ctx: PluginContext):
 
     @ctx.register_tool(
         name="rag_index",
-        description="Manually rebuild the project RAG structure index (file tree × AST chunks with comment/docstring basis) and persist it; returns stats",
+        description="Manually rebuild the project RAG structure index (file tree × AST chunks with comment/docstring basis; incremental — unchanged files are not reparsed) and persist it; returns stats",
         usage="rag_index",
         schema={"type": "object", "properties": {}},
     )
@@ -724,7 +832,7 @@ def setup(ctx: PluginContext):
 
     @ctx.register_tool(
         name="set_rag",
-        description="Enable or disable RAG for the current project (affects proactive recall and rag_search)",
+        description="Enable or disable RAG for the current project (affects proactive recall and rag_search; the setting is persisted per project)",
         usage="set_rag <on|off>",
         schema={
             "type": "object",
@@ -740,10 +848,10 @@ def setup(ctx: PluginContext):
         proj_enabled = bool(enabled)
         with lock:
             _dump(state_file, {"enabled": proj_enabled})
-            recall_cache = ("", "", [])
+            recall_cache = ("", "", "", [])
         return f"本项目 RAG 已{'开启' if proj_enabled else '关闭'}"
 
-    # ---------- 每回合主动召回（用户消息驱动） ----------
+    # ---------- 写入时主动召回（用户消息驱动，焊死进消息） ----------
 
     def _supplement(payload) -> Optional[str]:
         nonlocal recall_cache
@@ -752,21 +860,25 @@ def setup(ctx: PluginContext):
         if not _TS_OK:
             return None
         message = str((payload or {}).get("user_message") or "")
-        if not message.strip() or not docs_index:
+        if not message.strip():
+            return None
+        if _evict_if_expired() or not docs_index:
             return None
         cfg = _cfg()
         mode = _mode()
-        c_mode, c_msg, c_secs = recall_cache
-        if c_msg == message and c_mode == mode:
+        # 缓存键纳入召回参数：改 top_k/budget/min_score 不换消息也不吃旧结果
+        ck = "{}|{}|{}|{}".format(cfg.get("top_k"), cfg.get("budget_chars"), cfg.get("embedding_min_score"), cfg.get("chunk_chars"))
+        c_mode, c_msg, c_key, c_secs = recall_cache
+        if c_msg == message and c_mode == mode and c_key == ck:
             sections = c_secs
         else:
             sections = _recall(message)
-            recall_cache = (mode, message, sections)
+            recall_cache = (mode, message, ck, sections)
         if not sections:
             return None
         return f"{cfg.get('prefix') or '项目RAG补充'}:\n" + "\n---\n".join(sections)
 
-    ctx.register_context_supplement(_supplement)
+    ctx.register_user_message_supplement(_supplement)
 
     # ---------- 用户命令 /rag ----------
 
