@@ -89,6 +89,8 @@ class TurnContext:
         self.display_session = None
         # 回合级工具面过滤器（工具名 -> bool）：后台工作流实例经此剔除递归派发类工具
         self.tool_filter: Optional[Callable[[str], bool]] = None
+        # 工作流后台/前台实例置真：节点产物不重复落会话（final 已随节点轨迹/工具结果返回）
+        self.skip_standalone_final = False
         self._last_autosave = time.monotonic()
 
 

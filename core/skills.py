@@ -442,7 +442,6 @@ def summon(session, llm, config, scope: str = "global", system_prompt: Optional[
         _summon_inflight = True
     try:
         if system_prompt is None:
-            # 工作流非常驻模式：技能生成系统提示词跟随默认人格（不再引用工作流 system_prompt 节点）
             system_prompt = prompt_loader.get_system_prompt(
                 config=config, files=None,
                 extra_variables=_memory_prompt_vars(session),

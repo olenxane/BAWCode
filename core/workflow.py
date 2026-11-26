@@ -270,9 +270,10 @@ def save_workflow(config, data: dict) -> Tuple[Optional[Path], str]:
 
 def delete_workflow(config, name: str) -> Tuple[bool, str]:
     """删除预定义工作流文件；返回 (是否删除, 错误信息)"""
-    name = _safe_workflow_name(name)
-    if name is None:
+    safe_name = _safe_workflow_name(name)
+    if safe_name is None:
         return False, "name 非法或为空"
+    name = safe_name
     path = workflow_path(config, name)
     if not path.exists():
         return False, f"工作流不存在: {name}"
@@ -794,6 +795,7 @@ def _node_task_text(turn: TurnContext, node: dict, agent_id: str, spec: Optional
             files = node.get("prompt_files")
             if isinstance(files, str):
                 files = [files]
+            files = files if isinstance(files, list) else []
             segs = prompt_loader.load_prompt_bundle([str(f) for f in files], variables, config=turn.config)
             task = prompt_loader.join_segments(segs).strip()
         if not task:
@@ -1443,7 +1445,8 @@ def register_tools(config) -> bool:
             "mode=foreground runs the whole chain synchronously inside this conversation: the call "
             "blocks until the chain finishes and returns its final output, with node progress shown "
             "in the session timeline. Pass nodes to define an ad-hoc chain inline instead of a saved "
-            "workflow name. The prompt must be self-contained: every node runs in an isolated context "
+            "workflow name."
+            "The prompt must be self-contained: every node runs in an isolated context "
             "and only receives the task prompt plus the previous nodes' outputs"
         ),
         usage="workflow <name> <prompt> [mode] | workflow <prompt> nodes=[...]",

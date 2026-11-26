@@ -813,7 +813,7 @@ class SettingsPanelMixin(UiState):
                                 "options": d.get("options"),
                                 "current": plugins_mod.get_setting(pid, d["key"], d.get("default"), config),
                                 "hint": d.get("hint")
-                                or {"list": "←→ 切换选项", "bool": "Enter/←→ 勾选"}.get(d["type"], "Enter 编辑"),
+                                or {"list": "←→ 切换选项", "bool": "←→ 勾选"}.get(d["type"], "Enter 编辑"),
                             }
                         )
         else:
@@ -984,16 +984,12 @@ class SettingsPanelMixin(UiState):
                 self._clamp_settings_index()
                 field = self.settings_fields[self.settings_index] if self.settings_fields else {}
                 ftype = field.get("type")
-                # 插件页：Enter 展开/收起插件行；勾选 bool；行编辑 str/int/float
+                # 插件页：Enter 展开/收起插件行；行编辑 str/int/float
+                # （pbool/pchoice 等勾选与切换一律用 ←→，Enter 遵循面板契约保存退出）
                 if ftype == "plugin":
                     self._settings_plugin_expand(field)
                     self._immediate_settings_refresh(config)
                     self._clamp_settings_index()
-                    self.render()
-                    continue
-                if ftype == "pbool":
-                    self._settings_plugin_toggle_bool(config, field)
-                    self._immediate_settings_refresh(config)
                     self.render()
                     continue
                 if ftype == "ptext":
@@ -1066,11 +1062,7 @@ class SettingsPanelMixin(UiState):
                     self.render()
                     continue
                 if ftype in ("bool", "advbool", "check", "body_enabled"):
-                    if ftype == "body_enabled":
-                        item = self.settings_scratch["adv_custom_body"][field["body_index"]]
-                        item["enabled"] = not bool(item.get("enabled", True))
-                        self.render()
-                        continue
+                    # 勾选行（含请求体启用）：←→ 切换，Enter 保存退出
                     updates = self._settings_apply(config)
                     self.settings_mode = False
                     self.bind_config(config)

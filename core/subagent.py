@@ -1514,7 +1514,7 @@ def register_tools(config) -> bool:
             "the subagent continues in the background while you work or dispatch other tasks. "
             "Use wait_subagent(id, timeout) to wait for a result or query_subagent(id) to "
             "inspect progress. Completion will also be injected into the conversation as a "
-            "notification. Independent tasks should be emitted together in one response. "
+            "notification. Independent tasks should be emitted together in one response"
             "The task prompt must be self-contained because the subagent cannot see the "
             "main conversation history"
         ),

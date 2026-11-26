@@ -104,7 +104,7 @@ class UsageStatistics:
 
     def record_tool_event(self, payload: dict) -> None:
         """接收 after_tool 观察事件，只记录执行链明确提供的结果类型"""
-        self.record_tool(payload.get("name"), payload.get("elapsed", 0.0), payload.get("outcome", "ok"))
+        self.record_tool(str(payload.get("name") or ""), payload.get("elapsed", 0.0), payload.get("outcome", "ok"))
 
     def begin_turn(self, session_id: str, model: str, now: Optional[datetime] = None) -> tuple:
         now = now or datetime.now()

@@ -169,7 +169,8 @@ def _accepted_params(tool: dict) -> tuple:
     if cached is not None and cached[0] is tool:
         return cached[1]
     schema = tool.get("schema") if isinstance(tool.get("schema"), dict) else {}
-    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    raw_props = schema.get("properties") if isinstance(schema, dict) else None
+    props = raw_props if isinstance(raw_props, dict) else {}
     accepted = set(props)
     accept_all = False
     func = tool.get("func")
@@ -209,7 +210,8 @@ def sanitize_args(tool_name: str, args: Any) -> dict:
         return result
     clean = result["args"]
     schema = tool.get("schema") if isinstance(tool.get("schema"), dict) else {}
-    required = [str(k) for k in (schema.get("required") or []) if str(k)]
+    raw_required = schema.get("required") if isinstance(schema, dict) else None
+    required = [str(k) for k in (raw_required if isinstance(raw_required, list) else []) if str(k)]
     accepted, accept_all = _accepted_params(tool)
     result["required"] = required
     result["allowed"] = sorted(accepted, key=str)
@@ -265,7 +267,8 @@ def arg_error_message(tool_name: str, sanitized: dict, detail: str = "") -> str:
         lines.append("必填参数: " + ", ".join(str(k) for k in required))
     tool = _registry.get(tool_name) or {}
     schema = tool.get("schema") if isinstance(tool.get("schema"), dict) else {}
-    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    raw_props = schema.get("properties") if isinstance(schema, dict) else None
+    props = raw_props if isinstance(raw_props, dict) else {}
     keys = required or [k for k in props if k in allowed][:2]
     if keys:
         example = {str(k): _example_value(props.get(k)) for k in keys}
