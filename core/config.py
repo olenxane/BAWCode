@@ -80,7 +80,7 @@ def default_config() -> dict:
             "theme": "dark",
             "mode": "auto",
             "logo": True,
-            "render_mode": "fullscreen",
+            "render_mode": "inline",
             "send": "ctrl+enter",
             "newline": "shift+enter",
             "switch_focus": "tab",

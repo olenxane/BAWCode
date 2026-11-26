@@ -2849,7 +2849,7 @@ class RenderMixin(UiState):
         except Exception:
             arg_line = str(args)
         rows: List[str] = []
-        rows.append(self.c("warn") + " ⚠ " + self.RESET + self.c("accent") + _clip(f"工具确认: {name}", w - 4) + self.RESET)
+        rows.append(self.c("warn") + self.RESET + self.c("accent") + _clip(f"工具确认: {name}", w - 4) + self.RESET)
         purpose = _oneline(str(tool.get("description") or ""), w - 6)
         if purpose:
             rows.append(self.c("dim") + _clip(f" 目的: {purpose}", w - 2) + self.RESET)
@@ -2869,12 +2869,12 @@ class RenderMixin(UiState):
                 f"{self.c('accent')}{prompt}{self.RESET}"
                 f"{self.c('ink')}{left_c}{self.C_HL} {self.RESET}{right_c}{self.RESET}"
             )
-            rows.append(self.c("dim") + _clip(" Enter 提交（空=默认理由） · Esc 返回选项", w - 1) + self.RESET)
+            rows.append(self.c("dim") + _clip(" Enter 提交 · Esc 返回选项", w - 1) + self.RESET)
             return rows
         labels = (
             ("allow_once", "允许执行一次"),
             ("allow_always", "在本项目中始终允许该类指令"),
-            ("reject", "拒绝（默认理由）"),
+            ("reject", "拒绝"),
             ("reason", "拒绝并输入原因"),
         )
         idx = self.confirm_index % len(labels)
@@ -2895,20 +2895,19 @@ class RenderMixin(UiState):
         rows: List[str] = []
         question = str(spec.get("question") or "")
         if self.ask_multiline:
-            rows.append(self.c("accent") + " ❓ " + self.RESET
-                        + self.c("warn") + _clip("询问用户:", w - 6) + self.RESET)
+            rows.append(self.c("accent") + self.RESET
+                        + self.c("warn") + _clip("询问:", w - 6) + self.RESET)
             for qr in _wrap_width(question, w - 7, max_rows=6):
                 rows.append("   " + self.c("warn") + _clip(qr, w - 6) + self.RESET)
         else:
             rows.append(
-                self.c("accent") + " ❓ " + self.RESET
-                + self.c("warn") + _clip(f"询问用户: {question}", w - 6) + self.RESET
+                self.c("accent") + self.RESET
+                + self.c("warn") + _clip(f"询问: {question}", w - 6) + self.RESET
             )
         if self.ask_input_mode:
-            # 自由输入态：块光标跟随文本（同 confirm 拒绝原因输入）；多行模式逐行渲染
             text = self._ask_buf.to_text()
             cur = max(0, min(self._ask_buf.cursor, len(text)))
-            prompt = " 你的意见> "
+            prompt = " 输入> "
             inner = max(4, w - _display_width(prompt) - 3)
             if self.ask_multiline:
                 lines = text.split("\n")
