@@ -255,7 +255,7 @@ _DELETE_CMD_RE = re.compile(
 _PS_DELETE_HINT_RE = re.compile(
     r"(?i)(?<![\w-])(?:remove-item|ri|rm|del|erase|rd|rmdir|rimraf|deltree|unlink|iex|invoke-expression|delete)(?![\w-])"
 )
-_WRAPPER_WORDS = ("sudo", "command", "builtin", "exec", "nohup", "time", "doas")
+_WRAPPER_WORDS = ("sudo", "command", "builtin", "exec", "nohup", "time", "doas", "start")
 _INTERPRETERS = ("python", "python3", "py", "node", "perl", "ruby", "deno", "bun")
 _INTERP_DELETE_RE = re.compile(
     r"(?i)(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|\.unlink\(|\.rmdir\(|"
@@ -331,7 +331,8 @@ def _nested_command(word: str, toks: List[str]) -> Tuple[str, str]:
 
 
 def _join_tokens(toks: List[str]) -> str:
-    return " ".join(f'"{t}"' if any(c.isspace() for c in t) else t for t in toks)
+    # 内层命令按空白重组即可：token 已剥过引号，重新加引号会把多词命令粘成一个词（如 rmdir x），递归分析就认不出删除词
+    return " ".join(toks)
 
 
 def _strip_exe(token: str) -> str:
@@ -389,9 +390,14 @@ def _segment_tokens(seg: str) -> List[str]:
     text = seg.strip().lstrip(_GROUP_STRIP).rstrip(")}").strip()
     toks = _strip_redirects(_tokenize(text))
     while toks and _strip_exe(toks[0]) in _WRAPPER_WORDS + ("then", "do", "else"):
+        head = _strip_exe(toks[0])
         toks = toks[1:]
         while toks and toks[0].startswith("-"):
             toks = toks[1:]
+        if head == "start":
+            # start 的旗标是 /b /min 这类斜杠形，另有一个可省略的引号标题位（剥引号后是空 token）
+            while toks and (toks[0].startswith("/") or not toks[0]):
+                toks = toks[1:]
     return toks
 
 
