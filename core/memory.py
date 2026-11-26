@@ -528,6 +528,13 @@ class Memory:
             self.session_title = self._clip_title(" ".join(title_text.split()))
         message = {"role": role, "content": content}
         message.update(extra)
+        # 用户消息补充（RAG 召回/情绪提示等）写入时焊死为 user_supplement 字段：
+        # 字节从此冻结，会话历史保持前缀缓存友好；出站时由 _api_session_item 拼进
+        # content 的 <system> 块，存档与 UI 只见原始 content。插话/通知与隔离会话不焊。
+        if role == "user" and not extra.get("injected") and not self.memory_readonly:
+            supplement = self._collect_user_supplement(content)
+            if supplement:
+                message["user_supplement"] = supplement
         self.messages.append(message)
         self._dirty = True
         # message_added 观察链：外部同步/转发方消费（content 可能为多模态数组）；
@@ -550,6 +557,35 @@ class Memory:
             len(self.messages),
         )
         return message
+
+    def _collect_user_supplement(self, content) -> str:
+        """收集用户消息补充文本（RAG 主动召回/情绪提示等插件贡献）
+
+        user_message_supplement 观察链在消息写入时触发一次，结果焊死进消息字段，
+        此后字节冻结——前缀缓存按字节比对，召回内容随消息走就不会再炸历史缓存。
+        多模态数组取文本片段作为召回依据。处理函数异常已在 hooks 内隔离；
+        重入防护：处理函数内再写 user 消息会递归触发本钩，直接放弃该次收集。"""
+        if getattr(self, "_collecting_user_supplement", False):
+            return ""
+        self._collecting_user_supplement = True
+        try:
+            texts = [
+                t for t in hooks.collect_hook(
+                    "user_message_supplement",
+                    {
+                        "project_id": self.project_id,
+                        "session_id": self.session_id,
+                        "user_message": content_text(content),
+                    },
+                )
+                if isinstance(t, str) and t.strip()
+            ]
+        except Exception as e:
+            log.warn("用户消息补充收集失败: %s", e)
+            return ""
+        finally:
+            self._collecting_user_supplement = False
+        return "\n".join(texts)
 
     # ----- 分类记忆（多 md 文件） -----
     # global/{功能}.md 全局记忆：每个文件可追加多条记忆，启动时全量注入；
@@ -1860,29 +1896,14 @@ class Memory:
         return {"global_memory": global_text, "project_memory_index": index_text}
 
     def build_context_supplements(self) -> List[dict]:
-        """计划/步骤 + 技能清单 + 插件补充（队首 system 区域）
+        """队首补充：仅技能清单（字节低频变更，前缀缓存友好）
 
-        记忆块已并入系统提示词环境段（会话初始化时注入后固定），不再在此重建；
-        计划/步骤仍随回合动态刷新，技能清单与插件补充（RAG 主动召回）每回合重建。"""
+        缓存友好的出站结构要求队首只放字节级稳定的内容：
+        计划/步骤状态随执行翻转，挪到队尾（build_plan_steps_tail）；
+        RAG 召回等插件补充按 user 消息写入时焊死（user_supplement 字段），随历史出站。"""
         supplements = []
-        parts = []
-        if self.plan.get("status") not in ("empty", ""):
-            parts.append(
-                f"当前计划[{self.plan.get('status')}]: {self.plan.get('title')}\n{self.plan.get('content')}"
-            )
-        if self.steps:
-            step_lines = [f"{s.get('id')}. [{s.get('status')}] {s.get('title')}" for s in self.steps]
-            parts.append("当前步骤:\n" + "\n".join(step_lines))
-        if parts:
-            supplements.append(
-                {
-                    "role": "system",
-                    "content": "[记忆补充]\n" + "\n".join(parts),
-                    "type": "memory",
-                }
-            )
-        # 技能元数据清单（core/skills.py）：每回合重建，不进会话历史，
-        # 故不参与回合末剥离与压缩；正文由模型按需 load_skill 取用
+        # 技能元数据清单（core/skills.py）：每回合重建但内容基本不变（同字节不炸缓存），
+        # 不进会话历史，故不参与回合末剥离与压缩；正文由模型按需 load_skill 取用
         try:
             from core import skills as skills_mod
 
@@ -1904,32 +1925,28 @@ class Memory:
                     )
         except Exception as e:
             log.debug("技能清单注入失败: %s", e)
-        # 插件上下文补充（core/plugins.py）：context_supplement 观察链收集文本，
-        # 与技能清单同为每回合重建，不进会话历史（处理函数异常已在 hooks 内隔离）。
-        # payload 带当前用户消息（最后一条可见 user 消息），供 RAG 类插件做
-        # 按消息内容的主动召回（数组形态 content 取文本部分，防图片块 repr 污染检索）
-        user_message = ""
-        for m in reversed(self.messages):
-            if m.get("role") == "user" and self._api_visible(m):
-                user_message = content_text(m.get("content"))
-                break
-        plugin_texts = [
-            t for t in hooks.collect_hook(
-                "context_supplement",
-                {"project_id": self.project_id, "session_id": self.session_id,
-                 "user_message": user_message},
-            )
-            if isinstance(t, str) and t.strip()
-        ]
-        if plugin_texts:
-            supplements.append(
-                {
-                    "role": "system",
-                    "content": "[插件补充]\n" + "\n".join(plugin_texts),
-                    "type": "memory",
-                }
-            )
         return supplements
+
+    def build_plan_steps_tail(self) -> Optional[dict]:
+        """计划/步骤队尾块：组包时追加在消息列表最末尾
+
+        状态随执行进度翻转（update_step_status 等），队尾位置反正每轮都长新消息、
+        缓存本就断在那里，变更零额外代价；若留在队首，每次翻转都会让全部历史缓存作废。"""
+        parts = []
+        if self.plan.get("status") not in ("empty", ""):
+            parts.append(
+                f"当前计划[{self.plan.get('status')}]: {self.plan.get('title')}\n{self.plan.get('content')}"
+            )
+        if self.steps:
+            step_lines = [f"{s.get('id')}. [{s.get('status')}] {s.get('title')}" for s in self.steps]
+            parts.append("当前步骤:\n" + "\n".join(step_lines))
+        if not parts:
+            return None
+        return {
+            "role": "system",
+            "content": "[计划与步骤]\n" + "\n".join(parts),
+            "type": "memory",
+        }
 
     def _active_model_row(self) -> Optional[dict]:
         """激活模型的配置行（不校验 api_key：回放档位属协议行为，与凭证无关；查询失败返回 None）"""
@@ -1997,6 +2014,16 @@ class Memory:
             return {}
         # content 原样出站：str 或数组形态（多模态图片块）均透传
         out: dict = {"role": role, "content": content if isinstance(content, (str, list)) else str(content)}
+        # 写入时焊死的用户消息补充（RAG 召回/情绪提示）拼进 content 开头 <system> 块：
+        # 字段写入后不变，历史字节冻结；字段缺失的旧会话消息原样透传，天然兼容
+        if role == "user":
+            supplement = str(item.get("user_supplement") or "").strip()
+            if supplement:
+                block = f"<system>\n{supplement}\n</system>\n\n"
+                if isinstance(out["content"], str):
+                    out["content"] = block + out["content"]
+                elif isinstance(out["content"], list):
+                    out["content"] = [{"type": "text", "text": block}] + list(out["content"])
         if role == "tool":
             out["role"] = "tool"
             if item.get("tool_call_id"):
@@ -2098,7 +2125,7 @@ class Memory:
         return kept
 
     def _assemble_messages(self, extra_system: Optional[str] = None) -> List[dict]:
-        """组装出站消息：system 提示 → 记忆等补充 → 会话历史（含 tool/tool_calls）"""
+        """组装出站消息：system 提示 → 队首补充（技能清单）→ 会话历史 → 队尾计划/步骤块"""
         messages: List[dict] = []
         if extra_system:
             messages.append({"role": "system", "content": extra_system})
@@ -2109,6 +2136,9 @@ class Memory:
             mapped = self._api_session_item(item, replay=replay, reasoning_on=reasoning_on)
             if mapped:
                 messages.append(mapped)
+        tail = self.build_plan_steps_tail()
+        if tail:
+            messages.append(tail)
         return messages
 
     def assemble_payload(self, extra_system: Optional[str] = None) -> List[dict]:

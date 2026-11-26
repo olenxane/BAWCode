@@ -1933,6 +1933,18 @@ _WEBFETCH_IMG_SKIP_HINTS = (           # 装饰图 URL 启发式：icon/logo/头
 )
 _WEBFETCH_IMG_LAZY_ATTRS = ("src", "data-src", "data-original", "data-lazy-src", "data-srcset")
 
+# 不可信网页文本净化：剥 C0/C1/DEL 控制字符（含 ESC，防终端注入）但放行 \n，
+# tab 是 C0 之一同时被剥——终端按 8 列制表位展开而 wcwidth 记 1 列，
+# 放行会破坏 inline 渲染的行宽记账；\r 只作行尾归一（\r\n/\r → \n）。
+# markdown 结构（换行）保留，与 web-search 插件整行拍平的策略不同：webfetch 返回结构化正文
+_WEBFETCH_CTRL_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+
+
+def _webfetch_sanitize(text: str) -> str:
+    """网页文本进上下文/渲染前的净化：行尾归一 + 剥控制字符（换行保留）"""
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return _WEBFETCH_CTRL_RE.sub("", text)
+
 
 def _webfetch_deps():
     """webfetch 依赖 requests/bs4/lxml，缺失返回 None 由调用方给依赖提示"""
@@ -2317,6 +2329,9 @@ def webfetch(url: str, timeout: int = 30) -> str:
     else:
         return f"不支持的内容类型: {ctype or '未知'}（仅支持 html/xml/json/text）"
 
+    # 不可信外部内容统一净化：剥控制字符（含 ESC 终端注入面）、行尾归一；
+    # 三条内容路径（html/json/text）的产出都要过，防裸字节混进上下文与渲染层
+    text = _webfetch_sanitize(text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) > _WEBFETCH_MAX_CHARS:
         text = text[:_WEBFETCH_MAX_CHARS] + f"\n\n[内容已截断：原始 {len(text)} 字符，上限 {_WEBFETCH_MAX_CHARS}]"
