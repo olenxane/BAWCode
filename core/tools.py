@@ -79,10 +79,7 @@ def _clamp_timeout(value) -> int:
 
 
 def _console_output_encoding() -> str:
-    """控制台输出代码页（非 win32 回落 utf-8）
-
-    子进程凭什么编码写标准输出与它无关（见 proc._decode_output）；本函数只反映当前控制台
-    的代码页，供输出解码与送入子进程的脚本文本编码取用。"""
+    """控制台输出代码页"""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -131,7 +128,7 @@ def _trash_result_text(moved, missing, skipped, failed, trash) -> str:
         lines.append(f"- 移入回收站失败: {path}: {err}")
     if not moved and not skipped and not failed:
         lines.append("- 未解析出可删除的目标")
-    lines.append("后续删除文件请使用 delete_file 工具，不要再用 rm/del 等命令。")
+    lines.append("删除文件请尽量使用 delete_file 工具")
     return "\n".join(lines)
 
 
@@ -141,10 +138,7 @@ def _join_argv(parts: List[str]) -> str:
 
 
 def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute_command", shell: str = "") -> Optional[str]:
-    """护栏开启时把删除命令的目标移入回收站；非删除类命令返回 None
-
-    目标解析跟随执行器：PowerShell 走 AST 取字面路径，动态表达式（变量/展开）不猜目标，
-    返回要求改用 delete_file 的明确结果；护栏关闭时直接放行原始删除命令。"""
+    """护栏开启时把删除命令的目标移入回收站；非删除类命令返回 None"""
     session = _session()
     config = getattr(session, "config", None)
     safety_cfg = (getattr(config, "data", None) or {}).get("security") or {}
@@ -198,11 +192,7 @@ def _trash_delete_command(command: str, cwd: Optional[str], tool: str = "execute
 
 
 def shell_syntax_issue(command: str, shell: str = "") -> str:
-    """命令在当前执行器下不能安全执行的语法问题，返回可操作的提示；无问题返回空串。
-
-    按实际执行器判定：Git Bash / PowerShell 交各自解释器做语法检查（只解析不执行），
-    cmd.exe 只拦可确定会截断命令的换行。执行器不可用时按回退后的执行器检查，
-    检查与删除安全无关，与 delete_guard 开关独立。"""
+    """命令在当前执行器下不能安全执行的语法问题，返回可操作的提示；无问题返回空串"""
     name, _notice, error = _resolve_shell(shell)
     if error:
         return error
@@ -215,16 +205,14 @@ def _with_notice(text: str, notice: str) -> str:
 
 
 _PS_ROUTE_NOTICE = (
-    "注意：检测到 powershell 子调用，为避免 cmd.exe 解析嵌套引号破坏脚本，"
-    "本次已改用 PowerShell 执行器直跑。"
+    "注意：检测到 powershell 子调用，为避免 cmd.exe 解析嵌套引号破坏脚本，本次已改用 PowerShell 执行器直接执行。"
 )
 
 
 def _resolve_shell(shell: str) -> Tuple[str, str, str]:
     """解析执行器：返回 (执行器, 回退提示, 错误文本)
 
-    未知名称是参数错误（不执行）；已知执行器不可用时回退到 cmd.exe 并给出提示——
-    命令仍会执行，只是换了解释器，提示随结果一并回给模型。"""
+    未知名称是参数错误；已知执行器不可用时回退到 cmd.exe 并给出提示"""
     name = shells.resolve_name(shell)
     if not shells.is_valid(name):
         return name, "", (
@@ -236,11 +224,7 @@ def _resolve_shell(shell: str) -> Tuple[str, str, str]:
     if not shells.available(fallback):
         return name, "", shells.unavailable_message(name)
     shown = shells.label(name)
-    return fallback, (
-        f"注意：执行器 {shown} 在本机不可用，本次命令已回退到 {shells.label(fallback)} 执行；"
-        f"命令需按 {shells.label(fallback)} 语法书写（可在设置中改默认执行器，"
-        f"或用 BAWCODE_GIT_BASH 指定 bash.exe 路径）。"
-    ), ""
+    return fallback, (f"注意：执行器 {shown} 在本机不可用，本次命令已回退到 {shells.label(fallback)} 执行；"), ""
 
 
 @register.register(
@@ -253,8 +237,7 @@ def _resolve_shell(shell: str) -> Tuple[str, str, str]:
         "check the session's shell note before using ';', '&&' or quoting. Pass shell="
         "'git_bash'|'powershell'|'cmd' for one call when another executor is "
         "needed. Use mode='background' for long-running commands. Prefer "
-        "dedicated tools (read/write/edit_file/search/...) over shell commands"
-    ),
+        "dedicated tools over shell commands "),
     usage="execute_command <command>",
     schema={
         "type": "object",
@@ -449,7 +432,7 @@ def _execute_command_background(command: str, cwd: Optional[str], argv, stdin_te
     text = _with_notice(
         f"已在后台启动（id={task_id} pid={proc.pid}，cwd={cwd or '当前目录'}）\n"
         f"输出文件: {out_file}\n"
-        f"完成后系统会自动通知（届时用 read 工具读取输出文件）；期间也可随时用 read 查看该文件获取当前输出。",
+        f"完成后系统会自动通知；期间也可随时用 read 查看该文件获取当前输出。",
         notice,
     )
     # 启动回执不代表执行完成，不能预填退出码 0。
@@ -502,14 +485,14 @@ ASK_USER_TIMEOUT = 300
 
 
 def set_ask_user_bridge(fn) -> None:
-    """注册 ask_user 的 UI 交互桥：payload 进，result dict 出（主回合全局绑定）"""
+    """注册 ask_user 的 UI 交互桥"""
     global _ask_bridge
     _ask_bridge = fn
 
 
 @contextmanager
 def bind_thread_ask_bridge(fn):
-    """线程级 ask_user 桥：后台实例线程绑定自己的桥（捕获自身取消信号），退出恢复原值，不动全局绑定"""
+    """ask_user桥：后台实例线程绑定自己的桥（捕获自身取消信号），退出恢复原值，不动全局绑定"""
     previous = getattr(_ask_bridge_local, "fn", None)
     _ask_bridge_local.fn = fn
     try:
@@ -541,8 +524,7 @@ def _ask_user_timeout() -> int:
     description=(
         "Ask the user a clarifying question with selectable options; use when "
         "requirements are ambiguous or an approach needs confirmation. The user "
-        "may also type a free-form answer; on timeout or skip the result says so "
-        "and you should proceed with existing information instead of waiting"
+        "may also type a free-form answer"
     ),
     usage="ask_user <question> <options...>",
     schema={
@@ -592,9 +574,9 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
     status = str(result.get("status") or "")
     if status == "timeout":
         secs = int(result.get("timeout") or payload["timeout"] or 0)
-        return f"超时：{secs}秒内用户未作出选择，已自动跳过。请基于现有信息继续推进，不要等待。"
+        return f"超时：{secs}秒内用户未作出选择，已自动跳过。请基于现有信息继续推进。"
     if status == "declined":
-        return "用户按 Esc 跳过了本次询问（未作出选择），请基于现有信息继续推进。"
+        return "用户未作出选择，请基于现有信息继续推进。"
     if status == "cancelled":
         return "询问被取消（回合中断）。"
     answer = str(result.get("answer") or "").strip()
@@ -613,14 +595,14 @@ def ask_user(question: str, options: Optional[List[dict]] = None) -> str:
 @register.register(
     name="schedule",
     description=(
-        "Arm a single standby check-in: when a long-running background job (download, "
-        "build) is in flight, register a wake-up so the agent can go idle and get a "
+        "Arm a single standby check-in: when a long-running background job "
+        "is in flight, register a wake-up so you can go idle and get a "
         "turn injected at fire time to inspect progress. action='create' registers a "
         "one-shot (delay_minutes or run_at) or recurring (every_minutes) check-in; "
         "only ONE inspection may exist — a second create is rejected until you cancel "
-        "the current one. action='list' shows it; action='cancel' removes it (id "
-        "optional). Memory-only: lost on process restart, never replayed, bound to "
-        "the current session"
+        "the current one. action='list' shows it; action='cancel' "
+        "removes it (id optional). Memory-only: lost on process restart, never "
+        "replayed, bound to the current session"
     ),
     usage="schedule <action> [text] [delay_minutes|run_at|every_minutes|id]",
     schema={
@@ -703,8 +685,7 @@ def bind_thread_mode_bridge(fn):
     description=(
         "Request the user to switch the session access mode (confirm/edit/auto/full) "
         "when the current mode blocks a command you deem necessary for the task. The "
-        "user decides; on approval the mode takes effect immediately and you may retry "
-        "the blocked call. State a concrete reason"
+        "user decides; on approval the mode takes effect immediately and you may retry the blocked call"
     ),
     usage="request_mode_switch <mode> <reason>",
     schema={
@@ -756,9 +737,8 @@ def request_mode_switch(mode: str, reason: str = "") -> str:
         "Read a file. Text files come back with line-number prefixes; use the "
         "numbers to anchor edit_file. Long files are paged via offset/limit, and "
         "each read registers the file baseline required before edit_file or "
-        "positional write — read a file before editing it. Image files "
-        "(png/jpg/jpeg/gif/webp/bmp) are returned as pictures you can see "
-        "(requires a vision-capable model)"
+        "positional write. Image files (png/jpg/jpeg/gif/webp/bmp) are returned "
+        "as pictures you can see"
     ),
     usage="read <file_path> [offset] [limit]",
     schema={
@@ -837,7 +817,7 @@ def _read_image(path: Path) -> Union[str, dict]:
     sess = _session()
     cfg = getattr(sess, "config", None) if sess is not None else None
     if cfg is not None and not cfg.supports_vision:
-        return "当前模型不支持视觉输入，图片内容无法查看；请用文本方式获取该文件的相关信息"
+        return "当前模型不支持视觉输入，图片内容无法查看"
     if not path.is_file():
         return f"图片不存在: {path}"
     size = path.stat().st_size
@@ -854,7 +834,8 @@ def _read_image(path: Path) -> Union[str, dict]:
         "Write content to a file. With optional start_line: positional write that "
         "overwrites line-by-line starting at that line and keeps all other lines "
         "(appends when start_line is past EOF); positional writes require a prior "
-        "read of the file, full overwrite does not."
+        "read of the file, full overwrite does not. Parent directories are "
+        "created as needed"
     ),
     usage="write <file_path> <content> [start_line]",
     schema={
@@ -901,28 +882,24 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
                     f"拒绝写入：{path} 含非文本字节（可能是二进制或 UTF-16/32 编码），已保持原文件不变；"
                     "如确需替换，请先 delete_file 再用 write 新建（新文件将使用 UTF-8）"
                 )
-            # 已有文件：保留原编码与行尾风格，与位置写入/edit_file 同口径
             _written, serr = _save_editable_msg(path, content, is_crlf, enc, bom)
             if serr:
                 return serr
             toolstore.ledger_register(path, content, source="write")
             log.info("写入文件: %s（%d字符，覆盖，编码 %s）", path, len(content), enc)
             suffix = f"（原编码 {enc} 已保留）" if enc != "utf-8" else ""
-            # 返回带路径与体量：区分不同文件的写入结果，防空转误判
             return f"写入成功: {path}（{len(content)} 字符）{suffix}"
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 新建文件：UTF-8 + 系统默认行尾风格
         _written, serr = _save_editable_msg(path, content, os.linesep != "\n", "utf-8", False)
         if serr:
             return serr
         toolstore.ledger_register(path, content, source="write")
         log.info("写入文件: %s（%d字符，新建）", path, len(content))
         return f"写入成功: {path}（{len(content)} 字符）"
-    # ---- 位置写入，行号口径与 read 的 splitlines 编号一致 ----
     if not content:
-        return "位置写入的 content 不能为空（清空文件请省略 start_line 整文件覆盖）"
+        return "位置写入的 content 不能为空"
     if not path.exists():
-        return "找不到文件（位置写入要求文件已存在；新建文件请省略 start_line）"
+        return "找不到文件"
     refusal = toolstore.ledger_check(path)
     if refusal:
         log.warn("位置写入门禁拦截: %s", path)
@@ -966,7 +943,8 @@ def write(file_path: str, content: str, start_line: int = 0) -> str:
         "For several changes to one file, issue one edit_file call per change in the "
         "same message — calls run in order and each one sees the previous result, so "
         "write every old_str against the state left by the earlier edits. Each call "
-        "is atomic on its own and an earlier failure does not roll back the rest"
+        "is atomic on its own and an earlier failure does not roll back the rest "
+        "(every successful edit re-registers the file baseline automatically1)"
     ),
     usage="edit_file <file_path> <old_str> <new_str> [replace_all]",
     schema={
@@ -1059,20 +1037,17 @@ def edit_file(file_path: str, old_str: str, new_str: str, replace_all: bool = Fa
 
 def _load_editable(path: Path) -> tuple:
     """读取待编辑文件：解码探测 utf-8→gbk→有损拒改，UTF-16/32 与 NUL 拒改，UTF-8 BOM 剥离，行尾归一。
-
-    返回 (归一文本, 是否 CRLF 主导, 编码名, 错误消息, 是否带 UTF-8 BOM)，错误消息非 None 时其余值无意义。
-    BOM 剥离后由 _save_editable 按读取状态还原，模型锚定文件首行时无需输入不可见的 BOM 字符。
     """
     raw = path.read_bytes()
     bom = raw.startswith(b"\xef\xbb\xbf")
     if raw.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff", b"\xff\xfe", b"\xfe\xff")):
-        return "", False, "utf-8", "文件带 UTF-16/32 编码标记（或非文本字节），拒绝编辑以免损坏", False
+        return "", False, "utf-8", "文件带 UTF-16/32 编码标记（或非文本字节），为避免损坏本次编辑已取消", False
     if b"\x00" in raw[:512]:
         # 无 BOM 的二进制：GBK 能把控制字节当文本解码成功，必须 NUL 嗅探兜底
         return "", False, "utf-8", "文件含非文本字节（NUL），拒绝编辑以免损坏", False
     text, enc, decodable = _decode_best_effort(raw)
     if not decodable:
-        return "", False, "utf-8", "文件含非文本字节（UTF-8/GBK 均无法解码），拒绝编辑以免损坏", bom
+        return "", False, "utf-8", "文件含非文本字节（UTF-8/GBK 均无法解码），为避免损坏本次编辑已取消", bom
     crlf = text.count("\r\n")
     is_crlf = crlf > text.count("\n") - crlf
     content = text.replace("\r\n", "\n") if is_crlf else text
@@ -1127,10 +1102,7 @@ _REPLACE_TOL_MULTI = "tol_multi"  # 容差多处命中且未开 replace_all
 
 
 def _apply_replacement(content: str, old_str: str, new_str: str, replace_all: bool) -> tuple:
-    """edit_file 的单项替换核心；只在内存文本上替换，落盘由调用方负责。
-
-    返回 (kind, 新内容或 None, info)，OK 类 info=替换处数，MULTI 类 info=(处数, 起始行号列表)。
-    容差命中取磁盘原文行并保留其原行尾空白，行首缩进绝不放宽。"""
+    """edit_file 的单项替换核心；只在内存文本上替换，落盘由调用方负责。"""
     count = content.count(old_str)
     if count == 1:
         return _REPLACE_OK, content.replace(old_str, new_str, 1), 1
@@ -1147,10 +1119,7 @@ def _apply_replacement(content: str, old_str: str, new_str: str, replace_all: bo
 
 
 def _tolerance_spans(content: str, old_str: str) -> list:
-    """二级行尾空白容差匹配：old_str 与文件逐行比较，双方 rstrip 后相等即命中。
-
-    返回命中列表 [(起始行号1基, 区间起, 区间止)]，old_str 以换行结尾时区间吞掉该换行，无命中返回 []。
-    纯空白 old_str 直接不匹配，防误吞整文件。"""
+    """二级行尾空白容差匹配：old_str 与文件逐行比较，双方 rstrip 后相等即命中。"""
     if not old_str or not old_str.strip():
         return []
     needle = old_str.split("\n")
@@ -1184,7 +1153,7 @@ def _tolerance_spans(content: str, old_str: str) -> list:
 
 
 def _splice_spans(content: str, spans: list, new_str: str) -> str:
-    """把 content 中各 (行号, start, end) 区间依次替换为 new_str；行锚定区间天然不重叠"""
+    """把 content 中各 (行号, start, end) 区间依次替换为 new_str"""
     out, prev = [], 0
     for _line, s, e in spans:
         out.append(content[prev:s])
@@ -1210,17 +1179,13 @@ def _match_spots(content: str, needle: str) -> list:
 @register.register(
     name="delete_file",
     description=(
-        "Move a file or directory to the project trash instead of permanently "
-        "deleting it. The item can be restored with /undo when applicable; "
-        "/clear-trash permanently removes items from the trash. Use this tool "
-        "for file and directory deletion; shell delete commands are redirected "
-        "to the project trash while the delete safety guard is enabled."
+        "Delete a file safely and the execution is retractable."
     ),
     usage="delete_file <file_or_directory_path>",
     schema={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "File or directory path to move to the project trash, absolute or relative to the current directory"},
+            "file_path": {"type": "string", "description": "File or directory path to trash, absolute or relative to the current directory"},
         },
         "required": ["file_path"],
     },
@@ -1234,18 +1199,18 @@ def delete_file(file_path: str) -> str:
     try:
         dest = snapshot.move_to_trash(path)
     except (OSError, shutil.Error) as e:
-        log.error("移入回收站失败 %s: %s", path, e)
-        return f"删除失败（移入回收站出错）: {e}"
+        log.error("删除失败 %s: %s", path, e)
+        return f"删除失败: {e}"
     log.info("文件或目录已移入回收站: %s -> %s", path, dest)
-    return f"已移入回收站: {dest}\n（/undo 可回滚本次删除 · /clear-trash 真正清空回收站）"
+    return f"已删除: {dest}"
 
 
 # edit_file 失败反馈/成功回显参数
 _SUGGEST_MAX_LINES = 20000
 _SNIPPET_CONTEXT = 3
 _SNIPPET_MAX_LINES = 30
-_NOTE_REGIONS = 3             # 成功回显最多展示的变更区间数，超出提示另有 K 处
-_NOTE_DIFF_MAX_LINES = 20000  # 超过此行数退回单区间首尾扫描，difflib 全量太慢
+_NOTE_REGIONS = 3
+_NOTE_DIFF_MAX_LINES = 20000
 
 # 工具结果失败启发式模式：UI 状态展示与工作流轮次续期判定共用
 _TOOL_FAILURE_PATTERNS = (
@@ -1362,7 +1327,7 @@ def _decode_best_effort(raw: bytes) -> tuple:
 
 def _edit_miss_feedback(old_str: str, content: str) -> str:
     """0 匹配时的定位反馈：对 old_str 较长行做全文相似度匹配，给出最接近的现有行原文"""
-    parts = ["未找到待替换内容（检查空白、缩进与全半角字符差异）"]
+    parts = ["未找到待替换内容"]
     lines = content.splitlines()
     if len(lines) <= _SUGGEST_MAX_LINES:
         probes = sorted(
@@ -1519,7 +1484,7 @@ _GLOB_RECENT_SECONDS = 86400
     },
 )
 def glob(pattern: str, path: str = ".") -> str:
-    """文件名模式匹配：** 跨目录；24h 内修改的按新→旧置顶，其余按路径；上限 _GLOB_MAX_RESULTS"""
+    """文件名模式匹配"""
     if not pattern:
         return "pattern 不能为空"
     root = Path(path or ".")
@@ -1571,7 +1536,7 @@ _MATCH_LINE_MAX_CHARS = 200
     description=(
         "Search file contents with a regex across a directory tree. "
         "Returns matches grouped by file as path + line number + line text; "
-        "supports filename glob filter and per-match context blocks."
+        "supports filename glob filter and per-match context blocks"
     ),
     usage="search <pattern> [path] [glob] [context] [max_matches] [case_sensitive]",
     schema={
@@ -1707,7 +1672,6 @@ def _rg_search(
     except OSError:
         return None
     matches = []
-    # 达到条数上限主动停读时进程会被 kill，退出码不可作为执行失败依据
     hit_limit = False
     try:
         for line in proc.stdout or ():
@@ -1844,7 +1808,12 @@ def _load_lines(full: str) -> Optional[List[str]]:
 
 @register.register(
     name="run_program",
-    description="Run a program/script with arguments",
+    description=(
+        "Run a program/script directly with an argument array."
+        "Returns stdout and stderr separately; foreground only, timeout "
+        "clamped to 600s. Prefer this over execute_command for launching a "
+        "single known executable with fixed arguments"
+    ),
     usage="run_program <program> [args] [cwd] [timeout]",
     schema={
         "type": "object",
@@ -1939,7 +1908,6 @@ _WEBFETCH_DROP_TAGS = frozenset({
     "select", "option", "input", "textarea", "label", "dialog",
 })
 _WEBFETCH_ROLES = frozenset({"navigation", "banner", "contentinfo", "complementary", "search"})
-# 启发式噪音 class/id 关键词，保守集合，只打明显广告/追踪/装饰，避免误伤正文
 _WEBFETCH_NOISE_HINTS = (
     "advert", "sponsor", "promo", "cookie", "consent", "gdpr", "newsletter",
     "subscribe", "breadcrumb", "social-share", "share-bar", "popup", "banner",
@@ -2273,8 +2241,7 @@ def _webfetch_render(soup, page_url: str) -> tuple:
         "Fetch a web page with real-browser headers and return the cleaned main "
         "text as markdown (scripts/nav/ads stripped). Content images are saved "
         "to disk and annotated in place with their paths — use read to "
-        "view them. Use this instead of curl/wget in execute_command"
-    ),
+        "view them. Use this instead of curl/wget in execute_command"),
     usage="webfetch <url> [timeout]",
     schema={
         "type": "object",
@@ -2465,9 +2432,9 @@ def generate_steps(steps: List[str], external_handler=None) -> str:
         steps = steps.splitlines()  # 弱模型可能传单个字符串而非数组：按行容错
     cleaned = [str(s).strip() for s in (steps or []) if str(s).strip()]
     if not cleaned:
-        return "步骤列表为空：请提供 3-8 条可执行步骤（动词开头，每步具体可验证）"
+        return "步骤列表为空：请提供可执行步骤"
     if len(cleaned) > 15:
-        return f"步骤过多（{len(cleaned)} 条）：请合并为 3-8 条关键步骤后重新调用"
+        return f"步骤过多（{len(cleaned)} 条）：请合并为3-8条关键步骤后重新调用"
     payload = {"steps": cleaned}
     external_result = hooks.call_user_participating(
         "step_generate",
@@ -2511,7 +2478,6 @@ def update_step_status(step_id: int, status: str, detail: str = "", external_han
     target = session.update_step_status(step_id, status, detail=detail)
     if target is None:
         return f"步骤不存在: {step_id}"
-    # memory 内部已触发 step_update；此处支持调用方临时注入外部 handler
     if external_handler is not None:
         hooks.call_user_participating("step_update", {"step": target}, handler=external_handler)
     return json.dumps(target, ensure_ascii=False)
@@ -2522,8 +2488,9 @@ def update_step_status(step_id: int, status: str, detail: str = "", external_han
     description=(
         "External computer-use interface for native GUI operations such as "
         "screenshot, click and type. Requires an external handler configured "
-        "via config.external_apis.computer_use or a runtime hook; without one "
-        "the call returns a setup hint"
+        "via config.external_apis.computer_use or a runtime hook (the bundled "
+        "computer-use plugin installs one1); without one the call returns a "
+        "setup hint"
     ),
     usage="computer_use <action> [params]",
     schema={
@@ -2608,7 +2575,7 @@ def write_memory(keyword: str, content: str, type: str = "project") -> str:
 
 @register.register(
     name="update_memory",
-    description="Update a memory file (optional rename): project keyword memories are fully replaced, global function files merge by '## section' keeping unmentioned sections",
+    description="Update a memory file (optional rename via new_keyword1): project keyword memories are fully replaced, global function files merge by '## section' keeping unmentioned sections",
     usage="update_memory <keyword> <content> <type> [new_keyword]",
     schema={
         "type": "object",
@@ -2650,7 +2617,7 @@ def update_memory(keyword: str, content: str, type: str = "project", new_keyword
 
 @register.register(
     name="read_memory",
-    description="Read one or more project memory files by keyword (results are kept across turns, not stripped)",
+    description="Read one or more project memory files by keyword (results are kept across turns, not stripped; multiple keywords return concatenated bodies1)",
     usage="read_memory <keywords...>",
     schema={
         "type": "object",
