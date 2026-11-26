@@ -1,0 +1,15 @@
+{
+  "sdk_version": 1,
+  "id": "ask-user-subagent",
+  "name": "用户子代理",
+  "version": "0.1.0",
+  "description": "主 Agent 将任务委派给用户：调用 ask_user_as_subagent 后弹出任务卡片等待多行作答，用户提交的内容作为调用结果返回，在 Agent 看来与普通子代理一致；委派倾向（0-100）与子代理说明经 [插件补充] 每请求注入，支持超时与 WebUI 远程代答",
+  "author": "BAWCode",
+  "entry": "main.py",
+  "config": [
+    { "key": "enabled", "type": "bool", "default": true, "label": "启用用户子代理", "hint": "关闭后委派工具回复已停用、提示注入一并消失；/asksub on|off 同效" },
+    { "key": "delegation_bias", "type": "int", "default": 50, "min": 0, "max": 100, "label": "委派倾向 (0-100)", "hint": "0=几乎全部自己做；50=均衡；100=能交就交，只保留必须在本环境执行的动作" },
+    { "key": "timeout_seconds", "type": "int", "default": 0, "min": 0, "max": 86400, "label": "等待超时（秒）", "hint": "任务卡片等待作答的时限，到点按超时收场并告知 Agent；0=不限时等待（卡片被其他弹窗覆盖时需手动收场）" },
+    { "key": "subagent_description", "type": "str", "default": "", "label": "子代理说明", "hint": "告诉主 Agent 这个子代理擅长什么、适合接什么任务；留空用默认表述；超过 2000 字截断" }
+  ]
+}
