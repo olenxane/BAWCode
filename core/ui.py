@@ -1645,11 +1645,13 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
 
 
     def show_ask_form(self, payload: dict) -> dict:
-        """询问用户面板（阻塞）：↑↓/数字选择 · Enter 确认 · 末项进自由输入 · Esc 跳过。
+        """询问用户面板（阻塞）：↑↓/数字选择 · Enter 确认 · 末项直输 · Esc 跳过。
 
         payload: {"question": str, "options": [{"title", "description"}], "timeout": 秒，0=禁用}
         返回 {"status": "answer"|"declined"|"timeout"|"cancelled", "answer"/"index"/"timeout"}。
-        自动超时经键盘轮询 tick 检查 deadline，超时返回 timeout 让 agent 循环继续。"""
+        自动超时经键盘轮询 tick 检查 deadline，超时返回 timeout 让 agent 循环继续。
+        输入态键位对齐主输入栈：Enter 提交、newline 事件（Ctrl+Enter/Ctrl+J）换行；
+        选项无内容可答时空选项直达输入态。"""
         question = str((payload or {}).get("question") or "")
         raw_opts = payload.get("options") or []
         options = [
@@ -1664,7 +1666,7 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
         self.ask_mode = True
         self.ask_spec = {"question": question, "options": options}
         self.ask_index = 0
-        self.ask_input_mode = False
+        self.ask_input_mode = not options  # 空选项无可选内容：直达自由输入态
         self.ask_multiline = bool((payload or {}).get("multiline"))
         self._ask_buf = TextBuffer()
         self.ask_deadline = (time.monotonic() + timeout) if timeout > 0 else None
@@ -1695,18 +1697,20 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                 if kind in ("mode_switch",):
                     continue
                 if self.ask_input_mode:
-                    # 自由输入态
+                    # 自由输入态（键位对齐主输入栈：Enter 提交、Ctrl+Enter 换行）
                     if kind == "interrupt":
                         return {"status": "cancelled"}
                     if kind == "escape":
-                        self.ask_input_mode = False
-                        self._ask_buf.clear()
-                        self.render()
-                        continue
-                    if kind == "newline":
-                        # Ctrl+Enter：多行模式的提交键（单行模式与 Enter 同义）
-                        return {"status": "answer", "answer": self._ask_buf.to_text().strip()}
+                        # 返回选项时保留已输入文本（防误触丢失）；无可选项即跳过本次询问
+                        if options:
+                            self.ask_input_mode = False
+                            self.render()
+                            continue
+                        return {"status": "declined"}
                     if kind == "submit":
+                        return {"status": "answer", "answer": self._ask_buf.to_text().strip()}
+                    if kind == "newline":
+                        # newline 事件（Ctrl+Enter/Ctrl+J/Alt+Enter）：多行换行；单行无换行可表达，与 Enter 同义
                         if self.ask_multiline:
                             self._ask_buf.insert("\n")
                             self.render()
@@ -1763,11 +1767,9 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                             "index": self.ask_index,
                             "answer": options[self.ask_index]["title"],
                         }
-                    self.ask_input_mode = True
-                    self._ask_buf = TextBuffer()
+                    self.ask_input_mode = True  # 缓冲不清空：Esc 退回再进来的文本还在
                     self.render()
                     continue
-                # 数字快捷键：直接选中对应项（选项立即生效，末项进输入态）
                 if kind == "char" and str(value).isdigit():
                     idx = int(value) - 1
                     if 0 <= idx < len(options):
@@ -1775,7 +1777,13 @@ class TuiApp(SettingsPanelMixin, RenderMixin):
                     if idx == len(options):
                         self.ask_index = len(options)
                         self.ask_input_mode = True
-                        self._ask_buf = TextBuffer()
+                        self.render()
+                    continue
+                # 焦点在末项"其他"时键入字符直达输入态（数字保留给快选）；输入即带着该字符
+                if kind == "char" and self.ask_index == len(options):
+                    if isinstance(value, str) and value and all(ord(c) >= 32 for c in value):
+                        self.ask_input_mode = True
+                        self._ask_buf.insert(value)
                         self.render()
                     continue
         finally:

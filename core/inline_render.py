@@ -71,7 +71,11 @@ def prefix_intact(marks: Sequence[Tuple[dict, tuple]], timeline: Sequence[dict])
 
 def redraw_sequence(prev_h: int, commit: Sequence[str], live: Sequence[str]) -> str:
     """回到动态区顶部清屏尾，先追加提交行进 scrollback，再画新的动态区；光标停在末行"""
-    parts = [SYNC_BEGIN]
+    # erase+commit+live 整个重写阶段关 DECAWM 自动换行：任一行显示宽超 w 时按列裁剪
+    # 而非折行，保证物理行数==逻辑行数；否则 _live_h 欠账→erase 漏行→旧帧残留进 scrollback。
+    # commit 行同样会超宽（webfetch 等外部内容的 emoji/二义宽字符使 wcwidth 低估），
+    # 只罩 live 段时 commit 折行产生的幽灵行照样滚进 scrollback，故须覆盖全程
+    parts = [SYNC_BEGIN, "\x1b[?7l"]
     if prev_h > 0:
         parts.append("\r")
         if prev_h > 1:
@@ -79,9 +83,6 @@ def redraw_sequence(prev_h: int, commit: Sequence[str], live: Sequence[str]) -> 
         parts.append("\033[J")
     for row in commit:
         parts.append(row + "\033[0m\r\n")
-    # live 区写期间关 DECAWM 自动换行：任一 live 行显示宽超 w 时按列裁剪而非折行，
-    # 保证物理行数==len(live)；否则 _live_h 欠账→erase 漏行→live 顶行残留进 scrollback
-    parts.append("\x1b[?7l")
     parts.append("\r\n".join(row + "\033[0m" for row in live))
     parts.append("\x1b[?7h")
     parts.append(SYNC_END)

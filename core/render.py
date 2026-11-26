@@ -2943,7 +2943,8 @@ class RenderMixin(UiState):
                     f"{self.c('accent')}{prompt}{self.RESET}"
                     f"{self.c('ink')}{left_c}{self.C_HL} {self.RESET}{right_c}{self.RESET}"
                 )
-            hint = " Enter 换行 · Ctrl+Enter 提交 · Esc 返回选项" if self.ask_multiline else " Enter 提交 · Esc 返回选项"
+            esc_hint = "Esc 返回选项" if options else "Esc 跳过"
+            hint = f" Enter 提交 · Ctrl+Enter 换行 · {esc_hint}" if self.ask_multiline else f" Enter 提交 · {esc_hint}"
             rows.append(self.c("dim") + _clip(hint, w - 1) + self.RESET)
             return rows
         for i, opt in enumerate(options):
@@ -2964,7 +2965,7 @@ class RenderMixin(UiState):
             rows.append(self.C_HL + _pad(_clip(line, w - 1), w - 1) + self.RESET)
         else:
             rows.append(self.c("ink") + _clip(line, w - 1) + self.RESET)
-        hint = " ↑↓ 选择 · 数字快选 · Enter 确认 · Esc 跳过"
+        hint = " ↑↓ 选择 · 数字快选 · 末项直输 · Enter 确认 · Esc 跳过"
         if self.ask_deadline is not None:
             rem = max(0, int(self.ask_deadline - time.monotonic()))
             hint += f" · ⏱ {rem // 60}:{rem % 60:02d} 后自动跳过"
