@@ -31,7 +31,7 @@ _seq = 0
 _lock = threading.Lock()
 
 # 默认超时（秒）
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 15
 
 # 事件目录单一事实源在 bawcode_sdk/events.py（SDK 侧校验/常量共用同一份）
 from bawcode_sdk.events import EVENTS  # noqa: F401  (re-export: 事件目录见该模块)
@@ -174,26 +174,28 @@ def call_hook(event: str, payload: Optional[dict] = None, default: Any = None) -
     """变换链触发：无结果/无处理函数返回 default
 
     处理函数返回 dict 时与当前 payload 浅合并后继续向后传递（可逐步改写）；
-    返回 None 表示"不参与"，不影响链条。最终返回值为各 dict 贡献的浅合并
-    （后者覆盖前者），非 dict 结果原样返回——观察型处理函数应返回 None。
+    返回 None 表示"不参与"，不影响链条；返回非 dict 视为终态立即返回。最终返回值为各 dict 贡献的浅合并（后者覆盖前者）——
+    观察型处理函数应返回 None。
     """
     data = dict(payload) if payload is not None else {}
     data.setdefault("_event", event)
     if event == "tool_confirm":
         return confirm_hook(data, default)
-    result = None
     merged: Dict[str, Any] = {}
+    saw_dict = False
     for entry in _ordered(event):
         out = _invoke(entry, data)
         if out is None:
             continue
-        result = out
         if isinstance(out, dict):
+            saw_dict = True
             merged.update(out)
             data.update(out)
-    if result is None:
+            continue
+        return out
+    if not saw_dict:
         return default
-    return merged if isinstance(result, dict) else result
+    return merged
 
 
 def confirm_hook(data: dict, default: Any = None) -> Any:
@@ -240,14 +242,23 @@ def set_external_apis(api_map: Optional[dict]) -> None:
 
     配置值为 URL 字符串时，自动挂接 HTTP POST 扩展点（owner=external_apis，
     重复调用时替换旧挂接）；值为 null 时保持本地默认逻辑。
+    值也可为 {"url": ..., "timeout": 秒} 字典，按需放宽/收紧单事件超时。
     """
     if not api_map:
         return
-    for event, url in api_map.items():
-        if url:
+    for event, spec in api_map.items():
+        timeout = DEFAULT_TIMEOUT
+        url = spec
+        if isinstance(spec, dict):
+            url = spec.get("url")
+            try:
+                timeout = max(1, min(120, int(spec.get("timeout") or DEFAULT_TIMEOUT)))
+            except (TypeError, ValueError):
+                timeout = DEFAULT_TIMEOUT
+        if url and isinstance(url, str):
             unregister_hook(event, owner="external_apis")
-            _register(event, _make_http_handler(event, url), priority=50, owner="external_apis", name="http")
-            log.info("外部接口已挂接: %s -> %s", event, url)
+            _register(event, _make_http_handler(event, url, timeout), priority=50, owner="external_apis", name="http")
+            log.info("外部接口已挂接: %s -> %s（超时 %ds）", event, url, timeout)
 
 
 def list_hooks() -> Dict[str, List[dict]]:
@@ -263,7 +274,7 @@ def list_hooks() -> Dict[str, List[dict]]:
     return out
 
 
-def _make_http_handler(event: str, url: str) -> Callable[[dict], Any]:
+def _make_http_handler(event: str, url: str, timeout: int = DEFAULT_TIMEOUT) -> Callable[[dict], Any]:
     """构造 POST JSON 的外部接口处理函数
 
     请求体: {"event": <事件名>, "payload": {...}}
@@ -279,7 +290,7 @@ def _make_http_handler(event: str, url: str) -> Callable[[dict], Any]:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 text = resp.read().decode("utf-8")
             return json.loads(text) if text else {}
         except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:

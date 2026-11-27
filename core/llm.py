@@ -898,15 +898,26 @@ class LLM:
             payload["temperature"] = temperature
         elif _tri_state(advanced.get("send_temperature")):
             payload["temperature"] = req.get("temperature", 1.0)
-        # 提供商可自定义强度键名；effort=none 仍显式发出 none 和关闭开关
         effort = _thinking_effort_of(
             req.get("thinking_effort"), advanced,
             model_override=bool(req.get("thinking_effort_explicit", False)),
         )
         effort_field = str(advanced.get("thinking_effort_field") or "reasoning_effort").strip() or "reasoning_effort"
         enabled_field = str(advanced.get("thinking_enabled_field") or "enable_thinking").strip() or "enable_thinking"
-        payload[effort_field] = effort
-        payload[enabled_field] = effort != "none"
+        disable_intent = (
+            _tri_state(advanced.get("thinking_enabled")) is False
+            or str(advanced.get("thinking_effort") or "").strip().lower() == "none"
+            or (bool(req.get("thinking_effort_explicit", False))
+                and str(req.get("thinking_effort") or "").strip().lower() == "none")
+            or "thinking_effort_field" in advanced
+            or "thinking_enabled_field" in advanced
+        )
+        if effort != "none":
+            payload[effort_field] = effort
+            payload[enabled_field] = True
+        elif disable_intent:
+            payload[effort_field] = "none"
+            payload[enabled_field] = False
         if tools:
             payload["tools"] = tools
             # DeepSeek 思考模式不支持 required/指定 function，固定 auto
@@ -938,7 +949,9 @@ class LLM:
             key = str(item.get("key") or default_key).strip()
             if not key:
                 continue
-            payload[key] = preset_values[preset] if item.get("inherit", True) else item.get("value")
+            value = preset_values[preset] if item.get("inherit", True) else item.get("value")
+            if value is not None or not item.get("inherit", True):
+                payload[key] = value
         for item in custom_body:
             if not isinstance(item, dict) or item.get("preset") or not item.get("enabled", True):
                 continue

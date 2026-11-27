@@ -1,4 +1,3 @@
-"""Public plugin context. All host calls go through an injected HostAPI."""
 import threading
 from pathlib import Path
 from typing import Any, Callable, List, Optional
@@ -47,15 +46,15 @@ class PluginContext:
         self.plugin_id = pid
         self.dir = dir_path
         self.manifest = manifest
-        self.source = source  # global | project因
-        self.config = config  # 宿主 Config（只读约定；改配置走 /settings）
+        self.source = source
+        self.config = config
         self.workspace = workspace
         # plugin.json 的 config 声明（设置面板插件页与 ctx.settings 缺省值的依据）
         self.config_decls: List[dict] = _parse_config_decls(manifest, pid)
         self.log = self.host.logging.get_logger(f"plugins.{pid}")
         self.ui = PluginUI(self)
-        self._teardowns: List[Callable] = []  # register_teardown 登记，卸载时按序执行
-        self._workers: List[Worker] = []      # spawn_worker 登记，close 时自动兜底停止
+        self._teardowns: List[Callable] = []
+        self._workers: List[Worker] = []
 
     @property
     def runtime(self) -> dict:
@@ -286,8 +285,7 @@ class PluginContext:
         safe=True 声明免确认工具（纯交互/无副作用类）：所有访问模式直接放行，
         与宿主 SAFE_TOOLS 成员同待遇——问用户/委派任务类工具先确认"能调用"纯属打扰。
         仅对确无副作用的工具使用；标志随插件卸载自动消失。
-        safe_actions 为 action 参数级白名单：分发式工具（按 action 分发内部操作的
-        单工具）可声明其中纯观测动作免确认，其余 action 照常过门禁。
+        safe_actions 为 action 参数级白名单：分发式工具（按 action 分发内部操作的单工具）可声明其中纯观测动作免确认，其余 action 照常过门禁。
         """
         def decorator(func: Callable) -> Callable:
             self._ensure_active()
@@ -339,7 +337,6 @@ class PluginContext:
             return
         self.host.runtime.notify(text)
 
-    # ---- 杂项 ----
 
     def request_llm_retry(self) -> bool:
         """请求重试当前失败的 LLM 请求：仅当回合正处于 API 错误等待态（瞬态错误

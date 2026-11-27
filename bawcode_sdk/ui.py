@@ -8,9 +8,7 @@ if TYPE_CHECKING:
 class PluginUI:
     """app.request_ui/wait_ui 交互桥的插件包装：confirm/choose/line 三个用户动作原语。
 
-    仅可在 agent 线程（hook / 工具执行内）调用——桥的应答由主线程帧循环完成，
-    主线程命令 handler 里调用会阻塞帧循环造成死锁；主线程请直接用 app 的阻塞
-    表单（app.read_line / app.show_sessions_form 等，见 /run /resume 的做法）。
+    仅可在 agent 线程（hook / 工具执行内）调用——桥的应答由主线程帧循环完成；主线程请直接用 app 的阻塞表单（app.read_line / app.show_sessions_form 等，见 /run /resume 的做法）。
     用户取消或运行时未注入（bind_runtime 之前）返回 None，不抛异常。
     """
 
@@ -49,9 +47,7 @@ class PluginUI:
     def ask(self, question: str, options=(), timeout: int = 0, multiline: bool = False, cancelled=None) -> Optional[dict]:
         """任务卡片面板：自由作答/选项作答，支持多行输入与超时。
 
-        返回 {status: answer|timeout|rejected, answer?: str}；用户取消（Esc/回合中断/
-        交互通道未就绪）统一返回 None。仅可在 agent/后台线程调用，主线程调用会
-        被宿主防护拒绝（主线程请直调 app.show_ask_form）。"""
+        返回 {status: answer|timeout|rejected, answer?: str}；用户取消（Esc/回合中断/交互通道未就绪）统一返回 None。仅可在 agent/后台线程调用（主线程请直调 app.show_ask_form）。"""
         question = str(question or "").strip()
         if not question:
             return None

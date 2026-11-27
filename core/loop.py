@@ -323,17 +323,23 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             reasoning: str = response.get("reasoning") or ""
             tool_calls: list = response.get("tool_calls") or []
             if not content.strip() and not reasoning.strip() and not tool_calls:
-                if empty_retries < 2:
+                finish = str(response.get("finish_reason") or "")
+                retry_cap = 1 if finish == "length" else 2
+                if empty_retries < retry_cap:
                     empty_retries += 1
-                    io.status(f"空回复补试 {empty_retries}/2")
-                    log.warn("第%d轮模型空回复，补试", round_no)
+                    io.status(f"空回复补试 {empty_retries}/{retry_cap}")
+                    log.warn("第%d轮模型空回复（finish_reason=%s），补试", round_no, finish or "-")
+                    check_cancel(turn)
                     continue
-                reason = "[回合异常：模型未返回有效内容]"
-                session.add_message("assistant", reason, type="error")
+                if finish == "length":
+                    detail = "模型输出在生成途中被 max_tokens 截空（finish_reason=length），建议调大该模型的 max_tokens 后重试"
+                else:
+                    detail = f"模型连续返回空内容（finish_reason={finish or '无'}，已补试 {retry_cap} 次）"
+                session.add_message("assistant", f"[回合异常：{detail}]", type="error")
                 turn.last_error = "empty_response"
                 turn.turn_failed = True
                 io.status("出错")
-                log.error("第%d轮模型空回复，放弃回合", round_no)
+                log.error("第%d轮模型空回复（finish_reason=%s），放弃回合", round_no, finish or "-")
                 return {"status": "error", "content": ""}
             break
         if response.get("error"):
@@ -397,10 +403,7 @@ def tool_loop(turn: TurnContext, extra_system: Optional[str], max_rounds: int, m
             ],
             **thinking_extra,
         )
-        # 同步到 UI 快照：工具确认弹窗期间主线程读 self.messages 渲染树，
-        # 否则本轮 assistant(tool_call) 节点要等下轮 io.status 才出现。
-        # 工作流 Agent 节点隔离执行时刷新显示会话（主会话树持续显示链路标记），
-        # 不把 UI 树切到随链路即弃的节点会话
+        # 同步到 UI 快照：工具确认弹窗期间主线程读 self.messages 渲染树
         if turn.app is not None:
             turn.app.refresh_from_session(getattr(turn, "display_session", None) or session, render=False)
         registered = 0

@@ -7,7 +7,6 @@ class HostAPI(Protocol):
     def value(self, service: str, name: str) -> Any: ...
 
 
-# Explicit contracts: adapters may change internally without exposing entire modules.
 SERVICE_METHODS = {
     "hooks": ("register_hook", "unregister_hook", "call_hook", "collect_hook", "list_hooks", "http_handler"),
     "commands": ("register", "register_arg_completer", "list_commands", "complete", "execute", "resolve"),
@@ -60,8 +59,7 @@ class Service:
 class _HooksService:
     """hooks 服务的 owner 感知包装：注册/注销缺省归属调用方插件。
 
-    防两类事故：register_hook 忘传 owner → 卸载时残留；unregister_hook 只按
-    handler/name 的宿主默认 OR 匹配 → 误注销别家插件的订阅。"""
+    防两类事故：register_hook 忘传 owner → 卸载时残留；unregister_hook 只按handler/name 的宿主默认 OR 匹配 → 误注销别家插件的订阅。"""
 
     def __init__(self, service: Service, owner: str):
         self._service = service
@@ -85,8 +83,7 @@ class _HooksService:
 class HostServices:
     """Advanced host services for management plugins, injected per context.
 
-    服务名与服务集合一一对应：新增服务须同步在 SERVICE_METHODS/SERVICE_VALUES
-    声明并在 __init__ 挂载，静态检查才能看到属性。"""
+    服务名与服务集合一一对应：新增服务须同步在 SERVICE_METHODS/SERVICE_VALUES声明并在 __init__ 挂载，静态检查才能看到属性。"""
 
     hooks: Service
     commands: Service

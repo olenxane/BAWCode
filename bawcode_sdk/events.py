@@ -5,8 +5,7 @@ kind: call=变换链 collect=观察链。插件可直接引用常量避免拼写
     from bawcode_sdk.events import AFTER_TURN
     ctx.register_hook(AFTER_TURN, fn)
 
-目录外的事件名允许注册（插件间自定义互通事件，见开发指南 §14），
-但 register_hook 会 warn 一次提示可能拼错——确为自定义事件时可忽略。
+目录外的事件名允许注册（插件间自定义互通事件，见开发指南 §14），但 register_hook 会 warn 一次提示可能拼错——确为自定义事件时可忽略。
 """
 import difflib
 
@@ -53,7 +52,6 @@ EVENTS = {
     "tool_confirm": {"kind": "call", "desc": "工具确认代答，首个有效应答生效；None 交回 UI 面板"},
     "tool_confirm_closed": {"kind": "collect", "desc": "工具确认已应答，按 request_id 关闭其他通道请求"},
     "ui_request": {"kind": "call", "desc": "交互弹窗代答 confirm/choose/line/ask（返回与键盘输入同语义的应答值生效；None 交回 UI 面板）"},
-    # ---- 生命周期事件 ----
     "session_start": {"kind": "collect", "desc": "会话初始化完成（collect）"},
     "before_turn": {"kind": "call", "desc": "回合开始，可改写 user_text（返回 {user_text: ...} 生效）"},
     "after_turn": {"kind": "collect", "desc": "回合结束通知（collect）"},
