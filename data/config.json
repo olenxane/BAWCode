@@ -92,7 +92,7 @@
     "theme": "dark",
     "mode": "auto",
     "logo": true,
-    "render_mode": "fullscreen",
+    "render_mode": "inline",
     "send": "ctrl+enter",
     "newline": "shift+enter",
     "switch_focus": "tab",
@@ -201,7 +201,13 @@
   "plugins": {
     "enabled": true,
     "dir": "data/plugins",
-    "disable": [],
+    "disable": [
+      "music-player",
+      "computer-use",
+      "qbridge",
+      "hello-plugin",
+      "bottom-banter"
+    ],
     "auto_install_deps": true
   },
   "plugins_config": {},

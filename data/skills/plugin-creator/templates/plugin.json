@@ -1,0 +1,10 @@
+{
+  "id": "{{PLUGIN_ID}}",
+  "sdk_version": 1,
+  "name": "{{PLUGIN_NAME}}",
+  "version": "0.1.0",
+  "description": "{{PLUGIN_DESC}}",
+  "author": "",
+  "entry": "main.py",
+  "enabled": true
+}
