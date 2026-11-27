@@ -192,7 +192,7 @@ special_read: Dict[str, Callable] = {
     "mode": _read_mode,
     "active_model_name": _read_active_model,
     "log_level": _read_log_level,
-    "system_prompt": _read_system_prompt,
+    "persona": _read_system_prompt,
 }
 
 
@@ -257,5 +257,5 @@ special_write: Dict[str, Callable] = {
     "log_level": _write_log_level,
     "active_model_name": _write_active_model,
     "default_shell": _write_default_shell,
-    "system_prompt": _write_system_prompt,
+    "persona": _write_system_prompt,
 }

@@ -3,7 +3,7 @@
 演示五类扩展点的接入方式（详见 docs/plugin-development.md）：
   1. 斜杠命令     /hello <名字>
   2. 模型可见工具 plugin_hello（走统一权限/确认/上下文限额管线）
-  3. hook 事件    after_tool / before_turn 观察，context_supplement 上下文补充
+  3. hook 事件    after_tool / before_turn 观察，user_message_supplement 用户消息补充
   4. 技能         skills/hello-usage/SKILL.md 自动并入技能清单
   5. 配置声明     plugin.json config 数组 → 设置面板"插件"标签页可视化编辑，
                   ctx.settings 实时读取（改动即时生效，无需重载）
@@ -63,10 +63,11 @@ def setup(ctx: PluginContext):
     ctx.register_hook("after_tool", _on_after_tool)
     ctx.register_hook("before_turn", _on_before_turn)
 
-    # ---- 4/5. 上下文补充：实时读 supplement 开关（设置面板/配置改动即时生效）----
+    # ---- 4/5. 用户消息补充：实时读 supplement 开关（设置面板/配置改动即时生效）----
+    # 命中时文本焊进该条 user 消息，出站以 <system> 块拼在正文开头，随消息长期存在
     def _supplement(payload):
         if not ctx.settings.get("supplement"):
             return None
-        return "hello-plugin 示例补充：此行为插件经 context_supplement 注入。"
+        return "hello-plugin 示例补充：此行由插件经 user_message_supplement 注入。"
 
-    ctx.register_context_supplement(_supplement)
+    ctx.register_user_message_supplement(_supplement)

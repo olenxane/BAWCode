@@ -828,8 +828,8 @@ def _normalize_entry(entry):
         out["cwd"] = str(entry["cwd"])
     if entry.get("timeout") is not None:
         timeout = _int(entry["timeout"], -1)
-        if timeout < 1:
-            return out, "timeout 必须是正整数秒"
+        if timeout < 0:
+            return out, "timeout 必须是正整数秒，0 表示回退全局值"
         out["timeout"] = timeout
     if entry.get("enabled") is not None:
         raw = entry["enabled"]

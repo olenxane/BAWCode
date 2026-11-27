@@ -1,15 +1,15 @@
-"""emotion-detector —— 用户情绪识别插件 v0.1.0（无状态单轮注入）。
+"""emotion-detector —— 用户情绪识别插件 v0.1.0（用户消息补充注入）。
 
-检测用户消息中的愤怒/不耐烦/急躁语气，命中时经 context_supplement 扩展点
-向当前回合注入情绪提示（[插件补充] system 消息，紧跟系统提示词之后、会话
-历史之前），引导 Agent：有错诚恳道歉、多汇报好消息、简化回复、安抚情绪。
+检测用户消息中的愤怒/不耐烦/急躁语气，命中时经 user_message_supplement
+扩展点把情绪提示焊进该条 user 消息（出站时以 <system> 块拼在正文开头），
+引导 Agent：有错诚恳道歉、多汇报好消息、简化回复、安抚情绪。
 
 注入通道（复用宿主现有提示词注入逻辑，零宿主改动）：
-  context_supplement（collect 观察链）在 build_messages 时触发，payload 带
-  user_message（当前用户消息文本，多模态数组已由宿主提取）；返回非空 str 即
-  以 [插件补充] 合并注入。无持久化：只在本回合的模型上下文里存在，下一回合
-  不命中就消失。工具循环内每轮推理都会重建消息，本插件为纯函数——同消息
-  返回同一份文本，天然幂等，无需去重状态。
+  user_message_supplement（collect 观察链）在 user 消息写入时触发一次，
+  payload 带 user_message（当前用户消息文本，多模态数组已由宿主提取）；
+  返回非空 str 即焊入该消息的 user_supplement 字段，字节从此冻结、随消息
+  长期存在——语义上正合适：情绪提示本就属于产生它的那条消息。本插件为
+  纯函数，同消息返回同一份文本，天然幂等，无需去重状态。
 
 分级词表（内置，设置面板可屏蔽/追加）：
   strong 愤怒/辱骂（他妈/卧槽/废物…）；weak 不耐烦/质疑（你在干什么/都跟你说了…）。
@@ -153,7 +153,7 @@ def setup(ctx: PluginContext) -> None:
     def _disabled() -> str:
         return str(ctx.settings.get("disabled_keywords") or "")
 
-    # ---- 每回合检测注入（无状态：命中当轮生效，下回合自然消失）----
+    # ---- 按消息检测注入（无状态：提示焊进命中消息本身，随该消息存续）----
     def _supplement(payload) -> Optional[str]:
         if not ctx.settings.get("enabled"):
             return None
@@ -166,7 +166,7 @@ def setup(ctx: PluginContext) -> None:
         ctx.log.info("检测到用户情绪 level=%s hits=%s", level, hits)
         return render_note(level, hits)
 
-    ctx.register_context_supplement(_supplement)
+    ctx.register_user_message_supplement(_supplement)
 
     # ---- /emotion：status | on | off | test <文本> ----
     def _emotion_cmd(cctx, args: str) -> str:
@@ -190,7 +190,7 @@ def setup(ctx: PluginContext) -> None:
         # status
         n_strong, n_weak = word_counts(_extra(), _disabled())
         state = "开启" if ctx.settings.get("enabled") else "关闭"
-        return (f"情绪识别：{state} · 注入方式：命中当轮生效（无延续）\n"
+        return (f"情绪识别：{state} · 注入方式：提示焊进命中消息（随该消息存续）\n"
                 f"词表规模：强 {n_strong} / 弱 {n_weak}（追加/屏蔽词见设置面板插件页）")
 
     ctx.register_command(

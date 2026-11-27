@@ -100,6 +100,9 @@ class MusicController:
         self.lyrics_data = None
         self.stats = StatsTracker(str(self.data_dir / "stats.json"))
         self._stats_flush = 0.0
+        self._load_error = ""
+        self._lyrics_cache_key = None
+        self._lyrics_cache_val = None
 
         if self.playlist.tracks:
             self._load_current_track()
@@ -124,15 +127,32 @@ class MusicController:
         path = self.playlist.current
         if not path:
             return
-        self.current_track = read_metadata(path)
-        self.lyrics_data = load_lyrics(
-            path,
-            lyrics_dir=self.cfg.lyrics.lyrics_dir,
-            fuzzy_match=self.cfg.lyrics.fuzzy_match,
-            fuzzy_threshold=self.cfg.lyrics.fuzzy_threshold,
-        )
-        self.player.load(path, eq_bands=self.cfg.equalizer.bands_db,
-                         q_values=self.cfg.equalizer.q_values)
+        try:
+            self.current_track = read_metadata(path)
+            try:
+                lkey = (path, os.stat(path).st_mtime_ns)
+            except OSError:
+                lkey = None
+            if lkey is not None and lkey == self._lyrics_cache_key:
+                self.lyrics_data = self._lyrics_cache_val
+            else:
+                self.lyrics_data = load_lyrics(
+                    path,
+                    lyrics_dir=self.cfg.lyrics.lyrics_dir,
+                    fuzzy_match=self.cfg.lyrics.fuzzy_match,
+                    fuzzy_threshold=self.cfg.lyrics.fuzzy_threshold,
+                )
+                self._lyrics_cache_key, self._lyrics_cache_val = lkey, self.lyrics_data
+            self.player.load(path, eq_bands=self.cfg.equalizer.bands_db,
+                             q_values=self.cfg.equalizer.q_values)
+            self._load_error = ""
+        except Exception as e:
+            # 加载失败回滚到空态：半初始化会让 play() 静默无声（点了播放却永远没声音）
+            self.current_track = None
+            self.lyrics_data = None
+            self._lyrics_cache_key = None
+            self._load_error = f"{type(e).__name__}: {e}"
+            self.log.warn("加载失败 %s: %s", os.path.basename(path), self._load_error)
 
     def _leave_current_to_history(self):
         idx = self._current_index()
@@ -140,26 +160,46 @@ class MusicController:
             self.playlist.push_buffer(idx)
 
     def _on_track_end(self):
+        # 音频线程回调：异常必须就地兜底——回调线程带异常死亡后自动切歌永久失效
+        try:
+            self._on_track_end_advance()
+        except Exception as e:
+            self._load_error = f"{type(e).__name__}: {e}"
+            try:
+                self.player.stop()
+            except Exception:
+                pass
+            try:
+                self.ctx.notify(f"[music] 自动切歌失败，已停止播放：{self._load_error}")
+            except Exception:
+                pass
+
+    def _on_track_end_advance(self):
         # 音频线程回调：队列优先，其次按模式顺延
         with self._lock:
             if self.playlist.has_queue():
                 self._leave_current_to_history()
                 self.playlist.next_from_queue()
-                self._load_current_track()
-                self.player.play()
+                self._advance_play()
                 return
             if not self.playlist.tracks:
                 return
             if self.playlist.mode == "repeat_one":
-                self._load_current_track()
-                self.player.play()
+                self._advance_play()
                 return
             if (self.playlist.mode == "sequential"
                     and self.playlist.index == len(self.playlist.tracks) - 1):
                 return
             self.playlist.next()
-            self._load_current_track()
+            self._advance_play()
+
+    def _advance_play(self):
+        # 自动切歌的装载+播放：加载失败显式通知（否则静默无声，用户不知情）
+        self._load_current_track()
+        if self.player.loaded:
             self.player.play()
+        else:
+            self.ctx.notify(f"[music] 自动切歌失败，已停止播放：{self._load_error}")
 
     def _jump_and_play(self, index: int):
         self.playlist.jump_to(index)
@@ -205,9 +245,10 @@ class MusicController:
         if sub in ("pause", "p"):
             self.player.pause()
             return self._say("已暂停")
-        if sub in ("toggle", "resume"):
-            self._cmd_play("")
-            return ""
+        if sub == "toggle":
+            return self._cmd_toggle()
+        if sub == "resume":
+            return self._cmd_play("")
         if sub == "next":
             return self._cmd_next()
         if sub == "prev":
@@ -278,10 +319,24 @@ class MusicController:
             return "曲库为空：用 /music dir add <目录> 添加后 /music rescan"
         if self.player.state == PlayState.PLAYING:
             return self._say("正在播放")
-        if self.current_track is None:
+        if self.current_track is None or not self.player.loaded:
             self._load_current_track()
+        if not self.player.loaded:
+            return self._say(f"加载失败：{self._load_error or '未知原因'}（详见插件日志）")
         self.player.play()
         return self._say("继续播放")
+
+    def _cmd_toggle(self) -> str:
+        if not self.playlist.tracks:
+            return "曲库为空：用 /music dir add <目录> 添加后 /music rescan"
+        before = self.player.state
+        self.player.toggle_pause()
+        after = self.player.state
+        if before == PlayState.PLAYING and after == PlayState.PAUSED:
+            return self._say("已暂停")
+        if before == PlayState.PAUSED and after == PlayState.PLAYING:
+            return self._say("继续播放")
+        return self._cmd_play("")  # 停止态无可切换的暂停：走播放语义
 
     def _cmd_next(self) -> str:
         if not self.playlist.tracks:

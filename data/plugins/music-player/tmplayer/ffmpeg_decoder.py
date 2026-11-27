@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -35,6 +36,11 @@ def _find_ffprobe_binary() -> Optional[str]:
 
 _FFMPEG_BIN = None
 _FFPROBE_BIN = None
+
+# 探测结果缓存，key=(绝对路径, mtime_ns, 大小, header 参数)。同一文件重复装载
+# （重播/响度分析再开文件）免二次探测；ffprobe 缺失时兜底是全文件解码，代价极大
+_PROBE_CACHE: dict = {}
+_PROBE_CACHE_MAX = 64
 
 
 def _build_header_args(headers: Optional[dict]) -> list:
@@ -100,11 +106,25 @@ class FFmpegAudioFile:
 
     # ---- 元数据探测 ----
     def _probe(self, path: str):
-        """通过 ffprobe（优先）或 ffmpeg stderr（兜底）获取采样率/声道/时长"""
+        """通过 ffprobe（优先）或 ffmpeg stderr（兜底）获取采样率/声道/时长；结果按文件指纹缓存"""
+        key = None
+        try:
+            stat = os.stat(path)
+            key = (os.path.abspath(path), stat.st_mtime_ns, stat.st_size,
+                   tuple(self._header_args))  # header_args 是 list，必须转 tuple 才可哈希
+        except OSError:
+            pass
+        if key is not None and key in _PROBE_CACHE:
+            self.samplerate, self.channels, self._duration_sec = _PROBE_CACHE[key]
+            return
         if ffprobe_available():
             self._probe_with_ffprobe(path)
         if self.samplerate == 0:
             self._probe_with_ffmpeg(path)
+        if key is not None and self.samplerate > 0 and self.channels > 0:
+            if len(_PROBE_CACHE) >= _PROBE_CACHE_MAX:
+                _PROBE_CACHE.pop(next(iter(_PROBE_CACHE)), None)
+            _PROBE_CACHE[key] = (self.samplerate, self.channels, self._duration_sec)
 
     def _probe_with_ffprobe(self, path: str):
         cmd = [

@@ -207,8 +207,7 @@ def setup(ctx: PluginContext):
         else:
             segments = [segment]
         _send(origin["target"], segments, force=True)
-        with st.lock:
-            st.qq_origin = None
+        # origin 保留到回合结束（after_turn 清理）：同回合第二次发附件仍可用
         ctx.notify(f"[QQ桥] Agent 请求发送{('图片' if kind == 'image' else '文件')}到 {origin['target']}：{path.name}")
         return f"已提交发送到 {origin['target']}：{path.name}"
 
@@ -304,6 +303,10 @@ def setup(ctx: PluginContext):
                         images.append(url)
         return "\n".join(t for t in texts if t).strip(), images
 
+    def _echo_key(text: str) -> str:
+        """回声比对键：宿主带图提交时会给正文追加 [图片说明] 备注，比对前剥掉（精确全等会失配漏过滤）"""
+        return text.split("[图片说明]", 1)[0].strip()
+
     # ---- 终端 → QQ：hook 观察（一律只入队，不阻塞）----
 
     def _on_after_turn(payload):
@@ -326,8 +329,9 @@ def setup(ctx: PluginContext):
         if role == "user":
             text, images = _extract_user_content(content)
             with st.lock:
-                if text and text in st.pending_submits:
-                    st.pending_submits.remove(text)  # QQ 提交的回声，不回发
+                key = _echo_key(text)
+                if key and key in st.pending_submits:
+                    st.pending_submits.remove(key)  # QQ 提交的回声，不回发
                     return
             if not text and not images:
                 return
@@ -394,6 +398,9 @@ def setup(ctx: PluginContext):
         return item.get("response")
 
     def _take_pending(kind: str, request_id=None):
+        if not _allowlist():
+            # 白名单为空：QQ 回复在入口即被丢弃，代答只会让 agent 死等——直接不启用
+            return None
         with st.lock:
             if st.pending is not None or not _online():
                 return None
@@ -765,7 +772,8 @@ def setup(ctx: PluginContext):
                 app = _app()
                 if app is not None:
                     app._tree_follow_tail = True
-                    app.status = f"已切换：{session.session_title or session.session_id}"
+                    # 状态栏显示按显示宽裁剪（标题落库已全量，显示层统一口径）
+                    app.status = f"已切换：{session._clip_title(session.session_title or session.session_id)}"
                 _refresh_session(session)
                 return f"已切换会话：{session.session_title or session.session_id}"
 
@@ -913,6 +921,8 @@ def setup(ctx: PluginContext):
                 ctx.log.warn("qbridge API 失败 echo=%s retcode=%s data=%s",
                              data.get("echo"), retcode, str(data.get("data"))[:200])
 
+    ctx._qbridge_handle_frame = _handle_frame  # 测试缝：单测直驱帧路由
+
     def _ws_loop():
         while not st.stop.is_set():
             url = str(_cfg("ws_url") or "").strip()
@@ -941,6 +951,7 @@ def setup(ctx: PluginContext):
                 if configured:
                     st.bound = configured  # 配置了目标即生效，无需等首个消息
             ctx.log.info("qbridge 已连接 %s", url)
+            reconnect = False
             try:
                 _api_call(ws, "get_login_info", {}, echo="qb-login")
                 while not st.stop.is_set():
@@ -948,6 +959,7 @@ def setup(ctx: PluginContext):
                         reconnect_requested = st.reconnect_requested
                         st.reconnect_requested = False
                     if reconnect_requested:
+                        reconnect = True  # 标志在此已被消费，底部重读必为 False：本次 break 原因要带出去
                         break
                     try:
                         raw = ws.recv(timeout=0.2)
@@ -978,7 +990,7 @@ def setup(ctx: PluginContext):
             with st.lock:
                 reconnect_requested = st.reconnect_requested
                 st.reconnect_requested = False
-            st.stop.wait(0 if reconnect_requested else 5)
+            st.stop.wait(0 if (reconnect or reconnect_requested) else 5)
 
     def _start() -> str:
         if not _WS_OK:

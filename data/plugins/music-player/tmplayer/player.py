@@ -212,6 +212,11 @@ class Player:
     def path(self) -> str:
         return self._path
 
+    @property
+    def loaded(self) -> bool:
+        """是否已装载可播放文件：load 失败/stop 后为 False，供上层识别「假播放」死端"""
+        return self._file is not None
+
     # ---------- 加载/控制 ----------
     def load(self, path: str, eq_bands=None, q_values=None, headers=None):
         self.stop()
@@ -429,6 +434,12 @@ class Player:
             self.state = PlayState.PLAYING
             self._decode_wake.set()
             return
+        if self._eof_notified:
+            # 自然播完后的重播：先回卷，否则解码线程立即再遇 EOF 误触自动切歌
+            try:
+                self._file.seek(0)
+            except Exception:
+                pass
         self._open_stream()
         self.state = PlayState.PLAYING
         self._decode_wake.set()
