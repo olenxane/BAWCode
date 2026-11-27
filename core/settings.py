@@ -133,7 +133,7 @@ class SettingsPanelMixin(UiState):
                 tab_parts.append(self.C_HL + f" {name} " + self.RESET)
             else:
                 tab_parts.append(self.c("dim") + f" {name} " + self.RESET)
-        tab_line = " ".join(tab_parts) + self.c("dim") + "  PgUp/PgDn切页 · ↑↓选项 · ←→切换 · x重置本页 · Enter保存 · Esc放弃" + self.RESET
+        tab_line = " ".join(tab_parts) + self.c("dim") + "  PgUp/PgDn切页 · ↑↓选项 · ←→切换 · 空格勾选 · x重置本页 · Enter保存 · Esc放弃" + self.RESET
         lines.append(_clip_keep_ansi(tab_line, w))
         lines.append(self._rule(w))
 
@@ -891,7 +891,7 @@ class SettingsPanelMixin(UiState):
         self._settings_body_provider_id = ""
         self.settings_provider_id = config.data.get("active_provider_id", "")
         self.settings_model_name = config.model_name
-        self.settings_notice = "↑↓ 选择 · ←→ 修改 · PgUp/PgDn切页 · x重置本页 · Enter保存退出 · Esc放弃"
+        self.settings_notice = "↑↓ 选择 · ←→ 修改 · 空格勾选 · PgUp/PgDn切页 · x重置本页 · Enter保存退出 · Esc放弃"
         self.settings_model_work = getattr(self, "settings_model_work", {}) or {}
         self.settings_model_removed = getattr(self, "settings_model_removed", {}) or {}
         self._settings_model_scratch_name = ""
@@ -960,7 +960,7 @@ class SettingsPanelMixin(UiState):
                     self.bind_config(config)
                     return updates
                 self._settings_esc_stage = 0
-                self.settings_notice = "↑↓ 选择 · ←→ 修改 · PgUp/PgDn切页 · x重置本页 · Enter保存退出 · Esc放弃"
+                self.settings_notice = "↑↓ 选择 · ←→ 修改 · 空格勾选 · PgUp/PgDn切页 · x重置本页 · Enter保存退出 · Esc放弃"
                 # 继续处理当前键
             if kind == "mode_switch":
                 continue
@@ -1095,6 +1095,8 @@ class SettingsPanelMixin(UiState):
                 else:
                     self._settings_cycle_choice(1, config)
                 self.render()
+            elif kind == "char" and value == " " and self._settings_toggle_checkbox(config):
+                self.render()
             elif kind == "char" and str(value).lower() == "x" and not self._settings_field_editable():
                 # x 两按确认重置当前标签页；文本字段选中时 x 照常进入行内编辑
                 self._settings_reset_request(config)
@@ -1205,6 +1207,29 @@ class SettingsPanelMixin(UiState):
             self.settings_notice = "提供商页已恢复已保存配置 · 未保存修改已丢弃"
         self._immediate_settings_refresh(config)
         self._clamp_settings_index()
+
+    def _settings_toggle_checkbox(self, config) -> bool:
+        """空格勾选：仅勾选框类字段（check/bool/advbool/body_enabled/pbool）。"""
+        field = self._plugin_current_field()
+        ftype = field.get("type")
+        if not field.get("key") and ftype not in ("pbool", "body_enabled"):
+            return False
+        if ftype == "body_enabled":
+            item = self.settings_scratch["adv_custom_body"][field["body_index"]]
+            item["enabled"] = not bool(item.get("enabled", True))
+        elif ftype in ("bool", "advbool", "check"):
+            key = field["key"]
+            cur = self.settings_scratch.get(key, field.get("current"))
+            self.settings_scratch[key] = not bool(cur in (True, "true", "1", 1))
+            cur_marks = {True: "勾选", False: "取消勾选"}
+            self.settings_notice = f"{field.get('label', key)} 已{cur_marks[bool(self.settings_scratch[key])]}"
+        elif ftype == "pbool":
+            self._settings_plugin_toggle_bool(config, field)
+            self._immediate_settings_refresh(config)
+            self._clamp_settings_index()
+        else:
+            return False
+        return True
 
     def _settings_move_selection(self, direction: int) -> None:
         """↑↓ 移动选中项，跳过 sep 分隔行"""
